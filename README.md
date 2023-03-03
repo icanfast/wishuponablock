@@ -4,15 +4,15 @@ This repo is based on a Tech with Tim course: https://youtu.be/zfvxp7PgQ6c
 
 ## How to play
 
-open terminal
+Open terminal
 
-`python -m pip install pygame`
+Run `python -m pip install pygame`
 
-wait for installation to finish
+Wait for installation to finish
 
-make sure you're within this directory
+Make sure you're within the repo directory
 
-`python tetris.py`
+Run `python tetris.py`
 
 ## Why to play
 
