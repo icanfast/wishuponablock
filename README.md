@@ -1,16 +1,16 @@
 # Wish Upon a Block
 
-## How to play(Mac and Linux(probably Windows too)):
+## How to play
 
 open terminal
 
-python -m pip install pygame
+`python -m pip install pygame`
 
 wait for installation to finish
 
 make sure you're within this directory
 
-python tetris.py
+`python tetris.py`
 
 ## Why to play
 
