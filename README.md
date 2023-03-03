@@ -8,7 +8,7 @@ Open terminal
 
 Run `python -m pip install pygame`
 
-Wait for installation to finish
+Wait for the installation to finish
 
 Make sure you're within the repo directory
 
@@ -16,7 +16,7 @@ Run `python tetris.py`
 
 ## Why to play
 
-This iteration is meant to **gather data** on typical games of Tetris. Not t-spinning/PC/PvP/comboing for now, just striding like in classic Tetris. Cheese is ok, mistakes are welcome. Your games will be saved in the snapshots directory. After playing a few games please zip the snapshots directory and send it to me. It's going to be very useful to the project, thanks!
+This iteration is meant to **gather data** on typical games of Tetris. Not t-spinning/PC/PvP/comboing for now, just striding like in classic Tetris. Cheese is ok, mistakes are welcome. Your games will be saved in the snapshots directory. After playing a few games please zip the snapshots directory and send it to me. It's going to be very useful for the project, thanks!
 
 nikitin.maxim.94@gmail.com - mail
 
@@ -24,7 +24,7 @@ nikitin.maxim.94@gmail.com - mail
 
 ## Roadmap
 
-In a nutshell, i'm trying to introduce guidline tetris features, some of them (bags, both rotations, 180, poor man's harddrop) already have been realised. The following will come:
+In a nutshell, I'm trying to introduce guidline tetris features. Some of them (bags, both rotations, 180, poor man's harddrop) already have been realised. The following will come:
 - Both rotations - DONE
 - 180 rotation - DONE
 - Hard drop - sorta DONE
