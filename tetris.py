@@ -20,115 +20,6 @@ bag = []
 top_left_x = (s_width - play_width) // 2
 top_left_y = s_height - play_height
 
-
-# # SHAPE FORMATS
-
-# S = [['.....',
-#       '.....',
-#       '..00.',
-#       '.00..',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '..00.',
-#       '...0.',
-#       '.....']]
-
-# Z = [['.....',
-#       '.....',
-#       '.00..',
-#       '..00.',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '.00..',
-#       '.0...',
-#       '.....']]
-
-# I = [['..0..',
-#       '..0..',
-#       '..0..',
-#       '..0..',
-#       '.....'],
-#      ['.....',
-#       '0000.',
-#       '.....',
-#       '.....',
-#       '.....']]
-
-# O = [['.....',
-#       '.....',
-#       '.00..',
-#       '.00..',
-#       '.....']]
-
-# J = [['.....',
-#       '.0...',
-#       '.000.',
-#       '.....',
-#       '.....'],
-#      ['.....',
-#       '..00.',
-#       '..0..',
-#       '..0..',
-#       '.....'],
-#      ['.....',
-#       '.....',
-#       '.000.',
-#       '...0.',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '..0..',
-#       '.00..',
-#       '.....']]
-
-# L = [['.....',
-#       '...0.',
-#       '.000.',
-#       '.....',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '..0..',
-#       '..00.',
-#       '.....'],
-#      ['.....',
-#       '.....',
-#       '.000.',
-#       '.0...',
-#       '.....'],
-#      ['.....',
-#       '.00..',
-#       '..0..',
-#       '..0..',
-#       '.....']]
-
-# T = [['.....',
-#       '..0..',
-#       '.000.',
-#       '.....',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '..00.',
-#       '..0..',
-#       '.....'],
-#      ['.....',
-#       '.....',
-#       '.000.',
-#       '..0..',
-#       '.....'],
-#      ['.....',
-#       '..0..',
-#       '.00..',
-#       '..0..',
-#       '.....']]
-
-# shapes = [S, Z, I, O, J, L, T]
-# shape_colors = [(0, 255, 0), (255, 0, 0), (0, 255, 255),
-# (255, 255, 0), (255, 165, 0), (0, 0, 255), (128, 0, 128)]
-# index 0 - 6 represent shape
 shapes = {
     'S': {
         'rotations':
@@ -341,23 +232,11 @@ def bag_shuffler():
         yield Piece(5, 0, current_piece)
 
 
-shuffler = bag_shuffler()
-
-# def get_shape():
-#     global bag, shapes
-#     if not bag:
-#         bag = copy.deepcopy(shapes)
-#         random.shuffle(bag)
-#     print('bag: ', bag)
-#     current_piece = bag.pop()
-#     yield Piece(5, 0, random.choice(bag))
+shuffler = bag_shuffler()  # dubious idea idk
 
 
 def get_shape():
     return next(shuffler)
-
-# def get_shape():
-#     return Piece(5, 0, random.choice(shapes))
 
 
 def draw_text_middle(surface, text, size, color):
@@ -422,23 +301,6 @@ def draw_next_shape(shape, surface):
     surface.blit(label, (sx + 10, sy - 30))
 
 
-# def update_score(nscore):
-#     score = max_score()
-
-#     with open('scores.txt', 'w') as f:
-#         if int(score) > nscore:
-#             f.write(str(score))
-#         else:
-#             f.write(str(nscore))
-
-
-# def max_score():
-#     with open('scores.txt', 'r') as f:
-#         lines = f.readlines()
-#         score = lines[0].strip()
-
-#     return score
-
 def max_score():
     return '0'
 
@@ -468,14 +330,6 @@ def draw_window(surface, grid, score=0, last_score=0):
 
     surface.blit(label, (sx + 20, sy + 160))
 
-    # last score
-    # label = font.render('High Score: ' + last_score, 1, (255, 255, 255))
-
-    # sx = top_left_x - 250
-    # sy = top_left_y + 200
-
-    # surface.blit(label, (sx + 20, sy + 160))
-
     for i in range(len(grid)):
         for j in range(len(grid[i])):
             pygame.draw.rect(surface, grid[i][j], (top_left_x + j*block_size,
@@ -485,10 +339,9 @@ def draw_window(surface, grid, score=0, last_score=0):
                      top_left_y, play_width, play_height), 5)
 
     draw_grid(surface, grid)
-    # pygame.display.update()
 
 
-def main(win):  # *
+def main(win):
     snapshot_path = os.path.join(
         './snapshots',
         getpass.getuser() + '_snapshots',
@@ -572,13 +425,11 @@ def main(win):  # *
             if y > -1:
                 grid[y][x] = current_piece.color
 
-        if change_piece:  # snapshot somewhere here
+        if change_piece:
             snapshot = {
                 'grid': grid,
                 'score': score,
                 'last_score': last_score}
-            # with open('./snapshots/'+str(hash(datetime.datetime.now()))+'.json', 'w') as f:
-            #     json.dump(snapshot, f)
             write_snapshot(snapshot=snapshot,
                            snapshot_path=snapshot_path, turn=turn)
             for pos in shape_pos:
@@ -600,7 +451,6 @@ def main(win):  # *
             pygame.display.update()
             pygame.time.delay(1500)
             run = False
-            # update_score(score)
 
 
 def main_menu(win):  # *
