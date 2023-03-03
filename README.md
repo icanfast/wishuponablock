@@ -32,7 +32,7 @@ In a nutshell, i'm trying to introduce guidline tetris features, some of them (b
 - Comic Sans - REMOVED
 - Customise controls - WIP
 - Replay and markup tools - WIP
-- Bug which sometimes leaves empty lines
+- Fix the bug which sometimes leaves empty lines
 - Auto repeat (+ DAS, ARR settings)
 - Kickback
 - Ghost piece and proper harddrop
