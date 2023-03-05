@@ -30,13 +30,14 @@ In a nutshell, I'm trying to introduce guidline tetris features. Some of them (b
 - Hard drop - sorta DONE
 - 7 bag - DONE
 - Comic Sans - REMOVED
+- SRS piece rotations - WIP
 - Customise controls - WIP
 - Replay and markup tools - WIP
 - Fix the bug which sometimes leaves empty lines
 - Auto repeat (+ DAS, ARR settings)
-- Kickback
+- SRS kickback
 - Ghost piece and proper harddrop
 - Hold
 - Preview 5
-- Fix starting rotation
+- SRS spawning rotation - WIP
 - Blitz scoring
