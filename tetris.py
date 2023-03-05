@@ -6,7 +6,7 @@ import datetime
 import pickle as pkl
 import getpass
 import os
-from assets import shapes
+from assets import shapes, controls
 import pdb
 
 pygame.font.init()
@@ -99,7 +99,7 @@ def bag_shuffler():
         print()
 
         turn_no += 1
-        yield Piece(5, 0, current_piece)
+        yield Piece(5, 2, current_piece)
 
 
 shuffler = bag_shuffler()  # dubious idea idk
@@ -265,31 +265,31 @@ def main(win):
                 return True
 
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_LEFT:
+                if event.key == controls['Left']:
                     current_piece.x -= 1
                     if not(valid_space(current_piece, grid)):
                         current_piece.x += 1
-                if event.key == pygame.K_RIGHT:
+                if event.key == controls['Right']:
                     current_piece.x += 1
                     if not(valid_space(current_piece, grid)):
                         current_piece.x -= 1
-                if event.key == pygame.K_DOWN:
+                if event.key == controls['Down']:
                     current_piece.y += 1
                     if not(valid_space(current_piece, grid)):
                         current_piece.y -= 1
-                if event.key == pygame.K_w or event.key == pygame.K_UP:
+                if event.key == controls['Rotate Clockwise'] or event.key == controls['Rotate']:
                     current_piece.rotation += 1
                     if not(valid_space(current_piece, grid)):
                         current_piece.rotation -= 1
-                if event.key == pygame.K_q:
+                if event.key == controls['Rotate Counterclockwise']:
                     current_piece.rotation -= 1
                     if not(valid_space(current_piece, grid)):
                         current_piece.rotation += 1
-                if event.key == pygame.K_a:
+                if event.key == controls['Rotate 180']:
                     current_piece.rotation -= len(current_piece.shape)//2
                     if not(valid_space(current_piece, grid)):
                         current_piece.rotation += len(current_piece.shape)//2
-                if event.key == pygame.K_SPACE:
+                if event.key == controls['Hard Drop']:
                     fall_speed = 0.00001
         shape_pos = convert_shape_format(current_piece)
 

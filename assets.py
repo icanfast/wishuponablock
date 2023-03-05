@@ -1,3 +1,16 @@
+import pygame
+
+controls = {
+    'Left': pygame.K_LEFT,
+    'Right': pygame.K_RIGHT,
+    'Down': pygame.K_DOWN,
+    'Rotate': pygame.K_UP,
+    'Rotate Clockwise': pygame.K_e,
+    'Rotate Counterclockwise': pygame.K_w,
+    'Rotate 180': pygame.K_a,
+    'Hard Drop': pygame.K_SPACE
+}
+
 shapes = {
     'S': {
         'rotations':
