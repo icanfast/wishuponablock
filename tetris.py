@@ -6,6 +6,7 @@ import datetime
 import pickle as pkl
 import getpass
 import os
+from assets import shapes
 
 pygame.font.init()
 
@@ -19,138 +20,6 @@ bag = []
 
 top_left_x = (s_width - play_width) // 2
 top_left_y = s_height - play_height
-
-shapes = {
-    'S': {
-        'rotations':
-        [['.....',
-          '.....',
-          '..00.',
-          '.00..',
-          '.....'],
-         ['.....',
-         '..0..',
-          '..00.',
-          '...0.',
-          '.....']],
-        'colour': (0, 244, 0)
-    },
-
-    'Z': {
-        'rotations':
-        [['.....',
-          '.....',
-          '.00..',
-          '..00.',
-          '.....'],
-         ['.....',
-            '..0..',
-            '.00..',
-            '.0...',
-            '.....']],
-        'colour': (255, 0, 0)
-    },
-
-    'I': {
-        'rotations':
-        [['..0..',
-          '..0..',
-          '..0..',
-          '..0..',
-          '.....'],
-         ['.....',
-            '0000.',
-            '.....',
-            '.....',
-            '.....']],
-        'colour': (0, 244, 242)
-    },
-
-    'O': {
-        'rotations':
-        [['.....',
-          '.....',
-          '.00..',
-          '.00..',
-          '.....']],
-        'colour': (240, 240, 0)
-    },
-
-    'J': {
-        'rotations':
-        [['.....',
-          '.0...',
-          '.000.',
-          '.....',
-          '.....'],
-         ['.....',
-            '..00.',
-            '..0..',
-            '..0..',
-            '.....'],
-            ['.....',
-             '.....',
-             '.000.',
-             '...0.',
-             '.....'],
-            ['.....',
-             '..0..',
-             '..0..',
-             '.00..',
-             '.....']],
-        'colour': (0, 0, 250)
-    },
-
-    'L': {
-        'rotations':
-        [['.....',
-          '...0.',
-          '.000.',
-          '.....',
-          '.....'],
-         ['.....',
-            '..0..',
-            '..0..',
-            '..00.',
-            '.....'],
-            ['.....',
-             '.....',
-             '.000.',
-             '.0...',
-             '.....'],
-            ['.....',
-             '.00..',
-             '..0..',
-             '..0..',
-             '.....']],
-        'colour': (254, 155, 0)
-    },
-
-    'T': {
-        'rotations':
-        [['.....',
-          '..0..',
-          '.000.',
-          '.....',
-          '.....'],
-         ['.....',
-            '..0..',
-            '..00.',
-            '..0..',
-            '.....'],
-            ['.....',
-             '.....',
-             '.000.',
-             '..0..',
-             '.....'],
-            ['.....',
-             '..0..',
-             '.00..',
-             '..0..',
-             '.....']],
-        'colour': (175, 0, 249)
-    }
-}
 
 
 class Piece(object):  # *
@@ -342,16 +211,6 @@ def draw_window(surface, grid, score=0, last_score=0):
 
 
 def main(win):
-    snapshot_path = os.path.join(
-        './snapshots',
-        getpass.getuser() + '_snapshots',
-        datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
-    )
-    try:
-        os.makedirs(snapshot_path)
-    except Exception as e:
-        print(e)
-
     last_score = max_score()
     locked_positions = {}
     grid = create_grid(locked_positions)
@@ -366,6 +225,17 @@ def main(win):
     level_time = 0
     score = 0
     turn = 1
+    record = False
+    if record:
+        snapshot_path = os.path.join(
+            './snapshots',
+            getpass.getuser() + '_snapshots',
+            datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
+        )
+        try:
+            os.makedirs(snapshot_path)
+        except Exception as e:
+            print(e)
 
     while run:
         grid = create_grid(locked_positions)
@@ -430,8 +300,9 @@ def main(win):
                 'grid': grid,
                 'score': score,
                 'last_score': last_score}
-            write_snapshot(snapshot=snapshot,
-                           snapshot_path=snapshot_path, turn=turn)
+            if record:
+                write_snapshot(snapshot=snapshot,
+                               snapshot_path=snapshot_path, turn=turn)
             for pos in shape_pos:
                 p = (pos[0], pos[1])
                 locked_positions[p] = current_piece.color
