@@ -7,6 +7,7 @@ import pickle as pkl
 import getpass
 import os
 from assets import shapes
+import pdb
 
 pygame.font.init()
 
@@ -259,6 +260,9 @@ def main(win):
             if event.type == pygame.QUIT:
                 run = False
                 pygame.display.quit()
+                pygame.quit()
+                # pdb.set_trace()
+                return True
 
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_LEFT:
@@ -287,7 +291,6 @@ def main(win):
                         current_piece.rotation += len(current_piece.shape)//2
                 if event.key == pygame.K_SPACE:
                     fall_speed = 0.00001
-
         shape_pos = convert_shape_format(current_piece)
 
         for i in range(len(shape_pos)):
@@ -326,6 +329,7 @@ def main(win):
 
 def main_menu(win):  # *
     run = True
+    quit = False
     while run:
         win.fill((0, 0, 0))
         draw_text_middle(win, 'Press Any Key To Play', 60, (255, 255, 255))
@@ -334,7 +338,10 @@ def main_menu(win):  # *
             if event.type == pygame.QUIT:
                 run = False
             if event.type == pygame.KEYDOWN:
-                main(win)
+                quit = main(win)
+            if quit:
+                pygame.display.quit()
+                return None
     pygame.display.quit()
 
 
