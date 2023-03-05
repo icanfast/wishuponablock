@@ -225,7 +225,7 @@ def main(win):
     level_time = 0
     score = 0
     turn = 1
-    record = False
+    record = True
     if record:
         snapshot_path = os.path.join(
             './snapshots',
