@@ -7,7 +7,6 @@ import pickle as pkl
 import getpass
 import os
 from assets import shapes, controls
-import pdb
 
 pygame.font.init()
 
@@ -261,7 +260,6 @@ def main(win):
                 run = False
                 pygame.display.quit()
                 pygame.quit()
-                # pdb.set_trace()
                 return True
 
             if event.type == pygame.KEYDOWN:
