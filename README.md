@@ -21,23 +21,3 @@ This iteration is meant to **gather data** on typical games of Tetris. Not t-spi
 nikitin.maxim.94@gmail.com - mail
 
 @icanfast - everywhere else
-
-## Roadmap
-
-In a nutshell, I'm trying to introduce guidline tetris features. Some of them (bags, both rotations, 180, poor man's harddrop) already have been realised. The following will come:
-- Both rotations - DONE
-- 180 rotation - DONE
-- Hard drop - sorta DONE
-- 7 bag - DONE
-- Comic Sans - REMOVED
-- SRS piece rotations - WIP
-- Customise controls - WIP
-- Replay and markup tools - WIP
-- Fix the bug which sometimes leaves empty lines
-- Auto repeat (+ DAS, ARR settings)
-- SRS kickback
-- Ghost piece and proper harddrop
-- Hold
-- Preview 5
-- SRS spawning rotation - WIP
-- Blitz scoring
