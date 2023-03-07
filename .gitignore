@@ -1,4 +1,6 @@
 tetris.ipynb
-__pycache__/*
+__pycache__/
 deprecated_assets.py
 .DS_Store
+snapshots/
+resourses/
