@@ -32,7 +32,7 @@ class Piece(object):  # *
 
 
 def create_grid(locked_pos={}):  # *
-    grid = [[(0, 0, 0) for _ in range(10)] for _ in range(20)]
+    grid = [[(30, 30, 30) for _ in range(10)] for _ in range(20)]
 
     for i in range(len(grid)):
         for j in range(len(grid[i])):
@@ -60,7 +60,7 @@ def convert_shape_format(shape):
 
 def valid_space(shape, grid):
     accepted_pos = [[(j, i) for j in range(10) if grid[i]
-                     [j] == (0, 0, 0)] for i in range(20)]
+                     [j] == (30, 30, 30)] for i in range(20)]
     accepted_pos = [j for sub in accepted_pos for j in sub]
 
     formatted = convert_shape_format(shape)
@@ -121,10 +121,10 @@ def draw_grid(surface, grid):
     sy = top_left_y
 
     for i in range(len(grid)):
-        pygame.draw.line(surface, (128, 128, 128), (sx, sy +
+        pygame.draw.line(surface, (64, 64, 64), (sx, sy +
                          i*block_size), (sx+play_width, sy + i*block_size))
         for j in range(len(grid[i])):
-            pygame.draw.line(surface, (128, 128, 128), (sx + j *
+            pygame.draw.line(surface, (64, 64, 64), (sx + j *
                              block_size, sy), (sx + j*block_size, sy + play_height))
 
 
@@ -133,7 +133,7 @@ def clear_rows(grid, locked):
     inc = 0
     for i in range(len(grid)-1, -1, -1):
         row = grid[i]
-        if (0, 0, 0) not in row:
+        if (30, 30, 30) not in row:
             inc += 1
             ind = i
             for j in range(len(row)):
@@ -156,8 +156,8 @@ def draw_next_shape(shape, surface):
     font = pygame.font.SysFont('sfnsmono', 30)
     label = font.render('Next Shape', 1, (255, 255, 255))
 
-    sx = top_left_x + play_width + 50
-    sy = top_left_y + play_height/2 - 100
+    sx = top_left_x + play_width + 70
+    sy = top_left_y + play_height/2 - 250
     format = shape.shape[shape.rotation % len(shape.shape)]
 
     for i, line in enumerate(format):
@@ -167,7 +167,7 @@ def draw_next_shape(shape, surface):
                 pygame.draw.rect(surface, shape.color, (sx + j*block_size,
                                  sy + i*block_size, block_size, block_size), 0)
 
-    surface.blit(label, (sx + 10, sy - 30))
+    surface.blit(label, (sx - 30, sy - 50))
 
 
 def max_score():
@@ -181,7 +181,7 @@ def write_snapshot(snapshot, snapshot_path, turn):
 
 
 def draw_window(surface, grid, score=0, last_score=0):
-    surface.fill((0, 0, 0))
+    surface.fill((20, 20, 20))
 
     pygame.font.init()
     font = pygame.font.SysFont('sfnsmono', 60)
@@ -197,14 +197,14 @@ def draw_window(surface, grid, score=0, last_score=0):
     sx = top_left_x + play_width + 50
     sy = top_left_y + play_height/2 - 100
 
-    surface.blit(label, (sx + 20, sy + 160))
+    surface.blit(label, (sx, sy + 350))
 
     for i in range(len(grid)):
         for j in range(len(grid[i])):
             pygame.draw.rect(surface, grid[i][j], (top_left_x + j*block_size,
                              top_left_y + i*block_size, block_size, block_size), 0)
 
-    pygame.draw.rect(surface, (255, 0, 0), (top_left_x,
+    pygame.draw.rect(surface, (64, 64, 64), (top_left_x,
                      top_left_y, play_width, play_height), 5)
 
     draw_grid(surface, grid)
@@ -329,7 +329,7 @@ def main_menu(win):  # *
     run = True
     quit = False
     while run:
-        win.fill((0, 0, 0))
+        win.fill((20, 20, 20))
         draw_text_middle(win, 'Press Any Key To Play', 60, (255, 255, 255))
         pygame.display.update()
         for event in pygame.event.get():
