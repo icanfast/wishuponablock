@@ -3,7 +3,6 @@ import random
 import copy
 import json
 import datetime
-import pickle as pkl
 import getpass
 import os
 from assets import shapes, controls
@@ -17,22 +16,35 @@ play_width = 300  # meaning 300 // 10 = 30 width per block
 play_height = 600  # meaning 600 // 20 = 30 height per block
 block_size = 30
 bag = []
-
+LOCK_DELAY = 40
+GRID_COLOUR = (30, 30, 30)
+BACKGROUND_COLOUR = (20, 20, 20)
 top_left_x = (s_width - play_width) // 2
 top_left_y = s_height - play_height
 
 
 class Piece(object):  # *
-    def __init__(self, x, y, shape):
+    def __init__(self, x, y, shape, color=None):
         self.x = x
         self.y = y
         self.shape = shape['rotations']
-        self.color = shape['colour']
+        if color:
+            self.color = color
+        else:
+            self.color = shape['colour']
         self.rotation = 0
+
+    def __str__(self) -> str:
+        description = 'X: ' + str(self.x)
+        description += '\n'
+        description += 'Y: ' + str(self.y)
+        description += '\n'
+        description += str(self.shape[self.rotation % 4])
+        return description
 
 
 def create_grid(locked_pos={}):  # *
-    grid = [[(30, 30, 30) for _ in range(10)] for _ in range(20)]
+    grid = [[GRID_COLOUR for _ in range(10)] for _ in range(20)]
 
     for i in range(len(grid)):
         for j in range(len(grid[i])):
@@ -60,7 +72,7 @@ def convert_shape_format(shape):
 
 def valid_space(shape, grid):
     accepted_pos = [[(j, i) for j in range(10) if grid[i]
-                     [j] == (30, 30, 30)] for i in range(20)]
+                     [j] == GRID_COLOUR] for i in range(20)]
     accepted_pos = [j for sub in accepted_pos for j in sub]
 
     formatted = convert_shape_format(shape)
@@ -98,7 +110,7 @@ def bag_shuffler():
         print()
 
         turn_no += 1
-        yield Piece(5, 2, current_piece)
+        yield Piece(5, 3, current_piece)
 
 
 shuffler = bag_shuffler()  # dubious idea idk
@@ -116,16 +128,16 @@ def draw_text_middle(surface, text, size, color):
                  top_left_y + play_height/2 - label.get_height()/2))
 
 
-def draw_grid(surface, grid):
+def draw_gridlines(surface, grid):
     sx = top_left_x
     sy = top_left_y
 
     for i in range(len(grid)):
         pygame.draw.line(surface, (64, 64, 64), (sx, sy +
                          i*block_size), (sx+play_width, sy + i*block_size))
-        for j in range(len(grid[i])):
-            pygame.draw.line(surface, (64, 64, 64), (sx + j *
-                             block_size, sy), (sx + j*block_size, sy + play_height))
+    for j in range(len(grid[i])):
+        pygame.draw.line(surface, (64, 64, 64), (sx + j *
+                                                 block_size, sy), (sx + j*block_size, sy + play_height))
 
 
 def clear_rows(grid, locked):
@@ -133,7 +145,7 @@ def clear_rows(grid, locked):
     inc = 0
     for i in range(len(grid)-1, -1, -1):
         row = grid[i]
-        if (30, 30, 30) not in row:
+        if GRID_COLOUR not in row:
             inc += 1
             ind = i
             for j in range(len(row)):
@@ -170,6 +182,43 @@ def draw_next_shape(shape, surface):
     surface.blit(label, (sx - 30, sy - 50))
 
 
+def shape_to_colours(piece):  # unused for now
+    colours = []
+    for row in piece.shape[piece.rotation % 4]:
+        row_colours = []
+        for item in row:
+            if item == '0':
+                row_colours.append(piece.colour)
+            else:
+                row_colours.append(GRID_COLOUR)
+        colours.append(row_colours)
+    return colours
+
+
+def draw_ghost(surface, shape, grid):
+    ghost = Piece(shape.x, 19, {'rotations': shape.shape}, shape.color)
+    while not valid_space(ghost, grid):
+        ghost.y += 1
+    ghost.y -= 1
+    # print()
+    # print()
+    # print(shape)
+    # print()
+    # print(ghost)
+    # print()
+    # print()
+    # exit()
+    # draw ghost
+    ghost_colour = tuple([(i+j)/2 for i, j in zip(ghost.color, GRID_COLOUR)])
+    for i, line in enumerate(ghost.shape[shape.rotation % 4]):
+        row = list(line)
+        for j, column in enumerate(row):
+            if column == '0':
+                pygame.draw.rect(surface, ghost_colour, (top_left_x + (ghost.x-2)*block_size + j*block_size,
+                                                         top_left_y + ghost.y*block_size + i*block_size,
+                                                         block_size, block_size), 0)
+
+
 def max_score():
     return '0'
 
@@ -181,7 +230,7 @@ def write_snapshot(snapshot, snapshot_path, turn):
 
 
 def draw_window(surface, grid, score=0, last_score=0):
-    surface.fill((20, 20, 20))
+    surface.fill(BACKGROUND_COLOUR)
 
     pygame.font.init()
     font = pygame.font.SysFont('sfnsmono', 60)
@@ -207,7 +256,7 @@ def draw_window(surface, grid, score=0, last_score=0):
     pygame.draw.rect(surface, (64, 64, 64), (top_left_x,
                      top_left_y, play_width, play_height), 5)
 
-    draw_grid(surface, grid)
+    draw_gridlines(surface, grid)
 
 
 def main(win):
@@ -226,6 +275,7 @@ def main(win):
     score = 0
     turn = 1
     record = True
+    lock_delay = 0
     if record:
         snapshot_path = os.path.join(
             './snapshots',
@@ -253,7 +303,10 @@ def main(win):
             current_piece.y += 1
             if not(valid_space(current_piece, grid)) and current_piece.y > 0:
                 current_piece.y -= 1
-                change_piece = True
+                lock_delay += clock.get_rawtime()
+                if lock_delay >= LOCK_DELAY:
+                    lock_delay = 0
+                    change_piece = True
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -289,6 +342,7 @@ def main(win):
                         current_piece.rotation += len(current_piece.shape)//2
                 if event.key == controls['Hard Drop']:
                     fall_speed = 0.00001
+                    # change_piece = True
         shape_pos = convert_shape_format(current_piece)
 
         for i in range(len(shape_pos)):
@@ -316,6 +370,7 @@ def main(win):
 
         draw_window(win, grid, score, last_score)
         draw_next_shape(next_piece, win)
+        # draw_ghost(win, current_piece, grid)
         pygame.display.update()
 
         if check_lost(locked_positions):
@@ -329,7 +384,7 @@ def main_menu(win):  # *
     run = True
     quit = False
     while run:
-        win.fill((20, 20, 20))
+        win.fill(BACKGROUND_COLOUR)
         draw_text_middle(win, 'Press Any Key To Play', 60, (255, 255, 255))
         pygame.display.update()
         for event in pygame.event.get():
