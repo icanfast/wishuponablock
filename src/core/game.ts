@@ -1,15 +1,18 @@
 import {
+  COLS,
   DEFAULT_GRAVITY_MS,
   DEFAULT_HARD_LOCK_DELAY_MS,
   DEFAULT_LOCK_DELAY_MS,
   DEFAULT_SOFT_DROP_MS,
   NEXT_COUNT,
+  ROWS,
   SPAWN_X,
   SPAWN_Y,
 } from './constants';
 import { clearLines, makeBoard } from './board';
 import { Bag7 } from './bag7';
 import type { PieceGenerator } from './generator';
+import { XorShift32 } from './rng';
 import {
   collides,
   cellsOf,
@@ -20,6 +23,7 @@ import {
 } from './piece';
 
 import type { Board, GameState, InputFrame, PieceKind } from './types';
+import { PIECES } from './types';
 
 export interface GameConfig {
   seed: number;
@@ -35,11 +39,15 @@ export class Game {
   readonly state: GameState;
 
   private generator: PieceGenerator;
+  private rng: XorShift32;
 
   private gravityAcc = 0;
   private dropIntervalMs: number;
   private lockAcc = 0;
   private hardLockAcc = 0;
+  private cheeseRows: boolean[] = [];
+  private cheeseRemaining = 0;
+  private cheeseActive = false;
 
   private gravityMs: number;
   private softDropMs: number;
@@ -48,6 +56,7 @@ export class Game {
   private onPieceLock?: (board: Board) => void;
 
   constructor(cfg: GameConfig) {
+    this.rng = new XorShift32(cfg.seed);
     this.gravityMs = cfg.gravityMs ?? DEFAULT_GRAVITY_MS;
     this.dropIntervalMs = this.gravityMs;
     this.softDropMs = cfg.softDropMs ?? DEFAULT_SOFT_DROP_MS;
@@ -69,8 +78,10 @@ export class Game {
       canHold: true,
       next: [],
       gameOver: false,
+      gameWon: false,
     };
 
+    this.resetCheeseState();
     this.updateNextView();
     this.spawnActive(first);
   }
@@ -94,7 +105,7 @@ export class Game {
   }
 
   step(dtMs: number, input: InputFrame): void {
-    if (this.state.gameOver) return;
+    if (this.state.gameOver || this.state.gameWon) return;
 
     if (this.applyInput(input)) return;
     this.applyGravity(dtMs, input);
@@ -160,6 +171,7 @@ export class Game {
   }
 
   reset(seed: number): void {
+    this.rng = new XorShift32(seed);
     this.generator.reset(seed);
 
     this.state.board = makeBoard();
@@ -167,6 +179,8 @@ export class Game {
     this.state.canHold = true;
     this.state.next = [];
     this.state.gameOver = false;
+    this.state.gameWon = false;
+    this.resetCheeseState();
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
@@ -175,6 +189,53 @@ export class Game {
     const first = this.generator.next();
     this.updateNextView();
     this.spawnActive(first);
+  }
+
+  applyCheese(lines: number): void {
+    const count = Math.max(0, Math.min(ROWS, Math.trunc(lines)));
+    this.cheeseActive = count > 0;
+    this.cheeseRemaining = count;
+    this.cheeseRows = Array(ROWS).fill(false);
+    this.state.gameWon = false;
+
+    if (!this.cheeseActive) {
+      return;
+    }
+
+    for (let i = 0; i < count; i++) {
+      const y = ROWS - 1 - i;
+      this.cheeseRows[y] = true;
+      const hole = this.rng.nextInt(COLS);
+      for (let x = 0; x < COLS; x++) {
+        if (x === hole) {
+          this.state.board[y][x] = null;
+        } else {
+          const kind = PIECES[this.rng.nextInt(PIECES.length)];
+          this.state.board[y][x] = kind;
+        }
+      }
+    }
+
+    this.recomputeGhost();
+  }
+
+  private resetCheeseState(): void {
+    this.cheeseRows = Array(ROWS).fill(false);
+    this.cheeseRemaining = 0;
+    this.cheeseActive = false;
+    this.state.gameWon = false;
+  }
+
+  private applyCheeseClears(clearedRows: number[]): void {
+    if (!this.cheeseActive) return;
+
+    for (const y of clearedRows) {
+      if (this.cheeseRows[y]) {
+        this.cheeseRemaining = Math.max(0, this.cheeseRemaining - 1);
+      }
+      this.cheeseRows.splice(y, 1);
+      this.cheeseRows.unshift(false);
+    }
   }
 
   private adjustDropInterval(newInterval: number): void {
@@ -291,7 +352,10 @@ export class Game {
   private lockPiece(): void {
     const hasAboveTop = cellsOf(this.state.active).some(([, y]) => y < 0);
     merge(this.state.board, this.state.active);
-    clearLines(this.state.board);
+    const cleared = clearLines(this.state.board);
+    if (cleared.length > 0) {
+      this.applyCheeseClears(cleared);
+    }
     this.onPieceLock?.(this.state.board);
 
     this.gravityAcc = 0;
@@ -301,6 +365,11 @@ export class Game {
 
     if (hasAboveTop) {
       this.state.gameOver = true;
+      return;
+    }
+
+    if (this.cheeseActive && this.cheeseRemaining <= 0) {
+      this.state.gameWon = true;
       return;
     }
 

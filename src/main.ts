@@ -1,11 +1,15 @@
 import { Application, Graphics } from 'pixi.js';
 import {
+  BOARD_CELL_PX,
+  BOARD_X,
+  BOARD_Y,
   COLS,
   GAME_OVER_Y,
   HOLD_X,
   HOLD_Y,
   HOLD_WIDTH,
   OUTER_MARGIN,
+  PANEL_GAP,
   PLAY_HEIGHT,
   PLAY_WIDTH,
   ROWS,
@@ -28,6 +32,7 @@ import {
   downloadSnapshotSession,
   saveSnapshotSessionToDirectory,
 } from './core/snapshotRecorder';
+import { getMode, type GameMode, type ModeOptions } from './core/modes';
 import { Keyboard } from './input/keyboard';
 import { InputController } from './input/controller';
 import { KeyboardInputSource } from './input/keyboardInputSource';
@@ -123,6 +128,8 @@ async function boot() {
   const recorder = new SnapshotRecorder();
   let updateRecorderUI = () => {};
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
+  let selectedMode: GameMode = getMode('default');
+  let selectedModeOptions: ModeOptions = {};
 
   const kb = new Keyboard();
   const input = new InputController(kb, settings.input);
@@ -145,24 +152,63 @@ async function boot() {
     }
   };
 
-  const createGame = (cfg: Settings): Game =>
-    new Game({
+  const applyModeSettings = (base: Settings, mode: GameMode): Settings => {
+    if (!mode.settingsPatch) return base;
+    return {
+      ...base,
+      ...mode.settingsPatch,
+      game: {
+        ...base.game,
+        ...mode.settingsPatch.game,
+      },
+      input: {
+        ...base.input,
+        ...mode.settingsPatch.input,
+      },
+      generator: {
+        ...base.generator,
+        ...mode.settingsPatch.generator,
+      },
+      audio: {
+        ...base.audio,
+        ...mode.settingsPatch.audio,
+      },
+    };
+  };
+
+  const createGame = (
+    cfg: Settings,
+    mode: GameMode,
+    options: ModeOptions,
+  ): Game => {
+    const merged = applyModeSettings(cfg, mode);
+    const game = new Game({
       seed: Date.now(),
-      ...cfg.game,
-      generatorFactory: createGeneratorFactory(cfg.generator),
+      ...merged.game,
+      generatorFactory: createGeneratorFactory(merged.generator),
       onPieceLock: handlePieceLock,
     });
+    mode.onStart?.(game, options);
+    return game;
+  };
 
-  const createRunner = (g: Game): GameRunner =>
+  const createRunner = (
+    g: Game,
+    mode: GameMode,
+    options: ModeOptions,
+  ): GameRunner =>
     new GameRunner(g, {
       fixedStepMs: 1000 / 120,
-      onRestart: () => g.reset(Date.now()),
+      onRestart: () => {
+        g.reset(Date.now());
+        mode.onStart?.(g, options);
+      },
       maxElapsedMs: 250,
       maxStepsPerTick: 10,
     });
 
-  let game = createGame(settings);
-  let runner = createRunner(game);
+  let game = createGame(settings, selectedMode, selectedModeOptions);
+  let runner = createRunner(game, selectedMode, selectedModeOptions);
 
   const renderer = new PixiRenderer(gfx);
 
@@ -171,7 +217,9 @@ async function boot() {
     position: 'absolute',
     left: `${SETTINGS_X}px`,
     top: `${SETTINGS_Y}px`,
-    minWidth: `${SETTINGS_PANEL_WIDTH}px`,
+    width: `${SETTINGS_PANEL_WIDTH}px`,
+    maxHeight: `${PLAY_HEIGHT - SETTINGS_Y - OUTER_MARGIN}px`,
+    overflowY: 'auto',
     padding: '8px',
     background: '#121a24',
     color: '#e2e8f0',
@@ -342,9 +390,17 @@ async function boot() {
         snapshotDirHandle = await picker();
       }
 
-      const permission = await snapshotDirHandle.requestPermission({
-        mode: 'readwrite',
-      });
+      let permission: PermissionState = 'granted';
+      if (snapshotDirHandle.queryPermission) {
+        permission = await snapshotDirHandle.queryPermission({
+          mode: 'readwrite',
+        });
+      }
+      if (permission !== 'granted' && snapshotDirHandle.requestPermission) {
+        permission = await snapshotDirHandle.requestPermission({
+          mode: 'readwrite',
+        });
+      }
       if (permission !== 'granted') {
         updateFolderStatus('Folder access denied.');
         snapshotDirHandle = null;
@@ -443,7 +499,10 @@ async function boot() {
 
   recordButton.addEventListener('click', async () => {
     if (!recorder.isRecording) {
-      recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value);
+      recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value, {
+        id: selectedMode.id,
+        options: { ...selectedModeOptions },
+      });
       updateRecorderUI();
       return;
     }
@@ -484,24 +543,123 @@ async function boot() {
   settingsPanel.appendChild(recordStatus);
   uiLayer.appendChild(settingsPanel);
 
-  const syncPlayWindowSize = () => {
-    const settingsWidth = settingsPanel.offsetWidth;
-    const settingsBottom = settingsPanel.offsetTop + settingsPanel.offsetHeight;
-    const desiredWidth = Math.max(
-      PLAY_WIDTH,
-      SETTINGS_X + settingsWidth + OUTER_MARGIN,
-    );
-    const desiredHeight = Math.max(
-      PLAY_HEIGHT,
-      settingsBottom + OUTER_MARGIN,
-    );
+  const menuLayer = document.createElement('div');
+  Object.assign(menuLayer.style, {
+    position: 'absolute',
+    inset: '0',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'rgba(11, 15, 20, 0.7)',
+    pointerEvents: 'auto',
+  });
 
-    playWindow.style.width = `${desiredWidth}px`;
-    playWindow.style.height = `${desiredHeight}px`;
-    app.renderer.resize(desiredWidth, desiredHeight);
+  const makeMenuPanel = () => {
+    const panel = document.createElement('div');
+    Object.assign(panel.style, {
+      width: '240px',
+      padding: '16px',
+      background: '#121a24',
+      color: '#e2e8f0',
+      border: '2px solid #0b0f14',
+      borderRadius: '8px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '10px',
+      textAlign: 'center',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+      fontSize: '14px',
+    });
+    return panel;
   };
 
-  requestAnimationFrame(syncPlayWindowSize);
+  const menuMainPanel = makeMenuPanel();
+  const playPanel = makeMenuPanel();
+  const cheesePanel = makeMenuPanel();
+  Object.assign(playPanel.style, {
+    minHeight: '240px',
+    display: 'none',
+  });
+  Object.assign(cheesePanel.style, {
+    minHeight: '240px',
+    display: 'none',
+  });
+
+  const makeMenuButton = (labelText: string) => {
+    const btn = document.createElement('button');
+    btn.textContent = labelText;
+    Object.assign(btn.style, {
+      background: '#0b0f14',
+      color: '#e2e8f0',
+      border: '1px solid #1f2a37',
+      borderRadius: '6px',
+      padding: '10px 12px',
+      fontSize: '13px',
+      cursor: 'pointer',
+    });
+    return btn;
+  };
+
+  const playButton = makeMenuButton('PLAY');
+  const optionsButton = makeMenuButton('OPTIONS');
+  const placeholderButton = makeMenuButton('PLACEHOLDER');
+  const creditsButton = makeMenuButton('CREDITS');
+
+  menuMainPanel.appendChild(playButton);
+  menuMainPanel.appendChild(optionsButton);
+  menuMainPanel.appendChild(placeholderButton);
+  menuMainPanel.appendChild(creditsButton);
+
+  const playTitle = document.createElement('div');
+  playTitle.textContent = 'PLAY';
+  Object.assign(playTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const defaultButton = makeMenuButton('DEFAULT');
+  const cheeseModeButton = makeMenuButton('CHEESE');
+  const playBackButton = makeMenuButton('BACK');
+  Object.assign(playBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  playPanel.appendChild(playTitle);
+  playPanel.appendChild(defaultButton);
+  playPanel.appendChild(cheeseModeButton);
+  playPanel.appendChild(playBackButton);
+
+  const cheeseTitle = document.createElement('div');
+  cheeseTitle.textContent = 'CHEESE';
+  Object.assign(cheeseTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const cheese4Button = makeMenuButton('4 LINES');
+  const cheese8Button = makeMenuButton('8 LINES');
+  const cheese12Button = makeMenuButton('12 LINES');
+  const cheeseBackButton = makeMenuButton('BACK');
+  Object.assign(cheeseBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  cheesePanel.appendChild(cheeseTitle);
+  cheesePanel.appendChild(cheese4Button);
+  cheesePanel.appendChild(cheese8Button);
+  cheesePanel.appendChild(cheese12Button);
+  cheesePanel.appendChild(cheeseBackButton);
+
+  menuLayer.appendChild(menuMainPanel);
+  menuLayer.appendChild(playPanel);
+  menuLayer.appendChild(cheesePanel);
+  uiLayer.appendChild(menuLayer);
+
+  app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
 
   let generatorType = settings.generator.type;
 
@@ -511,8 +669,8 @@ async function boot() {
 
     if (next.generator.type !== generatorType) {
       generatorType = next.generator.type;
-      game = createGame(next);
-      runner = createRunner(game);
+      game = createGame(next, selectedMode, selectedModeOptions);
+      runner = createRunner(game, selectedMode, selectedModeOptions);
       if (select.value !== next.generator.type) {
         select.value = next.generator.type;
       }
@@ -539,11 +697,18 @@ async function boot() {
 
   let pausedByVisibility = document.visibilityState !== 'visible';
   let pausedByInput = false;
-  let paused = pausedByVisibility || pausedByInput;
+  let pausedByMenu = true;
+  let paused: boolean = pausedByVisibility || pausedByInput || pausedByMenu;
   let resumePending = false;
 
+  const showMenuPanel = (panel: 'main' | 'play' | 'cheese') => {
+    menuMainPanel.style.display = panel === 'main' ? 'flex' : 'none';
+    playPanel.style.display = panel === 'play' ? 'flex' : 'none';
+    cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
+  };
+
   const updatePaused = () => {
-    const next = pausedByVisibility || pausedByInput;
+    const next = pausedByVisibility || pausedByInput || pausedByMenu;
     if (next === paused) return;
     paused = next;
     if (!paused) resumePending = true;
@@ -562,7 +727,76 @@ async function boot() {
     updatePaused();
   });
 
+  const setMode = (mode: 'menu' | 'game') => {
+    const inMenu = mode === 'menu';
+    menuLayer.style.display = inMenu ? 'flex' : 'none';
+    settingsPanel.style.display = inMenu ? 'none' : 'block';
+    menuButton.style.display = inMenu ? 'none' : 'block';
+    holdLabel.style.display = inMenu ? 'none' : 'block';
+    pausedByMenu = inMenu;
+    updatePaused();
+    if (!inMenu) {
+      const nextSettings = settingsStore.get();
+      input.setConfig(nextSettings.input);
+      game = createGame(nextSettings, selectedMode, selectedModeOptions);
+      runner = createRunner(game, selectedMode, selectedModeOptions);
+      gameOverLabel.style.display = 'none';
+    } else {
+      gfx.clear();
+      gameOverLabel.style.display = 'none';
+      showMenuPanel('main');
+    }
+  };
+
+  playButton.addEventListener('click', () => showMenuPanel('play'));
+  defaultButton.addEventListener('click', () => {
+    selectedMode = getMode('default');
+    selectedModeOptions = {};
+    setMode('game');
+  });
+  cheeseModeButton.addEventListener('click', () => showMenuPanel('cheese'));
+  optionsButton.addEventListener('click', () => {
+    // Placeholder for future options screen
+  });
+  placeholderButton.addEventListener('click', () => {
+    // Placeholder for future mode
+  });
+  creditsButton.addEventListener('click', () => {
+    // Placeholder for future credits screen
+  });
+
+  const startCheese = (lines: number) => {
+    selectedMode = getMode('cheese');
+    selectedModeOptions = { cheeseLines: lines };
+    setMode('game');
+  };
+
+  cheese4Button.addEventListener('click', () => startCheese(4));
+  cheese8Button.addEventListener('click', () => startCheese(8));
+  cheese12Button.addEventListener('click', () => startCheese(12));
+  cheeseBackButton.addEventListener('click', () => showMenuPanel('play'));
+  playBackButton.addEventListener('click', () => showMenuPanel('main'));
+
+  const menuButton = makeMenuButton('MENU');
+  Object.assign(menuButton.style, {
+    position: 'absolute',
+    left: `${BOARD_X}px`,
+    top: `${BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP}px`,
+    width: `${COLS * BOARD_CELL_PX}px`,
+    pointerEvents: 'auto',
+    zIndex: '2',
+  });
+  uiLayer.appendChild(menuButton);
+
+  menuButton.addEventListener('click', () => setMode('menu'));
+
+  setMode('menu');
+
   const updateGameOverLabel = () => {
+    if (pausedByMenu) {
+      gameOverLabel.style.display = 'none';
+      return;
+    }
     gameOverLabel.style.display = runner.state.gameOver ? 'block' : 'none';
   };
 

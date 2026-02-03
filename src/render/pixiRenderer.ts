@@ -64,7 +64,7 @@ export class PixiRenderer {
       }
     }
 
-    if (state.gameOver) return;
+    if (state.gameOver || state.gameWon) return;
 
     // ghost
     const ghostColor = dim(COLORS[state.active.k], 0.35);

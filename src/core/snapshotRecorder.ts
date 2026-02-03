@@ -10,6 +10,7 @@ export interface SnapshotSessionMeta {
   cols: number;
   pieceOrder: readonly string[];
   settings: Pick<Settings, 'game' | 'generator'>;
+  mode?: SnapshotModeInfo;
   comment?: string;
 }
 
@@ -22,6 +23,11 @@ export interface SnapshotSample {
 export interface SnapshotSession {
   meta: SnapshotSessionMeta;
   samples: SnapshotSample[];
+}
+
+export interface SnapshotModeInfo {
+  id: string;
+  options?: Record<string, unknown>;
 }
 
 const PIECE_TO_INDEX = new Map(PIECES.map((k, i) => [k, i + 1]));
@@ -61,6 +67,7 @@ export class SnapshotRecorder {
     rows: number,
     cols: number,
     comment?: string,
+    mode?: SnapshotModeInfo,
   ): SnapshotSession {
     const now = new Date();
     const trimmedComment = comment?.trim();
@@ -73,9 +80,10 @@ export class SnapshotRecorder {
         cols,
         pieceOrder: PIECES,
         settings: {
-          game: settings.game,
-          generator: settings.generator,
+          game: { ...settings.game },
+          generator: { ...settings.generator },
         },
+        ...(mode ? { mode } : {}),
         ...(trimmedComment ? { comment: trimmedComment } : {}),
       },
       samples: [],

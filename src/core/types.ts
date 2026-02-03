@@ -22,6 +22,7 @@ export interface GameState {
   canHold: boolean;
   next: PieceKind[]; // preview window (derived from generator)
   gameOver: boolean;
+  gameWon: boolean;
 }
 
 export interface InputFrame {
