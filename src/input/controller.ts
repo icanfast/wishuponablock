@@ -75,9 +75,7 @@ export class InputController {
           } else {
             const steps =
               1 +
-              Math.floor(
-                (this.heldMs - this.nextRepeatAt) / this.cfg.arrMs,
-              );
+              Math.floor((this.heldMs - this.nextRepeatAt) / this.cfg.arrMs);
             moveX = this.activeDir * steps;
             this.nextRepeatAt += steps * this.cfg.arrMs;
           }
