@@ -40,6 +40,7 @@ export class Game {
 
   private generator: PieceGenerator;
   private rng: XorShift32;
+  totalLinesCleared = 0;
 
   private gravityAcc = 0;
   private dropIntervalMs: number;
@@ -48,6 +49,9 @@ export class Game {
   private cheeseRows: boolean[] = [];
   private cheeseRemaining = 0;
   private cheeseActive = false;
+  private initialBlocks: boolean[][] = [];
+  private initialBlocksRemaining = 0;
+  private initialBlocksActive = false;
 
   private gravityMs: number;
   private softDropMs: number;
@@ -81,7 +85,9 @@ export class Game {
       gameWon: false,
     };
 
+    this.totalLinesCleared = 0;
     this.resetCheeseState();
+    this.resetInitialBlocks();
     this.updateNextView();
     this.spawnActive(first);
   }
@@ -181,6 +187,8 @@ export class Game {
     this.state.gameOver = false;
     this.state.gameWon = false;
     this.resetCheeseState();
+    this.resetInitialBlocks();
+    this.totalLinesCleared = 0;
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
@@ -192,6 +200,7 @@ export class Game {
   }
 
   applyCheese(lines: number): void {
+    this.resetInitialBlocks();
     const count = Math.max(0, Math.min(ROWS, Math.trunc(lines)));
     this.cheeseActive = count > 0;
     this.cheeseRemaining = count;
@@ -235,6 +244,44 @@ export class Game {
       }
       this.cheeseRows.splice(y, 1);
       this.cheeseRows.unshift(false);
+    }
+  }
+
+  markInitialBlocks(): void {
+    this.initialBlocks = this.state.board.map((row) =>
+      row.map((cell) => cell != null),
+    );
+    this.initialBlocksRemaining = this.initialBlocks.reduce(
+      (sum, row) => sum + row.filter(Boolean).length,
+      0,
+    );
+    this.initialBlocksActive = this.initialBlocksRemaining > 0;
+    this.state.gameWon = false;
+  }
+
+  private resetInitialBlocks(): void {
+    this.initialBlocks = Array.from({ length: ROWS }, () =>
+      Array(COLS).fill(false),
+    );
+    this.initialBlocksRemaining = 0;
+    this.initialBlocksActive = false;
+  }
+
+  private applyInitialBlockClears(clearedRows: number[]): void {
+    if (!this.initialBlocksActive) return;
+
+    for (const y of clearedRows) {
+      const row = this.initialBlocks[y];
+      for (const cell of row) {
+        if (cell) this.initialBlocksRemaining -= 1;
+      }
+      this.initialBlocks.splice(y, 1);
+      this.initialBlocks.unshift(Array(COLS).fill(false));
+    }
+
+    if (this.initialBlocksRemaining <= 0) {
+      this.initialBlocksActive = false;
+      this.state.gameWon = true;
     }
   }
 
@@ -355,7 +402,9 @@ export class Game {
     const cleared = clearLines(this.state.board);
     if (cleared.length > 0) {
       this.applyCheeseClears(cleared);
+      this.applyInitialBlockClears(cleared);
     }
+    this.totalLinesCleared += cleared.length;
     this.onPieceLock?.(this.state.board);
 
     this.gravityAcc = 0;
@@ -370,6 +419,15 @@ export class Game {
 
     if (this.cheeseActive && this.cheeseRemaining <= 0) {
       this.state.gameWon = true;
+      return;
+    }
+
+    if (this.initialBlocksActive && this.initialBlocksRemaining <= 0) {
+      this.state.gameWon = true;
+      return;
+    }
+
+    if (this.state.gameWon) {
       return;
     }
 

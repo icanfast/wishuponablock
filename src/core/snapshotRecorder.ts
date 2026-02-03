@@ -136,10 +136,9 @@ export async function saveSnapshotSessionToDirectory(
   session: SnapshotSession,
   directory: FileSystemDirectoryHandle,
 ): Promise<void> {
-  const handle = await directory.getFileHandle(
-    buildSnapshotFilename(session),
-    { create: true },
-  );
+  const handle = await directory.getFileHandle(buildSnapshotFilename(session), {
+    create: true,
+  });
   const writable = await handle.createWritable();
   await writable.write(serializeSnapshotSession(session));
   await writable.close();

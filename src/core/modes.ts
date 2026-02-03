@@ -3,10 +3,13 @@ import type { Settings } from './settings';
 
 export interface ModeOptions {
   cheeseLines?: number;
+  pieces?: number;
+  simCount?: number;
+  seed?: number;
 }
 
 export interface GameMode {
-  id: 'default' | 'cheese';
+  id: 'default' | 'cheese' | 'charcuterie';
   label: string;
   settingsPatch?: Partial<Settings>;
   onStart?: (game: Game, options: ModeOptions) => void;
@@ -25,6 +28,10 @@ export const MODES: GameMode[] = [
         game.applyCheese(options.cheeseLines);
       }
     },
+  },
+  {
+    id: 'charcuterie',
+    label: 'Charcuterie',
   },
 ];
 

@@ -38,6 +38,7 @@ import { InputController } from './input/controller';
 import { KeyboardInputSource } from './input/keyboardInputSource';
 import { PixiRenderer } from './render/pixiRenderer';
 import type { Board } from './core/types';
+import { CharcuterieBot, runBotForPieces } from './bot/charcuterieBot';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -130,6 +131,17 @@ async function boot() {
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
   let selectedMode: GameMode = getMode('default');
   let selectedModeOptions: ModeOptions = {};
+  const charcuterieDefaultSimCount = 10000;
+  const charcuterieScoreWeights = {
+    height: 10,
+    holes: 20,
+    blocks: 0.01,
+    clears: 100,
+  };
+  const charcuterieHoleWeights = {
+    bottom: 5,
+    mid: 2,
+  };
 
   const kb = new Keyboard();
   const input = new InputController(kb, settings.input);
@@ -144,12 +156,78 @@ async function boot() {
       // Ignore autoplay restrictions and playback errors.
     });
   };
+  let suppressLockEffects = false;
   const handlePieceLock = (board: Board) => {
+    if (suppressLockEffects) return;
     playLockSound();
     if (recorder.isRecording) {
       recorder.record(board);
       updateRecorderUI();
     }
+  };
+
+  const getStackHeight = (board: Board): number => {
+    for (let y = 0; y < ROWS; y++) {
+      if (board[y].some((cell) => cell != null)) {
+        return ROWS - y;
+      }
+    }
+    return 0;
+  };
+
+  const countBlocks = (board: Board): number =>
+    board.reduce((sum, row) => {
+      const rowCount = row.reduce((rowSum, cell) => rowSum + (cell ? 1 : 0), 0);
+      return sum + rowCount;
+    }, 0);
+
+  const getHolePenalty = (board: Board): number => {
+    let penalty = 0;
+    for (let y = ROWS - 1; y >= 0; y--) {
+      const row = board[y];
+      let empty = 0;
+      let anyFilled = false;
+      for (const cell of row) {
+        if (cell == null) {
+          empty++;
+        } else {
+          anyFilled = true;
+        }
+      }
+      if (!anyFilled) continue;
+      const extraHoles = Math.max(0, empty - 1);
+      if (extraHoles === 0) continue;
+
+      const depth = ROWS - 1 - y;
+      if (depth < 4) {
+        penalty += extraHoles * charcuterieHoleWeights.bottom;
+      } else if (depth < 8) {
+        penalty += extraHoles * charcuterieHoleWeights.mid;
+      }
+    }
+    return penalty;
+  };
+
+  const scoreCharcuterieBoard = (
+    board: Board,
+    gameOver: boolean,
+    clears: number,
+  ): {
+    score: number;
+    height: number;
+    holes: number;
+    blocks: number;
+    clears: number;
+  } => {
+    const height = getStackHeight(board) + (gameOver ? ROWS : 0);
+    const holes = getHolePenalty(board);
+    const blocks = countBlocks(board);
+    const score =
+      height * charcuterieScoreWeights.height +
+      holes * charcuterieScoreWeights.holes +
+      blocks * charcuterieScoreWeights.blocks -
+      clears * charcuterieScoreWeights.clears;
+    return { score, height, holes, blocks, clears };
   };
 
   const applyModeSettings = (base: Settings, mode: GameMode): Settings => {
@@ -176,19 +254,132 @@ async function boot() {
     };
   };
 
+  const runModeStart = (
+    game: Game,
+    mode: GameMode,
+    options: ModeOptions,
+  ): void => {
+    mode.onStart?.(game, options);
+  };
+
+  const buildGame = (cfg: Settings, mode: GameMode, seed: number): Game => {
+    const merged = applyModeSettings(cfg, mode);
+    return new Game({
+      seed,
+      ...merged.game,
+      generatorFactory: createGeneratorFactory(merged.generator),
+      onPieceLock: handlePieceLock,
+    });
+  };
+
+  const createCharcuterieGame = (
+    cfg: Settings,
+    mode: GameMode,
+    options: ModeOptions,
+  ): Game => {
+    const pieces = Math.max(0, Math.trunc(Number(options.pieces ?? 0)));
+    const sims = Math.max(
+      1,
+      Math.trunc(Number(options.simCount ?? charcuterieDefaultSimCount)),
+    );
+    const seedOverride = options.seed;
+    const baseSeed =
+      seedOverride !== undefined ? Math.trunc(seedOverride) : Date.now();
+    const simStart = performance.now();
+
+    if (pieces === 0 || sims === 1) {
+      const game = buildGame(cfg, mode, baseSeed);
+      if (pieces > 0) {
+        suppressLockEffects = true;
+        try {
+          const bot = new CharcuterieBot(baseSeed ^ 0x9e3779b9);
+          runBotForPieces(game, bot, pieces);
+        } finally {
+          suppressLockEffects = false;
+        }
+      }
+      game.markInitialBlocks();
+      return game;
+    }
+
+    let bestGame: Game | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+    let bestHeight = Number.POSITIVE_INFINITY;
+    let bestHoles = Number.POSITIVE_INFINITY;
+    let bestBlocks = Number.POSITIVE_INFINITY;
+    let bestClears = 0;
+
+    let totalClears = 0;
+    let simsWithClears = 0;
+    let maxClears = 0;
+
+    suppressLockEffects = true;
+    try {
+      for (let i = 0; i < sims; i++) {
+        const seed = baseSeed + i * 977;
+        const game = buildGame(cfg, mode, seed);
+        const bot = new CharcuterieBot(seed ^ 0x9e3779b9);
+        runBotForPieces(game, bot, pieces);
+
+        const clears = game.totalLinesCleared;
+        const scored = scoreCharcuterieBoard(
+          game.state.board,
+          game.state.gameOver,
+          clears,
+        );
+        totalClears += clears;
+        if (clears > 0) simsWithClears += 1;
+        if (clears > maxClears) maxClears = clears;
+
+        if (
+          scored.score < bestScore ||
+          (scored.score === bestScore && scored.height < bestHeight) ||
+          (scored.score === bestScore &&
+            scored.height === bestHeight &&
+            scored.holes < bestHoles)
+        ) {
+          bestGame = game;
+          bestScore = scored.score;
+          bestHeight = scored.height;
+          bestHoles = scored.holes;
+          bestBlocks = scored.blocks;
+          bestClears = clears;
+        }
+      }
+    } finally {
+      suppressLockEffects = false;
+    }
+
+    if (sims > 1) {
+      const simElapsedMs = performance.now() - simStart;
+      console.info(
+        `[Charcuterie] sims=${sims} pieces=${pieces} ` +
+          `bestScore=${bestScore.toFixed(2)} ` +
+          `height=${bestHeight} holes=${bestHoles} blocks=${bestBlocks.toFixed(
+            0,
+          )} clears=${bestClears} ` +
+          `clearsTotal=${totalClears} simsWithClears=${simsWithClears} maxClears=${maxClears} ` +
+          `seed=${baseSeed} ` +
+          `elapsedMs=${simElapsedMs.toFixed(1)}`,
+      );
+    }
+
+    const finalGame = bestGame ?? buildGame(cfg, mode, baseSeed);
+    finalGame.markInitialBlocks();
+    return finalGame;
+  };
+
   const createGame = (
     cfg: Settings,
     mode: GameMode,
     options: ModeOptions,
   ): Game => {
-    const merged = applyModeSettings(cfg, mode);
-    const game = new Game({
-      seed: Date.now(),
-      ...merged.game,
-      generatorFactory: createGeneratorFactory(merged.generator),
-      onPieceLock: handlePieceLock,
-    });
-    mode.onStart?.(game, options);
+    if (mode.id === 'charcuterie') {
+      return createCharcuterieGame(cfg, mode, options);
+    }
+
+    const game = buildGame(cfg, mode, Date.now());
+    runModeStart(game, mode, options);
     return game;
   };
 
@@ -200,8 +391,14 @@ async function boot() {
     new GameRunner(g, {
       fixedStepMs: 1000 / 120,
       onRestart: () => {
+        if (mode.id === 'charcuterie') {
+          const nextSettings = settingsStore.get();
+          game = createGame(nextSettings, selectedMode, selectedModeOptions);
+          runner = createRunner(game, selectedMode, selectedModeOptions);
+          return;
+        }
         g.reset(Date.now());
-        mode.onStart?.(g, options);
+        runModeStart(g, mode, options);
       },
       maxElapsedMs: 250,
       maxStepsPerTick: 10,
@@ -576,11 +773,16 @@ async function boot() {
   const menuMainPanel = makeMenuPanel();
   const playPanel = makeMenuPanel();
   const cheesePanel = makeMenuPanel();
+  const charcuteriePanel = makeMenuPanel();
   Object.assign(playPanel.style, {
     minHeight: '240px',
     display: 'none',
   });
   Object.assign(cheesePanel.style, {
+    minHeight: '240px',
+    display: 'none',
+  });
+  Object.assign(charcuteriePanel.style, {
     minHeight: '240px',
     display: 'none',
   });
@@ -621,6 +823,7 @@ async function boot() {
 
   const defaultButton = makeMenuButton('DEFAULT');
   const cheeseModeButton = makeMenuButton('CHEESE');
+  const charcuterieModeButton = makeMenuButton('CHARCUTERIE');
   const playBackButton = makeMenuButton('BACK');
   Object.assign(playBackButton.style, {
     marginTop: 'auto',
@@ -629,6 +832,7 @@ async function boot() {
   playPanel.appendChild(playTitle);
   playPanel.appendChild(defaultButton);
   playPanel.appendChild(cheeseModeButton);
+  playPanel.appendChild(charcuterieModeButton);
   playPanel.appendChild(playBackButton);
 
   const cheeseTitle = document.createElement('div');
@@ -654,9 +858,88 @@ async function boot() {
   cheesePanel.appendChild(cheese12Button);
   cheesePanel.appendChild(cheeseBackButton);
 
+  const charcuterieTitle = document.createElement('div');
+  charcuterieTitle.textContent = 'CHARCUTERIE';
+  Object.assign(charcuterieTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const charcuterie8Button = makeMenuButton('8 PIECES');
+  const charcuterie14Button = makeMenuButton('14 PIECES');
+  const charcuterie20Button = makeMenuButton('20 PIECES');
+  const charcuterieSimInput = document.createElement('input');
+  charcuterieSimInput.type = 'number';
+  charcuterieSimInput.min = '1';
+  charcuterieSimInput.step = '1';
+  charcuterieSimInput.value = String(charcuterieDefaultSimCount);
+  Object.assign(charcuterieSimInput.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+
+  const charcuterieSeedInput = document.createElement('input');
+  charcuterieSeedInput.type = 'text';
+  charcuterieSeedInput.placeholder = 'Random';
+  Object.assign(charcuterieSeedInput.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+
+  const makeMenuField = (labelText: string, input: HTMLInputElement) => {
+    const field = document.createElement('div');
+    Object.assign(field.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '6px',
+      textAlign: 'left',
+      marginTop: '4px',
+    });
+    const label = document.createElement('div');
+    label.textContent = labelText;
+    Object.assign(label.style, {
+      color: '#b6c2d4',
+      fontSize: '11px',
+      letterSpacing: '0.3px',
+    });
+    field.appendChild(label);
+    field.appendChild(input);
+    return field;
+  };
+
+  const charcuterieSimField = makeMenuField('SIMULATIONS', charcuterieSimInput);
+  const charcuterieSeedField = makeMenuField('SEED', charcuterieSeedInput);
+  const charcuterieBackButton = makeMenuButton('BACK');
+  Object.assign(charcuterieBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  charcuteriePanel.appendChild(charcuterieTitle);
+  charcuteriePanel.appendChild(charcuterie8Button);
+  charcuteriePanel.appendChild(charcuterie14Button);
+  charcuteriePanel.appendChild(charcuterie20Button);
+  charcuteriePanel.appendChild(charcuterieSimField);
+  charcuteriePanel.appendChild(charcuterieSeedField);
+  charcuteriePanel.appendChild(charcuterieBackButton);
+
   menuLayer.appendChild(menuMainPanel);
   menuLayer.appendChild(playPanel);
   menuLayer.appendChild(cheesePanel);
+  menuLayer.appendChild(charcuteriePanel);
   uiLayer.appendChild(menuLayer);
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
@@ -701,10 +984,11 @@ async function boot() {
   let paused: boolean = pausedByVisibility || pausedByInput || pausedByMenu;
   let resumePending = false;
 
-  const showMenuPanel = (panel: 'main' | 'play' | 'cheese') => {
+  const showMenuPanel = (panel: 'main' | 'play' | 'cheese' | 'charcuterie') => {
     menuMainPanel.style.display = panel === 'main' ? 'flex' : 'none';
     playPanel.style.display = panel === 'play' ? 'flex' : 'none';
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
+    charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
   };
 
   const updatePaused = () => {
@@ -755,6 +1039,9 @@ async function boot() {
     setMode('game');
   });
   cheeseModeButton.addEventListener('click', () => showMenuPanel('cheese'));
+  charcuterieModeButton.addEventListener('click', () =>
+    showMenuPanel('charcuterie'),
+  );
   optionsButton.addEventListener('click', () => {
     // Placeholder for future options screen
   });
@@ -776,6 +1063,37 @@ async function boot() {
   cheese12Button.addEventListener('click', () => startCheese(12));
   cheeseBackButton.addEventListener('click', () => showMenuPanel('play'));
   playBackButton.addEventListener('click', () => showMenuPanel('main'));
+
+  const readCharcuterieSimCount = (): number => {
+    const raw = Number(charcuterieSimInput.value);
+    if (!Number.isFinite(raw)) return charcuterieDefaultSimCount;
+    return Math.max(1, Math.trunc(raw));
+  };
+
+  const readCharcuterieSeed = (): number | undefined => {
+    const raw = charcuterieSeedInput.value.trim();
+    if (!raw) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return undefined;
+    return Math.trunc(value);
+  };
+
+  const startCharcuterie = (pieces: number) => {
+    selectedMode = getMode('charcuterie');
+    const simCount = readCharcuterieSimCount();
+    const seed = readCharcuterieSeed();
+    selectedModeOptions = {
+      pieces,
+      simCount,
+      ...(seed !== undefined ? { seed } : {}),
+    };
+    setMode('game');
+  };
+
+  charcuterie8Button.addEventListener('click', () => startCharcuterie(8));
+  charcuterie14Button.addEventListener('click', () => startCharcuterie(14));
+  charcuterie20Button.addEventListener('click', () => startCharcuterie(20));
+  charcuterieBackButton.addEventListener('click', () => showMenuPanel('play'));
 
   const menuButton = makeMenuButton('MENU');
   Object.assign(menuButton.style, {
