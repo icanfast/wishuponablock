@@ -1,5 +1,6 @@
 import {
   DEFAULT_GRAVITY_MS,
+  DEFAULT_HARD_LOCK_DELAY_MS,
   DEFAULT_LOCK_DELAY_MS,
   DEFAULT_SOFT_DROP_MS,
   NEXT_COUNT,
@@ -11,20 +12,23 @@ import { Bag7 } from './bag7';
 import type { PieceGenerator } from './generator';
 import {
   collides,
+  cellsOf,
   dropDistance,
   merge,
   tryRotateSRS,
   tryRotate180PreferDirect,
 } from './piece';
 
-import type { GameState, InputFrame } from './types';
+import type { GameState, InputFrame, PieceKind } from './types';
 
 export interface GameConfig {
   seed: number;
   gravityMs?: number;
   softDropMs?: number;
   lockDelayMs?: number;
+  hardLockDelayMs?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
+  onPieceLock?: () => void;
 }
 
 export class Game {
@@ -35,16 +39,21 @@ export class Game {
   private gravityAcc = 0;
   private dropIntervalMs: number;
   private lockAcc = 0;
+  private hardLockAcc = 0;
 
   private gravityMs: number;
   private softDropMs: number;
   private lockDelayMs: number;
+  private hardLockDelayMs: number;
+  private onPieceLock?: () => void;
 
   constructor(cfg: GameConfig) {
     this.gravityMs = cfg.gravityMs ?? DEFAULT_GRAVITY_MS;
     this.dropIntervalMs = this.gravityMs;
     this.softDropMs = cfg.softDropMs ?? DEFAULT_SOFT_DROP_MS;
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
+    this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
+    this.onPieceLock = cfg.onPieceLock;
 
     const makeGenerator = cfg.generatorFactory ?? ((seed) => new Bag7(seed));
     this.generator = makeGenerator(cfg.seed);
@@ -63,9 +72,7 @@ export class Game {
     };
 
     this.updateNextView();
-    this.recomputeGhost();
-    if (collides(this.state.board, this.state.active))
-      this.state.gameOver = true;
+    this.spawnActive(first);
   }
 
   setConfig(cfg: Partial<GameConfig>): void {
@@ -75,6 +82,8 @@ export class Game {
     if (cfg.gravityMs !== undefined) this.gravityMs = cfg.gravityMs;
     if (cfg.softDropMs !== undefined) this.softDropMs = cfg.softDropMs;
     if (cfg.lockDelayMs !== undefined) this.lockDelayMs = cfg.lockDelayMs;
+    if (cfg.hardLockDelayMs !== undefined)
+      this.hardLockDelayMs = cfg.hardLockDelayMs;
 
     // Keep current interval in sync if it was previously matching one of these.
     if (this.dropIntervalMs === prevGravity) {
@@ -137,11 +146,16 @@ export class Game {
       collides(this.state.board, this.state.active, this.state.active.r, 0, 1)
     ) {
       this.lockAcc += dtMs;
-      if (this.lockAcc >= this.lockDelayMs) {
+      this.hardLockAcc += dtMs;
+      if (
+        this.lockAcc >= this.lockDelayMs ||
+        this.hardLockAcc >= this.hardLockDelayMs
+      ) {
         this.lockPiece();
       }
     } else {
       this.lockAcc = 0;
+      this.hardLockAcc = 0;
     }
   }
 
@@ -156,16 +170,11 @@ export class Game {
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
+    this.hardLockAcc = 0;
 
     const first = this.generator.next();
-    this.state.active = { k: first, r: 0, x: SPAWN_X, y: SPAWN_Y };
-
     this.updateNextView();
-    this.recomputeGhost();
-
-    if (collides(this.state.board, this.state.active)) {
-      this.state.gameOver = true;
-    }
+    this.spawnActive(first);
   }
 
   private adjustDropInterval(newInterval: number): void {
@@ -280,27 +289,28 @@ export class Game {
   }
 
   private lockPiece(): void {
+    this.onPieceLock?.();
+    const hasAboveTop = cellsOf(this.state.active).some(([, y]) => y < 0);
     merge(this.state.board, this.state.active);
     clearLines(this.state.board);
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
     this.state.canHold = true;
+    this.hardLockAcc = 0;
+
+    if (hasAboveTop) {
+      this.state.gameOver = true;
+      return;
+    }
 
     this.spawnNext();
   }
 
   private spawnNext(): void {
     const k = this.generator.next();
-
-    this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
-
     this.updateNextView();
-    this.recomputeGhost();
-
-    if (collides(this.state.board, this.state.active)) {
-      this.state.gameOver = true;
-    }
+    this.spawnActive(k);
   }
 
   private doHold(): void {
@@ -318,19 +328,31 @@ export class Game {
     }
 
     this.state.hold = current;
-    this.state.active = { k: held, r: 0, x: SPAWN_X, y: SPAWN_Y };
     this.gravityAcc = 0;
     this.lockAcc = 0;
+    this.hardLockAcc = 0;
 
+    this.spawnActive(held);
+  }
+
+  private updateNextView(): void {
+    this.state.next = this.generator.peek(NEXT_COUNT);
+  }
+
+  private spawnActive(k: PieceKind): void {
+    this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
+    this.liftSpawnIfBlocked();
     this.recomputeGhost();
-
     if (collides(this.state.board, this.state.active)) {
       this.state.gameOver = true;
     }
   }
 
-  private updateNextView(): void {
-    this.state.next = this.generator.peek(NEXT_COUNT);
+  private liftSpawnIfBlocked(): void {
+    for (let i = 0; i < 4; i++) {
+      if (!collides(this.state.board, this.state.active)) return;
+      this.state.active.y -= 1;
+    }
   }
 
   private recomputeGhost(): void {

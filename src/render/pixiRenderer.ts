@@ -1,6 +1,26 @@
 import { Graphics } from 'pixi.js';
-import { COLS, ROWS } from '../core/constants';
+import {
+  BOARD_CELL_PX,
+  BOARD_X,
+  BOARD_Y,
+  COLS,
+  HOLD_COLS,
+  HOLD_INNER_Y,
+  HOLD_LABEL_HEIGHT,
+  HOLD_PANEL_HEIGHT,
+  HOLD_WIDTH,
+  HOLD_X,
+  HOLD_Y,
+  NEXT_COUNT,
+  QUEUE_COLS,
+  QUEUE_GAP_PX,
+  QUEUE_PREVIEW_HEIGHT,
+  QUEUE_X,
+  QUEUE_Y,
+  ROWS,
+} from '../core/constants';
 import { cellsOf } from '../core/piece';
+import { TETROMINOES } from '../core/tetromino';
 import type { GameState, PieceKind } from '../core/types';
 
 const COLORS: Record<PieceKind, number> = {
@@ -16,9 +36,9 @@ const COLORS: Record<PieceKind, number> = {
 export class PixiRenderer {
   constructor(
     private gfx: Graphics,
-    private cell = 28,
-    private boardX = 40,
-    private boardY = 40,
+    private cell = BOARD_CELL_PX,
+    private boardX = BOARD_X,
+    private boardY = BOARD_Y,
   ) {}
 
   render(state: GameState): void {
@@ -26,11 +46,14 @@ export class PixiRenderer {
 
     gfx.clear();
 
-    // background + frame
+    // board background + frame
     gfx
       .rect(boardX - 2, boardY - 2, COLS * cell + 4, ROWS * cell + 4)
       .fill(0x121a24);
     gfx.rect(boardX, boardY, COLS * cell, ROWS * cell).fill(0x0b0f14);
+
+    this.renderHold(state);
+    this.renderQueue(state);
 
     // settled blocks
     for (let y = 0; y < ROWS; y++) {
@@ -56,6 +79,57 @@ export class PixiRenderer {
     for (const [x, y] of cellsOf(state.active)) {
       if (y < 0) continue;
       drawCell(gfx, boardX, boardY, cell, x, y, color);
+    }
+  }
+
+  private renderQueue(state: GameState): void {
+    const { gfx, cell } = this;
+    const count = Math.min(state.next.length, NEXT_COUNT);
+    if (count === 0) return;
+
+    const panelHeight =
+      count * QUEUE_PREVIEW_HEIGHT + (count - 1) * QUEUE_GAP_PX;
+    const panelWidth = QUEUE_COLS * cell;
+
+    gfx
+      .rect(QUEUE_X - 2, QUEUE_Y - 2, panelWidth + 4, panelHeight + 4)
+      .fill(0x121a24);
+    gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, panelHeight).fill(0x0b0f14);
+
+    const offsetX = Math.floor((QUEUE_COLS - 4) / 2) * cell;
+
+    for (let i = 0; i < count; i++) {
+      const kind = state.next[i];
+      const boxY = QUEUE_Y + i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX);
+      this.drawPreviewPiece(kind, QUEUE_X + offsetX, boxY, cell);
+    }
+  }
+
+  private renderHold(state: GameState): void {
+    const { gfx, cell } = this;
+
+    gfx
+      .rect(HOLD_X - 2, HOLD_Y - 2, HOLD_WIDTH + 4, HOLD_PANEL_HEIGHT + 4)
+      .fill(0x121a24);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_PANEL_HEIGHT).fill(0x0b0f14);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_LABEL_HEIGHT).fill(0x121a24);
+
+    if (!state.hold) return;
+
+    const offsetX = Math.floor((HOLD_COLS - 4) / 2) * cell;
+    this.drawPreviewPiece(state.hold, HOLD_X + offsetX, HOLD_INNER_Y, cell);
+  }
+
+  private drawPreviewPiece(
+    kind: PieceKind,
+    originX: number,
+    originY: number,
+    cell: number,
+  ): void {
+    const color = COLORS[kind];
+    const shape = TETROMINOES[kind][0];
+    for (const [x, y] of shape) {
+      drawCell(this.gfx, originX, originY, cell, x, y, color);
     }
   }
 }

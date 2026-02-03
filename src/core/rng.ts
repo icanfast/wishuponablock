@@ -19,6 +19,12 @@ export class XorShift32 {
   nextInt(maxExclusive: number): number {
     return this.nextU32() % maxExclusive;
   }
+
+  clone(): XorShift32 {
+    const copy = new XorShift32(1);
+    copy.s = this.s;
+    return copy;
+  }
 }
 
 export function shuffleInPlace<T>(arr: T[], rng: XorShift32): void {
