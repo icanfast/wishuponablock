@@ -1,35 +1,102 @@
-import { Application, Assets, Sprite } from 'pixi.js';
+import { Application, Graphics } from 'pixi.js';
+import { Game } from './core/game';
+import { GameRunner } from './core/runner';
+import type { Settings } from './core/settings';
+import { createSettingsStore } from './core/settingsStore';
+import { Keyboard } from './input/keyboard';
+import { InputController } from './input/controller';
+import { KeyboardInputSource } from './input/keyboardInputSource';
+import { PixiRenderer } from './render/pixiRenderer';
 
-(async () => {
-  // Create a new application
+function hasWebGL(): boolean {
+  const c = document.createElement('canvas');
+  return !!(c.getContext('webgl2') || c.getContext('webgl'));
+}
+
+async function boot() {
+  if (!hasWebGL()) {
+    document.body.innerHTML = `<div style="padding:16px;color:#fff;background:#000;height:100vh">
+      WebGL is disabled/unavailable. Enable hardware acceleration.
+    </div>`;
+    return;
+  }
+
   const app = new Application();
-
-  // Initialize the application
-  await app.init({ background: '#1099bb', resizeTo: window });
-
-  // Append the application canvas to the document body
-  document.getElementById('pixi-container')!.appendChild(app.canvas);
-
-  // Load the bunny texture
-  const texture = await Assets.load('/assets/bunny.png');
-
-  // Create a bunny Sprite
-  const bunny = new Sprite(texture);
-
-  // Center the sprite's anchor point
-  bunny.anchor.set(0.5);
-
-  // Move the sprite to the center of the screen
-  bunny.position.set(app.screen.width / 2, app.screen.height / 2);
-
-  // Add the bunny to the stage
-  app.stage.addChild(bunny);
-
-  // Listen for animate update
-  app.ticker.add((time) => {
-    // Just for fun, let's rotate mr rabbit a little.
-    // * Delta is 1 if running at 100% performance *
-    // * Creates frame-independent transformation *
-    bunny.rotation += 0.1 * time.deltaTime;
+  await app.init({
+    width: 420,
+    height: 680,
+    backgroundColor: 0x0b0f14,
+    preference: 'webgl',
+    powerPreference: 'high-performance',
+    antialias: false,
   });
-})();
+
+  const root = document.getElementById('app') ?? document.body;
+  root.innerHTML = '';
+  Object.assign(document.body.style, { margin: '0', overflow: 'hidden' });
+  Object.assign(root.style, {
+    position: 'fixed',
+    inset: '0',
+    overflow: 'hidden',
+  });
+  root.appendChild(app.canvas);
+
+  const gfx = new Graphics();
+  app.stage.addChild(gfx);
+
+  const settingsStore = createSettingsStore();
+  const settings = settingsStore.get();
+
+  const kb = new Keyboard();
+  const input = new InputController(kb, settings.input);
+  const inputSource = new KeyboardInputSource(input);
+  const game = new Game({ seed: Date.now(), ...settings.game });
+  const runner = new GameRunner(game, {
+    fixedStepMs: 1000 / 120,
+    onRestart: (g) => g.reset(Date.now()),
+    maxElapsedMs: 250,
+    maxStepsPerTick: 10,
+  });
+
+  const renderer = new PixiRenderer(gfx);
+
+  settingsStore.subscribe((next) => {
+    input.setConfig(next.input);
+    game.setConfig(next.game);
+  });
+
+  const applySettings = (patch: Partial<Settings>): void => {
+    settingsStore.apply(patch);
+  };
+
+  // TODO: Wire applySettings to UI when settings controls are added.
+  void applySettings;
+
+  let paused = document.visibilityState !== 'visible';
+  let resumePending = false;
+
+  const setPaused = (next: boolean) => {
+    if (next === paused) return;
+    paused = next;
+    if (!paused) resumePending = true;
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    setPaused(document.visibilityState !== 'visible');
+  });
+  window.addEventListener('blur', () => setPaused(true));
+  window.addEventListener('focus', () => setPaused(false));
+
+  app.ticker.add((t) => {
+    if (paused) return;
+    if (resumePending) {
+      runner.resetTiming();
+      resumePending = false;
+      return;
+    }
+    runner.tick(t.elapsedMS, inputSource);
+    renderer.render(runner.state);
+  });
+}
+
+boot().catch((e) => console.error(e));
