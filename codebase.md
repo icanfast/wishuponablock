@@ -38,12 +38,15 @@ The content is organized as follows:
   workflows/
     ci.yml
 public/
-  assets/
-    bunny.png
-    logo.svg
+  sfx/
+    lock.ogg
   favicon.png
   style.css
+resources/
+  lock.ogg
 src/
+  __tests__/
+    core.test.ts
   bot/
     controller.ts
   core/
@@ -52,7 +55,10 @@ src/
     constants.ts
     game.ts
     generator.ts
+    generators.ts
     piece.ts
+    randomGenerator.ts
+    replay.ts
     rng.ts
     runner.ts
     settings.ts
@@ -71,20 +77,56 @@ src/
 .eslintrc.cjs
 .gitignore
 .prettierrc
+CHANGELOG.md
 eslint.config.mjs
 index.html
 package.json
 tsconfig.json
 vite.config.ts
+vitest.config.ts
 ```
 
 # Files
 
-## File: src/bot/controller.ts
-```typescript
-import type { InputSource } from '../core/runner';
+## File: .github/workflows/ci.yml
+```yaml
+name: ci
 
-export interface BotController extends InputSource {}
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+```
+
+## File: public/style.css
+```css
+body {
+  margin: 0;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #000000;
+}
+
+#app {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
 ```
 
 ## File: src/core/bag7.ts
@@ -153,28 +195,816 @@ export function clearLines(board: Board): number {
 }
 ```
 
+## File: src/core/generator.ts
+```typescript
+import type { PieceKind } from './types';
+
+export interface PieceGenerator {
+  next(): PieceKind;
+  peek(n: number): PieceKind[];
+  reset(seed: number): void;
+}
+```
+
+## File: src/core/generators.ts
+```typescript
+import type { PieceGenerator } from './generator';
+import { Bag7 } from './bag7';
+import { RandomGenerator } from './randomGenerator';
+
+export const GENERATOR_TYPES = ['bag7', 'random'] as const;
+export type GeneratorType = (typeof GENERATOR_TYPES)[number];
+
+export interface GeneratorSettings {
+  type: GeneratorType;
+}
+
+export function isGeneratorType(value: unknown): value is GeneratorType {
+  return (
+    typeof value === 'string' &&
+    (GENERATOR_TYPES as readonly string[]).includes(value)
+  );
+}
+
+export function createGeneratorFactory(
+  settings: GeneratorSettings,
+): (seed: number) => PieceGenerator {
+  switch (settings.type) {
+    case 'random':
+      return (seed) => new RandomGenerator(seed);
+    case 'bag7':
+    default:
+      return (seed) => new Bag7(seed);
+  }
+}
+```
+
+## File: src/core/piece.ts
+```typescript
+import { COLS, ROWS } from './constants';
+import { TETROMINOES, rotAdd } from './tetromino';
+import { getSrsKickTests } from './srs';
+import type { ActivePiece, Board, Rotation, Vec2 } from './types';
+
+export function cellsOf(
+  piece: ActivePiece,
+  r: Rotation = piece.r,
+  dx = 0,
+  dy = 0,
+): Vec2[] {
+  const shape = TETROMINOES[piece.k][r];
+  return shape.map(([x, y]) => [piece.x + x + dx, piece.y + y + dy]);
+}
+
+export function collides(
+  board: Board,
+  piece: ActivePiece,
+  r: Rotation = piece.r,
+  dx = 0,
+  dy = 0,
+): boolean {
+  for (const [cx, cy] of cellsOf(piece, r, dx, dy)) {
+    if (cx < 0 || cx >= COLS || cy >= ROWS) return true;
+    if (cy >= 0 && board[cy][cx] != null) return true;
+  }
+  return false;
+}
+
+export function merge(board: Board, piece: ActivePiece): void {
+  for (const [cx, cy] of cellsOf(piece)) {
+    if (cy >= 0) board[cy][cx] = piece.k;
+  }
+}
+
+export function dropDistance(board: Board, piece: ActivePiece): number {
+  let d = 0;
+  while (!collides(board, piece, piece.r, 0, d + 1)) d++;
+  return d;
+}
+
+export function tryRotateSRS(
+  board: Board,
+  piece: ActivePiece,
+  dir: -1 | 1,
+): boolean {
+  const from = piece.r;
+  const to = rotAdd(from, dir);
+
+  // SRS defines a list of translation tests depending on (from -> to) and piece type. :contentReference[oaicite:5]{index=5}
+  const tests = getSrsKickTests(piece.k, from, to);
+
+  for (const [dx, dy] of tests) {
+    if (!collides(board, piece, to, dx, dy)) {
+      piece.r = to;
+      piece.x += dx;
+      piece.y += dy;
+      return true;
+    }
+  }
+  return false;
+}
+
+export function tryRotate180PreferDirect(
+  board: Board,
+  piece: ActivePiece,
+): boolean {
+  const to = ((piece.r + 2) % 4) as Rotation;
+
+  // 1) Direct 180, no kicks, no intermediate state
+  if (!collides(board, piece, to, 0, 0)) {
+    piece.r = to;
+    return true;
+  }
+
+  // 2) Fallback: two 90-degree SRS rotations (with kicks)
+  return tryRotate180ViaSRS(board, piece);
+}
+
+/**
+ * This implementation tries CW+CW, then CCW+CCW, using SRS kicks for each 90° step.
+ */
+export function tryRotate180ViaSRS(board: Board, piece: ActivePiece): boolean {
+  const attempt = (dir: -1 | 1): boolean => {
+    const tmp: ActivePiece = { ...piece };
+    if (!tryRotateSRS(board, tmp, dir)) return false;
+    if (!tryRotateSRS(board, tmp, dir)) return false;
+    piece.x = tmp.x;
+    piece.y = tmp.y;
+    piece.r = tmp.r;
+    return true;
+  };
+
+  return attempt(1) || attempt(-1);
+}
+```
+
+## File: src/core/randomGenerator.ts
+```typescript
+import { PIECES, type PieceKind } from './types';
+import { XorShift32 } from './rng';
+import type { PieceGenerator } from './generator';
+
+export class RandomGenerator implements PieceGenerator {
+  private rng: XorShift32;
+
+  constructor(seed: number) {
+    this.rng = new XorShift32(seed);
+  }
+
+  reset(seed: number): void {
+    this.rng = new XorShift32(seed);
+  }
+
+  next(): PieceKind {
+    const i = this.rng.nextInt(PIECES.length);
+    return PIECES[i];
+  }
+
+  peek(n: number): PieceKind[] {
+    const out: PieceKind[] = [];
+    const rng = this.rng.clone();
+    for (let i = 0; i < n; i++) {
+      out.push(PIECES[rng.nextInt(PIECES.length)]);
+    }
+    return out;
+  }
+}
+```
+
+## File: src/core/replay.ts
+```typescript
+import type { InputFrame } from './types';
+import type { Settings } from './settings';
+
+export interface ReplayHeader {
+  protocolVersion: number;
+  buildVersion?: string;
+  seed: number;
+  generator: {
+    type: string;
+    params?: Record<string, unknown>;
+  };
+  settings: Settings;
+  createdAt: string;
+}
+
+export interface Replay {
+  header: ReplayHeader;
+  inputs: InputFrame[];
+}
+```
+
+## File: src/core/runner.ts
+```typescript
+import type { Game } from './game';
+import type { GameState, InputFrame } from './types';
+
+export interface InputSource {
+  sample(state: GameState, dtMs: number): InputFrame;
+  reset?(seed: number): void;
+}
+
+export interface GameRunnerOptions {
+  fixedStepMs: number;
+  onRestart?: (game: Game) => void;
+  /**
+   * Optional clamp to prevent spiral-of-death after long stalls.
+   */
+  maxElapsedMs?: number;
+  /**
+   * Optional cap on steps per tick. Extra accumulated time is dropped.
+   */
+  maxStepsPerTick?: number;
+}
+
+const EMPTY_INPUT: InputFrame = {
+  moveX: 0,
+  rotate: 0,
+  rotate180: false,
+  softDrop: false,
+  hardDrop: false,
+  hold: false,
+  restart: false,
+};
+
+export class GameRunner {
+  private accMs = 0;
+
+  constructor(
+    private game: Game,
+    private options: GameRunnerOptions,
+  ) {}
+
+  get state(): GameState {
+    return this.game.state;
+  }
+
+  resetTiming(): void {
+    this.accMs = 0;
+  }
+
+  tick(elapsedMs: number, input: InputSource = NullInputSource): void {
+    const clamped =
+      this.options.maxElapsedMs == null
+        ? elapsedMs
+        : Math.min(elapsedMs, this.options.maxElapsedMs);
+
+    this.accMs += clamped;
+    let steps = 0;
+
+    while (this.accMs >= this.options.fixedStepMs) {
+      this.step(input);
+      this.accMs -= this.options.fixedStepMs;
+      steps++;
+      if (
+        this.options.maxStepsPerTick != null &&
+        steps >= this.options.maxStepsPerTick
+      ) {
+        this.accMs = 0;
+        break;
+      }
+    }
+  }
+
+  step(input: InputSource = NullInputSource): void {
+    const frame = input.sample(this.game.state, this.options.fixedStepMs);
+    if (frame.restart) {
+      this.options.onRestart?.(this.game);
+      return;
+    }
+    this.game.step(this.options.fixedStepMs, frame);
+  }
+
+  runSteps(steps: number, input: InputSource = NullInputSource): void {
+    const count = Math.max(0, Math.trunc(steps));
+    for (let i = 0; i < count; i++) this.step(input);
+  }
+
+  runFor(ms: number, input: InputSource = NullInputSource): void {
+    const steps = Math.floor(ms / this.options.fixedStepMs);
+    this.runSteps(steps, input);
+  }
+
+  runUntil(
+    predicate: (state: GameState) => boolean,
+    maxSteps: number | undefined,
+    input: InputSource = NullInputSource,
+  ): void {
+    const limit = maxSteps == null ? Infinity : Math.max(0, maxSteps);
+    let steps = 0;
+    while (!predicate(this.game.state) && steps < limit) {
+      this.step(input);
+      steps++;
+    }
+  }
+}
+
+export const NullInputSource: InputSource = {
+  sample: () => EMPTY_INPUT,
+};
+```
+
+## File: src/core/tetromino.ts
+```typescript
+import type { PieceKind, Rotation, Vec2 } from './types';
+
+export type CellOffset = Vec2;
+
+// Offsets inside a 4x4 box; piece position (x,y) is top-left of the 4x4.
+export const TETROMINOES: Record<
+  PieceKind,
+  readonly (readonly CellOffset[])[]
+> = {
+/* eslint-disable prettier/prettier */
+  I: [
+    [[0, 1], [1, 1], [2, 1], [3, 1]],
+    [[2, 0], [2, 1], [2, 2], [2, 3]],
+    [[0, 2], [1, 2], [2, 2], [3, 2]],
+    [[1, 0], [1, 1], [1, 2], [1, 3]],
+  ],
+  O: [
+    [[1, 1], [2, 1], [1, 2], [2, 2]],
+    [[1, 1], [2, 1], [1, 2], [2, 2]],
+    [[1, 1], [2, 1], [1, 2], [2, 2]],
+    [[1, 1], [2, 1], [1, 2], [2, 2]],
+  ],
+  T: [
+    [[1, 1], [0, 2], [1, 2], [2, 2]],
+    [[1, 1], [1, 2], [2, 2], [1, 3]],
+    [[0, 2], [1, 2], [2, 2], [1, 3]],
+    [[1, 1], [0, 2], [1, 2], [1, 3]],
+  ],
+  S: [
+    [[1, 1], [2, 1], [0, 2], [1, 2]],
+    [[1, 1], [1, 2], [2, 2], [2, 3]],
+    [[1, 2], [2, 2], [0, 3], [1, 3]],
+    [[0, 1], [0, 2], [1, 2], [1, 3]],
+  ],
+  Z: [
+    [[0, 1], [1, 1], [1, 2], [2, 2]],
+    [[2, 1], [1, 2], [2, 2], [1, 3]],
+    [[0, 2], [1, 2], [1, 3], [2, 3]],
+    [[1, 1], [0, 2], [1, 2], [0, 3]],
+  ],
+  J: [
+    [[0, 1], [0, 2], [1, 2], [2, 2]],
+    [[1, 1], [2, 1], [1, 2], [1, 3]],
+    [[0, 2], [1, 2], [2, 2], [2, 3]],
+    [[1, 1], [1, 2], [0, 3], [1, 3]],
+  ],
+  L: [
+    [[2, 1], [0, 2], [1, 2], [2, 2]],
+    [[1, 1], [1, 2], [1, 3], [2, 3]],
+    [[0, 2], [1, 2], [2, 2], [0, 3]],
+    [[0, 1], [1, 1], [1, 2], [1, 3]],
+  ],
+} as const;
+/* eslint-enable prettier/prettier */
+
+export function rotAdd(r: Rotation, delta: -1 | 1): Rotation {
+  const v = (r + (delta === 1 ? 1 : 3)) % 4;
+  return v as Rotation;
+}
+```
+
+## File: src/core/types.ts
+```typescript
+export const PIECES = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'] as const;
+export type PieceKind = (typeof PIECES)[number];
+
+export type Rotation = 0 | 1 | 2 | 3;
+export type Vec2 = readonly [number, number];
+
+export type Cell = PieceKind | null;
+export type Board = Cell[][];
+
+export interface ActivePiece {
+  k: PieceKind;
+  r: Rotation;
+  x: number;
+  y: number; // can be negative while spawning
+}
+
+export interface GameState {
+  board: Board;
+  active: ActivePiece;
+  ghostY: number;
+  hold: PieceKind | null;
+  canHold: boolean;
+  next: PieceKind[]; // preview window (derived from generator)
+  gameOver: boolean;
+}
+
+export interface InputFrame {
+  /**
+   * Signed number of horizontal steps to attempt this frame.
+   * Can be +/-Infinity to indicate "instant ARR" to the wall.
+   */
+  moveX: number;
+  rotate: -1 | 0 | 1; // -1 = CCW, +1 = CW
+  rotate180: boolean;
+  softDrop: boolean;
+  hardDrop: boolean;
+  hold: boolean;
+  restart: boolean;
+}
+```
+
+## File: src/input/keyboard.ts
+```typescript
+export class Keyboard {
+  private held = new Set<string>();
+  private pressed = new Set<string>(); // “went down since last consume”
+
+  constructor() {
+    window.addEventListener('keydown', (e) => {
+      const code = e.code;
+      if (!this.held.has(code)) {
+        this.pressed.add(code);
+      }
+      this.held.add(code);
+
+      if (
+        ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(
+          code,
+        )
+      ) {
+        e.preventDefault();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      this.held.delete(e.code);
+    });
+
+    window.addEventListener('blur', () => {
+      this.held.clear();
+      this.pressed.clear();
+    });
+  }
+
+  isHeld(code: string): boolean {
+    return this.held.has(code);
+  }
+
+  consumePressed(code: string): boolean {
+    if (this.pressed.has(code)) {
+      this.pressed.delete(code);
+      return true;
+    }
+    return false;
+  }
+}
+```
+
+## File: src/input/keyboardInputSource.ts
+```typescript
+import type { InputSource } from '../core/runner';
+import type { GameState, InputFrame } from '../core/types';
+import { InputController } from './controller';
+
+export class KeyboardInputSource implements InputSource {
+  constructor(private controller: InputController) {}
+
+  sample(_state: GameState, dtMs: number): InputFrame {
+    return this.controller.sample(dtMs);
+  }
+}
+```
+
+## File: src/vite-env.d.ts
+```typescript
+/// <reference types="vite/client" />
+```
+
+## File: .eslintrc.cjs
+```javascript
+module.exports = {
+  root: true,
+  env: { browser: true, es2022: true },
+  parser: '@typescript-eslint/parser',
+  plugins: ['@typescript-eslint'],
+  extends: [
+    'eslint:recommended',
+    'plugin:@typescript-eslint/recommended',
+    'prettier',
+  ],
+};
+```
+
+## File: .prettierrc
+```
+{
+  "singleQuote": true,
+  "semi": true,
+  "trailingComma": "all"
+}
+```
+
+## File: CHANGELOG.md
+```markdown
+# Changelog
+
+## 0.1.0
+- Initial internal prototype.
+```
+
+## File: eslint.config.mjs
+```javascript
+import js from '@eslint/js';
+import prettier from 'eslint-plugin-prettier/recommended';
+import tseslint from 'typescript-eslint';
+
+export default tseslint.config(
+  { ignores: ['dist'] },
+  {
+    extends: [
+      js.configs.recommended,
+      ...tseslint.configs.recommended,
+      prettier,
+    ],
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+    },
+    rules: {},
+  },
+);
+```
+
+## File: index.html
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/style.css" />
+    <title>PixiJS - Template</title>
+  </head>
+
+  <body>
+    <div id="app">
+      <div id="pixi-container"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+```
+
+## File: tsconfig.json
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["src"]
+}
+```
+
+## File: vite.config.ts
+```typescript
+import { defineConfig } from 'vite';
+
+// https://vite.dev/config/
+export default defineConfig({
+  server: {
+    port: 8080,
+    open: true,
+  },
+});
+```
+
+## File: vitest.config.ts
+```typescript
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    include: ['src/__tests__/**/*.test.ts'],
+  },
+});
+```
+
+## File: src/__tests__/core.test.ts
+```typescript
+import { describe, expect, it } from 'vitest';
+import { Bag7 } from '../core/bag7';
+import { Game } from '../core/game';
+import { GameRunner, type InputSource } from '../core/runner';
+import { dropDistance } from '../core/piece';
+import type { GameState, InputFrame, PieceKind } from '../core/types';
+import type { PieceGenerator } from '../core/generator';
+
+const EMPTY_INPUT: InputFrame = {
+  moveX: 0,
+  rotate: 0,
+  rotate180: false,
+  softDrop: false,
+  hardDrop: false,
+  hold: false,
+  restart: false,
+};
+
+class FixedGenerator implements PieceGenerator {
+  private queue: PieceKind[];
+
+  constructor(kind: PieceKind) {
+    this.queue = [kind];
+  }
+
+  next(): PieceKind {
+    return this.queue[0];
+  }
+
+  peek(n: number): PieceKind[] {
+    return Array.from({ length: n }, () => this.queue[0]);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  reset(_seed: number): void {
+    // fixed generator has no state
+  }
+}
+
+class CountingInput implements InputSource {
+  count = 0;
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  sample(_state: GameState, _dtMs: number): InputFrame {
+    this.count++;
+    return EMPTY_INPUT;
+  }
+}
+
+describe('Bag7', () => {
+  it('is deterministic for a given seed', () => {
+    const a = new Bag7(123456);
+    const b = new Bag7(123456);
+
+    const take = (bag: Bag7, n: number): PieceKind[] =>
+      Array.from({ length: n }, () => bag.next());
+
+    expect(take(a, 14)).toEqual(take(b, 14));
+  });
+
+  it('peek does not consume pieces', () => {
+    const bag = new Bag7(42);
+    const preview = bag.peek(7);
+    const actual = Array.from({ length: 7 }, () => bag.next());
+    expect(actual).toEqual(preview);
+  });
+});
+
+describe('Game', () => {
+  it('instant soft drop moves to floor without locking', () => {
+    const game = new Game({
+      seed: 1,
+      gravityMs: 1000,
+      softDropMs: 0,
+      lockDelayMs: 500,
+      generatorFactory: () => new FixedGenerator('O'),
+    });
+
+    const startY = game.state.active.y;
+    const d = dropDistance(game.state.board, game.state.active);
+    expect(d).toBeGreaterThan(0);
+
+    game.step(16, { ...EMPTY_INPUT, softDrop: true });
+
+    expect(game.state.active.y).toBe(startY + d);
+    const anyLocked = game.state.board.some((row) =>
+      row.some((cell) => cell != null),
+    );
+    expect(anyLocked).toBe(false);
+  });
+});
+
+describe('GameRunner', () => {
+  it('caps steps per tick', () => {
+    const game = new Game({
+      seed: 1,
+      generatorFactory: () => new FixedGenerator('T'),
+    });
+    const runner = new GameRunner(game, {
+      fixedStepMs: 16,
+      maxStepsPerTick: 2,
+    });
+
+    const input = new CountingInput();
+    runner.tick(1000, input);
+
+    expect(input.count).toBe(2);
+  });
+});
+```
+
+## File: src/bot/controller.ts
+```typescript
+import type { InputSource } from '../core/runner';
+
+export type BotController = InputSource;
+```
+
 ## File: src/core/constants.ts
 ```typescript
 export const COLS = 10;
 export const ROWS = 20;
+export const NEXT_COUNT = 5;
+
+// Layout
+export const OUTER_MARGIN = 40;
+export const BOARD_CELL_PX = 28;
+export const PANEL_GAP = 16;
+
+export const QUEUE_COLS = 6;
+export const QUEUE_PREVIEW_ROWS = 4;
+export const QUEUE_GAP_ROWS = 1;
+
+export const HOLD_COLS = 6;
+export const HOLD_ROWS = 4;
+export const HOLD_LABEL_HEIGHT = BOARD_CELL_PX;
+
+export const SETTINGS_PANEL_WIDTH = BOARD_CELL_PX * 5;
+
+export const BOARD_WIDTH = COLS * BOARD_CELL_PX;
+export const BOARD_HEIGHT = ROWS * BOARD_CELL_PX;
+
+export const QUEUE_WIDTH = QUEUE_COLS * BOARD_CELL_PX;
+export const QUEUE_PREVIEW_HEIGHT =
+  QUEUE_PREVIEW_ROWS * BOARD_CELL_PX;
+export const QUEUE_GAP_PX = QUEUE_GAP_ROWS * BOARD_CELL_PX;
+export const QUEUE_PANEL_HEIGHT =
+  NEXT_COUNT * QUEUE_PREVIEW_HEIGHT +
+  (NEXT_COUNT - 1) * QUEUE_GAP_PX;
+
+export const HOLD_WIDTH = HOLD_COLS * BOARD_CELL_PX;
+export const HOLD_HEIGHT = HOLD_ROWS * BOARD_CELL_PX;
+export const HOLD_PANEL_HEIGHT = HOLD_LABEL_HEIGHT + HOLD_HEIGHT;
+
+export const HOLD_X = OUTER_MARGIN;
+export const HOLD_Y = OUTER_MARGIN;
+export const HOLD_INNER_Y = HOLD_Y + HOLD_LABEL_HEIGHT;
+export const GAME_OVER_Y = HOLD_Y + HOLD_PANEL_HEIGHT + PANEL_GAP;
+
+export const BOARD_X = HOLD_X + HOLD_WIDTH + PANEL_GAP;
+export const BOARD_Y = OUTER_MARGIN;
+
+export const QUEUE_X = BOARD_X + BOARD_WIDTH + PANEL_GAP;
+export const QUEUE_Y = BOARD_Y;
+
+export const SETTINGS_X = QUEUE_X + QUEUE_WIDTH + PANEL_GAP;
+export const SETTINGS_Y = BOARD_Y;
+
+export const PLAY_WIDTH = SETTINGS_X + SETTINGS_PANEL_WIDTH + OUTER_MARGIN;
+export const PLAY_HEIGHT =
+  OUTER_MARGIN +
+  Math.max(BOARD_HEIGHT, QUEUE_PANEL_HEIGHT, HOLD_PANEL_HEIGHT) +
+  OUTER_MARGIN;
 
 export const DEFAULT_GRAVITY_MS = 800;
 export const DEFAULT_SOFT_DROP_MS = 0;
 export const DEFAULT_LOCK_DELAY_MS = 500;
+export const DEFAULT_HARD_LOCK_DELAY_MS = 2000;
 export const DEFAULT_DAS_MS = 130;
 export const DEFAULT_ARR_MS = 0;
+export const DEFAULT_MASTER_VOLUME = 1;
 
 export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 
+export const GAME_PROTOCOL_VERSION = 1;
+
 export const SPAWN_X = 3;
 export const SPAWN_Y = -1;
-export const NEXT_COUNT = 5;
 ```
 
 ## File: src/core/game.ts
 ```typescript
 import {
   DEFAULT_GRAVITY_MS,
+  DEFAULT_HARD_LOCK_DELAY_MS,
   DEFAULT_LOCK_DELAY_MS,
   DEFAULT_SOFT_DROP_MS,
   NEXT_COUNT,
@@ -186,20 +1016,23 @@ import { Bag7 } from './bag7';
 import type { PieceGenerator } from './generator';
 import {
   collides,
+  cellsOf,
   dropDistance,
   merge,
   tryRotateSRS,
   tryRotate180PreferDirect,
 } from './piece';
 
-import type { GameState, InputFrame } from './types';
+import type { GameState, InputFrame, PieceKind } from './types';
 
 export interface GameConfig {
   seed: number;
   gravityMs?: number;
   softDropMs?: number;
   lockDelayMs?: number;
+  hardLockDelayMs?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
+  onPieceLock?: () => void;
 }
 
 export class Game {
@@ -210,16 +1043,21 @@ export class Game {
   private gravityAcc = 0;
   private dropIntervalMs: number;
   private lockAcc = 0;
+  private hardLockAcc = 0;
 
   private gravityMs: number;
   private softDropMs: number;
   private lockDelayMs: number;
+  private hardLockDelayMs: number;
+  private onPieceLock?: () => void;
 
   constructor(cfg: GameConfig) {
     this.gravityMs = cfg.gravityMs ?? DEFAULT_GRAVITY_MS;
     this.dropIntervalMs = this.gravityMs;
     this.softDropMs = cfg.softDropMs ?? DEFAULT_SOFT_DROP_MS;
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
+    this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
+    this.onPieceLock = cfg.onPieceLock;
 
     const makeGenerator = cfg.generatorFactory ?? ((seed) => new Bag7(seed));
     this.generator = makeGenerator(cfg.seed);
@@ -238,9 +1076,7 @@ export class Game {
     };
 
     this.updateNextView();
-    this.recomputeGhost();
-    if (collides(this.state.board, this.state.active))
-      this.state.gameOver = true;
+    this.spawnActive(first);
   }
 
   setConfig(cfg: Partial<GameConfig>): void {
@@ -250,6 +1086,8 @@ export class Game {
     if (cfg.gravityMs !== undefined) this.gravityMs = cfg.gravityMs;
     if (cfg.softDropMs !== undefined) this.softDropMs = cfg.softDropMs;
     if (cfg.lockDelayMs !== undefined) this.lockDelayMs = cfg.lockDelayMs;
+    if (cfg.hardLockDelayMs !== undefined)
+      this.hardLockDelayMs = cfg.hardLockDelayMs;
 
     // Keep current interval in sync if it was previously matching one of these.
     if (this.dropIntervalMs === prevGravity) {
@@ -312,11 +1150,16 @@ export class Game {
       collides(this.state.board, this.state.active, this.state.active.r, 0, 1)
     ) {
       this.lockAcc += dtMs;
-      if (this.lockAcc >= this.lockDelayMs) {
+      this.hardLockAcc += dtMs;
+      if (
+        this.lockAcc >= this.lockDelayMs ||
+        this.hardLockAcc >= this.hardLockDelayMs
+      ) {
         this.lockPiece();
       }
     } else {
       this.lockAcc = 0;
+      this.hardLockAcc = 0;
     }
   }
 
@@ -331,16 +1174,11 @@ export class Game {
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
+    this.hardLockAcc = 0;
 
     const first = this.generator.next();
-    this.state.active = { k: first, r: 0, x: SPAWN_X, y: SPAWN_Y };
-
     this.updateNextView();
-    this.recomputeGhost();
-
-    if (collides(this.state.board, this.state.active)) {
-      this.state.gameOver = true;
-    }
+    this.spawnActive(first);
   }
 
   private adjustDropInterval(newInterval: number): void {
@@ -455,27 +1293,28 @@ export class Game {
   }
 
   private lockPiece(): void {
+    this.onPieceLock?.();
+    const hasAboveTop = cellsOf(this.state.active).some(([, y]) => y < 0);
     merge(this.state.board, this.state.active);
     clearLines(this.state.board);
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
     this.state.canHold = true;
+    this.hardLockAcc = 0;
+
+    if (hasAboveTop) {
+      this.state.gameOver = true;
+      return;
+    }
 
     this.spawnNext();
   }
 
   private spawnNext(): void {
     const k = this.generator.next();
-
-    this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
-
     this.updateNextView();
-    this.recomputeGhost();
-
-    if (collides(this.state.board, this.state.active)) {
-      this.state.gameOver = true;
-    }
+    this.spawnActive(k);
   }
 
   private doHold(): void {
@@ -493,135 +1332,37 @@ export class Game {
     }
 
     this.state.hold = current;
-    this.state.active = { k: held, r: 0, x: SPAWN_X, y: SPAWN_Y };
     this.gravityAcc = 0;
     this.lockAcc = 0;
+    this.hardLockAcc = 0;
 
-    this.recomputeGhost();
-
-    if (collides(this.state.board, this.state.active)) {
-      this.state.gameOver = true;
-    }
+    this.spawnActive(held);
   }
 
   private updateNextView(): void {
     this.state.next = this.generator.peek(NEXT_COUNT);
   }
 
+  private spawnActive(k: PieceKind): void {
+    this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
+    this.liftSpawnIfBlocked();
+    this.recomputeGhost();
+    if (collides(this.state.board, this.state.active)) {
+      this.state.gameOver = true;
+    }
+  }
+
+  private liftSpawnIfBlocked(): void {
+    for (let i = 0; i < 4; i++) {
+      if (!collides(this.state.board, this.state.active)) return;
+      this.state.active.y -= 1;
+    }
+  }
+
   private recomputeGhost(): void {
     const d = dropDistance(this.state.board, this.state.active);
     this.state.ghostY = this.state.active.y + d;
   }
-}
-```
-
-## File: src/core/generator.ts
-```typescript
-import type { PieceKind } from './types';
-
-export interface PieceGenerator {
-  next(): PieceKind;
-  peek(n: number): PieceKind[];
-  reset(seed: number): void;
-}
-```
-
-## File: src/core/piece.ts
-```typescript
-import { COLS, ROWS } from './constants';
-import { TETROMINOES, rotAdd } from './tetromino';
-import { getSrsKickTests } from './srs';
-import type { ActivePiece, Board, Rotation, Vec2 } from './types';
-
-export function cellsOf(
-  piece: ActivePiece,
-  r: Rotation = piece.r,
-  dx = 0,
-  dy = 0,
-): Vec2[] {
-  const shape = TETROMINOES[piece.k][r];
-  return shape.map(([x, y]) => [piece.x + x + dx, piece.y + y + dy]);
-}
-
-export function collides(
-  board: Board,
-  piece: ActivePiece,
-  r: Rotation = piece.r,
-  dx = 0,
-  dy = 0,
-): boolean {
-  for (const [cx, cy] of cellsOf(piece, r, dx, dy)) {
-    if (cx < 0 || cx >= COLS || cy >= ROWS) return true;
-    if (cy >= 0 && board[cy][cx] != null) return true;
-  }
-  return false;
-}
-
-export function merge(board: Board, piece: ActivePiece): void {
-  for (const [cx, cy] of cellsOf(piece)) {
-    if (cy >= 0) board[cy][cx] = piece.k;
-  }
-}
-
-export function dropDistance(board: Board, piece: ActivePiece): number {
-  let d = 0;
-  while (!collides(board, piece, piece.r, 0, d + 1)) d++;
-  return d;
-}
-
-export function tryRotateSRS(
-  board: Board,
-  piece: ActivePiece,
-  dir: -1 | 1,
-): boolean {
-  const from = piece.r;
-  const to = rotAdd(from, dir);
-
-  // SRS defines a list of translation tests depending on (from -> to) and piece type. :contentReference[oaicite:5]{index=5}
-  const tests = getSrsKickTests(piece.k, from, to);
-
-  for (const [dx, dy] of tests) {
-    if (!collides(board, piece, to, dx, dy)) {
-      piece.r = to;
-      piece.x += dx;
-      piece.y += dy;
-      return true;
-    }
-  }
-  return false;
-}
-
-export function tryRotate180PreferDirect(
-  board: Board,
-  piece: ActivePiece,
-): boolean {
-  const to = ((piece.r + 2) % 4) as Rotation;
-
-  // 1) Direct 180, no kicks, no intermediate state
-  if (!collides(board, piece, to, 0, 0)) {
-    piece.r = to;
-    return true;
-  }
-
-  // 2) Fallback: two 90-degree SRS rotations (with kicks)
-  return tryRotate180ViaSRS(board, piece);
-}
-
-/**
- * This implementation tries CW+CW, then CCW+CCW, using SRS kicks for each 90° step.
- */
-export function tryRotate180ViaSRS(board: Board, piece: ActivePiece): boolean {
-  const attempt = (dir: -1 | 1): boolean => {
-    const tmp: ActivePiece = { ...piece };
-    if (!tryRotateSRS(board, tmp, dir)) return false;
-    if (!tryRotateSRS(board, tmp, dir)) return false;
-    piece.x = tmp.x;
-    piece.y = tmp.y;
-    piece.r = tmp.r;
-    return true;
-  };
-
-  return attempt(1) || attempt(-1);
 }
 ```
 
@@ -648,6 +1389,12 @@ export class XorShift32 {
   nextInt(maxExclusive: number): number {
     return this.nextU32() % maxExclusive;
   }
+
+  clone(): XorShift32 {
+    const copy = new XorShift32(1);
+    copy.s = this.s;
+    return copy;
+  }
 }
 
 export function shuffleInPlace<T>(arr: T[], rng: XorShift32): void {
@@ -658,110 +1405,41 @@ export function shuffleInPlace<T>(arr: T[], rng: XorShift32): void {
 }
 ```
 
-## File: src/core/runner.ts
-```typescript
-import type { Game } from './game';
-import type { GameState, InputFrame } from './types';
-
-export interface InputSource {
-  sample(state: GameState, dtMs: number): InputFrame;
-  reset?(seed: number): void;
-}
-
-export interface GameRunnerOptions {
-  fixedStepMs: number;
-  onRestart?: (game: Game) => void;
-}
-
-const EMPTY_INPUT: InputFrame = {
-  moveX: 0,
-  rotate: 0,
-  rotate180: false,
-  softDrop: false,
-  hardDrop: false,
-  hold: false,
-  restart: false,
-};
-
-export class GameRunner {
-  private accMs = 0;
-
-  constructor(
-    private game: Game,
-    private options: GameRunnerOptions,
-  ) {}
-
-  get state(): GameState {
-    return this.game.state;
-  }
-
-  tick(elapsedMs: number, input: InputSource = NullInputSource): void {
-    this.accMs += elapsedMs;
-
-    while (this.accMs >= this.options.fixedStepMs) {
-      this.step(input);
-      this.accMs -= this.options.fixedStepMs;
-    }
-  }
-
-  step(input: InputSource = NullInputSource): void {
-    const frame = input.sample(this.game.state, this.options.fixedStepMs);
-    if (frame.restart) {
-      this.options.onRestart?.(this.game);
-      return;
-    }
-    this.game.step(this.options.fixedStepMs, frame);
-  }
-
-  runSteps(steps: number, input: InputSource = NullInputSource): void {
-    const count = Math.max(0, Math.trunc(steps));
-    for (let i = 0; i < count; i++) this.step(input);
-  }
-
-  runFor(ms: number, input: InputSource = NullInputSource): void {
-    const steps = Math.floor(ms / this.options.fixedStepMs);
-    this.runSteps(steps, input);
-  }
-
-  runUntil(
-    predicate: (state: GameState) => boolean,
-    maxSteps: number | undefined,
-    input: InputSource = NullInputSource,
-  ): void {
-    const limit = maxSteps == null ? Infinity : Math.max(0, maxSteps);
-    let steps = 0;
-    while (!predicate(this.game.state) && steps < limit) {
-      this.step(input);
-      steps++;
-    }
-  }
-}
-
-export const NullInputSource: InputSource = {
-  sample: () => EMPTY_INPUT,
-};
-```
-
 ## File: src/core/settings.ts
 ```typescript
 import {
   DEFAULT_ARR_MS,
   DEFAULT_DAS_MS,
   DEFAULT_GRAVITY_MS,
+  DEFAULT_HARD_LOCK_DELAY_MS,
   DEFAULT_LOCK_DELAY_MS,
+  DEFAULT_MASTER_VOLUME,
   DEFAULT_SOFT_DROP_MS,
   SETTINGS_STORAGE_KEY,
 } from './constants';
+import {
+  type GeneratorSettings,
+  isGeneratorType,
+} from './generators';
 import type { GameConfig } from './game';
 import type { InputConfig } from '../input/controller';
 
 export type GameSettings = Required<
-  Pick<GameConfig, 'gravityMs' | 'softDropMs' | 'lockDelayMs'>
+  Pick<
+    GameConfig,
+    'gravityMs' | 'softDropMs' | 'lockDelayMs' | 'hardLockDelayMs'
+  >
 >;
 
 export interface Settings {
   game: GameSettings;
   input: InputConfig;
+  generator: GeneratorSettings;
+  audio: AudioSettings;
+}
+
+export interface AudioSettings {
+  masterVolume: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -769,10 +1447,17 @@ export const DEFAULT_SETTINGS: Settings = {
     gravityMs: DEFAULT_GRAVITY_MS,
     softDropMs: DEFAULT_SOFT_DROP_MS,
     lockDelayMs: DEFAULT_LOCK_DELAY_MS,
+    hardLockDelayMs: DEFAULT_HARD_LOCK_DELAY_MS,
   },
   input: {
     dasMs: DEFAULT_DAS_MS,
     arrMs: DEFAULT_ARR_MS,
+  },
+  generator: {
+    type: 'bag7',
+  },
+  audio: {
+    masterVolume: DEFAULT_MASTER_VOLUME,
   },
 };
 
@@ -788,6 +1473,8 @@ function mergeGame(
     gravityMs: num(patch?.gravityMs) ?? base.gravityMs,
     softDropMs: num(patch?.softDropMs) ?? base.softDropMs,
     lockDelayMs: num(patch?.lockDelayMs) ?? base.lockDelayMs,
+    hardLockDelayMs:
+      num(patch?.hardLockDelayMs) ?? base.hardLockDelayMs,
   };
 }
 
@@ -801,6 +1488,24 @@ function mergeInput(
   };
 }
 
+function mergeGenerator(
+  base: GeneratorSettings,
+  patch?: Partial<GeneratorSettings>,
+): GeneratorSettings {
+  return {
+    type: isGeneratorType(patch?.type) ? patch.type : base.type,
+  };
+}
+
+function mergeAudio(
+  base: AudioSettings,
+  patch?: Partial<AudioSettings>,
+): AudioSettings {
+  return {
+    masterVolume: num(patch?.masterVolume) ?? base.masterVolume,
+  };
+}
+
 export function mergeSettings(
   base: Settings,
   patch: Partial<Settings>,
@@ -808,6 +1513,8 @@ export function mergeSettings(
   return {
     game: mergeGame(base.game, patch.game),
     input: mergeInput(base.input, patch.input),
+    generator: mergeGenerator(base.generator, patch.generator),
+    audio: mergeAudio(base.audio, patch.audio),
   };
 }
 
@@ -846,9 +1553,7 @@ export interface SettingsStore {
   subscribe(listener: (settings: Settings) => void): () => void;
 }
 
-export function createSettingsStore(
-  initial?: Settings,
-): SettingsStore {
+export function createSettingsStore(initial?: Settings): SettingsStore {
   let settings = initial ?? loadSettings();
   const listeners = new Set<(s: Settings) => void>();
 
@@ -881,10 +1586,7 @@ import type { PieceKind, Rotation, Vec2 } from './types';
 // SRS basic-rotation kick data (y is "up" here).
 // We convert to our game coords (y down) by flipping dy.
 
-type KickTable = Record<
-  Rotation,
-  Partial<Record<Rotation, readonly Vec2[]>>
->;
+type KickTable = Record<Rotation, Partial<Record<Rotation, readonly Vec2[]>>>;
 
 const JLSTZ_KICKS: KickTable = {
   0: {
@@ -1046,112 +1748,6 @@ export function getSrsKickTests(
 }
 ```
 
-## File: src/core/tetromino.ts
-```typescript
-import type { PieceKind, Rotation, Vec2 } from './types';
-
-export type CellOffset = Vec2;
-
-// Offsets inside a 4x4 box; piece position (x,y) is top-left of the 4x4.
-export const TETROMINOES: Record<
-  PieceKind,
-  readonly (readonly CellOffset[])[]
-> = {
-/* eslint-disable prettier/prettier */
-  I: [
-    [[0, 1], [1, 1], [2, 1], [3, 1]],
-    [[2, 0], [2, 1], [2, 2], [2, 3]],
-    [[0, 2], [1, 2], [2, 2], [3, 2]],
-    [[1, 0], [1, 1], [1, 2], [1, 3]],
-  ],
-  O: [
-    [[1, 1], [2, 1], [1, 2], [2, 2]],
-    [[1, 1], [2, 1], [1, 2], [2, 2]],
-    [[1, 1], [2, 1], [1, 2], [2, 2]],
-    [[1, 1], [2, 1], [1, 2], [2, 2]],
-  ],
-  T: [
-    [[1, 1], [0, 2], [1, 2], [2, 2]],
-    [[1, 1], [1, 2], [2, 2], [1, 3]],
-    [[0, 2], [1, 2], [2, 2], [1, 3]],
-    [[1, 1], [0, 2], [1, 2], [1, 3]],
-  ],
-  S: [
-    [[1, 1], [2, 1], [0, 2], [1, 2]],
-    [[1, 1], [1, 2], [2, 2], [2, 3]],
-    [[1, 2], [2, 2], [0, 3], [1, 3]],
-    [[0, 1], [0, 2], [1, 2], [1, 3]],
-  ],
-  Z: [
-    [[0, 1], [1, 1], [1, 2], [2, 2]],
-    [[2, 1], [1, 2], [2, 2], [1, 3]],
-    [[0, 2], [1, 2], [1, 3], [2, 3]],
-    [[1, 1], [0, 2], [1, 2], [0, 3]],
-  ],
-  J: [
-    [[0, 1], [0, 2], [1, 2], [2, 2]],
-    [[1, 1], [2, 1], [1, 2], [1, 3]],
-    [[0, 2], [1, 2], [2, 2], [2, 3]],
-    [[1, 1], [1, 2], [0, 3], [1, 3]],
-  ],
-  L: [
-    [[2, 1], [0, 2], [1, 2], [2, 2]],
-    [[1, 1], [1, 2], [1, 3], [2, 3]],
-    [[0, 2], [1, 2], [2, 2], [0, 3]],
-    [[0, 1], [1, 1], [1, 2], [1, 3]],
-  ],
-} as const;
-/* eslint-enable prettier/prettier */
-
-export function rotAdd(r: Rotation, delta: -1 | 1): Rotation {
-  const v = (r + (delta === 1 ? 1 : 3)) % 4;
-  return v as Rotation;
-}
-```
-
-## File: src/core/types.ts
-```typescript
-export const PIECES = ['I', 'O', 'T', 'S', 'Z', 'J', 'L'] as const;
-export type PieceKind = (typeof PIECES)[number];
-
-export type Rotation = 0 | 1 | 2 | 3;
-export type Vec2 = readonly [number, number];
-
-export type Cell = PieceKind | null;
-export type Board = Cell[][];
-
-export interface ActivePiece {
-  k: PieceKind;
-  r: Rotation;
-  x: number;
-  y: number; // can be negative while spawning
-}
-
-export interface GameState {
-  board: Board;
-  active: ActivePiece;
-  ghostY: number;
-  hold: PieceKind | null;
-  canHold: boolean;
-  next: PieceKind[]; // preview window (derived from generator)
-  gameOver: boolean;
-}
-
-export interface InputFrame {
-  /**
-   * Signed number of horizontal steps to attempt this frame.
-   * Can be +/-Infinity to indicate "instant ARR" to the wall.
-   */
-  moveX: number;
-  rotate: -1 | 0 | 1; // -1 = CCW, +1 = CW
-  rotate180: boolean;
-  softDrop: boolean;
-  hardDrop: boolean;
-  hold: boolean;
-  restart: boolean;
-}
-```
-
 ## File: src/input/controller.ts
 ```typescript
 import type { InputFrame } from '../core/types';
@@ -1231,9 +1827,7 @@ export class InputController {
           } else {
             const steps =
               1 +
-              Math.floor(
-                (this.heldMs - this.nextRepeatAt) / this.cfg.arrMs,
-              );
+              Math.floor((this.heldMs - this.nextRepeatAt) / this.cfg.arrMs);
             moveX = this.activeDir * steps;
             this.nextRepeatAt += steps * this.cfg.arrMs;
           }
@@ -1270,73 +1864,31 @@ export class InputController {
 }
 ```
 
-## File: src/input/keyboard.ts
-```typescript
-export class Keyboard {
-  private held = new Set<string>();
-  private pressed = new Set<string>(); // “went down since last consume”
-
-  constructor() {
-    window.addEventListener('keydown', (e) => {
-      const code = e.code;
-      if (!this.held.has(code)) {
-        this.pressed.add(code);
-      }
-      this.held.add(code);
-
-      if (
-        ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(
-          code,
-        )
-      ) {
-        e.preventDefault();
-      }
-    });
-
-    window.addEventListener('keyup', (e) => {
-      this.held.delete(e.code);
-    });
-
-    window.addEventListener('blur', () => {
-      this.held.clear();
-      this.pressed.clear();
-    });
-  }
-
-  isHeld(code: string): boolean {
-    return this.held.has(code);
-  }
-
-  consumePressed(code: string): boolean {
-    if (this.pressed.has(code)) {
-      this.pressed.delete(code);
-      return true;
-    }
-    return false;
-  }
-}
-```
-
-## File: src/input/keyboardInputSource.ts
-```typescript
-import type { InputSource } from '../core/runner';
-import type { GameState, InputFrame } from '../core/types';
-import { InputController } from './controller';
-
-export class KeyboardInputSource implements InputSource {
-  constructor(private controller: InputController) {}
-
-  sample(_state: GameState, dtMs: number): InputFrame {
-    return this.controller.sample(dtMs);
-  }
-}
-```
-
 ## File: src/render/pixiRenderer.ts
 ```typescript
 import { Graphics } from 'pixi.js';
-import { COLS, ROWS } from '../core/constants';
+import {
+  BOARD_CELL_PX,
+  BOARD_X,
+  BOARD_Y,
+  COLS,
+  HOLD_COLS,
+  HOLD_INNER_Y,
+  HOLD_LABEL_HEIGHT,
+  HOLD_PANEL_HEIGHT,
+  HOLD_WIDTH,
+  HOLD_X,
+  HOLD_Y,
+  NEXT_COUNT,
+  QUEUE_COLS,
+  QUEUE_GAP_PX,
+  QUEUE_PREVIEW_HEIGHT,
+  QUEUE_X,
+  QUEUE_Y,
+  ROWS,
+} from '../core/constants';
 import { cellsOf } from '../core/piece';
+import { TETROMINOES } from '../core/tetromino';
 import type { GameState, PieceKind } from '../core/types';
 
 const COLORS: Record<PieceKind, number> = {
@@ -1352,9 +1904,9 @@ const COLORS: Record<PieceKind, number> = {
 export class PixiRenderer {
   constructor(
     private gfx: Graphics,
-    private cell = 28,
-    private boardX = 40,
-    private boardY = 40,
+    private cell = BOARD_CELL_PX,
+    private boardX = BOARD_X,
+    private boardY = BOARD_Y,
   ) {}
 
   render(state: GameState): void {
@@ -1362,11 +1914,14 @@ export class PixiRenderer {
 
     gfx.clear();
 
-    // background + frame
+    // board background + frame
     gfx
       .rect(boardX - 2, boardY - 2, COLS * cell + 4, ROWS * cell + 4)
       .fill(0x121a24);
     gfx.rect(boardX, boardY, COLS * cell, ROWS * cell).fill(0x0b0f14);
+
+    this.renderHold(state);
+    this.renderQueue(state);
 
     // settled blocks
     for (let y = 0; y < ROWS; y++) {
@@ -1394,6 +1949,57 @@ export class PixiRenderer {
       drawCell(gfx, boardX, boardY, cell, x, y, color);
     }
   }
+
+  private renderQueue(state: GameState): void {
+    const { gfx, cell } = this;
+    const count = Math.min(state.next.length, NEXT_COUNT);
+    if (count === 0) return;
+
+    const panelHeight =
+      count * QUEUE_PREVIEW_HEIGHT + (count - 1) * QUEUE_GAP_PX;
+    const panelWidth = QUEUE_COLS * cell;
+
+    gfx
+      .rect(QUEUE_X - 2, QUEUE_Y - 2, panelWidth + 4, panelHeight + 4)
+      .fill(0x121a24);
+    gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, panelHeight).fill(0x0b0f14);
+
+    const offsetX = Math.floor((QUEUE_COLS - 4) / 2) * cell;
+
+    for (let i = 0; i < count; i++) {
+      const kind = state.next[i];
+      const boxY = QUEUE_Y + i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX);
+      this.drawPreviewPiece(kind, QUEUE_X + offsetX, boxY, cell);
+    }
+  }
+
+  private renderHold(state: GameState): void {
+    const { gfx, cell } = this;
+
+    gfx
+      .rect(HOLD_X - 2, HOLD_Y - 2, HOLD_WIDTH + 4, HOLD_PANEL_HEIGHT + 4)
+      .fill(0x121a24);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_PANEL_HEIGHT).fill(0x0b0f14);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_LABEL_HEIGHT).fill(0x121a24);
+
+    if (!state.hold) return;
+
+    const offsetX = Math.floor((HOLD_COLS - 4) / 2) * cell;
+    this.drawPreviewPiece(state.hold, HOLD_X + offsetX, HOLD_INNER_Y, cell);
+  }
+
+  private drawPreviewPiece(
+    kind: PieceKind,
+    originX: number,
+    originY: number,
+    cell: number,
+  ): void {
+    const color = COLORS[kind];
+    const shape = TETROMINOES[kind][0];
+    for (const [x, y] of shape) {
+      drawCell(this.gfx, originX, originY, cell, x, y, color);
+    }
+  }
 }
 
 function drawCell(
@@ -1419,109 +2025,61 @@ function dim(color: number, factor: number): number {
 }
 ```
 
-## File: .github/workflows/ci.yml
-```yaml
-name: ci
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run build
-```
-
-## File: public/assets/logo.svg
-```xml
-<svg width="735" height="289" viewBox="0 0 735 289" fill="none" xmlns="http://www.w3.org/2000/svg">
-<g clip-path="url(#clip0_7_84)">
-<path d="M304.17 288.01V89.99H244.97C244.77 89.99 244.56 89.99 244.34 90C233.7 90.37 225.15 99.12 225.05 109.76C225.05 109.82 225.05 109.88 225.05 109.93V268.4C225.05 268.73 225.07 269.1 225.1 269.51C226 279.71 234.54 287.53 244.77 287.97C245.2 287.99 245.61 288 245.99 288H304.17V288.01Z" fill="#E72264"/>
-<path d="M548.21 287.91C559.24 287.08 567.97 278 568.05 266.93C568.05 266.86 568.05 266.79 568.05 266.72V110.16C568.05 110.1 568.05 110.03 568.05 109.97C568 99.03 559.1 90.11 548.16 90C548.08 90 548 90 547.92 90H488.93V288.02H545.74C546.51 288.02 547.34 287.98 548.21 287.92V287.91Z" fill="#E72264"/>
-<path d="M293.07 90H355.07C361.15 90 369.75 94.92 374.29 101L505.76 277C510.3 283.08 509.05 288 502.98 288H440.98C434.9 288 426.3 283.08 421.76 277L290.28 101C285.74 94.93 286.99 90 293.06 90H293.07Z" fill="#E72264"/>
-<path d="M498.07 90H436.07C429.99 90 421.39 94.92 416.85 101L285.38 277C280.84 283.08 282.09 288 288.16 288H350.16C356.24 288 364.84 283.08 369.38 277L500.85 101C505.39 94.93 504.14 90 498.07 90Z" fill="#E72264"/>
-<path d="M529.07 0C550.05 0 567.07 17.01 567.07 38C567.07 58.99 550.06 76 529.07 76C508.08 76 491.07 58.99 491.07 38C491.07 17.01 508.08 0 529.07 0Z" fill="#E72264"/>
-<path d="M265.07 0C286.05 0 303.07 17.01 303.07 38C303.07 58.99 286.06 76 265.07 76C244.08 76 227.07 58.99 227.07 38C227.07 17.01 244.08 0 265.07 0Z" fill="#E72264"/>
-<path d="M695.07 0H635.07C613.53 0 596.07 17.46 596.07 39V99C596.07 120.54 613.53 138 635.07 138H695.07C716.61 138 734.07 120.54 734.07 99V39C734.07 17.46 716.61 0 695.07 0ZM655.44 39.34V79.84C655.44 85.3 654.35 90.04 652.17 94.05C649.99 98.06 646.88 101.17 642.84 103.38C638.8 105.59 634.01 106.7 628.48 106.7C623.78 106.7 619.72 105.85 616.29 104.16C612.86 102.47 609.98 100.1 607.63 97.06C607.63 97.06 601.08 89.99 607.08 85C613.21 79.9 618.52 86.58 618.52 86.58C619.76 88.31 621.23 89.61 622.93 90.47C624.62 91.34 626.54 91.77 628.69 91.77C630.69 91.77 632.46 91.36 633.98 90.53C635.5 89.7 636.71 88.46 637.61 86.8C638.51 85.14 638.96 83.1 638.96 80.68V39.35C638.96 39.35 638.8 31.01 647.08 31.01C655.36 31.01 655.45 39.35 655.45 39.35L655.44 39.34ZM714.35 98.38C709.82 102.86 703.15 105.56 694.35 106.48C688.3 107.12 683.02 106.7 678.52 105.23C674.02 103.76 669.81 101.21 665.88 97.59C665.88 97.59 659.8 92.35 664.7 85.77C668.38 80.82 675.3 85.96 675.3 85.96C677.92 88.4 680.73 90.2 683.74 91.38C686.75 92.56 690.14 92.95 693.93 92.55C697.3 92.2 699.86 91.28 701.62 89.81C703.38 88.34 704.14 86.5 703.91 84.3C703.71 82.38 702.94 80.86 701.61 79.75C700.28 78.64 698.53 77.75 696.37 77.07C694.21 76.39 691.89 75.79 689.4 75.25C686.91 74.71 684.39 74.02 681.83 73.18C679.27 72.34 676.9 71.23 674.7 69.86C672.5 68.49 670.66 66.64 669.16 64.29C667.66 61.94 666.72 58.95 666.34 55.31C665.86 50.77 666.54 46.77 668.36 43.31C670.19 39.85 672.97 37.07 676.71 34.97C680.45 32.87 684.8 31.56 689.75 31.04C694.91 30.5 699.68 30.9 704.06 32.24C708.44 33.59 712.17 35.63 715.24 38.36C715.24 38.36 719.54 41.97 716.05 48.18C713.34 53.01 705.73 50.11 705.73 50.11C703.29 48.07 700.89 46.62 698.55 45.76C696.2 44.9 693.65 44.61 690.9 44.9C688.08 45.2 685.9 45.97 684.36 47.2C682.82 48.44 682.16 50.06 682.37 52.05C682.56 53.84 683.33 55.23 684.69 56.24C686.05 57.24 687.78 58.05 689.9 58.66C692.01 59.27 694.34 59.86 696.86 60.43C699.39 61 701.93 61.69 704.48 62.5C707.03 63.31 709.4 64.47 711.57 65.98C713.74 67.49 715.6 69.45 717.14 71.86C718.68 74.27 719.65 77.4 720.06 81.25C720.79 88.2 718.89 93.91 714.35 98.38Z" fill="#E72264"/>
-<path d="M107.17 0.340088C47.98 0.340088 0 48.3201 0 107.51C0 108.67 0.02 109.82 0.06 110.97V213.96C0.06 213.96 0.06 213.97 0.06 213.98V224.45C0.06 224.45 0.06 224.45 0.07 224.44V250.33C0.07 250.53 0.06 250.72 0.06 250.92C0.06 251.12 0.07 251.32 0.08 251.52V252H0.09C0.66 271.89 16.95 287.84 36.98 287.84C57.01 287.84 73.47 271.89 74.04 252V213.98H104.66C105.49 214 106.33 214.01 107.16 214.01C166.35 214.01 214.33 166.7 214.33 107.51C214.33 48.3201 166.36 0.340088 107.17 0.340088ZM107.17 140.01C100.62 140.01 84.02 140.01 77.13 140.01H74.07V107.52C74.07 89.3101 88.96 74.5401 107.17 74.5401C125.38 74.5401 140.15 89.3101 140.15 107.52C140.15 125.73 125.38 140.02 107.17 140.02V140.01Z" fill="#E72264"/>
-<path opacity="0.15" d="M36.05 214H73.99V252.01H73.82C73.25 271.9 56.96 287.85 36.93 287.85C16.9 287.85 0.6 271.9 0.03 252.01H0.02V251.53C0.02 251.33 0 251.13 0 250.93C0 250.73 0.01 250.54 0.01 250.34V247.66C1.15 229.87 17.94 214 36.04 214H36.05Z" fill="#1D1D1B"/>
-<g opacity="0.05">
-<path opacity="0.5" d="M0.0599976 168.28V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03V125.45C44.2 128.59 17.77 144.66 0.0599976 168.28Z" fill="black"/>
-<path d="M0.119995 248.37C8.84 241.97 19.42 238.2 30.84 238.2H74.06V213.98H37.03C17.47 213.98 1.48 229.15 0.119995 248.37Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V126.79C43.95 129.74 17.39 146.16 0.0599976 170.27V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C18 213.98 2.34001 228.35 0.26001 246.83C8.97001 240.03 19.73 236.01 31.4 236.01H74.05V213.99H37.02L37.03 213.98Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V128.12C43.68 130.87 16.95 147.69 0.0599976 172.34V213.97C0.0599976 173.71 33.89 140.57 74.05 140.02V140.03Z" fill="black"/>
-<path d="M37.03 213.98C18.53 213.98 3.22002 227.55 0.460022 245.28C9.12002 238.09 20.06 233.8 31.96 233.8H74.05V213.98H37.02H37.03Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V129.46C43.37 132 16.46 149.28 0.0599976 174.53V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C19.06 213.98 4.08998 226.79 0.72998 243.77C9.31998 236.18 20.41 231.6 32.53 231.6H74.06V213.98H37.03Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V130.81C43.01 133.11 15.89 150.93 0.0599976 176.84V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C19.6 213.98 5.00001 226.03 1.07001 242.24C9.54001 234.26 20.77 229.39 33.09 229.39H74.05V213.97H37.02L37.03 213.98Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V132.16C42.6 134.22 15.22 152.65 0.0599976 179.32V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C20.15 213.98 5.92998 225.28 1.47998 240.71C9.79998 232.34 21.14 227.19 33.66 227.19H74.06V213.98H37.03Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V133.52C42.12 135.31 14.43 154.48 0.0599976 182.01V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C20.72 213.98 6.88001 224.54 1.95001 239.19C10.08 230.44 21.53 224.99 34.21 224.99H74.05V213.98H37.02H37.03Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V134.89C41.53 136.39 13.47 156.46 0.0599976 185V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C21.28 213.98 7.83999 223.83 2.48999 237.7C10.4 228.56 21.92 222.79 34.78 222.79H74.06V213.98H37.03Z" fill="black"/>
-</g>
-<g opacity="0.05">
-<path opacity="0.5" d="M74.05 140.03V136.29C40.78 137.48 12.24 158.68 0.0599976 188.47V213.98C0.0599976 173.72 33.89 140.58 74.05 140.03Z" fill="black"/>
-<path d="M37.03 213.98C21.85 213.98 8.80999 223.13 3.10999 236.21C10.74 226.68 22.34 220.59 35.35 220.59H74.06V213.98H37.03Z" fill="black"/>
-</g>
-</g>
-<defs>
-<clipPath id="clip0_7_84">
-<rect width="734.07" height="288.01" fill="white"/>
-</clipPath>
-</defs>
-</svg>
-```
-
-## File: public/style.css
-```css
-body {
-  margin: 0;
-  padding: 0;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #000000;
-}
-
-#app {
-  width: 100%;
-  height: 100vh;
-  overflow: hidden;
-  display: flex;
-  justify-content: center;
-  align-items: center;
+## File: package.json
+```json
+{
+  "name": "wishuponablock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "npm run dev",
+    "build": "npm run lint && tsc && vite build",
+    "lint": "eslint .",
+    "dev": "vite",
+    "format": "prettier . --write",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "pixi.js": "^8.8.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.21.0",
+    "@typescript-eslint/eslint-plugin": "^8.54.0",
+    "@typescript-eslint/parser": "^8.54.0",
+    "eslint": "^9.39.2",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.2.6",
+    "prettier": "^3.8.1",
+    "typescript": "~5.7.3",
+    "typescript-eslint": "^8.25.0",
+    "vite": "^6.2.0",
+    "vitest": "^3.2.4"
+  }
 }
 ```
 
 ## File: src/main.ts
 ```typescript
 import { Application, Graphics } from 'pixi.js';
+import {
+  GAME_OVER_Y,
+  HOLD_X,
+  HOLD_Y,
+  HOLD_WIDTH,
+  PLAY_HEIGHT,
+  PLAY_WIDTH,
+  SETTINGS_X,
+  SETTINGS_Y,
+  SETTINGS_PANEL_WIDTH,
+} from './core/constants';
 import { Game } from './core/game';
+import {
+  createGeneratorFactory,
+  GENERATOR_TYPES,
+  isGeneratorType,
+  type GeneratorType,
+} from './core/generators';
 import { GameRunner } from './core/runner';
 import type { Settings } from './core/settings';
 import { createSettingsStore } from './core/settingsStore';
@@ -1545,8 +2103,8 @@ async function boot() {
 
   const app = new Application();
   await app.init({
-    width: 420,
-    height: 680,
+    width: PLAY_WIDTH,
+    height: PLAY_HEIGHT,
     backgroundColor: 0x0b0f14,
     preference: 'webgl',
     powerPreference: 'high-performance',
@@ -1561,10 +2119,58 @@ async function boot() {
     inset: '0',
     overflow: 'hidden',
   });
-  root.appendChild(app.canvas);
+
+  const playWindow = document.createElement('div');
+  Object.assign(playWindow.style, {
+    position: 'relative',
+    width: `${PLAY_WIDTH}px`,
+    height: `${PLAY_HEIGHT}px`,
+  });
+  root.appendChild(playWindow);
+  playWindow.appendChild(app.canvas);
 
   const gfx = new Graphics();
   app.stage.addChild(gfx);
+
+  const uiLayer = document.createElement('div');
+  Object.assign(uiLayer.style, {
+    position: 'absolute',
+    inset: '0',
+    pointerEvents: 'none',
+  });
+  playWindow.appendChild(uiLayer);
+
+  const holdLabel = document.createElement('div');
+  holdLabel.textContent = 'HOLD';
+  Object.assign(holdLabel.style, {
+    position: 'absolute',
+    left: `${HOLD_X + 8}px`,
+    top: `${HOLD_Y + 6}px`,
+    width: `${HOLD_WIDTH}px`,
+    color: '#b6c2d4',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.5px',
+    pointerEvents: 'none',
+  });
+  uiLayer.appendChild(holdLabel);
+
+  const gameOverLabel = document.createElement('div');
+  gameOverLabel.textContent = 'GAME OVER';
+  Object.assign(gameOverLabel.style, {
+    position: 'absolute',
+    left: `${HOLD_X}px`,
+    top: `${GAME_OVER_Y}px`,
+    width: `${HOLD_WIDTH}px`,
+    color: '#7f8a9a',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.5px',
+    textAlign: 'center',
+    pointerEvents: 'none',
+    display: 'none',
+  });
+  uiLayer.appendChild(gameOverLabel);
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
@@ -1572,17 +2178,176 @@ async function boot() {
   const kb = new Keyboard();
   const input = new InputController(kb, settings.input);
   const inputSource = new KeyboardInputSource(input);
-  const game = new Game({ seed: Date.now(), ...settings.game });
-  const runner = new GameRunner(game, {
-    fixedStepMs: 1000 / 120,
-    onRestart: (g) => g.reset(Date.now()),
-  });
+
+  const lockSound = new Audio('/sfx/lock.ogg');
+  lockSound.preload = 'auto';
+  lockSound.volume = settings.audio.masterVolume;
+  const playLockSound = () => {
+    lockSound.currentTime = 0;
+    void lockSound.play().catch(() => {
+      // Ignore autoplay restrictions and playback errors.
+    });
+  };
+
+  const createGame = (cfg: Settings): Game =>
+    new Game({
+      seed: Date.now(),
+      ...cfg.game,
+      generatorFactory: createGeneratorFactory(cfg.generator),
+      onPieceLock: playLockSound,
+    });
+
+  const createRunner = (g: Game): GameRunner =>
+    new GameRunner(g, {
+      fixedStepMs: 1000 / 120,
+      onRestart: () => g.reset(Date.now()),
+      maxElapsedMs: 250,
+      maxStepsPerTick: 10,
+    });
+
+  let game = createGame(settings);
+  let runner = createRunner(game);
 
   const renderer = new PixiRenderer(gfx);
 
+  const settingsPanel = document.createElement('div');
+  Object.assign(settingsPanel.style, {
+    position: 'absolute',
+    left: `${SETTINGS_X}px`,
+    top: `${SETTINGS_Y}px`,
+    minWidth: `${SETTINGS_PANEL_WIDTH}px`,
+    padding: '8px',
+    background: '#121a24',
+    color: '#e2e8f0',
+    border: '2px solid #0b0f14',
+    borderRadius: '6px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    pointerEvents: 'auto',
+  });
+
+  const label = document.createElement('div');
+  label.textContent = 'Generator';
+  Object.assign(label.style, {
+    marginBottom: '6px',
+    color: '#b6c2d4',
+  });
+
+  const select = document.createElement('select');
+  Object.assign(select.style, {
+    width: '100%',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '13px',
+  });
+
+  const labelFor = (type: GeneratorType): string => {
+    switch (type) {
+      case 'bag7':
+        return 'Bag 7';
+      case 'random':
+        return 'Random';
+      default:
+        return type;
+    }
+  };
+
+  for (const type of GENERATOR_TYPES) {
+    const option = document.createElement('option');
+    option.value = type;
+    option.textContent = labelFor(type);
+    select.appendChild(option);
+  }
+  select.value = settings.generator.type;
+
+  select.addEventListener('change', () => {
+    const value = select.value;
+    if (isGeneratorType(value)) {
+      settingsStore.apply({ generator: { type: value } });
+    }
+  });
+
+  settingsPanel.appendChild(label);
+  settingsPanel.appendChild(select);
+
+  const volumeLabel = document.createElement('div');
+  volumeLabel.textContent = 'Master Volume';
+  Object.assign(volumeLabel.style, {
+    marginTop: '12px',
+    marginBottom: '6px',
+    color: '#b6c2d4',
+  });
+
+  const volumeRow = document.createElement('div');
+  Object.assign(volumeRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  });
+
+  const volumeValue = document.createElement('span');
+  Object.assign(volumeValue.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    minWidth: '32px',
+    textAlign: 'right',
+  });
+
+  const volumeSlider = document.createElement('input');
+  volumeSlider.type = 'range';
+  volumeSlider.min = '0';
+  volumeSlider.max = '100';
+  volumeSlider.step = '1';
+  volumeSlider.value = String(Math.round(settings.audio.masterVolume * 100));
+  Object.assign(volumeSlider.style, {
+    flex: '1',
+    accentColor: '#6ea8ff',
+  });
+
+  const updateVolumeLabel = (value: number) => {
+    volumeValue.textContent = `${Math.round(value * 100)}%`;
+  };
+  updateVolumeLabel(settings.audio.masterVolume);
+
+  volumeSlider.addEventListener('input', () => {
+    const value = Math.max(0, Math.min(1, Number(volumeSlider.value) / 100));
+    settingsStore.apply({ audio: { masterVolume: value } });
+  });
+
+  volumeRow.appendChild(volumeSlider);
+  volumeRow.appendChild(volumeValue);
+  settingsPanel.appendChild(volumeLabel);
+  settingsPanel.appendChild(volumeRow);
+  uiLayer.appendChild(settingsPanel);
+
+  let generatorType = settings.generator.type;
+
   settingsStore.subscribe((next) => {
     input.setConfig(next.input);
+    lockSound.volume = next.audio.masterVolume;
+
+    if (next.generator.type !== generatorType) {
+      generatorType = next.generator.type;
+      game = createGame(next);
+      runner = createRunner(game);
+      if (select.value !== next.generator.type) {
+        select.value = next.generator.type;
+      }
+      return;
+    }
+
     game.setConfig(next.game);
+    if (select.value !== next.generator.type) {
+      select.value = next.generator.type;
+    }
+    const nextVolume = Math.round(next.audio.masterVolume * 100);
+    if (Number(volumeSlider.value) !== nextVolume) {
+      volumeSlider.value = String(nextVolume);
+      updateVolumeLabel(next.audio.masterVolume);
+    }
   });
 
   const applySettings = (patch: Partial<Settings>): void => {
@@ -1592,161 +2357,43 @@ async function boot() {
   // TODO: Wire applySettings to UI when settings controls are added.
   void applySettings;
 
+  let paused = document.visibilityState !== 'visible';
+  let resumePending = false;
+
+  const setPaused = (next: boolean) => {
+    if (next === paused) return;
+    paused = next;
+    if (!paused) resumePending = true;
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    setPaused(document.visibilityState !== 'visible');
+  });
+  window.addEventListener('blur', () => setPaused(true));
+  window.addEventListener('focus', () => setPaused(false));
+
+  const updateGameOverLabel = () => {
+    gameOverLabel.style.display = runner.state.gameOver ? 'block' : 'none';
+  };
+
   app.ticker.add((t) => {
+    if (paused) {
+      updateGameOverLabel();
+      return;
+    }
+    if (resumePending) {
+      runner.resetTiming();
+      resumePending = false;
+      updateGameOverLabel();
+      return;
+    }
     runner.tick(t.elapsedMS, inputSource);
     renderer.render(runner.state);
+    updateGameOverLabel();
   });
 }
 
 boot().catch((e) => console.error(e));
-```
-
-## File: src/vite-env.d.ts
-```typescript
-/// <reference types="vite/client" />
-```
-
-## File: .eslintrc.cjs
-```javascript
-module.exports = {
-  root: true,
-  env: { browser: true, es2022: true },
-  parser: '@typescript-eslint/parser',
-  plugins: ['@typescript-eslint'],
-  extends: [
-    'eslint:recommended',
-    'plugin:@typescript-eslint/recommended',
-    'prettier',
-  ],
-};
-```
-
-## File: .prettierrc
-```
-{
-  "singleQuote": true,
-  "semi": true,
-  "trailingComma": "all"
-}
-```
-
-## File: eslint.config.mjs
-```javascript
-import js from '@eslint/js';
-import prettier from 'eslint-plugin-prettier/recommended';
-import tseslint from 'typescript-eslint';
-
-export default tseslint.config(
-  { ignores: ['dist'] },
-  {
-    extends: [
-      js.configs.recommended,
-      ...tseslint.configs.recommended,
-      prettier,
-    ],
-    files: ['**/*.{ts,tsx}'],
-    languageOptions: {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
-    },
-    rules: {},
-  },
-);
-```
-
-## File: index.html
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/favicon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="stylesheet" href="/style.css" />
-    <title>PixiJS - Template</title>
-  </head>
-
-  <body>
-    <div id="app">
-      <div id="pixi-container"></div>
-    </div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
-</html>
-```
-
-## File: package.json
-```json
-{
-  "name": "wishuponablock",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "npm run dev",
-    "build": "npm run lint && tsc && vite build",
-    "lint": "eslint .",
-    "dev": "vite",
-    "format": "prettier . --write"
-  },
-  "dependencies": {
-    "pixi.js": "^8.8.1"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.21.0",
-    "@typescript-eslint/eslint-plugin": "^8.54.0",
-    "@typescript-eslint/parser": "^8.54.0",
-    "eslint": "^9.39.2",
-    "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-prettier": "^5.2.6",
-    "prettier": "^3.8.1",
-    "typescript": "~5.7.3",
-    "typescript-eslint": "^8.25.0",
-    "vite": "^6.2.0"
-  }
-}
-```
-
-## File: tsconfig.json
-```json
-{
-  "compilerOptions": {
-    "target": "ES2020",
-    "useDefineForClassFields": true,
-    "module": "ESNext",
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
-    "skipLibCheck": true,
-
-    /* Bundler mode */
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "moduleDetection": "force",
-    "noEmit": true,
-
-    /* Linting */
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
-  },
-  "include": ["src"]
-}
-```
-
-## File: vite.config.ts
-```typescript
-import { defineConfig } from 'vite';
-
-// https://vite.dev/config/
-export default defineConfig({
-  server: {
-    port: 8080,
-    open: true,
-  },
-});
 ```
 
 ## File: .gitignore

@@ -19,7 +19,7 @@ import {
   tryRotate180PreferDirect,
 } from './piece';
 
-import type { GameState, InputFrame, PieceKind } from './types';
+import type { Board, GameState, InputFrame, PieceKind } from './types';
 
 export interface GameConfig {
   seed: number;
@@ -28,7 +28,7 @@ export interface GameConfig {
   lockDelayMs?: number;
   hardLockDelayMs?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
-  onPieceLock?: () => void;
+  onPieceLock?: (board: Board) => void;
 }
 
 export class Game {
@@ -45,7 +45,7 @@ export class Game {
   private softDropMs: number;
   private lockDelayMs: number;
   private hardLockDelayMs: number;
-  private onPieceLock?: () => void;
+  private onPieceLock?: (board: Board) => void;
 
   constructor(cfg: GameConfig) {
     this.gravityMs = cfg.gravityMs ?? DEFAULT_GRAVITY_MS;
@@ -289,10 +289,10 @@ export class Game {
   }
 
   private lockPiece(): void {
-    this.onPieceLock?.();
     const hasAboveTop = cellsOf(this.state.active).some(([, y]) => y < 0);
     merge(this.state.board, this.state.active);
     clearLines(this.state.board);
+    this.onPieceLock?.(this.state.board);
 
     this.gravityAcc = 0;
     this.lockAcc = 0;

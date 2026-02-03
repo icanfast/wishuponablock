@@ -8,9 +8,12 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+snapshots/*
+!snapshots/.gitkeep
 dist
 dist-ssr
 *.local
+codebase.md
 
 # Editor directories and files
 .vscode/*

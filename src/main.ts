@@ -1,11 +1,14 @@
 import { Application, Graphics } from 'pixi.js';
 import {
+  COLS,
   GAME_OVER_Y,
   HOLD_X,
   HOLD_Y,
   HOLD_WIDTH,
+  OUTER_MARGIN,
   PLAY_HEIGHT,
   PLAY_WIDTH,
+  ROWS,
   SETTINGS_X,
   SETTINGS_Y,
   SETTINGS_PANEL_WIDTH,
@@ -20,10 +23,16 @@ import {
 import { GameRunner } from './core/runner';
 import type { Settings } from './core/settings';
 import { createSettingsStore } from './core/settingsStore';
+import {
+  SnapshotRecorder,
+  downloadSnapshotSession,
+  saveSnapshotSessionToDirectory,
+} from './core/snapshotRecorder';
 import { Keyboard } from './input/keyboard';
 import { InputController } from './input/controller';
 import { KeyboardInputSource } from './input/keyboardInputSource';
 import { PixiRenderer } from './render/pixiRenderer';
+import type { Board } from './core/types';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -111,6 +120,9 @@ async function boot() {
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
+  const recorder = new SnapshotRecorder();
+  let updateRecorderUI = () => {};
+  let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
 
   const kb = new Keyboard();
   const input = new InputController(kb, settings.input);
@@ -125,13 +137,20 @@ async function boot() {
       // Ignore autoplay restrictions and playback errors.
     });
   };
+  const handlePieceLock = (board: Board) => {
+    playLockSound();
+    if (recorder.isRecording) {
+      recorder.record(board);
+      updateRecorderUI();
+    }
+  };
 
   const createGame = (cfg: Settings): Game =>
     new Game({
       seed: Date.now(),
       ...cfg.game,
       generatorFactory: createGeneratorFactory(cfg.generator),
-      onPieceLock: playLockSound,
+      onPieceLock: handlePieceLock,
     });
 
   const createRunner = (g: Game): GameRunner =>
@@ -185,8 +204,14 @@ async function boot() {
     switch (type) {
       case 'bag7':
         return 'Bag 7';
+      case 'bag8i':
+        return 'I-Plus Bag';
+      case 'inconvenient':
+        return 'Inconvenient Bag';
       case 'random':
         return 'Random';
+      case 'nes':
+        return 'NES';
       default:
         return type;
     }
@@ -258,7 +283,225 @@ async function boot() {
   volumeRow.appendChild(volumeValue);
   settingsPanel.appendChild(volumeLabel);
   settingsPanel.appendChild(volumeRow);
+
+  const recordLabel = document.createElement('div');
+  recordLabel.textContent = 'Snapshots';
+  Object.assign(recordLabel.style, {
+    marginTop: '12px',
+    marginBottom: '6px',
+    color: '#b6c2d4',
+  });
+
+  const recordRow = document.createElement('div');
+  Object.assign(recordRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  });
+
+  const commentInput = document.createElement('input');
+  commentInput.type = 'text';
+  commentInput.placeholder = 'Comment';
+  Object.assign(commentInput.style, {
+    flex: '1',
+    minWidth: '0',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+
+  commentInput.addEventListener('focus', () => {
+    pausedByInput = true;
+    updatePaused();
+  });
+  commentInput.addEventListener('blur', () => {
+    pausedByInput = false;
+    updatePaused();
+  });
+
+  const getDirectoryPicker = () =>
+    (
+      window as Window & {
+        showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+      }
+    ).showDirectoryPicker;
+
+  const ensureSnapshotDirectory = async (): Promise<boolean> => {
+    const picker = getDirectoryPicker();
+    if (!picker) {
+      updateFolderStatus('Folder access not supported in this browser.');
+      snapshotDirHandle = null;
+      return false;
+    }
+
+    try {
+      if (!snapshotDirHandle) {
+        snapshotDirHandle = await picker();
+      }
+
+      const permission = await snapshotDirHandle.requestPermission({
+        mode: 'readwrite',
+      });
+      if (permission !== 'granted') {
+        updateFolderStatus('Folder access denied.');
+        snapshotDirHandle = null;
+        return false;
+      }
+
+      updateFolderStatus(`Folder: ${snapshotDirHandle.name}`);
+      updateRecorderUI();
+      return true;
+    } catch {
+      updateFolderStatus('Folder selection cancelled.');
+      return false;
+    }
+  };
+
+  const folderButton = document.createElement('button');
+  folderButton.textContent = 'Select Folder';
+  Object.assign(folderButton.style, {
+    background: '#0b0f14',
+    color: '#b6c2d4',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+
+  const recordButton = document.createElement('button');
+  Object.assign(recordButton.style, {
+    flex: '1',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+
+  const discardButton = document.createElement('button');
+  discardButton.textContent = 'Discard';
+  Object.assign(discardButton.style, {
+    background: '#0b0f14',
+    color: '#b6c2d4',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+    display: 'none',
+  });
+
+  const recordStatus = document.createElement('div');
+  Object.assign(recordStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+
+  const folderStatus = document.createElement('div');
+  Object.assign(folderStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+
+  const updateFolderStatus = (text: string) => {
+    folderStatus.textContent = text;
+  };
+
+  updateRecorderUI = () => {
+    if (recorder.isRecording) {
+      recordButton.textContent = snapshotDirHandle
+        ? 'Stop & Save'
+        : 'Stop & Download';
+      discardButton.style.display = 'inline-block';
+      recordStatus.textContent = `Samples: ${recorder.sampleCount}`;
+    } else {
+      recordButton.textContent = 'Start Recording';
+      discardButton.style.display = 'none';
+      recordStatus.textContent = 'Idle';
+    }
+  };
+
+  commentInput.addEventListener('input', () => {
+    if (recorder.isRecording) {
+      recorder.setComment(commentInput.value);
+    }
+  });
+
+  updateFolderStatus('No folder selected.');
+
+  folderButton.addEventListener('click', async () => {
+    await ensureSnapshotDirectory();
+  });
+
+  recordButton.addEventListener('click', async () => {
+    if (!recorder.isRecording) {
+      recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value);
+      updateRecorderUI();
+      return;
+    }
+
+    const session = recorder.stop();
+    updateRecorderUI();
+    if (!session) return;
+
+    const ready = await ensureSnapshotDirectory();
+    if (!ready || !snapshotDirHandle) {
+      updateFolderStatus('Auto-save unavailable. Downloading instead.');
+      downloadSnapshotSession(session);
+      return;
+    }
+
+    void saveSnapshotSessionToDirectory(session, snapshotDirHandle)
+      .then(() => updateFolderStatus(`Saved: ${session.meta.id}`))
+      .catch(() => {
+        updateFolderStatus('Save failed. Downloading instead.');
+        downloadSnapshotSession(session);
+      });
+  });
+
+  discardButton.addEventListener('click', () => {
+    recorder.discard();
+    updateRecorderUI();
+  });
+
+  updateRecorderUI();
+
+  recordRow.appendChild(commentInput);
+  recordRow.appendChild(recordButton);
+  recordRow.appendChild(discardButton);
+  settingsPanel.appendChild(recordLabel);
+  settingsPanel.appendChild(folderButton);
+  settingsPanel.appendChild(folderStatus);
+  settingsPanel.appendChild(recordRow);
+  settingsPanel.appendChild(recordStatus);
   uiLayer.appendChild(settingsPanel);
+
+  const syncPlayWindowSize = () => {
+    const settingsWidth = settingsPanel.offsetWidth;
+    const settingsBottom = settingsPanel.offsetTop + settingsPanel.offsetHeight;
+    const desiredWidth = Math.max(
+      PLAY_WIDTH,
+      SETTINGS_X + settingsWidth + OUTER_MARGIN,
+    );
+    const desiredHeight = Math.max(
+      PLAY_HEIGHT,
+      settingsBottom + OUTER_MARGIN,
+    );
+
+    playWindow.style.width = `${desiredWidth}px`;
+    playWindow.style.height = `${desiredHeight}px`;
+    app.renderer.resize(desiredWidth, desiredHeight);
+  };
+
+  requestAnimationFrame(syncPlayWindowSize);
 
   let generatorType = settings.generator.type;
 
@@ -294,20 +537,30 @@ async function boot() {
   // TODO: Wire applySettings to UI when settings controls are added.
   void applySettings;
 
-  let paused = document.visibilityState !== 'visible';
+  let pausedByVisibility = document.visibilityState !== 'visible';
+  let pausedByInput = false;
+  let paused = pausedByVisibility || pausedByInput;
   let resumePending = false;
 
-  const setPaused = (next: boolean) => {
+  const updatePaused = () => {
+    const next = pausedByVisibility || pausedByInput;
     if (next === paused) return;
     paused = next;
     if (!paused) resumePending = true;
   };
 
   document.addEventListener('visibilitychange', () => {
-    setPaused(document.visibilityState !== 'visible');
+    pausedByVisibility = document.visibilityState !== 'visible';
+    updatePaused();
   });
-  window.addEventListener('blur', () => setPaused(true));
-  window.addEventListener('focus', () => setPaused(false));
+  window.addEventListener('blur', () => {
+    pausedByVisibility = true;
+    updatePaused();
+  });
+  window.addEventListener('focus', () => {
+    pausedByVisibility = false;
+    updatePaused();
+  });
 
   const updateGameOverLabel = () => {
     gameOverLabel.style.display = runner.state.gameOver ? 'block' : 'none';
