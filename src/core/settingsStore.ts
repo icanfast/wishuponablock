@@ -11,9 +11,7 @@ export interface SettingsStore {
   subscribe(listener: (settings: Settings) => void): () => void;
 }
 
-export function createSettingsStore(
-  initial?: Settings,
-): SettingsStore {
+export function createSettingsStore(initial?: Settings): SettingsStore {
   let settings = initial ?? loadSettings();
   const listeners = new Set<(s: Settings) => void>();
 
