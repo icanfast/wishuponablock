@@ -3,11 +3,7 @@ import { Bag7 } from '../core/bag7';
 import { Game } from '../core/game';
 import { GameRunner, type InputSource } from '../core/runner';
 import { dropDistance } from '../core/piece';
-import type {
-  GameState,
-  InputFrame,
-  PieceKind,
-} from '../core/types';
+import type { GameState, InputFrame, PieceKind } from '../core/types';
 import type { PieceGenerator } from '../core/generator';
 
 const EMPTY_INPUT: InputFrame = {
@@ -35,6 +31,7 @@ class FixedGenerator implements PieceGenerator {
     return Array.from({ length: n }, () => this.queue[0]);
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   reset(_seed: number): void {
     // fixed generator has no state
   }
@@ -43,6 +40,7 @@ class FixedGenerator implements PieceGenerator {
 class CountingInput implements InputSource {
   count = 0;
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   sample(_state: GameState, _dtMs: number): InputFrame {
     this.count++;
     return EMPTY_INPUT;

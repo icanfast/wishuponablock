@@ -3,10 +3,7 @@ import type { PieceKind, Rotation, Vec2 } from './types';
 // SRS basic-rotation kick data (y is "up" here).
 // We convert to our game coords (y down) by flipping dy.
 
-type KickTable = Record<
-  Rotation,
-  Partial<Record<Rotation, readonly Vec2[]>>
->;
+type KickTable = Record<Rotation, Partial<Record<Rotation, readonly Vec2[]>>>;
 
 const JLSTZ_KICKS: KickTable = {
   0: {
