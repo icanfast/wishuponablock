@@ -32,7 +32,8 @@ export interface GameConfig {
   lockDelayMs?: number;
   hardLockDelayMs?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
-  onPieceLock?: (board: Board) => void;
+  onPieceLock?: (board: Board, hold: PieceKind | null) => void;
+  onHold?: (board: Board, hold: PieceKind | null) => void;
 }
 
 export class Game {
@@ -57,7 +58,8 @@ export class Game {
   private softDropMs: number;
   private lockDelayMs: number;
   private hardLockDelayMs: number;
-  private onPieceLock?: (board: Board) => void;
+  private onPieceLock?: (board: Board, hold: PieceKind | null) => void;
+  private onHold?: (board: Board, hold: PieceKind | null) => void;
 
   constructor(cfg: GameConfig) {
     this.rng = new XorShift32(cfg.seed);
@@ -67,6 +69,7 @@ export class Game {
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
     this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
     this.onPieceLock = cfg.onPieceLock;
+    this.onHold = cfg.onHold;
 
     const makeGenerator = cfg.generatorFactory ?? ((seed) => new Bag7(seed));
     this.generator = makeGenerator(cfg.seed);
@@ -405,7 +408,7 @@ export class Game {
       this.applyInitialBlockClears(cleared);
     }
     this.totalLinesCleared += cleared.length;
-    this.onPieceLock?.(this.state.board);
+    this.onPieceLock?.(this.state.board, this.state.hold);
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
@@ -451,6 +454,7 @@ export class Game {
     if (held == null) {
       this.state.hold = current;
       this.spawnNext();
+      this.onHold?.(this.state.board, this.state.hold);
       return;
     }
 
@@ -460,6 +464,7 @@ export class Game {
     this.hardLockAcc = 0;
 
     this.spawnActive(held);
+    this.onHold?.(this.state.board, this.state.hold);
   }
 
   private updateNextView(): void {

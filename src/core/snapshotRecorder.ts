@@ -1,5 +1,5 @@
 import { GAME_PROTOCOL_VERSION } from './constants';
-import { PIECES, type Board } from './types';
+import { PIECES, type Board, type PieceKind } from './types';
 import type { Settings } from './settings';
 
 export interface SnapshotSessionMeta {
@@ -18,6 +18,7 @@ export interface SnapshotSample {
   index: number;
   timeMs: number;
   board: number[][];
+  hold?: number;
 }
 
 export interface SnapshotSession {
@@ -36,6 +37,10 @@ function encodeBoard(board: Board): number[][] {
   return board.map((row) =>
     row.map((cell) => (cell ? (PIECE_TO_INDEX.get(cell) ?? 0) : 0)),
   );
+}
+
+function encodePiece(cell: PieceKind | null): number {
+  return cell ? (PIECE_TO_INDEX.get(cell) ?? 0) : 0;
 }
 
 function makeSessionId(now = new Date()): string {
@@ -93,13 +98,14 @@ export class SnapshotRecorder {
     return session;
   }
 
-  record(board: Board): void {
+  record(board: Board, hold: PieceKind | null): void {
     if (!this.active) return;
     const timeMs = performance.now() - this.startedAtMs;
     this.active.samples.push({
       index: this.active.samples.length,
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
+      hold: encodePiece(hold),
     });
   }
 

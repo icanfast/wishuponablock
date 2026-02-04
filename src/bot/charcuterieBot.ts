@@ -33,6 +33,7 @@ export class CharcuterieBot implements InputSource {
     this.queue = [];
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   sample(state: GameState, _dtMs: number): InputFrame {
     if (this.activeRef !== state.active) {
       this.activeRef = state.active;

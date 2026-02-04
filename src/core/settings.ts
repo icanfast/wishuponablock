@@ -8,10 +8,7 @@ import {
   DEFAULT_SOFT_DROP_MS,
   SETTINGS_STORAGE_KEY,
 } from './constants';
-import {
-  type GeneratorSettings,
-  isGeneratorType,
-} from './generators';
+import { type GeneratorSettings, isGeneratorType } from './generators';
 import type { GameConfig } from './game';
 import type { InputConfig } from '../input/controller';
 
@@ -64,8 +61,7 @@ function mergeGame(
     gravityMs: num(patch?.gravityMs) ?? base.gravityMs,
     softDropMs: num(patch?.softDropMs) ?? base.softDropMs,
     lockDelayMs: num(patch?.lockDelayMs) ?? base.lockDelayMs,
-    hardLockDelayMs:
-      num(patch?.hardLockDelayMs) ?? base.hardLockDelayMs,
+    hardLockDelayMs: num(patch?.hardLockDelayMs) ?? base.hardLockDelayMs,
   };
 }
 

@@ -3,6 +3,7 @@ import {
   BOARD_CELL_PX,
   BOARD_X,
   BOARD_Y,
+  BOARD_WIDTH,
   COLS,
   GAME_OVER_Y,
   HOLD_X,
@@ -37,8 +38,11 @@ import { Keyboard } from './input/keyboard';
 import { InputController } from './input/controller';
 import { KeyboardInputSource } from './input/keyboardInputSource';
 import { PixiRenderer } from './render/pixiRenderer';
-import type { Board } from './core/types';
+import { PIECES, type Board, type PieceKind } from './core/types';
+import type { SnapshotSession } from './core/snapshotRecorder';
 import { CharcuterieBot, runBotForPieces } from './bot/charcuterieBot';
+import { makeBoard } from './core/board';
+import { TETROMINOES } from './core/tetromino';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -157,11 +161,18 @@ async function boot() {
     });
   };
   let suppressLockEffects = false;
-  const handlePieceLock = (board: Board) => {
+  const handlePieceLock = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
     playLockSound();
     if (recorder.isRecording) {
-      recorder.record(board);
+      recorder.record(board, hold);
+      updateRecorderUI();
+    }
+  };
+  const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
+    if (suppressLockEffects) return;
+    if (recorder.isRecording) {
+      recorder.record(board, hold);
       updateRecorderUI();
     }
   };
@@ -269,6 +280,7 @@ async function boot() {
       ...merged.game,
       generatorFactory: createGeneratorFactory(merged.generator),
       onPieceLock: handlePieceLock,
+      onHold: handleHoldSnapshot,
     });
   };
 
@@ -408,6 +420,15 @@ async function boot() {
   let runner = createRunner(game, selectedMode, selectedModeOptions);
 
   const renderer = new PixiRenderer(gfx);
+  const PIECE_COLORS: Record<PieceKind, string> = {
+    I: '#4dd3ff',
+    O: '#ffd84d',
+    T: '#c77dff',
+    S: '#6eea6e',
+    Z: '#ff6b6b',
+    J: '#4d7cff',
+    L: '#ffa94d',
+  };
 
   const settingsPanel = document.createElement('div');
   Object.assign(settingsPanel.style, {
@@ -740,6 +761,501 @@ async function boot() {
   settingsPanel.appendChild(recordStatus);
   uiLayer.appendChild(settingsPanel);
 
+  const toolLayer = document.createElement('div');
+  Object.assign(toolLayer.style, {
+    position: 'absolute',
+    inset: '0',
+    pointerEvents: 'none',
+    display: 'none',
+  });
+  uiLayer.appendChild(toolLayer);
+
+  const toolPanel = document.createElement('div');
+  Object.assign(toolPanel.style, {
+    position: 'absolute',
+    left: `${SETTINGS_X}px`,
+    top: `${SETTINGS_Y}px`,
+    width: `${SETTINGS_PANEL_WIDTH}px`,
+    maxHeight: `${PLAY_HEIGHT - SETTINGS_Y - OUTER_MARGIN}px`,
+    overflowY: 'auto',
+    padding: '8px',
+    background: '#121a24',
+    color: '#e2e8f0',
+    border: '2px solid #0b0f14',
+    borderRadius: '6px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    pointerEvents: 'auto',
+  });
+  toolLayer.appendChild(toolPanel);
+
+  const toolTitle = document.createElement('div');
+  toolTitle.textContent = 'WISH UPON A BLOCK';
+  Object.assign(toolTitle.style, {
+    marginBottom: '8px',
+    color: '#b6c2d4',
+    letterSpacing: '0.5px',
+  });
+  toolPanel.appendChild(toolTitle);
+
+  const toolInputButton = document.createElement('button');
+  toolInputButton.textContent = 'Select Snapshot Folder';
+  Object.assign(toolInputButton.style, {
+    width: '100%',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolInputButton);
+
+  const toolInputStatus = document.createElement('div');
+  Object.assign(toolInputStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolInputStatus.textContent = 'No snapshots loaded.';
+  toolPanel.appendChild(toolInputStatus);
+
+  const toolOutputButton = document.createElement('button');
+  toolOutputButton.textContent = 'Select Output Folder';
+  Object.assign(toolOutputButton.style, {
+    width: '100%',
+    marginTop: '10px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolOutputButton);
+
+  const toolOutputStatus = document.createElement('div');
+  Object.assign(toolOutputStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolOutputStatus.textContent = 'No output folder.';
+  toolPanel.appendChild(toolOutputStatus);
+
+  const toolSampleStatus = document.createElement('div');
+  Object.assign(toolSampleStatus.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolSampleStatus.textContent = 'Sample: -';
+  toolPanel.appendChild(toolSampleStatus);
+
+  const toolActionStatus = document.createElement('div');
+  Object.assign(toolActionStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolActionStatus.textContent = '';
+  toolPanel.appendChild(toolActionStatus);
+
+  const toolBackButton = document.createElement('button');
+  toolBackButton.textContent = 'BACK TO MENU';
+  Object.assign(toolBackButton.style, {
+    width: '100%',
+    marginTop: '12px',
+    background: '#0b0f14',
+    color: '#b6c2d4',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolBackButton);
+
+  const toolPieceCellPx = Math.max(10, Math.round(BOARD_CELL_PX / 2));
+  const toolPiecePreviewPx = toolPieceCellPx * 4;
+  const toolPieceButtonHeight = toolPiecePreviewPx + 10;
+  const toolPieceButtonWidth = toolPiecePreviewPx + 8;
+  const toolPieceGap = 6;
+  const toolPieceRowWidth =
+    PIECES.length * toolPieceButtonWidth + (PIECES.length - 1) * toolPieceGap;
+  const toolPieceRowLeft = BOARD_X + (BOARD_WIDTH - toolPieceRowWidth) / 2;
+  const toolPieceRowTop = BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP;
+
+  const toolPieceRow = document.createElement('div');
+  Object.assign(toolPieceRow.style, {
+    position: 'absolute',
+    left: `${toolPieceRowLeft}px`,
+    top: `${toolPieceRowTop}px`,
+    width: `${toolPieceRowWidth}px`,
+    display: 'flex',
+    gap: `${toolPieceGap}px`,
+    alignItems: 'center',
+    pointerEvents: 'auto',
+  });
+  toolLayer.appendChild(toolPieceRow);
+
+  const toolNextButton = document.createElement('button');
+  toolNextButton.textContent = 'NEXT';
+  Object.assign(toolNextButton.style, {
+    position: 'absolute',
+    left: `${BOARD_X}px`,
+    top: `${toolPieceRowTop + toolPieceButtonHeight + 8}px`,
+    width: `${BOARD_WIDTH}px`,
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '10px 12px',
+    fontSize: '13px',
+    cursor: 'pointer',
+    pointerEvents: 'auto',
+  });
+  toolLayer.appendChild(toolNextButton);
+
+  const toolPieceButtons = new Map<PieceKind, HTMLButtonElement>();
+  const drawPiecePreview = (
+    canvas: HTMLCanvasElement,
+    piece: PieceKind,
+  ): void => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'transparent';
+    const color = PIECE_COLORS[piece];
+    const pad = Math.max(1, Math.floor(toolPieceCellPx / 6));
+    for (const [x, y] of TETROMINOES[piece][0]) {
+      const px = x * toolPieceCellPx;
+      const py = y * toolPieceCellPx;
+      ctx.fillStyle = color;
+      ctx.fillRect(
+        px + pad,
+        py + pad,
+        toolPieceCellPx - pad * 2,
+        toolPieceCellPx - pad * 2,
+      );
+    }
+  };
+
+  for (const piece of PIECES) {
+    const btn = document.createElement('button');
+    Object.assign(btn.style, {
+      flex: '1',
+      minWidth: `${toolPieceButtonWidth}px`,
+      height: `${toolPieceButtonHeight}px`,
+      background: '#0b0f14',
+      color: '#0b0f14',
+      border: '2px solid #1f2a37',
+      borderRadius: '6px',
+      padding: '4px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      cursor: 'pointer',
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = toolPiecePreviewPx;
+    canvas.height = toolPiecePreviewPx;
+    canvas.style.display = 'block';
+    drawPiecePreview(canvas, piece);
+    btn.appendChild(canvas);
+    toolPieceRow.appendChild(btn);
+    toolPieceButtons.set(piece, btn);
+  }
+
+  let toolOutputDirHandle: FileSystemDirectoryHandle | null = null;
+  let toolSnapshots: Array<{ name: string; session: SnapshotSession }> = [];
+  let toolTotalSamples = 0;
+  let toolSampleOffsets: number[] = [];
+  let currentSample: {
+    file: { name: string; session: SnapshotSession };
+    index: number;
+    board: Board;
+    raw: number[][];
+    hold: PieceKind | null;
+  } | null = null;
+  let selectedLabels: PieceKind[] = [];
+  let toolBusy = false;
+  let labelIndex: Record<string, number> = {};
+
+  const updateLabelButtons = () => {
+    for (const [piece, btn] of toolPieceButtons) {
+      const selected = selectedLabels.includes(piece);
+      btn.style.borderColor = selected ? '#ffffff' : '#1f2a37';
+      btn.style.boxShadow = selected
+        ? '0 0 0 1px rgba(255,255,255,0.5)'
+        : 'none';
+    }
+  };
+
+  const clearLabelSelection = () => {
+    selectedLabels = [];
+    updateLabelButtons();
+  };
+
+  for (const [piece, btn] of toolPieceButtons) {
+    btn.addEventListener('click', () => {
+      const idx = selectedLabels.indexOf(piece);
+      if (idx >= 0) {
+        selectedLabels.splice(idx, 1);
+      } else {
+        selectedLabels.push(piece);
+      }
+      updateLabelButtons();
+    });
+  }
+
+  const decodeBoard = (raw: number[][], order: readonly string[]): Board => {
+    return raw.map((row) =>
+      row.map((value) => {
+        if (value <= 0) return null;
+        const piece = order[value - 1] ?? PIECES[value - 1];
+        return piece as PieceKind;
+      }),
+    );
+  };
+
+  const decodeHold = (
+    hold: number | undefined,
+    order: readonly string[],
+  ): PieceKind | null => {
+    if (!hold || hold <= 0) return null;
+    const piece = order[hold - 1] ?? PIECES[hold - 1];
+    return (piece as PieceKind) ?? null;
+  };
+
+  const encodeBoardString = (raw: number[][]): string =>
+    raw.map((row) => row.join('')).join('/');
+
+  const requestDirectoryAccess = async (
+    handle: FileSystemDirectoryHandle,
+    mode: 'read' | 'readwrite',
+  ): Promise<boolean> => {
+    let permission: PermissionState = 'granted';
+    if (handle.queryPermission) {
+      permission = await handle.queryPermission({ mode });
+    }
+    if (permission !== 'granted' && handle.requestPermission) {
+      permission = await handle.requestPermission({ mode });
+    }
+    return permission === 'granted';
+  };
+
+  const writeFileInDir = async (
+    dir: FileSystemDirectoryHandle,
+    name: string,
+    contents: string,
+  ): Promise<void> => {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(contents);
+    await writable.close();
+  };
+
+  const appendJsonl = async (
+    dir: FileSystemDirectoryHandle,
+    name: string,
+    line: string,
+  ): Promise<void> => {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const file = await handle.getFile();
+    const existing = await file.text();
+    const prefix = existing && !existing.endsWith('\n') ? '\n' : '';
+    const next = `${existing}${prefix}${line}\n`;
+    await writeFileInDir(dir, name, next);
+  };
+
+  const loadLabelIndex = async (): Promise<void> => {
+    if (!toolOutputDirHandle) return;
+    try {
+      const handle = await toolOutputDirHandle.getFileHandle(
+        'labeling_index.json',
+        { create: true },
+      );
+      const file = await handle.getFile();
+      const text = await file.text();
+      labelIndex = text ? (JSON.parse(text) as Record<string, number>) : {};
+    } catch {
+      labelIndex = {};
+    }
+  };
+
+  const saveLabelIndex = async (): Promise<void> => {
+    if (!toolOutputDirHandle) return;
+    await writeFileInDir(
+      toolOutputDirHandle,
+      'labeling_index.json',
+      JSON.stringify(labelIndex),
+    );
+  };
+
+  const updateToolSampleStatus = (text: string) => {
+    toolSampleStatus.textContent = text;
+  };
+
+  const updateToolActionStatus = (text: string) => {
+    toolActionStatus.textContent = text;
+  };
+
+  const showNextToolSample = async (): Promise<void> => {
+    if (toolSnapshots.length === 0 || toolTotalSamples === 0) {
+      currentSample = null;
+      updateToolSampleStatus('Sample: -');
+      renderer.renderBoardOnly(makeBoard(), null);
+      return;
+    }
+
+    const pick = Math.floor(Math.random() * toolTotalSamples);
+    let fileIdx = 0;
+    for (let i = 0; i < toolSampleOffsets.length; i++) {
+      const start = toolSampleOffsets[i];
+      const end = start + toolSnapshots[i].session.samples.length;
+      if (pick >= start && pick < end) {
+        fileIdx = i;
+        break;
+      }
+    }
+
+    const file = toolSnapshots[fileIdx];
+    const sampleIdx = pick - toolSampleOffsets[fileIdx];
+    const sample = file.session.samples[sampleIdx];
+    const rawBoard = sample.board;
+    const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
+    const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
+    currentSample = {
+      file,
+      index: sample.index,
+      board,
+      raw: rawBoard,
+      hold,
+    };
+    const key = `${file.name}#${sample.index}`;
+    labelIndex[key] = (labelIndex[key] ?? 0) + 1;
+    if (toolOutputDirHandle) {
+      await saveLabelIndex();
+    }
+    updateToolSampleStatus(
+      `File: ${file.name} Sample: ${sample.index} Shown: ${labelIndex[key]}`,
+    );
+    clearLabelSelection();
+    renderer.renderBoardOnly(board, hold);
+  };
+
+  toolInputButton.addEventListener('click', async () => {
+    const picker = getDirectoryPicker();
+    if (!picker) {
+      toolInputStatus.textContent = 'Folder access not supported.';
+      return;
+    }
+    try {
+      const handle = await picker();
+      const granted = await requestDirectoryAccess(handle, 'read');
+      if (!granted) {
+        toolInputStatus.textContent = 'Folder access denied.';
+        return;
+      }
+      const files: Array<{ name: string; session: SnapshotSession }> = [];
+      for await (const entry of handle.values()) {
+        if (entry.kind !== 'file') continue;
+        if (!entry.name.endsWith('.json')) continue;
+        const fileHandle = entry as FileSystemFileHandle;
+        const file = await fileHandle.getFile();
+        const text = await file.text();
+        const session = JSON.parse(text) as SnapshotSession;
+        if (!session?.samples?.length) continue;
+        files.push({ name: entry.name, session });
+      }
+      files.sort((a, b) => a.name.localeCompare(b.name));
+      toolSnapshots = files;
+      toolSampleOffsets = [];
+      let running = 0;
+      for (const file of toolSnapshots) {
+        toolSampleOffsets.push(running);
+        running += file.session.samples.length;
+      }
+      toolTotalSamples = running;
+      const totalSamples = toolTotalSamples;
+      toolInputStatus.textContent = `Loaded ${toolSnapshots.length} files (${totalSamples} samples).`;
+      updateToolActionStatus(`Loaded ${toolSnapshots.length} files.`);
+      await showNextToolSample();
+    } catch {
+      toolInputStatus.textContent = 'Folder selection cancelled.';
+    }
+  });
+
+  toolOutputButton.addEventListener('click', async () => {
+    const picker = getDirectoryPicker();
+    if (!picker) {
+      toolOutputStatus.textContent = 'Folder access not supported.';
+      return;
+    }
+    try {
+      toolOutputDirHandle = await picker();
+      const granted = await requestDirectoryAccess(
+        toolOutputDirHandle,
+        'readwrite',
+      );
+      if (!granted) {
+        toolOutputStatus.textContent = 'Folder access denied.';
+        toolOutputDirHandle = null;
+        return;
+      }
+      await loadLabelIndex();
+      toolOutputStatus.textContent = `Output: ${toolOutputDirHandle.name}`;
+      updateToolActionStatus(`Output set: ${toolOutputDirHandle.name}`);
+    } catch {
+      toolOutputStatus.textContent = 'Folder selection cancelled.';
+    }
+  });
+
+  toolNextButton.addEventListener('click', async () => {
+    if (toolBusy) return;
+    if (!currentSample) {
+      updateToolSampleStatus('Sample: -');
+      return;
+    }
+    if (!toolOutputDirHandle) {
+      toolOutputStatus.textContent = 'Select output folder first.';
+      return;
+    }
+    toolBusy = true;
+    try {
+      const key = `${currentSample.file.name}#${currentSample.index}`;
+      const record = {
+        createdAt: new Date().toISOString(),
+        source: {
+          file: currentSample.file.name,
+          sessionId: currentSample.file.session.meta.id,
+          sampleIndex: currentSample.index,
+          shownCount: labelIndex[key] ?? 1,
+        },
+        pieceOrder: currentSample.file.session.meta.pieceOrder,
+        board: encodeBoardString(currentSample.raw),
+        hold: currentSample.hold,
+        labels: [...selectedLabels],
+      };
+      await appendJsonl(
+        toolOutputDirHandle,
+        'labels.jsonl',
+        JSON.stringify(record),
+      );
+      updateToolActionStatus(
+        `Saved label for ${currentSample.file.name} #${currentSample.index}`,
+      );
+      await showNextToolSample();
+    } finally {
+      toolBusy = false;
+    }
+  });
+
+  toolBackButton.addEventListener('click', () => setScreen('menu'));
+
   const menuLayer = document.createElement('div');
   Object.assign(menuLayer.style, {
     position: 'absolute',
@@ -774,6 +1290,7 @@ async function boot() {
   const playPanel = makeMenuPanel();
   const cheesePanel = makeMenuPanel();
   const charcuteriePanel = makeMenuPanel();
+  const toolsPanel = makeMenuPanel();
   Object.assign(playPanel.style, {
     minHeight: '240px',
     display: 'none',
@@ -783,6 +1300,10 @@ async function boot() {
     display: 'none',
   });
   Object.assign(charcuteriePanel.style, {
+    minHeight: '240px',
+    display: 'none',
+  });
+  Object.assign(toolsPanel.style, {
     minHeight: '240px',
     display: 'none',
   });
@@ -804,12 +1325,12 @@ async function boot() {
 
   const playButton = makeMenuButton('PLAY');
   const optionsButton = makeMenuButton('OPTIONS');
-  const placeholderButton = makeMenuButton('PLACEHOLDER');
+  const toolsButton = makeMenuButton('TOOLS');
   const creditsButton = makeMenuButton('CREDITS');
 
   menuMainPanel.appendChild(playButton);
   menuMainPanel.appendChild(optionsButton);
-  menuMainPanel.appendChild(placeholderButton);
+  menuMainPanel.appendChild(toolsButton);
   menuMainPanel.appendChild(creditsButton);
 
   const playTitle = document.createElement('div');
@@ -936,10 +1457,30 @@ async function boot() {
   charcuteriePanel.appendChild(charcuterieSeedField);
   charcuteriePanel.appendChild(charcuterieBackButton);
 
+  const toolsTitle = document.createElement('div');
+  toolsTitle.textContent = 'TOOLS';
+  Object.assign(toolsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const wishButton = makeMenuButton('WISH UPON A BLOCK');
+  const toolsBackButton = makeMenuButton('BACK');
+  Object.assign(toolsBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  toolsPanel.appendChild(toolsTitle);
+  toolsPanel.appendChild(wishButton);
+  toolsPanel.appendChild(toolsBackButton);
+
   menuLayer.appendChild(menuMainPanel);
   menuLayer.appendChild(playPanel);
   menuLayer.appendChild(cheesePanel);
   menuLayer.appendChild(charcuteriePanel);
+  menuLayer.appendChild(toolsPanel);
   uiLayer.appendChild(menuLayer);
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
@@ -984,11 +1525,14 @@ async function boot() {
   let paused: boolean = pausedByVisibility || pausedByInput || pausedByMenu;
   let resumePending = false;
 
-  const showMenuPanel = (panel: 'main' | 'play' | 'cheese' | 'charcuterie') => {
+  const showMenuPanel = (
+    panel: 'main' | 'play' | 'cheese' | 'charcuterie' | 'tools',
+  ) => {
     menuMainPanel.style.display = panel === 'main' ? 'flex' : 'none';
     playPanel.style.display = panel === 'play' ? 'flex' : 'none';
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
+    toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
   };
 
   const updatePaused = () => {
@@ -1011,15 +1555,30 @@ async function boot() {
     updatePaused();
   });
 
-  const setMode = (mode: 'menu' | 'game') => {
-    const inMenu = mode === 'menu';
+  const renderToolSample = () => {
+    if (!currentSample) {
+      if (toolSnapshots.length > 0) {
+        void showNextToolSample();
+      } else {
+        gfx.clear();
+      }
+      return;
+    }
+    renderer.renderBoardOnly(currentSample.board, currentSample.hold);
+  };
+
+  const setScreen = (screen: 'menu' | 'game' | 'tool') => {
+    const inMenu = screen === 'menu';
+    const inGame = screen === 'game';
+    const inTool = screen === 'tool';
     menuLayer.style.display = inMenu ? 'flex' : 'none';
-    settingsPanel.style.display = inMenu ? 'none' : 'block';
-    menuButton.style.display = inMenu ? 'none' : 'block';
-    holdLabel.style.display = inMenu ? 'none' : 'block';
-    pausedByMenu = inMenu;
+    settingsPanel.style.display = inGame ? 'block' : 'none';
+    menuButton.style.display = inGame ? 'block' : 'none';
+    holdLabel.style.display = inGame || inTool ? 'block' : 'none';
+    toolLayer.style.display = inTool ? 'block' : 'none';
+    pausedByMenu = !inGame;
     updatePaused();
-    if (!inMenu) {
+    if (inGame) {
       const nextSettings = settingsStore.get();
       input.setConfig(nextSettings.input);
       game = createGame(nextSettings, selectedMode, selectedModeOptions);
@@ -1029,6 +1588,9 @@ async function boot() {
       gfx.clear();
       gameOverLabel.style.display = 'none';
       showMenuPanel('main');
+      if (inTool) {
+        renderToolSample();
+      }
     }
   };
 
@@ -1036,7 +1598,7 @@ async function boot() {
   defaultButton.addEventListener('click', () => {
     selectedMode = getMode('default');
     selectedModeOptions = {};
-    setMode('game');
+    setScreen('game');
   });
   cheeseModeButton.addEventListener('click', () => showMenuPanel('cheese'));
   charcuterieModeButton.addEventListener('click', () =>
@@ -1045,9 +1607,7 @@ async function boot() {
   optionsButton.addEventListener('click', () => {
     // Placeholder for future options screen
   });
-  placeholderButton.addEventListener('click', () => {
-    // Placeholder for future mode
-  });
+  toolsButton.addEventListener('click', () => showMenuPanel('tools'));
   creditsButton.addEventListener('click', () => {
     // Placeholder for future credits screen
   });
@@ -1055,7 +1615,7 @@ async function boot() {
   const startCheese = (lines: number) => {
     selectedMode = getMode('cheese');
     selectedModeOptions = { cheeseLines: lines };
-    setMode('game');
+    setScreen('game');
   };
 
   cheese4Button.addEventListener('click', () => startCheese(4));
@@ -1087,13 +1647,16 @@ async function boot() {
       simCount,
       ...(seed !== undefined ? { seed } : {}),
     };
-    setMode('game');
+    setScreen('game');
   };
 
   charcuterie8Button.addEventListener('click', () => startCharcuterie(8));
   charcuterie14Button.addEventListener('click', () => startCharcuterie(14));
   charcuterie20Button.addEventListener('click', () => startCharcuterie(20));
   charcuterieBackButton.addEventListener('click', () => showMenuPanel('play'));
+
+  wishButton.addEventListener('click', () => setScreen('tool'));
+  toolsBackButton.addEventListener('click', () => showMenuPanel('main'));
 
   const menuButton = makeMenuButton('MENU');
   Object.assign(menuButton.style, {
@@ -1106,9 +1669,9 @@ async function boot() {
   });
   uiLayer.appendChild(menuButton);
 
-  menuButton.addEventListener('click', () => setMode('menu'));
+  menuButton.addEventListener('click', () => setScreen('menu'));
 
-  setMode('menu');
+  setScreen('menu');
 
   const updateGameOverLabel = () => {
     if (pausedByMenu) {

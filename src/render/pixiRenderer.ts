@@ -82,6 +82,43 @@ export class PixiRenderer {
     }
   }
 
+  renderBoardOnly(board: GameState['board'], hold?: PieceKind | null): void {
+    const { gfx, cell, boardX, boardY } = this;
+    gfx.clear();
+
+    gfx
+      .rect(boardX - 2, boardY - 2, COLS * cell + 4, ROWS * cell + 4)
+      .fill(0x121a24);
+    gfx.rect(boardX, boardY, COLS * cell, ROWS * cell).fill(0x0b0f14);
+
+    if (hold !== undefined) {
+      this.renderHoldPiece(hold);
+    }
+
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        const k = board[y][x];
+        if (!k) continue;
+        drawCell(gfx, boardX, boardY, cell, x, y, COLORS[k]);
+      }
+    }
+  }
+
+  private renderHoldPiece(hold: PieceKind | null): void {
+    const { gfx, cell } = this;
+
+    gfx
+      .rect(HOLD_X - 2, HOLD_Y - 2, HOLD_WIDTH + 4, HOLD_PANEL_HEIGHT + 4)
+      .fill(0x121a24);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_PANEL_HEIGHT).fill(0x0b0f14);
+    gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_LABEL_HEIGHT).fill(0x121a24);
+
+    if (!hold) return;
+
+    const offsetX = Math.floor((HOLD_COLS - 4) / 2) * cell;
+    this.drawPreviewPiece(hold, HOLD_X + offsetX, HOLD_INNER_Y, cell);
+  }
+
   private renderQueue(state: GameState): void {
     const { gfx, cell } = this;
     const count = Math.min(state.next.length, NEXT_COUNT);
