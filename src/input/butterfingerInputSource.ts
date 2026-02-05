@@ -3,6 +3,7 @@ import type { InputSource } from '../core/runner';
 import type { ButterfingerSettings } from '../core/settings';
 import { XorShift32 } from '../core/rng';
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
   rotate: 0,
@@ -13,8 +14,7 @@ const EMPTY_INPUT: InputFrame = {
   restart: false,
 };
 
-const clamp01 = (value: number): number =>
-  Math.min(1, Math.max(0, value));
+const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 
 export class ButterfingerInputSource implements InputSource {
   private rng: XorShift32;

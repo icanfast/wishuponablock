@@ -1459,8 +1459,7 @@ async function boot() {
   const extraTapSlider = makeButterfingerSlider('Extra Tap');
   const lockNudgeSlider = makeButterfingerSlider('Lock Nudge');
 
-  const clampRate = (value: number): number =>
-    Math.min(1, Math.max(0, value));
+  const clampRate = (value: number): number => Math.min(1, Math.max(0, value));
   const formatPercent = (value: number): string => {
     const rounded = Math.round(value * 10) / 10;
     return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
@@ -1489,9 +1488,7 @@ async function boot() {
     value: HTMLSpanElement;
   }): number => clampRate(Number(control.slider.value) / 100);
 
-  const applyButterfinger = (
-    patch: Partial<Settings['butterfinger']>,
-  ) => {
+  const applyButterfinger = (patch: Partial<Settings['butterfinger']>) => {
     const current = settingsStore.get().butterfinger;
     settingsStore.apply({
       butterfinger: { ...current, ...patch },

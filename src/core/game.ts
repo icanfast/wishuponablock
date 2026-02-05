@@ -23,7 +23,13 @@ import {
 } from './piece';
 import { getSrsKickTests } from './srs';
 
-import type { Board, GameState, InputFrame, PieceKind, Rotation } from './types';
+import type {
+  Board,
+  GameState,
+  InputFrame,
+  PieceKind,
+  Rotation,
+} from './types';
 import { PIECES } from './types';
 
 export interface GameConfig {
@@ -547,13 +553,7 @@ export class Game {
 
   private tryOffset(dx: number, dy: number): boolean {
     if (
-      collides(
-        this.state.board,
-        this.state.active,
-        this.state.active.r,
-        dx,
-        dy,
-      )
+      collides(this.state.board, this.state.active, this.state.active.r, dx, dy)
     ) {
       return false;
     }
