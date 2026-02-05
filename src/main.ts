@@ -46,6 +46,7 @@ import { CharcuterieBot, runBotForPieces } from './bot/charcuterieBot';
 import { makeBoard } from './core/board';
 import { TETROMINOES } from './core/tetromino';
 import { loadWubModel, type LoadedModel } from './core/wubModel';
+import { UploadClient, type UploadMode } from './core/uploadClient';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -133,6 +134,16 @@ async function boot() {
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
+  const uploadMode = (
+    (import.meta.env.VITE_UPLOAD_MODE as UploadMode | undefined) ?? 'local'
+  ).toLowerCase() as UploadMode;
+  const uploadBaseUrl =
+    (import.meta.env.VITE_UPLOAD_URL as string | undefined) ?? '/api';
+  const uploadClient = new UploadClient({
+    mode: uploadMode,
+    baseUrl: uploadBaseUrl,
+  });
+  const useRemoteUpload = uploadClient.isRemote;
   let mlModel: LoadedModel | null = null;
   let mlModelPromise: Promise<LoadedModel | null> | null = null;
   const ensureMlModel = (): Promise<LoadedModel | null> => {
@@ -189,20 +200,24 @@ async function boot() {
     });
   };
   let suppressLockEffects = false;
+  const enqueueSnapshotSample = (board: Board, hold: PieceKind | null) => {
+    if (!recorder.isRecording) return;
+    const sample = recorder.record(board, hold, { store: !useRemoteUpload });
+    updateRecorderUI();
+    if (!sample || !useRemoteUpload) return;
+    const session = recorder.sessionMeta;
+    if (!session) return;
+    void uploadClient.enqueueSnapshot(session, sample);
+  };
+
   const handlePieceLock = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
     playLockSound();
-    if (recorder.isRecording) {
-      recorder.record(board, hold);
-      updateRecorderUI();
-    }
+    enqueueSnapshotSample(board, hold);
   };
   const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
-    if (recorder.isRecording) {
-      recorder.record(board, hold);
-      updateRecorderUI();
-    }
+    enqueueSnapshotSample(board, hold);
   };
 
   const getStackHeight = (board: Board): number => {
@@ -767,11 +782,19 @@ async function boot() {
 
   updateFolderStatus('No folder selected.');
 
+  if (useRemoteUpload) {
+    folderButton.style.display = 'none';
+    folderStatus.style.display = 'none';
+    recordRow.style.display = 'none';
+    recordStatus.textContent = 'Auto upload enabled.';
+  }
+
   folderButton.addEventListener('click', async () => {
     await ensureSnapshotDirectory();
   });
 
   recordButton.addEventListener('click', async () => {
+    if (useRemoteUpload) return;
     if (!recorder.isRecording) {
       recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value, {
         id: selectedMode.id,
@@ -801,6 +824,7 @@ async function boot() {
   });
 
   discardButton.addEventListener('click', () => {
+    if (useRemoteUpload) return;
     recorder.discard();
     updateRecorderUI();
   });
@@ -923,6 +947,10 @@ async function boot() {
   });
   toolOutputStatus.textContent = 'No output folder.';
   toolPanel.appendChild(toolOutputStatus);
+  if (useRemoteUpload) {
+    toolOutputButton.style.display = 'none';
+    toolOutputStatus.style.display = 'none';
+  }
 
   const toolSampleStatus = document.createElement('div');
   Object.assign(toolSampleStatus.style, {
@@ -1375,7 +1403,7 @@ async function boot() {
       updateToolSampleStatus('Sample: -');
       return;
     }
-    if (!toolOutputDirHandle) {
+    if (!useRemoteUpload && !toolOutputDirHandle) {
       toolOutputStatus.textContent = 'Select output folder first.';
       return;
     }
@@ -1395,14 +1423,21 @@ async function boot() {
         hold: currentSample.hold,
         labels: [...selectedLabels],
       };
-      await appendJsonl(
-        toolOutputDirHandle,
-        'labels.jsonl',
-        JSON.stringify(record),
-      );
-      updateToolActionStatus(
-        `Saved label for ${currentSample.file.name} #${currentSample.index}`,
-      );
+      if (useRemoteUpload) {
+        await uploadClient.enqueueLabel(record);
+        updateToolActionStatus(
+          `Uploaded label for ${currentSample.file.name} #${currentSample.index}`,
+        );
+      } else {
+        await appendJsonl(
+          toolOutputDirHandle!,
+          'labels.jsonl',
+          JSON.stringify(record),
+        );
+        updateToolActionStatus(
+          `Saved label for ${currentSample.file.name} #${currentSample.index}`,
+        );
+      }
       await showNextToolSample();
     } finally {
       toolBusy = false;
@@ -1932,7 +1967,18 @@ async function boot() {
       game = createGame(nextSettings, selectedMode, selectedModeOptions);
       runner = createRunner(game, selectedMode, selectedModeOptions);
       gameOverLabel.style.display = 'none';
+      if (useRemoteUpload && !recorder.isRecording) {
+        recorder.start(nextSettings, ROWS, COLS, '', {
+          id: selectedMode.id,
+          options: { ...selectedModeOptions },
+        });
+        updateRecorderUI();
+      }
     } else {
+      if (useRemoteUpload && recorder.isRecording) {
+        recorder.stop();
+        updateRecorderUI();
+      }
       gfx.clear();
       gameOverLabel.style.display = 'none';
       showMenuPanel('main');

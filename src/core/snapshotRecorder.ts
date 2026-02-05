@@ -58,13 +58,18 @@ function makeSessionId(now = new Date()): string {
 export class SnapshotRecorder {
   private active: SnapshotSession | null = null;
   private startedAtMs = 0;
+  private nextIndex = 0;
 
   get isRecording(): boolean {
     return this.active != null;
   }
 
   get sampleCount(): number {
-    return this.active?.samples.length ?? 0;
+    return this.active ? this.nextIndex : 0;
+  }
+
+  get sessionMeta(): SnapshotSessionMeta | null {
+    return this.active?.meta ?? null;
   }
 
   start(
@@ -95,18 +100,28 @@ export class SnapshotRecorder {
     };
     this.active = session;
     this.startedAtMs = performance.now();
+    this.nextIndex = 0;
     return session;
   }
 
-  record(board: Board, hold: PieceKind | null): void {
-    if (!this.active) return;
+  record(
+    board: Board,
+    hold: PieceKind | null,
+    options: { store?: boolean } = {},
+  ): SnapshotSample | null {
+    if (!this.active) return null;
     const timeMs = performance.now() - this.startedAtMs;
-    this.active.samples.push({
-      index: this.active.samples.length,
+    const sample: SnapshotSample = {
+      index: this.nextIndex,
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
       hold: encodePiece(hold),
-    });
+    };
+    this.nextIndex += 1;
+    if (options.store ?? true) {
+      this.active.samples.push(sample);
+    }
+    return sample;
   }
 
   setComment(comment: string): void {
@@ -122,11 +137,13 @@ export class SnapshotRecorder {
   stop(): SnapshotSession | null {
     const session = this.active;
     this.active = null;
+    this.nextIndex = 0;
     return session;
   }
 
   discard(): void {
     this.active = null;
+    this.nextIndex = 0;
   }
 }
 

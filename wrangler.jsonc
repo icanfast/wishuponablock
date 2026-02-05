@@ -2,8 +2,17 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "wishuponablock",
   "compatibility_date": "2026-02-05",
+  "main": "./src/worker.ts",
   "assets": {
     "directory": "./dist",
+    "binding": "ASSETS",
     "not_found_handling": "single-page-application"
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "wishuponablock-dev",
+      "database_id": "032328e1-972f-4fc5-8976-2a504b2b71a5"
+    }
+  ]
 }
