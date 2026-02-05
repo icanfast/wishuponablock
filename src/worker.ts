@@ -56,8 +56,8 @@ const handleSnapshots = async (
 
   await env.DB.prepare(
     `INSERT OR IGNORE INTO snapshot_sessions
-      (id, created_at, protocol_version, rows, cols, piece_order, settings, mode_id, mode_options, comment)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, created_at, protocol_version, rows, cols, settings, mode_id, mode_options, comment)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       sessionId,
@@ -65,7 +65,6 @@ const handleSnapshots = async (
       session.protocolVersion ?? 0,
       session.rows ?? 0,
       session.cols ?? 0,
-      JSON.stringify(session.pieceOrder ?? []),
       JSON.stringify(session.settings ?? {}),
       mode?.id ?? null,
       JSON.stringify(mode?.options ?? null),
@@ -100,8 +99,8 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
 
   await env.DB.prepare(
     `INSERT INTO label_records
-      (created_at, session_id, file_name, sample_index, shown_count, piece_order, board, hold, labels)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (created_at, session_id, file_name, sample_index, shown_count, board, hold, labels)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       record.createdAt ?? new Date().toISOString(),
@@ -109,7 +108,6 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
       source.file ?? null,
       source.sampleIndex ?? null,
       source.shownCount ?? null,
-      JSON.stringify(record.pieceOrder ?? []),
       record.board ?? '',
       record.hold ?? null,
       JSON.stringify(record.labels ?? []),

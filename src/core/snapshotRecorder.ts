@@ -8,7 +8,7 @@ export interface SnapshotSessionMeta {
   protocolVersion: number;
   rows: number;
   cols: number;
-  pieceOrder: readonly string[];
+  pieceOrder?: readonly string[];
   settings: Pick<Settings, 'game' | 'generator'>;
   mode?: SnapshotModeInfo;
   comment?: string;
@@ -88,7 +88,6 @@ export class SnapshotRecorder {
         protocolVersion: GAME_PROTOCOL_VERSION,
         rows,
         cols,
-        pieceOrder: PIECES,
         settings: {
           game: { ...settings.game },
           generator: { ...settings.generator },

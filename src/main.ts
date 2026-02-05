@@ -1121,11 +1121,12 @@ async function boot() {
     });
   }
 
-  const decodeBoard = (raw: number[][], order: readonly string[]): Board => {
+  const decodeBoard = (raw: number[][], order?: readonly string[]): Board => {
+    const resolvedOrder = order ?? PIECES;
     return raw.map((row) =>
       row.map((value) => {
         if (value <= 0) return null;
-        const piece = order[value - 1] ?? PIECES[value - 1];
+        const piece = resolvedOrder[value - 1] ?? PIECES[value - 1];
         return piece as PieceKind;
       }),
     );
@@ -1133,10 +1134,11 @@ async function boot() {
 
   const decodeHold = (
     hold: number | undefined,
-    order: readonly string[],
+    order?: readonly string[],
   ): PieceKind | null => {
     if (!hold || hold <= 0) return null;
-    const piece = order[hold - 1] ?? PIECES[hold - 1];
+    const resolvedOrder = order ?? PIECES;
+    const piece = resolvedOrder[hold - 1] ?? PIECES[hold - 1];
     return (piece as PieceKind) ?? null;
   };
 
@@ -1418,7 +1420,6 @@ async function boot() {
           sampleIndex: currentSample.index,
           shownCount: labelIndex[key] ?? 1,
         },
-        pieceOrder: currentSample.file.session.meta.pieceOrder,
         board: encodeBoardString(currentSample.raw),
         hold: currentSample.hold,
         labels: [...selectedLabels],
@@ -1534,6 +1535,28 @@ async function boot() {
   menuMainPanel.appendChild(optionsButton);
   menuMainPanel.appendChild(toolsButton);
   menuMainPanel.appendChild(creditsButton);
+
+  const dataNotice = document.createElement('div');
+  dataNotice.textContent =
+    'This game collects anonymized board snapshots to train the piece generator.';
+  Object.assign(dataNotice.style, {
+    maxWidth: '320px',
+    color: '#8fa0b8',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    textAlign: 'center',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+  });
+
+  const menuMainWrapper = document.createElement('div');
+  Object.assign(menuMainWrapper.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '12px',
+  });
+  menuMainWrapper.appendChild(menuMainPanel);
+  menuMainWrapper.appendChild(dataNotice);
 
   const playTitle = document.createElement('div');
   playTitle.textContent = 'PLAY';
@@ -1845,7 +1868,7 @@ async function boot() {
   toolsPanel.appendChild(wishButton);
   toolsPanel.appendChild(toolsBackButton);
 
-  menuLayer.appendChild(menuMainPanel);
+  menuLayer.appendChild(menuMainWrapper);
   playMenuRow.appendChild(playPanel);
   playMenuRow.appendChild(butterfingerPanel);
   menuLayer.appendChild(playMenuRow);
@@ -1911,7 +1934,7 @@ async function boot() {
   const showMenuPanel = (
     panel: 'main' | 'play' | 'cheese' | 'charcuterie' | 'tools',
   ) => {
-    menuMainPanel.style.display = panel === 'main' ? 'flex' : 'none';
+    menuMainWrapper.style.display = panel === 'main' ? 'flex' : 'none';
     playMenuRow.style.display = panel === 'play' ? 'flex' : 'none';
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
