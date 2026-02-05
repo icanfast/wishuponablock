@@ -2,6 +2,8 @@ import {
   DEFAULT_ARR_MS,
   DEFAULT_BUTTERFINGER_ENABLED,
   DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE,
+  DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE,
+  DEFAULT_BUTTERFINGER_GRAVITY_DROP_RATE,
   DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE,
   DEFAULT_BUTTERFINGER_MISS_RATE,
   DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
@@ -42,6 +44,8 @@ export interface ButterfingerSettings {
   wrongDirRate: number;
   extraTapRate: number;
   lockNudgeRate: number;
+  gravityDropRate: number;
+  lockRotateRate: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -67,6 +71,8 @@ export const DEFAULT_SETTINGS: Settings = {
     wrongDirRate: DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
     extraTapRate: DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE,
     lockNudgeRate: DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE,
+    gravityDropRate: DEFAULT_BUTTERFINGER_GRAVITY_DROP_RATE,
+    lockRotateRate: DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE,
   },
 };
 
@@ -128,6 +134,8 @@ function mergeButterfinger(
     wrongDirRate: num(patch?.wrongDirRate) ?? base.wrongDirRate,
     extraTapRate: num(patch?.extraTapRate) ?? base.extraTapRate,
     lockNudgeRate: num(patch?.lockNudgeRate) ?? base.lockNudgeRate,
+    gravityDropRate: num(patch?.gravityDropRate) ?? base.gravityDropRate,
+    lockRotateRate: num(patch?.lockRotateRate) ?? base.lockRotateRate,
   };
 }
 

@@ -33,6 +33,10 @@ const COLORS: Record<PieceKind, number> = {
   L: 0xffa94d,
 };
 
+const BORDER_COLOR = 0x1f2a37;
+const BOARD_BORDER = 3;
+const PANEL_BORDER = 3;
+
 export class PixiRenderer {
   constructor(
     private gfx: Graphics,
@@ -48,8 +52,13 @@ export class PixiRenderer {
 
     // board background + frame
     gfx
-      .rect(boardX - 2, boardY - 2, COLS * cell + 4, ROWS * cell + 4)
-      .fill(0x121a24);
+      .rect(
+        boardX - BOARD_BORDER,
+        boardY - BOARD_BORDER,
+        COLS * cell + BOARD_BORDER * 2,
+        ROWS * cell + BOARD_BORDER * 2,
+      )
+      .fill(BORDER_COLOR);
     gfx.rect(boardX, boardY, COLS * cell, ROWS * cell).fill(0x0b0f14);
 
     this.renderHold(state);
@@ -87,8 +96,13 @@ export class PixiRenderer {
     gfx.clear();
 
     gfx
-      .rect(boardX - 2, boardY - 2, COLS * cell + 4, ROWS * cell + 4)
-      .fill(0x121a24);
+      .rect(
+        boardX - BOARD_BORDER,
+        boardY - BOARD_BORDER,
+        COLS * cell + BOARD_BORDER * 2,
+        ROWS * cell + BOARD_BORDER * 2,
+      )
+      .fill(BORDER_COLOR);
     gfx.rect(boardX, boardY, COLS * cell, ROWS * cell).fill(0x0b0f14);
 
     if (hold !== undefined) {
@@ -108,8 +122,13 @@ export class PixiRenderer {
     const { gfx, cell } = this;
 
     gfx
-      .rect(HOLD_X - 2, HOLD_Y - 2, HOLD_WIDTH + 4, HOLD_PANEL_HEIGHT + 4)
-      .fill(0x121a24);
+      .rect(
+        HOLD_X - PANEL_BORDER,
+        HOLD_Y - PANEL_BORDER,
+        HOLD_WIDTH + PANEL_BORDER * 2,
+        HOLD_PANEL_HEIGHT + PANEL_BORDER * 2,
+      )
+      .fill(BORDER_COLOR);
     gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_PANEL_HEIGHT).fill(0x0b0f14);
     gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_LABEL_HEIGHT).fill(0x121a24);
 
@@ -129,8 +148,13 @@ export class PixiRenderer {
     const panelWidth = QUEUE_COLS * cell;
 
     gfx
-      .rect(QUEUE_X - 2, QUEUE_Y - 2, panelWidth + 4, panelHeight + 4)
-      .fill(0x121a24);
+      .rect(
+        QUEUE_X - PANEL_BORDER,
+        QUEUE_Y - PANEL_BORDER,
+        panelWidth + PANEL_BORDER * 2,
+        panelHeight + PANEL_BORDER * 2,
+      )
+      .fill(BORDER_COLOR);
     gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, panelHeight).fill(0x0b0f14);
 
     const offsetX = Math.floor((QUEUE_COLS - 4) / 2) * cell;
@@ -146,8 +170,13 @@ export class PixiRenderer {
     const { gfx, cell } = this;
 
     gfx
-      .rect(HOLD_X - 2, HOLD_Y - 2, HOLD_WIDTH + 4, HOLD_PANEL_HEIGHT + 4)
-      .fill(0x121a24);
+      .rect(
+        HOLD_X - PANEL_BORDER,
+        HOLD_Y - PANEL_BORDER,
+        HOLD_WIDTH + PANEL_BORDER * 2,
+        HOLD_PANEL_HEIGHT + PANEL_BORDER * 2,
+      )
+      .fill(BORDER_COLOR);
     gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_PANEL_HEIGHT).fill(0x0b0f14);
     gfx.rect(HOLD_X, HOLD_Y, HOLD_WIDTH, HOLD_LABEL_HEIGHT).fill(0x121a24);
 

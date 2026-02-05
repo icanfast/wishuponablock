@@ -9,6 +9,7 @@ import {
   HOLD_X,
   HOLD_Y,
   HOLD_WIDTH,
+  ML_MODEL_URL,
   OUTER_MARGIN,
   PANEL_GAP,
   PLAY_HEIGHT,
@@ -44,6 +45,7 @@ import type { SnapshotSession } from './core/snapshotRecorder';
 import { CharcuterieBot, runBotForPieces } from './bot/charcuterieBot';
 import { makeBoard } from './core/board';
 import { TETROMINOES } from './core/tetromino';
+import { loadWubModel, type LoadedModel } from './core/wubModel';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -131,6 +133,24 @@ async function boot() {
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
+  let mlModel: LoadedModel | null = null;
+  let mlModelPromise: Promise<LoadedModel | null> | null = null;
+  const ensureMlModel = (): Promise<LoadedModel | null> => {
+    if (mlModelPromise) return mlModelPromise;
+    mlModelPromise = loadWubModel(ML_MODEL_URL)
+      .then((model) => {
+        mlModel = model;
+        return model;
+      })
+      .catch((err) => {
+        console.warn('Failed to load ML model:', err);
+        mlModel = null;
+        mlModelPromise = null;
+        return null;
+      });
+    return mlModelPromise;
+  };
+  void ensureMlModel();
   const recorder = new SnapshotRecorder();
   let updateRecorderUI = () => {};
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
@@ -289,7 +309,16 @@ async function boot() {
       lockNudgeRate: cfg.butterfinger.enabled
         ? cfg.butterfinger.lockNudgeRate
         : 0,
-      generatorFactory: createGeneratorFactory(merged.generator),
+      gravityDropRate: cfg.butterfinger.enabled
+        ? cfg.butterfinger.gravityDropRate
+        : 0,
+      lockRotateRate: cfg.butterfinger.enabled
+        ? cfg.butterfinger.lockRotateRate
+        : 0,
+      generatorFactory: createGeneratorFactory(merged.generator, {
+        mlModel,
+        mlModelPromise: mlModelPromise ?? undefined,
+      }),
       onPieceLock: handlePieceLock,
       onHold: handleHoldSnapshot,
     });
@@ -305,13 +334,20 @@ async function boot() {
       1,
       Math.trunc(Number(options.simCount ?? charcuterieDefaultSimCount)),
     );
+    const simSettings: Settings = {
+      ...cfg,
+      generator: {
+        ...cfg.generator,
+        type: 'bag7',
+      },
+    };
     const seedOverride = options.seed;
     const baseSeed =
       seedOverride !== undefined ? Math.trunc(seedOverride) : Date.now();
     const simStart = performance.now();
 
     if (pieces === 0 || sims === 1) {
-      const game = buildGame(cfg, mode, baseSeed);
+      const game = buildGame(simSettings, mode, baseSeed);
       if (pieces > 0) {
         suppressLockEffects = true;
         try {
@@ -321,8 +357,12 @@ async function boot() {
           suppressLockEffects = false;
         }
       }
-      game.markInitialBlocks();
-      return game;
+      const finalGame = buildGame(cfg, mode, baseSeed);
+      if (pieces > 0) {
+        finalGame.applyInitialBoard(game.state.board);
+      }
+      finalGame.markInitialBlocks();
+      return finalGame;
     }
 
     let bestGame: Game | null = null;
@@ -340,7 +380,7 @@ async function boot() {
     try {
       for (let i = 0; i < sims; i++) {
         const seed = baseSeed + i * 977;
-        const game = buildGame(cfg, mode, seed);
+        const game = buildGame(simSettings, mode, seed);
         const bot = new CharcuterieBot(seed ^ 0x9e3779b9);
         runBotForPieces(game, bot, pieces);
 
@@ -387,7 +427,10 @@ async function boot() {
       );
     }
 
-    const finalGame = bestGame ?? buildGame(cfg, mode, baseSeed);
+    const finalGame = buildGame(cfg, mode, baseSeed);
+    if (bestGame) {
+      finalGame.applyInitialBoard(bestGame.state.board);
+    }
     finalGame.markInitialBlocks();
     return finalGame;
   };
@@ -489,6 +532,8 @@ async function boot() {
         return 'Random';
       case 'nes':
         return 'NES';
+      case 'ml':
+        return 'ML Model';
       default:
         return type;
     }
@@ -828,9 +873,32 @@ async function boot() {
     marginTop: '6px',
     fontSize: '12px',
     color: '#8fa0b8',
+    whiteSpace: 'pre-line',
   });
   toolInputStatus.textContent = 'No snapshots loaded.';
   toolPanel.appendChild(toolInputStatus);
+
+  const toolModeLabel = document.createElement('div');
+  toolModeLabel.textContent = 'Mode Filter';
+  Object.assign(toolModeLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolModeLabel);
+
+  const toolModeSelect = document.createElement('select');
+  Object.assign(toolModeSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolModeSelect);
 
   const toolOutputButton = document.createElement('button');
   toolOutputButton.textContent = 'Select Output Folder';
@@ -981,9 +1049,12 @@ async function boot() {
   }
 
   let toolOutputDirHandle: FileSystemDirectoryHandle | null = null;
+  let toolSnapshotsAll: Array<{ name: string; session: SnapshotSession }> = [];
   let toolSnapshots: Array<{ name: string; session: SnapshotSession }> = [];
   let toolTotalSamples = 0;
+  let toolTotalSamplesAll = 0;
   let toolSampleOffsets: number[] = [];
+  let toolModeFilter = 'all';
   let currentSample: {
     file: { name: string; session: SnapshotSession };
     index: number;
@@ -1114,6 +1185,78 @@ async function boot() {
     toolActionStatus.textContent = text;
   };
 
+  const getModeLabel = (id: string): string => {
+    if (id === 'unknown') return 'Unknown';
+    if (id === 'default' || id === 'cheese' || id === 'charcuterie') {
+      return getMode(id).label.toUpperCase();
+    }
+    return id.toUpperCase();
+  };
+
+  const refreshToolModeOptions = () => {
+    toolModeSelect.innerHTML = '';
+    const addOption = (value: string, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolModeSelect.appendChild(option);
+    };
+
+    addOption('all', 'All Modes');
+    const counts = new Map<string, number>();
+    for (const file of toolSnapshotsAll) {
+      const modeId = file.session.meta.mode?.id ?? 'unknown';
+      counts.set(
+        modeId,
+        (counts.get(modeId) ?? 0) + file.session.samples.length,
+      );
+    }
+
+    const modeIds = Array.from(counts.keys()).sort((a, b) => {
+      if (a === 'unknown') return 1;
+      if (b === 'unknown') return -1;
+      return a.localeCompare(b);
+    });
+    for (const modeId of modeIds) {
+      const label = `${getModeLabel(modeId)} (${counts.get(modeId) ?? 0})`;
+      addOption(modeId, label);
+    }
+
+    if (toolModeFilter !== 'all' && !counts.has(toolModeFilter)) {
+      toolModeFilter = 'all';
+    }
+    toolModeSelect.value = toolModeFilter;
+    toolModeSelect.disabled = toolSnapshotsAll.length === 0;
+  };
+
+  const rebuildToolSampleOffsets = () => {
+    toolSampleOffsets = [];
+    let running = 0;
+    for (const file of toolSnapshots) {
+      toolSampleOffsets.push(running);
+      running += file.session.samples.length;
+    }
+    toolTotalSamples = running;
+  };
+
+  const applyToolModeFilter = async () => {
+    if (toolModeFilter === 'all') {
+      toolSnapshots = toolSnapshotsAll;
+    } else {
+      toolSnapshots = toolSnapshotsAll.filter((file) => {
+        const modeId = file.session.meta.mode?.id ?? 'unknown';
+        return modeId === toolModeFilter;
+      });
+    }
+    rebuildToolSampleOffsets();
+    const filterLabel =
+      toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
+    toolInputStatus.textContent =
+      `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
+      `Filter: ${filterLabel} (${toolTotalSamples} samples).`;
+    await showNextToolSample();
+  };
+
   const showNextToolSample = async (): Promise<void> => {
     if (toolSnapshots.length === 0 || toolTotalSamples === 0) {
       currentSample = null;
@@ -1183,21 +1326,22 @@ async function boot() {
         files.push({ name: entry.name, session });
       }
       files.sort((a, b) => a.name.localeCompare(b.name));
-      toolSnapshots = files;
-      toolSampleOffsets = [];
-      let running = 0;
-      for (const file of toolSnapshots) {
-        toolSampleOffsets.push(running);
-        running += file.session.samples.length;
-      }
-      toolTotalSamples = running;
-      const totalSamples = toolTotalSamples;
-      toolInputStatus.textContent = `Loaded ${toolSnapshots.length} files (${totalSamples} samples).`;
-      updateToolActionStatus(`Loaded ${toolSnapshots.length} files.`);
-      await showNextToolSample();
+      toolSnapshotsAll = files;
+      toolTotalSamplesAll = toolSnapshotsAll.reduce(
+        (sum, file) => sum + file.session.samples.length,
+        0,
+      );
+      refreshToolModeOptions();
+      await applyToolModeFilter();
+      updateToolActionStatus(`Loaded ${toolSnapshotsAll.length} files.`);
     } catch {
       toolInputStatus.textContent = 'Folder selection cancelled.';
     }
+  });
+
+  toolModeSelect.addEventListener('change', async () => {
+    toolModeFilter = toolModeSelect.value;
+    await applyToolModeFilter();
   });
 
   toolOutputButton.addEventListener('click', async () => {
@@ -1407,7 +1551,10 @@ async function boot() {
   butterfingerToggleRow.appendChild(butterfingerToggleText);
   butterfingerPanel.appendChild(butterfingerToggleRow);
 
-  const makeButterfingerSlider = (labelText: string) => {
+  const makeButterfingerSlider = (
+    labelText: string,
+    options: { max?: number; step?: number } = {},
+  ) => {
     const row = document.createElement('div');
     Object.assign(row.style, {
       display: 'flex',
@@ -1441,8 +1588,8 @@ async function boot() {
     const slider = document.createElement('input');
     slider.type = 'range';
     slider.min = '0';
-    slider.max = '10';
-    slider.step = '0.1';
+    slider.max = String(options.max ?? 10);
+    slider.step = String(options.step ?? 0.1);
     Object.assign(slider.style, {
       width: '100%',
       accentColor: '#6ea8ff',
@@ -1458,19 +1605,23 @@ async function boot() {
   const wrongDirSlider = makeButterfingerSlider('Wrong Direction');
   const extraTapSlider = makeButterfingerSlider('Extra Tap');
   const lockNudgeSlider = makeButterfingerSlider('Lock Nudge');
+  const gravityDropSlider = makeButterfingerSlider('Gravity Drop');
+  const lockRotateSlider = makeButterfingerSlider('Lock Rotate', {
+    max: 100,
+    step: 1,
+  });
 
   const clampRate = (value: number): number => Math.min(1, Math.max(0, value));
   const formatPercent = (value: number): string => {
     const rounded = Math.round(value * 10) / 10;
     return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
   };
-  const clampPercent = (value: number): number =>
-    Math.min(10, Math.max(0, value));
   const updateButterfingerControl = (
     control: { slider: HTMLInputElement; value: HTMLSpanElement },
     rate: number,
   ) => {
-    const percent = clampPercent(clampRate(rate) * 100);
+    const sliderMax = Number(control.slider.max) || 100;
+    const percent = Math.min(sliderMax, clampRate(rate) * 100);
     control.slider.value = String(percent);
     control.value.textContent = formatPercent(percent);
   };
@@ -1481,6 +1632,8 @@ async function boot() {
     updateButterfingerControl(wrongDirSlider, cfg.wrongDirRate);
     updateButterfingerControl(extraTapSlider, cfg.extraTapRate);
     updateButterfingerControl(lockNudgeSlider, cfg.lockNudgeRate);
+    updateButterfingerControl(gravityDropSlider, cfg.gravityDropRate);
+    updateButterfingerControl(lockRotateSlider, cfg.lockRotateRate);
   };
 
   const readButterfingerRate = (control: {
@@ -1521,6 +1674,18 @@ async function boot() {
     const rate = readButterfingerRate(lockNudgeSlider);
     lockNudgeSlider.value.textContent = formatPercent(rate * 100);
     applyButterfinger({ lockNudgeRate: rate });
+  });
+
+  gravityDropSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(gravityDropSlider);
+    gravityDropSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ gravityDropRate: rate });
+  });
+
+  lockRotateSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(lockRotateSlider);
+    lockRotateSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ lockRotateRate: rate });
   });
 
   updateButterfingerUI(settings.butterfinger);
@@ -1669,6 +1834,9 @@ async function boot() {
 
     if (next.generator.type !== generatorType) {
       generatorType = next.generator.type;
+      if (next.generator.type === 'ml') {
+        void ensureMlModel();
+      }
       game = createGame(next, selectedMode, selectedModeOptions);
       runner = createRunner(game, selectedMode, selectedModeOptions);
       if (select.value !== next.generator.type) {
@@ -1681,6 +1849,12 @@ async function boot() {
       ...next.game,
       lockNudgeRate: next.butterfinger.enabled
         ? next.butterfinger.lockNudgeRate
+        : 0,
+      gravityDropRate: next.butterfinger.enabled
+        ? next.butterfinger.gravityDropRate
+        : 0,
+      lockRotateRate: next.butterfinger.enabled
+        ? next.butterfinger.lockRotateRate
         : 0,
     });
     if (select.value !== next.generator.type) {

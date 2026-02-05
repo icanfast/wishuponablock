@@ -39,6 +39,8 @@ export interface GameConfig {
   lockDelayMs?: number;
   hardLockDelayMs?: number;
   lockNudgeRate?: number;
+  gravityDropRate?: number;
+  lockRotateRate?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
   onPieceLock?: (board: Board, hold: PieceKind | null) => void;
   onHold?: (board: Board, hold: PieceKind | null) => void;
@@ -62,6 +64,8 @@ export class Game {
   private initialBlocksRemaining = 0;
   private initialBlocksActive = false;
   private lockNudgeRate = 0;
+  private gravityDropRate = 0;
+  private lockRotateRate = 0;
   private butterfingerRng: XorShift32;
 
   private gravityMs: number;
@@ -79,6 +83,8 @@ export class Game {
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
     this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
     this.lockNudgeRate = clamp01(cfg.lockNudgeRate ?? 0);
+    this.gravityDropRate = clamp01(cfg.gravityDropRate ?? 0);
+    this.lockRotateRate = clamp01(cfg.lockRotateRate ?? 0);
     this.onPieceLock = cfg.onPieceLock;
     this.onHold = cfg.onHold;
     this.butterfingerRng = new XorShift32(cfg.seed ^ 0x6d2b79f5);
@@ -87,6 +93,7 @@ export class Game {
     this.generator = makeGenerator(cfg.seed);
 
     const board = makeBoard();
+    this.generator.onLock?.(board, null);
     const first = this.generator.next();
 
     this.state = {
@@ -107,6 +114,20 @@ export class Game {
     this.spawnActive(first);
   }
 
+  applyInitialBoard(board: Board): void {
+    this.state.board = board.map((row) => row.slice());
+    this.gravityAcc = 0;
+    this.lockAcc = 0;
+    this.hardLockAcc = 0;
+    this.state.gameOver = false;
+    this.state.gameWon = false;
+    this.liftSpawnIfBlocked();
+    this.recomputeGhost();
+    if (collides(this.state.board, this.state.active)) {
+      this.state.gameOver = true;
+    }
+  }
+
   setConfig(cfg: Partial<GameConfig>): void {
     const prevGravity = this.gravityMs;
     const prevSoftDrop = this.softDropMs;
@@ -118,6 +139,10 @@ export class Game {
       this.hardLockDelayMs = cfg.hardLockDelayMs;
     if (cfg.lockNudgeRate !== undefined)
       this.lockNudgeRate = clamp01(cfg.lockNudgeRate);
+    if (cfg.gravityDropRate !== undefined)
+      this.gravityDropRate = clamp01(cfg.gravityDropRate);
+    if (cfg.lockRotateRate !== undefined)
+      this.lockRotateRate = clamp01(cfg.lockRotateRate);
 
     // Keep current interval in sync if it was previously matching one of these.
     if (this.dropIntervalMs === prevGravity) {
@@ -170,6 +195,11 @@ export class Game {
           // grounded: stop consuming extra "gravity" this tick
           this.gravityAcc = 0;
           break;
+        }
+
+        if (this.tryButterfingerGravityDrop()) {
+          this.doHardDrop();
+          return;
         }
       }
     }
@@ -228,6 +258,7 @@ export class Game {
     this.lockAcc = 0;
     this.hardLockAcc = 0;
 
+    this.generator.onLock?.(this.state.board, null);
     const first = this.generator.next();
     this.updateNextView();
     this.spawnActive(first);
@@ -466,6 +497,7 @@ export class Game {
       return;
     }
 
+    this.generator.onLock?.(this.state.board, this.state.hold);
     this.spawnNext();
   }
 
@@ -527,8 +559,48 @@ export class Game {
   private tryButterfingerNudge(): boolean {
     if (this.lockNudgeRate <= 0) return false;
     if (!this.rollButterfinger(this.lockNudgeRate)) return false;
+    let changed = false;
+
+    if (this.lockRotateRate > 0 && this.rollButterfinger(this.lockRotateRate)) {
+      changed = this.tryButterfingerRotate();
+      if (
+        changed &&
+        !collides(
+          this.state.board,
+          this.state.active,
+          this.state.active.r,
+          0,
+          1,
+        )
+      ) {
+        return true;
+      }
+    }
+
     const dir = this.butterfingerRng.nextInt(2) === 0 ? -1 : 1;
-    return this.tryNudgeWithKicks(dir);
+    const nudged = this.tryNudgeWithKicks(dir);
+    return changed || nudged;
+  }
+
+  private tryButterfingerRotate(): boolean {
+    const roll = this.butterfingerRng.nextInt(3);
+    if (roll === 2) {
+      const changed = tryRotate180PreferDirect(
+        this.state.board,
+        this.state.active,
+      );
+      if (changed) this.recomputeGhost();
+      return changed;
+    }
+    const dir: -1 | 1 = roll === 0 ? 1 : -1;
+    const changed = tryRotateSRS(this.state.board, this.state.active, dir);
+    if (changed) this.recomputeGhost();
+    return changed;
+  }
+
+  private tryButterfingerGravityDrop(): boolean {
+    if (this.gravityDropRate <= 0) return false;
+    return this.rollButterfinger(this.gravityDropRate);
   }
 
   private tryNudgeWithKicks(dir: -1 | 1): boolean {

@@ -4,6 +4,8 @@ import { Bag8I } from './bag8I';
 import { BagInconvenient } from './bagInconvenient';
 import { RandomGenerator } from './randomGenerator';
 import { NesGenerator } from './nesGenerator';
+import { ModelGenerator } from './modelGenerator';
+import type { LoadedModel } from './wubModel';
 
 export const GENERATOR_TYPES = [
   'bag7',
@@ -11,11 +13,17 @@ export const GENERATOR_TYPES = [
   'inconvenient',
   'random',
   'nes',
+  'ml',
 ] as const;
 export type GeneratorType = (typeof GENERATOR_TYPES)[number];
 
 export interface GeneratorSettings {
   type: GeneratorType;
+}
+
+export interface GeneratorFactoryOptions {
+  mlModel?: LoadedModel | null;
+  mlModelPromise?: Promise<LoadedModel | null>;
 }
 
 export function isGeneratorType(value: unknown): value is GeneratorType {
@@ -27,6 +35,7 @@ export function isGeneratorType(value: unknown): value is GeneratorType {
 
 export function createGeneratorFactory(
   settings: GeneratorSettings,
+  options: GeneratorFactoryOptions = {},
 ): (seed: number) => PieceGenerator {
   switch (settings.type) {
     case 'bag8i':
@@ -37,6 +46,13 @@ export function createGeneratorFactory(
       return (seed) => new NesGenerator(seed);
     case 'random':
       return (seed) => new RandomGenerator(seed);
+    case 'ml':
+      return (seed) =>
+        new ModelGenerator(
+          seed,
+          options.mlModel ?? null,
+          options.mlModelPromise,
+        );
     case 'bag7':
     default:
       return (seed) => new Bag7(seed);
