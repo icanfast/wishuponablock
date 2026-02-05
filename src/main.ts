@@ -37,6 +37,7 @@ import { getMode, type GameMode, type ModeOptions } from './core/modes';
 import { Keyboard } from './input/keyboard';
 import { InputController } from './input/controller';
 import { KeyboardInputSource } from './input/keyboardInputSource';
+import { ButterfingerInputSource } from './input/butterfingerInputSource';
 import { PixiRenderer } from './render/pixiRenderer';
 import { PIECES, type Board, type PieceKind } from './core/types';
 import type { SnapshotSession } from './core/snapshotRecorder';
@@ -149,7 +150,14 @@ async function boot() {
 
   const kb = new Keyboard();
   const input = new InputController(kb, settings.input);
-  const inputSource = new KeyboardInputSource(input);
+  const baseInputSource = new KeyboardInputSource(input);
+  const butterfingerSource = new ButterfingerInputSource(
+    baseInputSource,
+    settings.butterfinger,
+  );
+  let inputSource = settings.butterfinger.enabled
+    ? butterfingerSource
+    : baseInputSource;
 
   const lockSound = new Audio('/sfx/lock.ogg');
   lockSound.preload = 'auto';
@@ -278,6 +286,9 @@ async function boot() {
     return new Game({
       seed,
       ...merged.game,
+      lockNudgeRate: cfg.butterfinger.enabled
+        ? cfg.butterfinger.lockNudgeRate
+        : 0,
       generatorFactory: createGeneratorFactory(merged.generator),
       onPieceLock: handlePieceLock,
       onHold: handleHoldSnapshot,
@@ -1291,9 +1302,11 @@ async function boot() {
   const cheesePanel = makeMenuPanel();
   const charcuteriePanel = makeMenuPanel();
   const toolsPanel = makeMenuPanel();
+  const butterfingerPanel = makeMenuPanel();
+  const playMenuRow = document.createElement('div');
   Object.assign(playPanel.style, {
     minHeight: '240px',
-    display: 'none',
+    display: 'flex',
   });
   Object.assign(cheesePanel.style, {
     minHeight: '240px',
@@ -1306,6 +1319,16 @@ async function boot() {
   Object.assign(toolsPanel.style, {
     minHeight: '240px',
     display: 'none',
+  });
+  Object.assign(butterfingerPanel.style, {
+    minHeight: '240px',
+    width: '240px',
+    display: 'flex',
+  });
+  Object.assign(playMenuRow.style, {
+    display: 'none',
+    gap: '16px',
+    alignItems: 'flex-start',
   });
 
   const makeMenuButton = (labelText: string) => {
@@ -1355,6 +1378,155 @@ async function boot() {
   playPanel.appendChild(cheeseModeButton);
   playPanel.appendChild(charcuterieModeButton);
   playPanel.appendChild(playBackButton);
+
+  const butterfingerTitle = document.createElement('div');
+  butterfingerTitle.textContent = 'BUTTERFINGER';
+  Object.assign(butterfingerTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+  butterfingerPanel.appendChild(butterfingerTitle);
+
+  const butterfingerToggleRow = document.createElement('label');
+  Object.assign(butterfingerToggleRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '12px',
+    color: '#e2e8f0',
+    cursor: 'pointer',
+  });
+  const butterfingerToggle = document.createElement('input');
+  butterfingerToggle.type = 'checkbox';
+  butterfingerToggle.style.cursor = 'pointer';
+  const butterfingerToggleText = document.createElement('span');
+  butterfingerToggleText.textContent = 'Enable';
+  butterfingerToggleRow.appendChild(butterfingerToggle);
+  butterfingerToggleRow.appendChild(butterfingerToggleText);
+  butterfingerPanel.appendChild(butterfingerToggleRow);
+
+  const makeButterfingerSlider = (labelText: string) => {
+    const row = document.createElement('div');
+    Object.assign(row.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '6px',
+      textAlign: 'left',
+      marginTop: '8px',
+    });
+    const label = document.createElement('div');
+    label.textContent = labelText;
+    Object.assign(label.style, {
+      color: '#b6c2d4',
+      fontSize: '11px',
+      letterSpacing: '0.3px',
+    });
+    const value = document.createElement('span');
+    Object.assign(value.style, {
+      color: '#8fa0b8',
+      fontSize: '11px',
+      marginLeft: '6px',
+    });
+    const labelRow = document.createElement('div');
+    Object.assign(labelRow.style, {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    });
+    labelRow.appendChild(label);
+    labelRow.appendChild(value);
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '10';
+    slider.step = '0.1';
+    Object.assign(slider.style, {
+      width: '100%',
+      accentColor: '#6ea8ff',
+    });
+
+    row.appendChild(labelRow);
+    row.appendChild(slider);
+    butterfingerPanel.appendChild(row);
+    return { slider, value };
+  };
+
+  const missSlider = makeButterfingerSlider('Miss Rate');
+  const wrongDirSlider = makeButterfingerSlider('Wrong Direction');
+  const extraTapSlider = makeButterfingerSlider('Extra Tap');
+  const lockNudgeSlider = makeButterfingerSlider('Lock Nudge');
+
+  const clampRate = (value: number): number =>
+    Math.min(1, Math.max(0, value));
+  const formatPercent = (value: number): string => {
+    const rounded = Math.round(value * 10) / 10;
+    return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+  };
+  const clampPercent = (value: number): number =>
+    Math.min(10, Math.max(0, value));
+  const updateButterfingerControl = (
+    control: { slider: HTMLInputElement; value: HTMLSpanElement },
+    rate: number,
+  ) => {
+    const percent = clampPercent(clampRate(rate) * 100);
+    control.slider.value = String(percent);
+    control.value.textContent = formatPercent(percent);
+  };
+
+  const updateButterfingerUI = (cfg: Settings['butterfinger']) => {
+    butterfingerToggle.checked = cfg.enabled;
+    updateButterfingerControl(missSlider, cfg.missRate);
+    updateButterfingerControl(wrongDirSlider, cfg.wrongDirRate);
+    updateButterfingerControl(extraTapSlider, cfg.extraTapRate);
+    updateButterfingerControl(lockNudgeSlider, cfg.lockNudgeRate);
+  };
+
+  const readButterfingerRate = (control: {
+    slider: HTMLInputElement;
+    value: HTMLSpanElement;
+  }): number => clampRate(Number(control.slider.value) / 100);
+
+  const applyButterfinger = (
+    patch: Partial<Settings['butterfinger']>,
+  ) => {
+    const current = settingsStore.get().butterfinger;
+    settingsStore.apply({
+      butterfinger: { ...current, ...patch },
+    });
+  };
+
+  butterfingerToggle.addEventListener('change', () => {
+    applyButterfinger({ enabled: butterfingerToggle.checked });
+  });
+
+  missSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(missSlider);
+    missSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ missRate: rate });
+  });
+
+  wrongDirSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(wrongDirSlider);
+    wrongDirSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ wrongDirRate: rate });
+  });
+
+  extraTapSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(extraTapSlider);
+    extraTapSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ extraTapRate: rate });
+  });
+
+  lockNudgeSlider.slider.addEventListener('input', () => {
+    const rate = readButterfingerRate(lockNudgeSlider);
+    lockNudgeSlider.value.textContent = formatPercent(rate * 100);
+    applyButterfinger({ lockNudgeRate: rate });
+  });
+
+  updateButterfingerUI(settings.butterfinger);
 
   const cheeseTitle = document.createElement('div');
   cheeseTitle.textContent = 'CHEESE';
@@ -1477,7 +1649,9 @@ async function boot() {
   toolsPanel.appendChild(toolsBackButton);
 
   menuLayer.appendChild(menuMainPanel);
-  menuLayer.appendChild(playPanel);
+  playMenuRow.appendChild(playPanel);
+  playMenuRow.appendChild(butterfingerPanel);
+  menuLayer.appendChild(playMenuRow);
   menuLayer.appendChild(cheesePanel);
   menuLayer.appendChild(charcuteriePanel);
   menuLayer.appendChild(toolsPanel);
@@ -1490,6 +1664,11 @@ async function boot() {
   settingsStore.subscribe((next) => {
     input.setConfig(next.input);
     lockSound.volume = next.audio.masterVolume;
+    butterfingerSource.setConfig(next.butterfinger);
+    inputSource = next.butterfinger.enabled
+      ? butterfingerSource
+      : baseInputSource;
+    updateButterfingerUI(next.butterfinger);
 
     if (next.generator.type !== generatorType) {
       generatorType = next.generator.type;
@@ -1501,7 +1680,12 @@ async function boot() {
       return;
     }
 
-    game.setConfig(next.game);
+    game.setConfig({
+      ...next.game,
+      lockNudgeRate: next.butterfinger.enabled
+        ? next.butterfinger.lockNudgeRate
+        : 0,
+    });
     if (select.value !== next.generator.type) {
       select.value = next.generator.type;
     }
@@ -1511,13 +1695,6 @@ async function boot() {
       updateVolumeLabel(next.audio.masterVolume);
     }
   });
-
-  const applySettings = (patch: Partial<Settings>): void => {
-    settingsStore.apply(patch);
-  };
-
-  // TODO: Wire applySettings to UI when settings controls are added.
-  void applySettings;
 
   let pausedByVisibility = document.visibilityState !== 'visible';
   let pausedByInput = false;
@@ -1529,7 +1706,7 @@ async function boot() {
     panel: 'main' | 'play' | 'cheese' | 'charcuterie' | 'tools',
   ) => {
     menuMainPanel.style.display = panel === 'main' ? 'flex' : 'none';
-    playPanel.style.display = panel === 'play' ? 'flex' : 'none';
+    playMenuRow.style.display = panel === 'play' ? 'flex' : 'none';
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';

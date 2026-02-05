@@ -57,6 +57,11 @@ export const DEFAULT_HARD_LOCK_DELAY_MS = 2000;
 export const DEFAULT_DAS_MS = 130;
 export const DEFAULT_ARR_MS = 0;
 export const DEFAULT_MASTER_VOLUME = 1;
+export const DEFAULT_BUTTERFINGER_ENABLED = false;
+export const DEFAULT_BUTTERFINGER_MISS_RATE = 0;
+export const DEFAULT_BUTTERFINGER_WRONG_DIR_RATE = 0;
+export const DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE = 0;
+export const DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE = 0;
 
 export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 

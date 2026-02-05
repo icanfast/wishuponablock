@@ -40,6 +40,7 @@ export class InputController {
     const rightHeld = this.kb.isHeld('ArrowRight');
 
     let moveX = 0;
+    let moveXFromRepeat = false;
 
     const leftPressed = this.kb.consumePressed('ArrowLeft');
     const rightPressed = this.kb.consumePressed('ArrowRight');
@@ -70,6 +71,7 @@ export class InputController {
       if (this.activeDir !== 0 && (leftHeld || rightHeld)) {
         this.heldMs += dtMs;
         if (this.heldMs >= this.nextRepeatAt) {
+          moveXFromRepeat = true;
           if (this.cfg.arrMs <= 0) {
             moveX = this.activeDir * Infinity;
           } else {
@@ -100,7 +102,16 @@ export class InputController {
           ? -1
           : 0;
 
-    return { moveX, rotate, rotate180, softDrop, hardDrop, hold, restart };
+    return {
+      moveX,
+      moveXFromRepeat,
+      rotate,
+      rotate180,
+      softDrop,
+      hardDrop,
+      hold,
+      restart,
+    };
   }
 
   private setActiveDir(dir: -1 | 0 | 1): void {

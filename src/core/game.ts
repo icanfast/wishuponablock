@@ -21,8 +21,9 @@ import {
   tryRotateSRS,
   tryRotate180PreferDirect,
 } from './piece';
+import { getSrsKickTests } from './srs';
 
-import type { Board, GameState, InputFrame, PieceKind } from './types';
+import type { Board, GameState, InputFrame, PieceKind, Rotation } from './types';
 import { PIECES } from './types';
 
 export interface GameConfig {
@@ -31,6 +32,7 @@ export interface GameConfig {
   softDropMs?: number;
   lockDelayMs?: number;
   hardLockDelayMs?: number;
+  lockNudgeRate?: number;
   generatorFactory?: (seed: number) => PieceGenerator;
   onPieceLock?: (board: Board, hold: PieceKind | null) => void;
   onHold?: (board: Board, hold: PieceKind | null) => void;
@@ -53,6 +55,8 @@ export class Game {
   private initialBlocks: boolean[][] = [];
   private initialBlocksRemaining = 0;
   private initialBlocksActive = false;
+  private lockNudgeRate = 0;
+  private butterfingerRng: XorShift32;
 
   private gravityMs: number;
   private softDropMs: number;
@@ -68,8 +72,10 @@ export class Game {
     this.softDropMs = cfg.softDropMs ?? DEFAULT_SOFT_DROP_MS;
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
     this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
+    this.lockNudgeRate = clamp01(cfg.lockNudgeRate ?? 0);
     this.onPieceLock = cfg.onPieceLock;
     this.onHold = cfg.onHold;
+    this.butterfingerRng = new XorShift32(cfg.seed ^ 0x6d2b79f5);
 
     const makeGenerator = cfg.generatorFactory ?? ((seed) => new Bag7(seed));
     this.generator = makeGenerator(cfg.seed);
@@ -104,6 +110,8 @@ export class Game {
     if (cfg.lockDelayMs !== undefined) this.lockDelayMs = cfg.lockDelayMs;
     if (cfg.hardLockDelayMs !== undefined)
       this.hardLockDelayMs = cfg.hardLockDelayMs;
+    if (cfg.lockNudgeRate !== undefined)
+      this.lockNudgeRate = clamp01(cfg.lockNudgeRate);
 
     // Keep current interval in sync if it was previously matching one of these.
     if (this.dropIntervalMs === prevGravity) {
@@ -171,6 +179,22 @@ export class Game {
         this.lockAcc >= this.lockDelayMs ||
         this.hardLockAcc >= this.hardLockDelayMs
       ) {
+        if (this.tryButterfingerNudge()) {
+          this.recomputeGhost();
+          if (
+            !collides(
+              this.state.board,
+              this.state.active,
+              this.state.active.r,
+              0,
+              1,
+            )
+          ) {
+            this.lockAcc = 0;
+            this.hardLockAcc = 0;
+            return;
+          }
+        }
         this.lockPiece();
       }
     } else {
@@ -181,6 +205,7 @@ export class Game {
 
   reset(seed: number): void {
     this.rng = new XorShift32(seed);
+    this.butterfingerRng = new XorShift32(seed ^ 0x6d2b79f5);
     this.generator.reset(seed);
 
     this.state.board = makeBoard();
@@ -382,6 +407,7 @@ export class Game {
   }
 
   private doHardDrop(): void {
+    this.tryButterfingerNudge();
     const d = dropDistance(this.state.board, this.state.active);
     this.state.active.y += d;
     this.lockPiece();
@@ -491,4 +517,56 @@ export class Game {
     const d = dropDistance(this.state.board, this.state.active);
     this.state.ghostY = this.state.active.y + d;
   }
+
+  private tryButterfingerNudge(): boolean {
+    if (this.lockNudgeRate <= 0) return false;
+    if (!this.rollButterfinger(this.lockNudgeRate)) return false;
+    const dir = this.butterfingerRng.nextInt(2) === 0 ? -1 : 1;
+    return this.tryNudgeWithKicks(dir);
+  }
+
+  private tryNudgeWithKicks(dir: -1 | 1): boolean {
+    if (this.tryOffset(dir, 0)) return true;
+
+    const from = this.state.active.r;
+    const cw = ((from + 1) % 4) as Rotation;
+    const ccw = ((from + 3) % 4) as Rotation;
+    const kickTests = [
+      ...getSrsKickTests(this.state.active.k, from, cw),
+      ...getSrsKickTests(this.state.active.k, from, ccw),
+    ];
+
+    for (const [dx, dy] of kickTests) {
+      if (this.tryOffset(dir + dx, dy)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private tryOffset(dx: number, dy: number): boolean {
+    if (
+      collides(
+        this.state.board,
+        this.state.active,
+        this.state.active.r,
+        dx,
+        dy,
+      )
+    ) {
+      return false;
+    }
+    this.state.active.x += dx;
+    this.state.active.y += dy;
+    return true;
+  }
+
+  private rollButterfinger(rate: number): boolean {
+    return this.butterfingerRng.nextU32() / 0xffffffff < rate;
+  }
+}
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
 }

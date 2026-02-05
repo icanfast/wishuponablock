@@ -1,5 +1,10 @@
 import {
   DEFAULT_ARR_MS,
+  DEFAULT_BUTTERFINGER_ENABLED,
+  DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE,
+  DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE,
+  DEFAULT_BUTTERFINGER_MISS_RATE,
+  DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
   DEFAULT_DAS_MS,
   DEFAULT_GRAVITY_MS,
   DEFAULT_HARD_LOCK_DELAY_MS,
@@ -24,10 +29,19 @@ export interface Settings {
   input: InputConfig;
   generator: GeneratorSettings;
   audio: AudioSettings;
+  butterfinger: ButterfingerSettings;
 }
 
 export interface AudioSettings {
   masterVolume: number;
+}
+
+export interface ButterfingerSettings {
+  enabled: boolean;
+  missRate: number;
+  wrongDirRate: number;
+  extraTapRate: number;
+  lockNudgeRate: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -47,10 +61,21 @@ export const DEFAULT_SETTINGS: Settings = {
   audio: {
     masterVolume: DEFAULT_MASTER_VOLUME,
   },
+  butterfinger: {
+    enabled: DEFAULT_BUTTERFINGER_ENABLED,
+    missRate: DEFAULT_BUTTERFINGER_MISS_RATE,
+    wrongDirRate: DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
+    extraTapRate: DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE,
+    lockNudgeRate: DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE,
+  },
 };
 
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+function bool(v: unknown): boolean | undefined {
+  return typeof v === 'boolean' ? v : undefined;
 }
 
 function mergeGame(
@@ -93,6 +118,19 @@ function mergeAudio(
   };
 }
 
+function mergeButterfinger(
+  base: ButterfingerSettings,
+  patch?: Partial<ButterfingerSettings>,
+): ButterfingerSettings {
+  return {
+    enabled: bool(patch?.enabled) ?? base.enabled,
+    missRate: num(patch?.missRate) ?? base.missRate,
+    wrongDirRate: num(patch?.wrongDirRate) ?? base.wrongDirRate,
+    extraTapRate: num(patch?.extraTapRate) ?? base.extraTapRate,
+    lockNudgeRate: num(patch?.lockNudgeRate) ?? base.lockNudgeRate,
+  };
+}
+
 export function mergeSettings(
   base: Settings,
   patch: Partial<Settings>,
@@ -102,6 +140,7 @@ export function mergeSettings(
     input: mergeInput(base.input, patch.input),
     generator: mergeGenerator(base.generator, patch.generator),
     audio: mergeAudio(base.audio, patch.audio),
+    butterfinger: mergeButterfinger(base.butterfinger, patch.butterfinger),
   };
 }
 

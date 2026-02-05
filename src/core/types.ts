@@ -31,6 +31,11 @@ export interface InputFrame {
    * Can be +/-Infinity to indicate "instant ARR" to the wall.
    */
   moveX: number;
+  /**
+   * True when moveX was produced by DAS/ARR repeat (post-initial press).
+   * Used to avoid applying mis-input effects after DAS.
+   */
+  moveXFromRepeat?: boolean;
   rotate: -1 | 0 | 1; // -1 = CCW, +1 = CW
   rotate180: boolean;
   softDrop: boolean;
