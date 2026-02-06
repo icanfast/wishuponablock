@@ -55,7 +55,7 @@ const handleSnapshots = async (
   const now = new Date().toISOString();
 
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO snapshot_sessions
+    `INSERT OR IGNORE INTO snapshot_sessions_v2
       (id, created_at, protocol_version, rows, cols, settings, mode_id, mode_options, comment)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
@@ -73,7 +73,7 @@ const handleSnapshots = async (
     .run();
 
   await env.DB.prepare(
-    `INSERT OR REPLACE INTO snapshot_samples
+    `INSERT OR REPLACE INTO snapshot_samples_v2
       (session_id, sample_index, time_ms, board, hold, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`,
   )
@@ -98,7 +98,7 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
   const source = (record.source ?? {}) as Record<string, unknown>;
 
   await env.DB.prepare(
-    `INSERT INTO label_records
+    `INSERT INTO label_records_v2
       (created_at, session_id, file_name, sample_index, shown_count, board, hold, labels)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )

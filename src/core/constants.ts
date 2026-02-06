@@ -67,7 +67,7 @@ export const DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE = 0.5;
 
 export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 
-export const GAME_PROTOCOL_VERSION = 1;
+export const GAME_PROTOCOL_VERSION = 2;
 
 export const ML_MODEL_URL = '/models/model_v1.json';
 
