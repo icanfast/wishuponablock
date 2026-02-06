@@ -286,6 +286,11 @@ async function boot() {
   const recorder = new SnapshotRecorder();
   let updateRecorderUI = () => {};
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
+  let startRecordingSession = () => {};
+  let stopRecordingSession: (options?: {
+    promptForFolder?: boolean;
+  }) => Promise<void> = async () => {};
+  let restartRecordingSession = () => {};
   let selectedMode: GameMode = getMode('default');
   let selectedModeOptions: ModeOptions = {};
   const charcuterieDefaultSimCount = 10000;
@@ -626,6 +631,7 @@ async function boot() {
     new GameRunner(g, {
       fixedStepMs: 1000 / 120,
       onRestart: () => {
+        restartRecordingSession();
         if (mode.id === 'charcuterie') {
           const nextSettings = settingsStore.get();
           game = createGame(nextSettings, selectedMode, selectedModeOptions);
@@ -935,6 +941,52 @@ async function boot() {
     }
   };
 
+  startRecordingSession = () => {
+    if (recorder.isRecording) return;
+    lastSnapshotKey = null;
+    recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value, {
+      id: selectedMode.id,
+      options: { ...selectedModeOptions },
+    });
+    updateRecorderUI();
+  };
+
+  stopRecordingSession = async (
+    options: { promptForFolder?: boolean } = {},
+  ) => {
+    if (!recorder.isRecording) return;
+    const session = recorder.stop();
+    updateRecorderUI();
+    lastSnapshotKey = null;
+    if (!session || session.samples.length === 0) return;
+    if (useRemoteUpload) return;
+
+    if (options.promptForFolder && !snapshotDirHandle) {
+      const ready = await ensureSnapshotDirectory();
+      if (!ready) {
+        updateFolderStatus('Auto-save unavailable. Downloading instead.');
+      }
+    }
+
+    if (snapshotDirHandle) {
+      void saveSnapshotSessionToDirectory(session, snapshotDirHandle)
+        .then(() => updateFolderStatus(`Saved: ${session.meta.id}`))
+        .catch(() => {
+          updateFolderStatus('Save failed. Downloading instead.');
+          downloadSnapshotSession(session);
+        });
+      return;
+    }
+
+    downloadSnapshotSession(session);
+    updateFolderStatus(`Downloaded: ${session.meta.id}`);
+  };
+
+  restartRecordingSession = () => {
+    void stopRecordingSession();
+    startRecordingSession();
+  };
+
   commentInput.addEventListener('input', () => {
     if (recorder.isRecording) {
       recorder.setComment(commentInput.value);
@@ -957,33 +1009,11 @@ async function boot() {
   recordButton.addEventListener('click', async () => {
     if (useRemoteUpload) return;
     if (!recorder.isRecording) {
-      lastSnapshotKey = null;
-      recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value, {
-        id: selectedMode.id,
-        options: { ...selectedModeOptions },
-      });
-      updateRecorderUI();
+      startRecordingSession();
       return;
     }
 
-    const session = recorder.stop();
-    updateRecorderUI();
-    lastSnapshotKey = null;
-    if (!session) return;
-
-    const ready = await ensureSnapshotDirectory();
-    if (!ready || !snapshotDirHandle) {
-      updateFolderStatus('Auto-save unavailable. Downloading instead.');
-      downloadSnapshotSession(session);
-      return;
-    }
-
-    void saveSnapshotSessionToDirectory(session, snapshotDirHandle)
-      .then(() => updateFolderStatus(`Saved: ${session.meta.id}`))
-      .catch(() => {
-        updateFolderStatus('Save failed. Downloading instead.');
-        downloadSnapshotSession(session);
-      });
+    await stopRecordingSession({ promptForFolder: true });
   });
 
   discardButton.addEventListener('click', () => {
@@ -991,6 +1021,12 @@ async function boot() {
     recorder.discard();
     updateRecorderUI();
     lastSnapshotKey = null;
+  });
+
+  window.addEventListener('beforeunload', () => {
+    if (recorder.isRecording) {
+      recorder.stop();
+    }
   });
 
   updateRecorderUI();
@@ -2647,21 +2683,10 @@ async function boot() {
       game = createGame(nextSettings, selectedMode, selectedModeOptions);
       runner = createRunner(game, selectedMode, selectedModeOptions);
       gameOverLabel.style.display = 'none';
-      lastSnapshotKey = null;
-      if (useRemoteUpload && !recorder.isRecording) {
-        recorder.start(nextSettings, ROWS, COLS, '', {
-          id: selectedMode.id,
-          options: { ...selectedModeOptions },
-        });
-        updateRecorderUI();
-      }
+      startRecordingSession();
       renderer.render(runner.state);
     } else {
-      if (useRemoteUpload && recorder.isRecording) {
-        recorder.stop();
-        updateRecorderUI();
-      }
-      lastSnapshotKey = null;
+      void stopRecordingSession();
       gfx.clear();
       gameOverLabel.style.display = 'none';
       showMenuPanel('main');
