@@ -1,5 +1,18 @@
 import type { InputFrame } from '../core/types';
+import { DEFAULT_KEY_BINDINGS } from '../core/constants';
 import { Keyboard } from './keyboard';
+
+export interface KeyBindings {
+  moveLeft: string;
+  moveRight: string;
+  softDrop: string;
+  hardDrop: string;
+  rotateCW: string;
+  rotateCCW: string;
+  rotate180: string;
+  hold: string;
+  restart: string;
+}
 
 export interface InputConfig {
   dasMs: number;
@@ -8,6 +21,7 @@ export interface InputConfig {
    * Use 0 for "instant ARR" (snap to wall after DAS).
    */
   arrMs: number;
+  bindings: KeyBindings;
 }
 
 export class InputController {
@@ -20,11 +34,24 @@ export class InputController {
 
   constructor(kb: Keyboard, cfg: InputConfig) {
     this.kb = kb;
-    this.cfg = cfg;
+    this.cfg = {
+      ...cfg,
+      bindings: {
+        ...DEFAULT_KEY_BINDINGS,
+        ...cfg.bindings,
+      },
+    };
   }
 
   setConfig(cfg: Partial<InputConfig>): void {
-    this.cfg = { ...this.cfg, ...cfg };
+    this.cfg = {
+      ...this.cfg,
+      ...cfg,
+      bindings: {
+        ...this.cfg.bindings,
+        ...cfg.bindings,
+      },
+    };
     // Reset repeat timing to avoid odd mid-hold behavior.
     if (this.activeDir === 0) {
       this.heldMs = 0;
@@ -36,14 +63,15 @@ export class InputController {
   }
 
   sample(dtMs: number): InputFrame {
-    const leftHeld = this.kb.isHeld('ArrowLeft');
-    const rightHeld = this.kb.isHeld('ArrowRight');
+    const bindings = this.cfg.bindings;
+    const leftHeld = this.kb.isHeld(bindings.moveLeft);
+    const rightHeld = this.kb.isHeld(bindings.moveRight);
 
     let moveX = 0;
     let moveXFromRepeat = false;
 
-    const leftPressed = this.kb.consumePressed('ArrowLeft');
-    const rightPressed = this.kb.consumePressed('ArrowRight');
+    const leftPressed = this.kb.consumePressed(bindings.moveLeft);
+    const rightPressed = this.kb.consumePressed(bindings.moveRight);
 
     // Fresh presses win and produce an immediate move
     if (leftPressed) {
@@ -86,13 +114,14 @@ export class InputController {
     }
 
     const rotateCW =
-      this.kb.consumePressed('ArrowUp') || this.kb.consumePressed('KeyE');
-    const rotateCCW = this.kb.consumePressed('KeyW');
-    const hold = this.kb.consumePressed('KeyQ');
-    const hardDrop = this.kb.consumePressed('Space');
-    const softDrop = this.kb.isHeld('ArrowDown');
-    const rotate180 = this.kb.consumePressed('KeyA');
-    const restart = this.kb.consumePressed('KeyR');
+      this.kb.consumePressed(bindings.rotateCW) ||
+      this.kb.consumePressed('ArrowUp');
+    const rotateCCW = this.kb.consumePressed(bindings.rotateCCW);
+    const hold = this.kb.consumePressed(bindings.hold);
+    const hardDrop = this.kb.consumePressed(bindings.hardDrop);
+    const softDrop = this.kb.isHeld(bindings.softDrop);
+    const rotate180 = this.kb.consumePressed(bindings.rotate180);
+    const restart = this.kb.consumePressed(bindings.restart);
 
     const rotate: -1 | 0 | 1 = rotate180
       ? 0

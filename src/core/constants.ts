@@ -15,7 +15,7 @@ export const HOLD_COLS = 6;
 export const HOLD_ROWS = 4;
 export const HOLD_LABEL_HEIGHT = BOARD_CELL_PX;
 
-export const SETTINGS_PANEL_WIDTH = BOARD_CELL_PX * 5;
+export const SETTINGS_PANEL_WIDTH = BOARD_CELL_PX * 5 + 40;
 
 export const BOARD_WIDTH = COLS * BOARD_CELL_PX;
 export const BOARD_HEIGHT = ROWS * BOARD_CELL_PX;
@@ -54,7 +54,7 @@ export const DEFAULT_GRAVITY_MS = 800;
 export const DEFAULT_SOFT_DROP_MS = 0;
 export const DEFAULT_LOCK_DELAY_MS = 500;
 export const DEFAULT_HARD_LOCK_DELAY_MS = 2000;
-export const DEFAULT_DAS_MS = 130;
+export const DEFAULT_DAS_MS = 150;
 export const DEFAULT_ARR_MS = 0;
 export const DEFAULT_MASTER_VOLUME = 1;
 export const DEFAULT_BUTTERFINGER_ENABLED = false;
@@ -64,6 +64,18 @@ export const DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE = 0;
 export const DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE = 0;
 export const DEFAULT_BUTTERFINGER_GRAVITY_DROP_RATE = 0;
 export const DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE = 0.5;
+
+export const DEFAULT_KEY_BINDINGS = {
+  moveLeft: 'ArrowLeft',
+  moveRight: 'ArrowRight',
+  softDrop: 'ArrowDown',
+  hardDrop: 'Space',
+  rotateCW: 'KeyE',
+  rotateCCW: 'KeyW',
+  rotate180: 'KeyA',
+  hold: 'KeyQ',
+  restart: 'KeyR',
+};
 
 export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 

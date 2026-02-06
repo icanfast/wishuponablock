@@ -1,6 +1,7 @@
 type D1PreparedStatement = {
   bind: (...values: unknown[]) => D1PreparedStatement;
   run: () => Promise<unknown>;
+  all: () => Promise<{ results: Array<Record<string, unknown>> }>;
 };
 
 type D1Database = {
@@ -38,53 +39,26 @@ const handleSnapshots = async (
   if (!payload || typeof payload !== 'object') {
     return jsonResponse({ error: 'Invalid payload.' }, 400);
   }
-  const { session, sample } = payload as {
-    session?: Record<string, unknown>;
-    sample?: Record<string, unknown>;
+
+  const record = payload as {
+    createdAt?: string;
+    meta?: Record<string, unknown>;
+    board?: unknown;
   };
-  if (!session || !sample) {
-    return jsonResponse({ error: 'Missing session or sample.' }, 400);
+
+  if (!record.meta || record.board == null) {
+    return jsonResponse({ error: 'Missing meta or board.' }, 400);
   }
 
-  const sessionId = session.id as string | undefined;
-  if (!sessionId) {
-    return jsonResponse({ error: 'Missing session id.' }, 400);
-  }
-
-  const mode = session.mode as { id?: string; options?: unknown } | undefined;
-  const now = new Date().toISOString();
+  const createdAt =
+    typeof record.createdAt === 'string'
+      ? record.createdAt
+      : new Date().toISOString();
 
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO snapshot_sessions_v2
-      (id, created_at, protocol_version, rows, cols, settings, mode_id, mode_options, comment)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO snapshots (created_at, meta, board) VALUES (?, ?, ?)`,
   )
-    .bind(
-      sessionId,
-      session.createdAt ?? now,
-      session.protocolVersion ?? 0,
-      session.rows ?? 0,
-      session.cols ?? 0,
-      JSON.stringify(session.settings ?? {}),
-      mode?.id ?? null,
-      JSON.stringify(mode?.options ?? null),
-      session.comment ?? null,
-    )
-    .run();
-
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO snapshot_samples_v2
-      (session_id, sample_index, time_ms, board, hold, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      sessionId,
-      sample.index ?? 0,
-      sample.timeMs ?? 0,
-      JSON.stringify(sample.board ?? []),
-      sample.hold ?? 0,
-      now,
-    )
+    .bind(createdAt, JSON.stringify(record.meta), JSON.stringify(record.board))
     .run();
 
   return okResponse();
@@ -94,24 +68,19 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
   if (!payload || typeof payload !== 'object') {
     return jsonResponse({ error: 'Invalid payload.' }, 400);
   }
-  const record = payload as Record<string, unknown>;
-  const source = (record.source ?? {}) as Record<string, unknown>;
+  const record = payload as { createdAt?: string; data?: unknown };
 
-  await env.DB.prepare(
-    `INSERT INTO label_records_v2
-      (created_at, session_id, file_name, sample_index, shown_count, board, hold, labels)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(
-      record.createdAt ?? new Date().toISOString(),
-      source.sessionId ?? null,
-      source.file ?? null,
-      source.sampleIndex ?? null,
-      source.shownCount ?? null,
-      record.board ?? '',
-      record.hold ?? null,
-      JSON.stringify(record.labels ?? []),
-    )
+  if (!record.data) {
+    return jsonResponse({ error: 'Missing data.' }, 400);
+  }
+
+  const createdAt =
+    typeof record.createdAt === 'string'
+      ? record.createdAt
+      : new Date().toISOString();
+
+  await env.DB.prepare(`INSERT INTO labels (created_at, data) VALUES (?, ?)`)
+    .bind(createdAt, JSON.stringify(record.data))
     .run();
 
   return okResponse();
@@ -126,6 +95,44 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/snapshots')) {
+      if (url.pathname.startsWith('/api/snapshots/random')) {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Method not allowed.' }, 405);
+        }
+        const mode = url.searchParams.get('mode') ?? 'all';
+        let sql = 'SELECT id, created_at, meta, board FROM snapshots';
+        const params: unknown[] = [];
+        if (mode !== 'all') {
+          if (mode === 'unknown') {
+            sql += " WHERE json_extract(meta, '$.session.mode.id') IS NULL";
+          } else {
+            sql += " WHERE json_extract(meta, '$.session.mode.id') = ?";
+            params.push(mode);
+          }
+        }
+        sql += ' ORDER BY RANDOM() LIMIT 1';
+        const result = await env.DB.prepare(sql)
+          .bind(...params)
+          .all();
+        const row = result?.results?.[0];
+        if (!row) {
+          return jsonResponse({ error: 'No snapshots available.' }, 404);
+        }
+        let meta: unknown = row.meta;
+        let board: unknown = row.board;
+        if (typeof meta === 'string') {
+          meta = JSON.parse(meta);
+        }
+        if (typeof board === 'string') {
+          board = JSON.parse(board);
+        }
+        return jsonResponse({
+          id: row.id,
+          createdAt: row.created_at,
+          meta,
+          board,
+        });
+      }
       if (request.method !== 'POST') {
         return jsonResponse({ error: 'Method not allowed.' }, 405);
       }

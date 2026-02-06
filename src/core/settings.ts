@@ -10,6 +10,7 @@ import {
   DEFAULT_DAS_MS,
   DEFAULT_GRAVITY_MS,
   DEFAULT_HARD_LOCK_DELAY_MS,
+  DEFAULT_KEY_BINDINGS,
   DEFAULT_LOCK_DELAY_MS,
   DEFAULT_MASTER_VOLUME,
   DEFAULT_SOFT_DROP_MS,
@@ -17,7 +18,7 @@ import {
 } from './constants';
 import { type GeneratorSettings, isGeneratorType } from './generators';
 import type { GameConfig } from './game';
-import type { InputConfig } from '../input/controller';
+import type { InputConfig, KeyBindings } from '../input/controller';
 
 export type GameSettings = Required<
   Pick<
@@ -58,9 +59,10 @@ export const DEFAULT_SETTINGS: Settings = {
   input: {
     dasMs: DEFAULT_DAS_MS,
     arrMs: DEFAULT_ARR_MS,
+    bindings: { ...DEFAULT_KEY_BINDINGS },
   },
   generator: {
-    type: 'bag7',
+    type: 'ml',
   },
   audio: {
     masterVolume: DEFAULT_MASTER_VOLUME,
@@ -84,6 +86,27 @@ function bool(v: unknown): boolean | undefined {
   return typeof v === 'boolean' ? v : undefined;
 }
 
+function mergeBindings(
+  base: KeyBindings,
+  patch?: Partial<KeyBindings>,
+): KeyBindings {
+  const bind = (value: unknown, fallback: string): string => {
+    if (typeof value !== 'string') return fallback;
+    return value.trim();
+  };
+  return {
+    moveLeft: bind(patch?.moveLeft, base.moveLeft),
+    moveRight: bind(patch?.moveRight, base.moveRight),
+    softDrop: bind(patch?.softDrop, base.softDrop),
+    hardDrop: bind(patch?.hardDrop, base.hardDrop),
+    rotateCW: bind(patch?.rotateCW, base.rotateCW),
+    rotateCCW: bind(patch?.rotateCCW, base.rotateCCW),
+    rotate180: bind(patch?.rotate180, base.rotate180),
+    hold: bind(patch?.hold, base.hold),
+    restart: bind(patch?.restart, base.restart),
+  };
+}
+
 function mergeGame(
   base: GameSettings,
   patch?: Partial<GameSettings>,
@@ -103,6 +126,7 @@ function mergeInput(
   return {
     dasMs: num(patch?.dasMs) ?? base.dasMs,
     arrMs: num(patch?.arrMs) ?? base.arrMs,
+    bindings: mergeBindings(base.bindings, patch?.bindings),
   };
 }
 

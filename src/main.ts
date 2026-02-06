@@ -5,6 +5,7 @@ import {
   BOARD_Y,
   BOARD_WIDTH,
   COLS,
+  DEFAULT_KEY_BINDINGS,
   GAME_OVER_Y,
   HOLD_X,
   HOLD_Y,
@@ -100,6 +101,58 @@ async function boot() {
   });
   playWindow.appendChild(uiLayer);
 
+  const spinnerStyle = document.createElement('style');
+  spinnerStyle.textContent = `
+@keyframes wab-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+`;
+  document.head.appendChild(spinnerStyle);
+
+  const charcuterieSpinner = document.createElement('div');
+  Object.assign(charcuterieSpinner.style, {
+    position: 'absolute',
+    inset: '0',
+    display: 'none',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'rgba(11, 15, 20, 0.45)',
+    zIndex: '10',
+    pointerEvents: 'none',
+  });
+  uiLayer.appendChild(charcuterieSpinner);
+
+  const spinnerPanel = document.createElement('div');
+  Object.assign(spinnerPanel.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    padding: '10px 12px',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '8px',
+    color: '#e2e8f0',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '12px',
+  });
+  charcuterieSpinner.appendChild(spinnerPanel);
+
+  const spinnerRing = document.createElement('div');
+  Object.assign(spinnerRing.style, {
+    width: '18px',
+    height: '18px',
+    border: '2px solid #2c3a4a',
+    borderTopColor: '#8fa0b8',
+    borderRadius: '50%',
+    animation: 'wab-spin 0.9s linear infinite',
+  });
+  spinnerPanel.appendChild(spinnerRing);
+
+  const spinnerText = document.createElement('div');
+  spinnerText.textContent = 'Generating board...';
+  spinnerPanel.appendChild(spinnerText);
+
   const holdLabel = document.createElement('div');
   holdLabel.textContent = 'HOLD';
   Object.assign(holdLabel.style, {
@@ -134,29 +187,97 @@ async function boot() {
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
-  const uploadMode = (
-    (import.meta.env.VITE_UPLOAD_MODE as UploadMode | undefined) ?? 'local'
-  ).toLowerCase() as UploadMode;
+  const SHOW_DEV_TOOLS =
+    import.meta.env.VITE_SHOW_DEV_TOOLS === 'true' || import.meta.env.DEV;
+  let generatorType = settings.generator.type;
+  const inferUploadMode = (): UploadMode => {
+    const host = window.location.hostname;
+    if (!host) return 'local';
+    if (host === 'localhost' || host === '127.0.0.1') return 'local';
+    return 'remote';
+  };
+  const rawUploadMode = (
+    import.meta.env.VITE_UPLOAD_MODE as string | undefined
+  )?.toLowerCase();
+  const uploadMode =
+    rawUploadMode === 'local' ||
+    rawUploadMode === 'remote' ||
+    rawUploadMode === 'auto'
+      ? (rawUploadMode as UploadMode)
+      : inferUploadMode();
   const uploadBaseUrl =
     (import.meta.env.VITE_UPLOAD_URL as string | undefined) ?? '/api';
+  console.info(`[Upload] mode=${uploadMode} baseUrl=${uploadBaseUrl}`);
   const uploadClient = new UploadClient({
     mode: uploadMode,
     baseUrl: uploadBaseUrl,
   });
   const useRemoteUpload = uploadClient.isRemote;
+  const toolUsesRemote = useRemoteUpload;
   let mlModel: LoadedModel | null = null;
   let mlModelPromise: Promise<LoadedModel | null> | null = null;
+  let mlStatus: 'idle' | 'loading' | 'ready' | 'failed' = 'idle';
+  let modelStatusLabel: HTMLDivElement | null = null;
+  let pausedByModel = false;
+  let updatePaused: () => void = () => {};
+  function updateModelStatusUI(): void {
+    if (!modelStatusLabel) return;
+    if (generatorType !== 'ml') {
+      modelStatusLabel.textContent = '';
+      modelStatusLabel.style.display = 'none';
+      if (pausedByModel) {
+        pausedByModel = false;
+        updatePaused();
+      }
+      return;
+    }
+    modelStatusLabel.style.display = 'block';
+    let text = 'ML generator: idle (RNG fallback)';
+    let color = '#f4b266';
+    let shouldPause = false;
+    if (mlStatus === 'ready') {
+      text = 'ML generator: loaded';
+      color = '#8fd19e';
+      shouldPause = false;
+    } else if (mlStatus === 'loading') {
+      text = 'ML generator: loading (RNG fallback)';
+      color = '#f4b266';
+      shouldPause = false;
+    } else if (mlStatus === 'failed') {
+      text = 'ML generator: failed to load model';
+      color = '#f28b82';
+      shouldPause = true;
+    }
+    modelStatusLabel.textContent = text;
+    modelStatusLabel.style.color = color;
+    if (pausedByModel !== shouldPause) {
+      pausedByModel = shouldPause;
+      updatePaused();
+    }
+  }
+  const setMlStatus = (next: 'idle' | 'loading' | 'ready' | 'failed') => {
+    if (mlStatus === next) return;
+    mlStatus = next;
+    updateModelStatusUI();
+  };
   const ensureMlModel = (): Promise<LoadedModel | null> => {
+    if (mlModel) {
+      setMlStatus('ready');
+      return Promise.resolve(mlModel);
+    }
     if (mlModelPromise) return mlModelPromise;
+    setMlStatus('loading');
     mlModelPromise = loadWubModel(ML_MODEL_URL)
       .then((model) => {
         mlModel = model;
+        setMlStatus(model ? 'ready' : 'failed');
         return model;
       })
       .catch((err) => {
         console.warn('Failed to load ML model:', err);
         mlModel = null;
         mlModelPromise = null;
+        setMlStatus('failed');
         return null;
       });
     return mlModelPromise;
@@ -224,10 +345,23 @@ async function boot() {
     if (!sample || !useRemoteUpload) return;
     const session = recorder.sessionMeta;
     if (!session) return;
+    const payload = {
+      createdAt: new Date().toISOString(),
+      meta: {
+        session,
+        sample: {
+          index: sample.index,
+          timeMs: sample.timeMs,
+          hold: sample.hold,
+        },
+        trigger: reason,
+      },
+      board: sample.board,
+    };
     console.info(
       `[Snapshot] ${reason} session=${session.id} index=${sample.index}`,
     );
-    void uploadClient.enqueueSnapshot(session, sample);
+    void uploadClient.enqueueSnapshot(payload);
   };
 
   const handlePieceLock = (board: Board, hold: PieceKind | null) => {
@@ -568,7 +702,7 @@ async function boot() {
       case 'nes':
         return 'NES';
       case 'ml':
-        return 'ML Model';
+        return 'Wish Upon a Block';
       default:
         return type;
     }
@@ -591,6 +725,15 @@ async function boot() {
 
   settingsPanel.appendChild(label);
   settingsPanel.appendChild(select);
+
+  modelStatusLabel = document.createElement('div');
+  Object.assign(modelStatusLabel.style, {
+    marginTop: '6px',
+    color: '#8fa0b8',
+    fontSize: '12px',
+  });
+  settingsPanel.appendChild(modelStatusLabel);
+  updateModelStatusUI();
 
   const volumeLabel = document.createElement('div');
   volumeLabel.textContent = 'Master Volume';
@@ -638,8 +781,6 @@ async function boot() {
 
   volumeRow.appendChild(volumeSlider);
   volumeRow.appendChild(volumeValue);
-  settingsPanel.appendChild(volumeLabel);
-  settingsPanel.appendChild(volumeRow);
 
   const recordLabel = document.createElement('div');
   recordLabel.textContent = 'Snapshots';
@@ -873,13 +1014,26 @@ async function boot() {
   });
   uiLayer.appendChild(toolLayer);
 
-  const toolPanel = document.createElement('div');
-  Object.assign(toolPanel.style, {
+  const toolColumn = document.createElement('div');
+  Object.assign(toolColumn.style, {
     position: 'absolute',
     left: `${SETTINGS_X}px`,
     top: `${SETTINGS_Y}px`,
     width: `${SETTINGS_PANEL_WIDTH}px`,
-    maxHeight: `${PLAY_HEIGHT - SETTINGS_Y - OUTER_MARGIN}px`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  toolLayer.appendChild(toolColumn);
+
+  const toolPanelMaxHeight = Math.max(
+    0,
+    PLAY_HEIGHT - SETTINGS_Y - OUTER_MARGIN - 48,
+  );
+  const toolPanel = document.createElement('div');
+  Object.assign(toolPanel.style, {
+    width: '100%',
+    maxHeight: `${toolPanelMaxHeight}px`,
     overflowY: 'auto',
     padding: '8px',
     background: '#121a24',
@@ -890,7 +1044,21 @@ async function boot() {
     fontSize: '13px',
     pointerEvents: 'auto',
   });
-  toolLayer.appendChild(toolPanel);
+  toolColumn.appendChild(toolPanel);
+
+  const toolInfo = document.createElement('div');
+  toolInfo.textContent =
+    "How to use:\nSelect all the pieces you would want to fall in this situation, then click 'Next'\n\n" +
+    'Your answers will be saved and used to train ML piece generator models.';
+  Object.assign(toolInfo.style, {
+    color: '#b6c2d4',
+    fontSize: '13px',
+    lineHeight: '1.4',
+    textAlign: 'center',
+    whiteSpace: 'pre-line',
+    pointerEvents: 'none',
+  });
+  toolColumn.appendChild(toolInfo);
 
   const toolTitle = document.createElement('div');
   toolTitle.textContent = 'WISH UPON A BLOCK';
@@ -922,7 +1090,7 @@ async function boot() {
     color: '#8fa0b8',
     whiteSpace: 'pre-line',
   });
-  toolInputStatus.textContent = 'No snapshots loaded.';
+  toolInputStatus.textContent = 'Source: Local (select folder).';
   toolPanel.appendChild(toolInputStatus);
 
   const toolModeLabel = document.createElement('div');
@@ -970,9 +1138,11 @@ async function boot() {
   });
   toolOutputStatus.textContent = 'No output folder.';
   toolPanel.appendChild(toolOutputStatus);
-  if (useRemoteUpload) {
+  if (toolUsesRemote) {
+    toolInputButton.style.display = 'none';
     toolOutputButton.style.display = 'none';
     toolOutputStatus.style.display = 'none';
+    toolInputStatus.textContent = 'Source: Online';
   }
 
   const toolSampleStatus = document.createElement('div');
@@ -1106,6 +1276,7 @@ async function boot() {
   let toolTotalSamplesAll = 0;
   let toolSampleOffsets: number[] = [];
   let toolModeFilter = 'all';
+  let toolActive = false;
   let currentSample: {
     file: { name: string; session: SnapshotSession };
     index: number;
@@ -1207,6 +1378,10 @@ async function boot() {
   };
 
   const loadLabelIndex = async (): Promise<void> => {
+    if (toolUsesRemote) {
+      labelIndex = {};
+      return;
+    }
     if (!toolOutputDirHandle) return;
     try {
       const handle = await toolOutputDirHandle.getFileHandle(
@@ -1222,6 +1397,7 @@ async function boot() {
   };
 
   const saveLabelIndex = async (): Promise<void> => {
+    if (toolUsesRemote) return;
     if (!toolOutputDirHandle) return;
     await writeFileInDir(
       toolOutputDirHandle,
@@ -1256,6 +1432,16 @@ async function boot() {
     };
 
     addOption('all', 'All Modes');
+    if (toolUsesRemote) {
+      const knownModes = ['default', 'cheese', 'charcuterie'];
+      for (const modeId of knownModes) {
+        addOption(modeId, getModeLabel(modeId));
+      }
+      addOption('unknown', 'Unknown');
+      toolModeSelect.value = toolModeFilter;
+      toolModeSelect.disabled = false;
+      return;
+    }
     const counts = new Map<string, number>();
     for (const file of toolSnapshotsAll) {
       const modeId = file.session.meta.mode?.id ?? 'unknown';
@@ -1292,7 +1478,63 @@ async function boot() {
     toolTotalSamples = running;
   };
 
+  const buildToolApiUrl = (path: string): URL => {
+    const base = uploadBaseUrl.replace(/\/+$/, '');
+    return new URL(`${base}${path}`, window.location.origin);
+  };
+
+  const fetchRemoteSample = async (): Promise<SnapshotSession | null> => {
+    const url = buildToolApiUrl('/snapshots/random');
+    if (toolModeFilter !== 'all') {
+      url.searchParams.set('mode', toolModeFilter);
+    }
+    const res = await fetch(url.toString());
+    if (!res.ok) {
+      return null;
+    }
+    const payload = (await res.json()) as {
+      id?: number | string;
+      createdAt?: string;
+      meta?: {
+        session?: SnapshotSession['meta'];
+        sample?: Record<string, unknown>;
+      };
+      board?: number[][];
+    };
+    const sessionMeta = payload.meta?.session;
+    if (!sessionMeta || !payload.board) return null;
+    const sampleMeta = payload.meta?.sample ?? {};
+    const readNumber = (value: unknown, fallback = 0): number => {
+      return typeof value === 'number' && Number.isFinite(value)
+        ? value
+        : fallback;
+    };
+    const holdValue =
+      typeof sampleMeta.hold === 'number' && Number.isFinite(sampleMeta.hold)
+        ? sampleMeta.hold
+        : undefined;
+    const sample = {
+      index: readNumber(sampleMeta.index),
+      timeMs: readNumber(sampleMeta.timeMs),
+      board: payload.board,
+      hold: holdValue,
+    };
+    const session: SnapshotSession = {
+      meta: sessionMeta,
+      samples: [sample],
+    };
+    return session;
+  };
+
   const applyToolModeFilter = async () => {
+    if (toolUsesRemote) {
+      const filterLabel =
+        toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
+      toolInputStatus.textContent = `Source: Online\nFilter: ${filterLabel}`;
+      if (!toolActive) return;
+      await showNextToolSample();
+      return;
+    }
     if (toolModeFilter === 'all') {
       toolSnapshots = toolSnapshotsAll;
     } else {
@@ -1305,12 +1547,46 @@ async function boot() {
     const filterLabel =
       toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
     toolInputStatus.textContent =
+      `Source: Local\n` +
       `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
       `Filter: ${filterLabel} (${toolTotalSamples} samples).`;
     await showNextToolSample();
   };
 
   const showNextToolSample = async (): Promise<void> => {
+    if (toolUsesRemote) {
+      const session = await fetchRemoteSample();
+      if (!session || session.samples.length === 0) {
+        currentSample = null;
+        updateToolSampleStatus('Sample: -');
+        if (toolActive) {
+          renderer.renderBoardOnly(makeBoard(), null);
+        }
+        return;
+      }
+      const sample = session.samples[0];
+      const rawBoard = sample.board;
+      const board = decodeBoard(rawBoard, session.meta.pieceOrder);
+      const hold = decodeHold(sample.hold, session.meta.pieceOrder);
+      const fileName = `remote:${session.meta.id ?? 'unknown'}`;
+      currentSample = {
+        file: { name: fileName, session },
+        index: sample.index,
+        board,
+        raw: rawBoard,
+        hold,
+      };
+      const key = `${fileName}#${sample.index}`;
+      labelIndex[key] = (labelIndex[key] ?? 0) + 1;
+      updateToolSampleStatus(
+        `Source: ${fileName} Sample: ${sample.index} Shown: ${labelIndex[key]}`,
+      );
+      clearLabelSelection();
+      if (toolActive) {
+        renderer.renderBoardOnly(board, hold);
+      }
+      return;
+    }
     if (toolSnapshots.length === 0 || toolTotalSamples === 0) {
       currentSample = null;
       updateToolSampleStatus('Sample: -');
@@ -1355,6 +1631,7 @@ async function boot() {
   };
 
   toolInputButton.addEventListener('click', async () => {
+    if (toolUsesRemote) return;
     const picker = getDirectoryPicker();
     if (!picker) {
       toolInputStatus.textContent = 'Folder access not supported.';
@@ -1397,7 +1674,12 @@ async function boot() {
     await applyToolModeFilter();
   });
 
+  if (toolUsesRemote) {
+    refreshToolModeOptions();
+  }
+
   toolOutputButton.addEventListener('click', async () => {
+    if (toolUsesRemote) return;
     const picker = getDirectoryPicker();
     if (!picker) {
       toolOutputStatus.textContent = 'Folder access not supported.';
@@ -1448,7 +1730,10 @@ async function boot() {
         labels: [...selectedLabels],
       };
       if (useRemoteUpload) {
-        await uploadClient.enqueueLabel(record);
+        await uploadClient.enqueueLabel({
+          createdAt: record.createdAt,
+          data: record,
+        });
         updateToolActionStatus(
           `Uploaded label for ${currentSample.file.name} #${currentSample.index}`,
         );
@@ -1502,6 +1787,8 @@ async function boot() {
 
   const menuMainPanel = makeMenuPanel();
   const playPanel = makeMenuPanel();
+  const optionsPanel = makeMenuPanel();
+  const aboutPanel = makeMenuPanel();
   const cheesePanel = makeMenuPanel();
   const charcuteriePanel = makeMenuPanel();
   const toolsPanel = makeMenuPanel();
@@ -1510,6 +1797,16 @@ async function boot() {
   Object.assign(playPanel.style, {
     minHeight: '240px',
     display: 'flex',
+  });
+  Object.assign(optionsPanel.style, {
+    minHeight: '240px',
+    display: 'none',
+  });
+  Object.assign(aboutPanel.style, {
+    minHeight: '260px',
+    width: '300px',
+    display: 'none',
+    textAlign: 'left',
   });
   Object.assign(cheesePanel.style, {
     minHeight: '240px',
@@ -1526,7 +1823,7 @@ async function boot() {
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
-    display: 'flex',
+    display: SHOW_DEV_TOOLS ? 'flex' : 'none',
   });
   Object.assign(playMenuRow.style, {
     display: 'none',
@@ -1552,12 +1849,285 @@ async function boot() {
   const playButton = makeMenuButton('PLAY');
   const optionsButton = makeMenuButton('OPTIONS');
   const toolsButton = makeMenuButton('TOOLS');
-  const creditsButton = makeMenuButton('CREDITS');
+  const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
   menuMainPanel.appendChild(optionsButton);
   menuMainPanel.appendChild(toolsButton);
-  menuMainPanel.appendChild(creditsButton);
+  menuMainPanel.appendChild(aboutButton);
+
+  const optionsTitle = document.createElement('div');
+  optionsTitle.textContent = 'OPTIONS';
+  Object.assign(optionsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const controlsTitle = document.createElement('div');
+  controlsTitle.textContent = 'CONTROLS';
+  Object.assign(controlsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '12px',
+    marginBottom: '4px',
+  });
+
+  const controlsList = document.createElement('div');
+  Object.assign(controlsList.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+
+  const controlsResetButton = makeMenuButton('RESET CONTROLS');
+  Object.assign(controlsResetButton.style, {
+    marginTop: '6px',
+  });
+
+  const optionsBackButton = makeMenuButton('BACK');
+  Object.assign(optionsBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  optionsPanel.appendChild(optionsTitle);
+  optionsPanel.appendChild(volumeLabel);
+  optionsPanel.appendChild(volumeRow);
+  optionsPanel.appendChild(controlsTitle);
+  optionsPanel.appendChild(controlsList);
+  optionsPanel.appendChild(controlsResetButton);
+  optionsPanel.appendChild(optionsBackButton);
+
+  const aboutTitle = document.createElement('div');
+  aboutTitle.textContent = 'ABOUT';
+  Object.assign(aboutTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+
+  const aboutBody = document.createElement('div');
+  aboutBody.textContent =
+    'Wish Upon a Block is a lightweight low-latency guideline tetromino game. ' +
+    'It is meant to recreate the feeling of "Tetris effect" when every next piece is "just right". ' +
+    'Play and try out the ML powered "Wish Upon a Block" piece generator.';
+  Object.assign(aboutBody.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    textAlign: 'center',
+  });
+
+  const creditsTitle = document.createElement('div');
+  creditsTitle.textContent = 'CREDITS';
+  Object.assign(creditsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '12px',
+    marginBottom: '4px',
+  });
+
+  const creditsList = document.createElement('div');
+  Object.assign(creditsList.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    color: '#b6c2d4',
+    fontSize: '12px',
+  });
+
+  const creditsName = document.createElement('div');
+  creditsName.textContent = 'Максим Никитин (Maksim Nikitin)';
+
+  const makeCreditsLink = (href: string, text: string) => {
+    const link = document.createElement('a');
+    link.href = href;
+    link.textContent = text;
+    link.target = '_blank';
+    link.rel = 'noreferrer';
+    Object.assign(link.style, {
+      color: '#b6c2d4',
+      textDecoration: 'none',
+      wordBreak: 'break-all',
+    });
+    return link;
+  };
+
+  const githubLinkLine = makeCreditsLink(
+    'https://github.com/icanfast/wishuponablock',
+    'https://github.com/icanfast/wishuponablock',
+  );
+  const emailLinkLine = makeCreditsLink(
+    'mailto:nikitin.maxim.94@gmail.com',
+    'nikitin.maxim.94@gmail.com',
+  );
+  const telegramLinkLine = makeCreditsLink(
+    'https://t.me/icanfast',
+    't.me/icanfast',
+  );
+
+  creditsList.appendChild(creditsName);
+  creditsList.appendChild(githubLinkLine);
+  creditsList.appendChild(emailLinkLine);
+  creditsList.appendChild(telegramLinkLine);
+
+  const aboutBackButton = makeMenuButton('BACK');
+  Object.assign(aboutBackButton.style, {
+    marginTop: 'auto',
+  });
+
+  aboutPanel.appendChild(aboutTitle);
+  aboutPanel.appendChild(aboutBody);
+  aboutPanel.appendChild(creditsTitle);
+  aboutPanel.appendChild(creditsList);
+  aboutPanel.appendChild(aboutBackButton);
+
+  type KeyBindingKey = keyof Settings['input']['bindings'];
+  const keybindButtons = new Map<KeyBindingKey, HTMLButtonElement>();
+  let rebindingKey: KeyBindingKey | null = null;
+  let rebindingButton: HTMLButtonElement | null = null;
+
+  const formatKeyLabel = (code: string): string => {
+    if (!code) return '';
+    if (code === 'Space') return 'Space';
+    if (code.startsWith('Key')) return code.slice(3);
+    if (code.startsWith('Digit')) return code.slice(5);
+    if (code.startsWith('Arrow')) return code.slice(5);
+    if (code.startsWith('Numpad')) return `Num ${code.slice(6)}`;
+    return code.replace(/([a-z])([A-Z])/g, '$1 $2');
+  };
+
+  const updateKeybindButtons = (bindings: Settings['input']['bindings']) => {
+    for (const [key, button] of keybindButtons) {
+      if (rebindingKey === key) continue;
+      const label = formatKeyLabel(bindings[key]);
+      button.textContent = label || '\u00a0';
+    }
+  };
+
+  const cancelRebind = () => {
+    if (rebindingKey && rebindingButton) {
+      const current = settingsStore.get().input.bindings;
+      rebindingButton.textContent = formatKeyLabel(current[rebindingKey]);
+      rebindingButton.blur();
+    }
+    rebindingKey = null;
+    rebindingButton = null;
+  };
+
+  const startRebind = (key: KeyBindingKey, button: HTMLButtonElement) => {
+    cancelRebind();
+    rebindingKey = key;
+    rebindingButton = button;
+    button.textContent = 'Press a key';
+  };
+
+  const reservedCodes = new Set([
+    'ControlLeft',
+    'ControlRight',
+    'AltLeft',
+    'AltRight',
+    'MetaLeft',
+    'MetaRight',
+  ]);
+
+  window.addEventListener(
+    'keydown',
+    (event) => {
+      if (!rebindingKey || !rebindingButton) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.code === 'Escape') {
+        cancelRebind();
+        return;
+      }
+      if (reservedCodes.has(event.code)) return;
+      const currentInput = settingsStore.get().input;
+      const nextBindings = { ...currentInput.bindings };
+      for (const [action, code] of Object.entries(nextBindings)) {
+        if (action === rebindingKey) continue;
+        if (code === event.code) {
+          nextBindings[action as KeyBindingKey] = '';
+        }
+      }
+      updateKeybindButtons(nextBindings);
+      settingsStore.apply({
+        input: {
+          ...currentInput,
+          bindings: { ...nextBindings, [rebindingKey]: event.code },
+        },
+      });
+      cancelRebind();
+    },
+    true,
+  );
+
+  const keybindConfig: Array<{ key: KeyBindingKey; label: string }> = [
+    { key: 'moveLeft', label: 'Move Left' },
+    { key: 'moveRight', label: 'Move Right' },
+    { key: 'softDrop', label: 'Soft Drop' },
+    { key: 'hardDrop', label: 'Hard Drop' },
+    { key: 'rotateCW', label: 'Rotate CW' },
+    { key: 'rotateCCW', label: 'Rotate CCW' },
+    { key: 'rotate180', label: 'Rotate 180' },
+    { key: 'hold', label: 'Hold' },
+    { key: 'restart', label: 'Restart' },
+  ];
+
+  for (const item of keybindConfig) {
+    const row = document.createElement('div');
+    Object.assign(row.style, {
+      display: 'grid',
+      gridTemplateColumns: '1fr 110px',
+      alignItems: 'center',
+      columnGap: '8px',
+    });
+
+    const label = document.createElement('div');
+    label.textContent = item.label;
+    Object.assign(label.style, {
+      color: '#b6c2d4',
+      fontSize: '12px',
+      flex: '1',
+    });
+
+    const button = document.createElement('button');
+    Object.assign(button.style, {
+      background: '#0b0f14',
+      color: '#e2e8f0',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      padding: '4px 8px',
+      fontSize: '12px',
+      lineHeight: '1.2',
+      minHeight: '24px',
+      width: '110px',
+      cursor: 'pointer',
+      textAlign: 'center',
+    });
+    button.addEventListener('click', () => startRebind(item.key, button));
+
+    row.appendChild(label);
+    row.appendChild(button);
+    controlsList.appendChild(row);
+    keybindButtons.set(item.key, button);
+  }
+
+  updateKeybindButtons(settings.input.bindings);
+
+  controlsResetButton.addEventListener('click', () => {
+    const currentInput = settingsStore.get().input;
+    settingsStore.apply({
+      input: {
+        ...currentInput,
+        bindings: { ...DEFAULT_KEY_BINDINGS },
+      },
+    });
+  });
 
   const dataNotice = document.createElement('div');
   dataNotice.textContent =
@@ -1604,172 +2174,178 @@ async function boot() {
   playPanel.appendChild(charcuterieModeButton);
   playPanel.appendChild(playBackButton);
 
-  const butterfingerTitle = document.createElement('div');
-  butterfingerTitle.textContent = 'BUTTERFINGER';
-  Object.assign(butterfingerTitle.style, {
-    color: '#8fa0b8',
-    fontSize: '12px',
-    letterSpacing: '0.5px',
-    marginBottom: '4px',
-  });
-  butterfingerPanel.appendChild(butterfingerTitle);
-
-  const butterfingerToggleRow = document.createElement('label');
-  Object.assign(butterfingerToggleRow.style, {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    fontSize: '12px',
-    color: '#e2e8f0',
-    cursor: 'pointer',
-  });
-  const butterfingerToggle = document.createElement('input');
-  butterfingerToggle.type = 'checkbox';
-  butterfingerToggle.style.cursor = 'pointer';
-  const butterfingerToggleText = document.createElement('span');
-  butterfingerToggleText.textContent = 'Enable';
-  butterfingerToggleRow.appendChild(butterfingerToggle);
-  butterfingerToggleRow.appendChild(butterfingerToggleText);
-  butterfingerPanel.appendChild(butterfingerToggleRow);
-
-  const makeButterfingerSlider = (
-    labelText: string,
-    options: { max?: number; step?: number } = {},
-  ) => {
-    const row = document.createElement('div');
-    Object.assign(row.style, {
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '6px',
-      textAlign: 'left',
-      marginTop: '8px',
-    });
-    const label = document.createElement('div');
-    label.textContent = labelText;
-    Object.assign(label.style, {
-      color: '#b6c2d4',
-      fontSize: '11px',
-      letterSpacing: '0.3px',
-    });
-    const value = document.createElement('span');
-    Object.assign(value.style, {
+  let updateButterfingerUI: (cfg: Settings['butterfinger']) => void = () => {};
+  if (SHOW_DEV_TOOLS) {
+    const butterfingerTitle = document.createElement('div');
+    butterfingerTitle.textContent = 'BUTTERFINGER';
+    Object.assign(butterfingerTitle.style, {
       color: '#8fa0b8',
-      fontSize: '11px',
-      marginLeft: '6px',
+      fontSize: '12px',
+      letterSpacing: '0.5px',
+      marginBottom: '4px',
     });
-    const labelRow = document.createElement('div');
-    Object.assign(labelRow.style, {
+    butterfingerPanel.appendChild(butterfingerTitle);
+
+    const butterfingerToggleRow = document.createElement('label');
+    Object.assign(butterfingerToggleRow.style, {
       display: 'flex',
-      justifyContent: 'space-between',
       alignItems: 'center',
+      gap: '8px',
+      fontSize: '12px',
+      color: '#e2e8f0',
+      cursor: 'pointer',
     });
-    labelRow.appendChild(label);
-    labelRow.appendChild(value);
+    const butterfingerToggle = document.createElement('input');
+    butterfingerToggle.type = 'checkbox';
+    butterfingerToggle.style.cursor = 'pointer';
+    const butterfingerToggleText = document.createElement('span');
+    butterfingerToggleText.textContent = 'Enable';
+    butterfingerToggleRow.appendChild(butterfingerToggle);
+    butterfingerToggleRow.appendChild(butterfingerToggleText);
+    butterfingerPanel.appendChild(butterfingerToggleRow);
 
-    const slider = document.createElement('input');
-    slider.type = 'range';
-    slider.min = '0';
-    slider.max = String(options.max ?? 10);
-    slider.step = String(options.step ?? 0.1);
-    Object.assign(slider.style, {
-      width: '100%',
-      accentColor: '#6ea8ff',
+    const makeButterfingerSlider = (
+      labelText: string,
+      options: { max?: number; step?: number } = {},
+    ) => {
+      const row = document.createElement('div');
+      Object.assign(row.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px',
+        textAlign: 'left',
+        marginTop: '8px',
+      });
+      const label = document.createElement('div');
+      label.textContent = labelText;
+      Object.assign(label.style, {
+        color: '#b6c2d4',
+        fontSize: '11px',
+        letterSpacing: '0.3px',
+      });
+      const value = document.createElement('span');
+      Object.assign(value.style, {
+        color: '#8fa0b8',
+        fontSize: '11px',
+        marginLeft: '6px',
+      });
+      const labelRow = document.createElement('div');
+      Object.assign(labelRow.style, {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+      });
+      labelRow.appendChild(label);
+      labelRow.appendChild(value);
+
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = '0';
+      slider.max = String(options.max ?? 10);
+      slider.step = String(options.step ?? 0.1);
+      Object.assign(slider.style, {
+        width: '100%',
+        accentColor: '#6ea8ff',
+      });
+
+      row.appendChild(labelRow);
+      row.appendChild(slider);
+      butterfingerPanel.appendChild(row);
+      return { slider, value };
+    };
+
+    const missSlider = makeButterfingerSlider('Miss Rate');
+    const wrongDirSlider = makeButterfingerSlider('Wrong Direction');
+    const extraTapSlider = makeButterfingerSlider('Extra Tap');
+    const lockNudgeSlider = makeButterfingerSlider('Lock Nudge');
+    const gravityDropSlider = makeButterfingerSlider('Gravity Drop');
+    const lockRotateSlider = makeButterfingerSlider('Lock Rotate', {
+      max: 100,
+      step: 1,
     });
 
-    row.appendChild(labelRow);
-    row.appendChild(slider);
-    butterfingerPanel.appendChild(row);
-    return { slider, value };
-  };
+    const clampRate = (value: number): number =>
+      Math.min(1, Math.max(0, value));
+    const formatPercent = (value: number): string => {
+      const rounded = Math.round(value * 10) / 10;
+      return Number.isInteger(rounded)
+        ? `${rounded}%`
+        : `${rounded.toFixed(1)}%`;
+    };
+    const updateButterfingerControl = (
+      control: { slider: HTMLInputElement; value: HTMLSpanElement },
+      rate: number,
+    ) => {
+      const sliderMax = Number(control.slider.max) || 100;
+      const percent = Math.min(sliderMax, clampRate(rate) * 100);
+      control.slider.value = String(percent);
+      control.value.textContent = formatPercent(percent);
+    };
 
-  const missSlider = makeButterfingerSlider('Miss Rate');
-  const wrongDirSlider = makeButterfingerSlider('Wrong Direction');
-  const extraTapSlider = makeButterfingerSlider('Extra Tap');
-  const lockNudgeSlider = makeButterfingerSlider('Lock Nudge');
-  const gravityDropSlider = makeButterfingerSlider('Gravity Drop');
-  const lockRotateSlider = makeButterfingerSlider('Lock Rotate', {
-    max: 100,
-    step: 1,
-  });
+    updateButterfingerUI = (cfg: Settings['butterfinger']) => {
+      butterfingerToggle.checked = cfg.enabled;
+      updateButterfingerControl(missSlider, cfg.missRate);
+      updateButterfingerControl(wrongDirSlider, cfg.wrongDirRate);
+      updateButterfingerControl(extraTapSlider, cfg.extraTapRate);
+      updateButterfingerControl(lockNudgeSlider, cfg.lockNudgeRate);
+      updateButterfingerControl(gravityDropSlider, cfg.gravityDropRate);
+      updateButterfingerControl(lockRotateSlider, cfg.lockRotateRate);
+    };
 
-  const clampRate = (value: number): number => Math.min(1, Math.max(0, value));
-  const formatPercent = (value: number): string => {
-    const rounded = Math.round(value * 10) / 10;
-    return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
-  };
-  const updateButterfingerControl = (
-    control: { slider: HTMLInputElement; value: HTMLSpanElement },
-    rate: number,
-  ) => {
-    const sliderMax = Number(control.slider.max) || 100;
-    const percent = Math.min(sliderMax, clampRate(rate) * 100);
-    control.slider.value = String(percent);
-    control.value.textContent = formatPercent(percent);
-  };
+    const readButterfingerRate = (control: {
+      slider: HTMLInputElement;
+      value: HTMLSpanElement;
+    }): number => clampRate(Number(control.slider.value) / 100);
 
-  const updateButterfingerUI = (cfg: Settings['butterfinger']) => {
-    butterfingerToggle.checked = cfg.enabled;
-    updateButterfingerControl(missSlider, cfg.missRate);
-    updateButterfingerControl(wrongDirSlider, cfg.wrongDirRate);
-    updateButterfingerControl(extraTapSlider, cfg.extraTapRate);
-    updateButterfingerControl(lockNudgeSlider, cfg.lockNudgeRate);
-    updateButterfingerControl(gravityDropSlider, cfg.gravityDropRate);
-    updateButterfingerControl(lockRotateSlider, cfg.lockRotateRate);
-  };
+    const applyButterfinger = (patch: Partial<Settings['butterfinger']>) => {
+      const current = settingsStore.get().butterfinger;
+      settingsStore.apply({
+        butterfinger: { ...current, ...patch },
+      });
+    };
 
-  const readButterfingerRate = (control: {
-    slider: HTMLInputElement;
-    value: HTMLSpanElement;
-  }): number => clampRate(Number(control.slider.value) / 100);
-
-  const applyButterfinger = (patch: Partial<Settings['butterfinger']>) => {
-    const current = settingsStore.get().butterfinger;
-    settingsStore.apply({
-      butterfinger: { ...current, ...patch },
+    butterfingerToggle.addEventListener('change', () => {
+      applyButterfinger({ enabled: butterfingerToggle.checked });
     });
-  };
 
-  butterfingerToggle.addEventListener('change', () => {
-    applyButterfinger({ enabled: butterfingerToggle.checked });
-  });
+    missSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(missSlider);
+      missSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ missRate: rate });
+    });
 
-  missSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(missSlider);
-    missSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ missRate: rate });
-  });
+    wrongDirSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(wrongDirSlider);
+      wrongDirSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ wrongDirRate: rate });
+    });
 
-  wrongDirSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(wrongDirSlider);
-    wrongDirSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ wrongDirRate: rate });
-  });
+    extraTapSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(extraTapSlider);
+      extraTapSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ extraTapRate: rate });
+    });
 
-  extraTapSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(extraTapSlider);
-    extraTapSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ extraTapRate: rate });
-  });
+    lockNudgeSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(lockNudgeSlider);
+      lockNudgeSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ lockNudgeRate: rate });
+    });
 
-  lockNudgeSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(lockNudgeSlider);
-    lockNudgeSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ lockNudgeRate: rate });
-  });
+    gravityDropSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(gravityDropSlider);
+      gravityDropSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ gravityDropRate: rate });
+    });
 
-  gravityDropSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(gravityDropSlider);
-    gravityDropSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ gravityDropRate: rate });
-  });
+    lockRotateSlider.slider.addEventListener('input', () => {
+      const rate = readButterfingerRate(lockRotateSlider);
+      lockRotateSlider.value.textContent = formatPercent(rate * 100);
+      applyButterfinger({ lockRotateRate: rate });
+    });
 
-  lockRotateSlider.slider.addEventListener('input', () => {
-    const rate = readButterfingerRate(lockRotateSlider);
-    lockRotateSlider.value.textContent = formatPercent(rate * 100);
-    applyButterfinger({ lockRotateRate: rate });
-  });
-
-  updateButterfingerUI(settings.butterfinger);
+    updateButterfingerUI(settings.butterfinger);
+  }
 
   const cheeseTitle = document.createElement('div');
   cheeseTitle.textContent = 'CHEESE';
@@ -1868,8 +2444,10 @@ async function boot() {
   charcuteriePanel.appendChild(charcuterie8Button);
   charcuteriePanel.appendChild(charcuterie14Button);
   charcuteriePanel.appendChild(charcuterie20Button);
-  charcuteriePanel.appendChild(charcuterieSimField);
-  charcuteriePanel.appendChild(charcuterieSeedField);
+  if (SHOW_DEV_TOOLS) {
+    charcuteriePanel.appendChild(charcuterieSimField);
+    charcuteriePanel.appendChild(charcuterieSeedField);
+  }
   charcuteriePanel.appendChild(charcuterieBackButton);
 
   const toolsTitle = document.createElement('div');
@@ -1893,12 +2471,17 @@ async function boot() {
 
   menuLayer.appendChild(menuMainWrapper);
   playMenuRow.appendChild(playPanel);
-  playMenuRow.appendChild(butterfingerPanel);
+  if (SHOW_DEV_TOOLS) {
+    playMenuRow.appendChild(butterfingerPanel);
+  }
   menuLayer.appendChild(playMenuRow);
+  menuLayer.appendChild(optionsPanel);
+  menuLayer.appendChild(aboutPanel);
   menuLayer.appendChild(cheesePanel);
   menuLayer.appendChild(charcuteriePanel);
   menuLayer.appendChild(toolsPanel);
   uiLayer.appendChild(menuLayer);
+  uiLayer.appendChild(charcuterieSpinner);
 
   const footer = document.createElement('div');
   Object.assign(footer.style, {
@@ -1939,8 +2522,6 @@ async function boot() {
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
 
-  let generatorType = settings.generator.type;
-
   settingsStore.subscribe((next) => {
     input.setConfig(next.input);
     lockSound.volume = next.audio.masterVolume;
@@ -1955,6 +2536,7 @@ async function boot() {
       if (next.generator.type === 'ml') {
         void ensureMlModel();
       }
+      updateModelStatusUI();
       game = createGame(next, selectedMode, selectedModeOptions);
       runner = createRunner(game, selectedMode, selectedModeOptions);
       if (select.value !== next.generator.type) {
@@ -1983,30 +2565,43 @@ async function boot() {
       volumeSlider.value = String(nextVolume);
       updateVolumeLabel(next.audio.masterVolume);
     }
+    updateKeybindButtons(next.input.bindings);
   });
 
   let pausedByVisibility = document.visibilityState !== 'visible';
   let pausedByInput = false;
   let pausedByMenu = true;
-  let paused: boolean = pausedByVisibility || pausedByInput || pausedByMenu;
+  let paused: boolean =
+    pausedByVisibility || pausedByInput || pausedByMenu || pausedByModel;
   let resumePending = false;
 
   const showMenuPanel = (
-    panel: 'main' | 'play' | 'cheese' | 'charcuterie' | 'tools',
+    panel:
+      | 'main'
+      | 'play'
+      | 'options'
+      | 'about'
+      | 'cheese'
+      | 'charcuterie'
+      | 'tools',
   ) => {
     menuMainWrapper.style.display = panel === 'main' ? 'flex' : 'none';
     playMenuRow.style.display = panel === 'play' ? 'flex' : 'none';
+    optionsPanel.style.display = panel === 'options' ? 'flex' : 'none';
+    aboutPanel.style.display = panel === 'about' ? 'flex' : 'none';
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
   };
 
-  const updatePaused = () => {
-    const next = pausedByVisibility || pausedByInput || pausedByMenu;
+  updatePaused = () => {
+    const next =
+      pausedByVisibility || pausedByInput || pausedByMenu || pausedByModel;
     if (next === paused) return;
     paused = next;
     if (!paused) resumePending = true;
   };
+  updateModelStatusUI();
 
   document.addEventListener('visibilitychange', () => {
     pausedByVisibility = document.visibilityState !== 'visible';
@@ -2023,7 +2618,7 @@ async function boot() {
 
   const renderToolSample = () => {
     if (!currentSample) {
-      if (toolSnapshots.length > 0) {
+      if (toolUsesRemote || toolSnapshots.length > 0) {
         void showNextToolSample();
       } else {
         gfx.clear();
@@ -2037,11 +2632,13 @@ async function boot() {
     const inMenu = screen === 'menu';
     const inGame = screen === 'game';
     const inTool = screen === 'tool';
+    toolActive = inTool;
     menuLayer.style.display = inMenu ? 'flex' : 'none';
     settingsPanel.style.display = inGame ? 'block' : 'none';
     menuButton.style.display = inGame ? 'block' : 'none';
     holdLabel.style.display = inGame || inTool ? 'block' : 'none';
     toolLayer.style.display = inTool ? 'block' : 'none';
+    footer.style.display = inMenu ? 'flex' : 'none';
     pausedByMenu = !inGame;
     updatePaused();
     if (inGame) {
@@ -2058,6 +2655,7 @@ async function boot() {
         });
         updateRecorderUI();
       }
+      renderer.render(runner.state);
     } else {
       if (useRemoteUpload && recorder.isRecording) {
         recorder.stop();
@@ -2068,6 +2666,10 @@ async function boot() {
       gameOverLabel.style.display = 'none';
       showMenuPanel('main');
       if (inTool) {
+        if (toolUsesRemote) {
+          refreshToolModeOptions();
+          void applyToolModeFilter();
+        }
         renderToolSample();
       }
     }
@@ -2084,12 +2686,10 @@ async function boot() {
     showMenuPanel('charcuterie'),
   );
   optionsButton.addEventListener('click', () => {
-    // Placeholder for future options screen
+    showMenuPanel('options');
   });
   toolsButton.addEventListener('click', () => showMenuPanel('tools'));
-  creditsButton.addEventListener('click', () => {
-    // Placeholder for future credits screen
-  });
+  aboutButton.addEventListener('click', () => showMenuPanel('about'));
 
   const startCheese = (lines: number) => {
     selectedMode = getMode('cheese');
@@ -2102,6 +2702,8 @@ async function boot() {
   cheese12Button.addEventListener('click', () => startCheese(12));
   cheeseBackButton.addEventListener('click', () => showMenuPanel('play'));
   playBackButton.addEventListener('click', () => showMenuPanel('main'));
+  optionsBackButton.addEventListener('click', () => showMenuPanel('main'));
+  aboutBackButton.addEventListener('click', () => showMenuPanel('main'));
 
   const readCharcuterieSimCount = (): number => {
     const raw = Number(charcuterieSimInput.value);
@@ -2126,7 +2728,13 @@ async function boot() {
       simCount,
       ...(seed !== undefined ? { seed } : {}),
     };
-    setScreen('game');
+    charcuterieSpinner.style.display = 'flex';
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setScreen('game');
+        charcuterieSpinner.style.display = 'none';
+      });
+    });
   };
 
   charcuterie8Button.addEventListener('click', () => startCharcuterie(8));

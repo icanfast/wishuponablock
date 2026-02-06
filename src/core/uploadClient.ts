@@ -1,4 +1,13 @@
-import type { SnapshotSample, SnapshotSessionMeta } from './snapshotRecorder';
+export type SnapshotUploadRecord = {
+  createdAt: string;
+  meta: Record<string, unknown>;
+  board: number[][];
+};
+
+export type LabelUploadRecord = {
+  createdAt: string;
+  data: unknown;
+};
 
 export type UploadMode = 'local' | 'remote' | 'auto';
 
@@ -32,17 +41,11 @@ export class UploadClient {
     return this.mode !== 'local';
   }
 
-  async enqueueSnapshot(
-    session: SnapshotSessionMeta,
-    sample: SnapshotSample,
-  ): Promise<void> {
-    await this.enqueue({
-      type: 'snapshot',
-      payload: { session, sample },
-    });
+  async enqueueSnapshot(record: SnapshotUploadRecord): Promise<void> {
+    await this.enqueue({ type: 'snapshot', payload: record });
   }
 
-  async enqueueLabel(record: unknown): Promise<void> {
+  async enqueueLabel(record: LabelUploadRecord): Promise<void> {
     await this.enqueue({ type: 'label', payload: record });
   }
 
@@ -102,21 +105,32 @@ export class UploadClient {
 function summarizePayload(item: QueueItem): Record<string, unknown> {
   if (item.type === 'snapshot') {
     const payload = item.payload as
-      | { session?: { id?: string }; sample?: { index?: number } }
+      | {
+          meta?: {
+            session?: { id?: string };
+            sample?: { index?: number };
+            trigger?: string;
+          };
+        }
       | undefined;
     return {
       type: 'snapshot',
-      sessionId: payload?.session?.id ?? null,
-      sampleIndex: payload?.sample?.index ?? null,
+      sessionId: payload?.meta?.session?.id ?? null,
+      sampleIndex: payload?.meta?.sample?.index ?? null,
+      trigger: payload?.meta?.trigger ?? null,
     };
   }
   const payload = item.payload as
-    | { source?: { sessionId?: string; sampleIndex?: number } }
+    | {
+        data?: {
+          source?: { sessionId?: string; sampleIndex?: number };
+        };
+      }
     | undefined;
   return {
     type: 'label',
-    sessionId: payload?.source?.sessionId ?? null,
-    sampleIndex: payload?.source?.sampleIndex ?? null,
+    sessionId: payload?.data?.source?.sessionId ?? null,
+    sampleIndex: payload?.data?.source?.sampleIndex ?? null,
   };
 }
 
