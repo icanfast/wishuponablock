@@ -55,7 +55,8 @@ export class UploadClient {
         await this.postItem(item);
         await deleteQueueItem(item.id!);
       }
-    } catch {
+    } catch (err) {
+      console.warn('[Upload] Flush failed.', err);
       // Leave queued items for later retry.
     } finally {
       this.flushing = false;
@@ -77,15 +78,46 @@ export class UploadClient {
       item.type === 'snapshot'
         ? `${this.baseUrl}/snapshots`
         : `${this.baseUrl}/labels`;
+    const summary = summarizePayload(item);
+    const startedAt = performance.now();
+    console.info(`[Upload] POST ${url}`, summary);
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(item.payload),
     });
+    const elapsed = performance.now() - startedAt;
     if (!res.ok) {
+      console.warn(
+        `[Upload] Failed ${url} (${res.status}) in ${elapsed.toFixed(1)}ms`,
+      );
       throw new Error(`Upload failed (${res.status})`);
     }
+    console.info(
+      `[Upload] OK ${url} (${res.status}) in ${elapsed.toFixed(1)}ms`,
+    );
   }
+}
+
+function summarizePayload(item: QueueItem): Record<string, unknown> {
+  if (item.type === 'snapshot') {
+    const payload = item.payload as
+      | { session?: { id?: string }; sample?: { index?: number } }
+      | undefined;
+    return {
+      type: 'snapshot',
+      sessionId: payload?.session?.id ?? null,
+      sampleIndex: payload?.sample?.index ?? null,
+    };
+  }
+  const payload = item.payload as
+    | { source?: { sessionId?: string; sampleIndex?: number } }
+    | undefined;
+  return {
+    type: 'label',
+    sessionId: payload?.source?.sessionId ?? null,
+    sampleIndex: payload?.source?.sampleIndex ?? null,
+  };
 }
 
 async function openDb(): Promise<IDBDatabase> {

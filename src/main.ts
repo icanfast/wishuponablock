@@ -1877,6 +1877,43 @@ async function boot() {
   menuLayer.appendChild(toolsPanel);
   uiLayer.appendChild(menuLayer);
 
+  const footer = document.createElement('div');
+  Object.assign(footer.style, {
+    position: 'absolute',
+    left: '0',
+    right: '0',
+    bottom: `${OUTER_MARGIN}px`,
+    display: 'flex',
+    justifyContent: 'center',
+    pointerEvents: 'auto',
+  });
+
+  const githubLink = document.createElement('a');
+  githubLink.href = 'https://github.com/icanfast/wishuponablock';
+  githubLink.target = '_blank';
+  githubLink.rel = 'noreferrer';
+  Object.assign(githubLink.style, {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '6px',
+    textDecoration: 'none',
+    color: '#b6c2d4',
+    opacity: '0.85',
+  });
+
+  const githubIcon = document.createElement('img');
+  githubIcon.src = '/assets/GitHub_Invertocat_White_Clearspace.svg';
+  githubIcon.alt = 'GitHub';
+  Object.assign(githubIcon.style, {
+    width: '36px',
+    height: '36px',
+    display: 'block',
+  });
+
+  githubLink.appendChild(githubIcon);
+  footer.appendChild(githubLink);
+  uiLayer.appendChild(footer);
+
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
 
   let generatorType = settings.generator.type;
