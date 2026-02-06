@@ -200,24 +200,44 @@ async function boot() {
     });
   };
   let suppressLockEffects = false;
-  const enqueueSnapshotSample = (board: Board, hold: PieceKind | null) => {
+  let lastSnapshotKey: string | null = null;
+  const buildSnapshotKey = (board: Board, hold: PieceKind | null): string => {
+    const rows = board
+      .map((row) => row.map((cell) => (cell ? cell : '.')).join(''))
+      .join('/');
+    return `${rows}|${hold ?? '.'}`;
+  };
+  const enqueueSnapshotSample = (
+    board: Board,
+    hold: PieceKind | null,
+    reason: 'lock' | 'hold',
+  ) => {
     if (!recorder.isRecording) return;
+    const key = buildSnapshotKey(board, hold);
+    if (key === lastSnapshotKey) {
+      console.warn(`[Snapshot] Skipping duplicate (${reason}).`);
+      return;
+    }
+    lastSnapshotKey = key;
     const sample = recorder.record(board, hold, { store: !useRemoteUpload });
     updateRecorderUI();
     if (!sample || !useRemoteUpload) return;
     const session = recorder.sessionMeta;
     if (!session) return;
+    console.info(
+      `[Snapshot] ${reason} session=${session.id} index=${sample.index}`,
+    );
     void uploadClient.enqueueSnapshot(session, sample);
   };
 
   const handlePieceLock = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
     playLockSound();
-    enqueueSnapshotSample(board, hold);
+    enqueueSnapshotSample(board, hold, 'lock');
   };
   const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
-    enqueueSnapshotSample(board, hold);
+    enqueueSnapshotSample(board, hold, 'hold');
   };
 
   const getStackHeight = (board: Board): number => {
@@ -796,6 +816,7 @@ async function boot() {
   recordButton.addEventListener('click', async () => {
     if (useRemoteUpload) return;
     if (!recorder.isRecording) {
+      lastSnapshotKey = null;
       recorder.start(settingsStore.get(), ROWS, COLS, commentInput.value, {
         id: selectedMode.id,
         options: { ...selectedModeOptions },
@@ -806,6 +827,7 @@ async function boot() {
 
     const session = recorder.stop();
     updateRecorderUI();
+    lastSnapshotKey = null;
     if (!session) return;
 
     const ready = await ensureSnapshotDirectory();
@@ -827,6 +849,7 @@ async function boot() {
     if (useRemoteUpload) return;
     recorder.discard();
     updateRecorderUI();
+    lastSnapshotKey = null;
   });
 
   updateRecorderUI();
@@ -2027,6 +2050,7 @@ async function boot() {
       game = createGame(nextSettings, selectedMode, selectedModeOptions);
       runner = createRunner(game, selectedMode, selectedModeOptions);
       gameOverLabel.style.display = 'none';
+      lastSnapshotKey = null;
       if (useRemoteUpload && !recorder.isRecording) {
         recorder.start(nextSettings, ROWS, COLS, '', {
           id: selectedMode.id,
@@ -2039,6 +2063,7 @@ async function boot() {
         recorder.stop();
         updateRecorderUI();
       }
+      lastSnapshotKey = null;
       gfx.clear();
       gameOverLabel.style.display = 'none';
       showMenuPanel('main');
