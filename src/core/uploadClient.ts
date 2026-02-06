@@ -14,7 +14,7 @@ type QueueItem = {
   createdAt: string;
 };
 
-const DB_NAME = 'wishuponablock.uploads';
+const DB_NAME = 'wishuponablock.uploads.v2';
 const STORE_NAME = 'queue';
 const DB_VERSION = 1;
 
