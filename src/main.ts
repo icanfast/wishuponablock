@@ -2584,10 +2584,20 @@ async function boot() {
   feedbackButtons.appendChild(feedbackBackButton);
   feedbackButtons.appendChild(feedbackSendButton);
 
+  const feedbackStatus = document.createElement('div');
+  Object.assign(feedbackStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+    textAlign: 'center',
+    minHeight: '16px',
+  });
+
   feedbackPanel.appendChild(feedbackTitle);
   feedbackPanel.appendChild(feedbackBody);
   feedbackPanel.appendChild(feedbackContact);
   feedbackPanel.appendChild(feedbackButtons);
+  feedbackPanel.appendChild(feedbackStatus);
 
   menuLayer.appendChild(menuMainWrapper);
   playMenuRow.appendChild(playPanel);
@@ -2887,6 +2897,7 @@ async function boot() {
     }
     feedbackSendButton.disabled = true;
     feedbackSendButton.textContent = 'SENDING...';
+    feedbackStatus.textContent = '';
     try {
       const res = await fetch(`${uploadBaseUrl}/feedback`, {
         method: 'POST',
@@ -2903,9 +2914,11 @@ async function boot() {
       feedbackBody.value = '';
       feedbackContact.value = '';
       updateFeedbackSendState();
+      feedbackStatus.textContent = 'Thank you for your feedback!';
     } catch (err) {
       console.warn('[Feedback] Upload failed.', err);
       updateFeedbackSendState();
+      feedbackStatus.textContent = 'Could not send feedback.';
     } finally {
       feedbackSendButton.textContent = 'SEND';
     }
