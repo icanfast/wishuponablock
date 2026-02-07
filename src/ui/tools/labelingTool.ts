@@ -1,5 +1,8 @@
 import { getMode } from '../../core/modes';
-import type { SnapshotSession } from '../../core/snapshotRecorder';
+import type {
+  SnapshotSession,
+  SnapshotSample,
+} from '../../core/snapshotRecorder';
 import type { UploadClient } from '../../core/uploadClient';
 import { PIECES, type Board, type PieceKind } from '../../core/types';
 import { createToolScreen } from '../screens/toolScreen';
@@ -20,10 +23,13 @@ export function createLabelingTool(
   const { toolUsesRemote, uploadClient, uploadBaseUrl, canvas, onBack } =
     options;
 
+  type TriggerFilter = 'all' | 'auto' | 'manual' | 'lock' | 'hold';
+
   const toolUi = createToolScreen({ toolUsesRemote });
   const toolInputButton = toolUi.inputButton;
   const toolInputStatus = toolUi.inputStatus;
   const toolModeSelect = toolUi.modeSelect;
+  const toolTriggerSelect = toolUi.triggerSelect;
   const toolOutputButton = toolUi.outputButton;
   const toolOutputStatus = toolUi.outputStatus;
   const toolSampleStatus = toolUi.sampleStatus;
@@ -37,8 +43,8 @@ export function createLabelingTool(
   let toolSnapshots: Array<{ name: string; session: SnapshotSession }> = [];
   let toolTotalSamples = 0;
   let toolTotalSamplesAll = 0;
-  let toolSampleOffsets: number[] = [];
   let toolModeFilter = 'all';
+  let toolTriggerFilter: TriggerFilter = 'all';
   let toolActive = false;
   let currentSample: {
     file: { name: string; session: SnapshotSession };
@@ -50,6 +56,32 @@ export function createLabelingTool(
   let selectedLabels: PieceKind[] = [];
   let toolBusy = false;
   let labelIndex: Record<string, number> = {};
+  let toolSampleIndex: Array<{
+    file: { name: string; session: SnapshotSession };
+    index: number;
+  }> = [];
+  const triggerLabel = (trigger: TriggerFilter): string => {
+    switch (trigger) {
+      case 'manual':
+        return 'Manual';
+      case 'lock':
+        return 'Lock';
+      case 'hold':
+        return 'Hold';
+      case 'auto':
+        return 'Auto (lock/hold)';
+      default:
+        return 'All Triggers';
+    }
+  };
+
+  const normalizeTrigger = (sample: SnapshotSample): TriggerFilter => {
+    const trigger = sample.trigger;
+    if (trigger === 'manual' || trigger === 'lock' || trigger === 'hold') {
+      return trigger;
+    }
+    return 'auto';
+  };
 
   const updateLabelButtons = () => {
     for (const [piece, btn] of toolPieceButtons) {
@@ -235,14 +267,43 @@ export function createLabelingTool(
     toolModeSelect.disabled = toolSnapshotsAll.length === 0;
   };
 
-  const rebuildToolSampleOffsets = () => {
-    toolSampleOffsets = [];
-    let running = 0;
+  const refreshToolTriggerOptions = () => {
+    toolTriggerSelect.innerHTML = '';
+    const addOption = (value: TriggerFilter, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolTriggerSelect.appendChild(option);
+    };
+
+    addOption('all', 'All Triggers');
+    addOption('auto', 'Auto (lock/hold)');
+    addOption('manual', 'Manual');
+    addOption('lock', 'Lock');
+    addOption('hold', 'Hold');
+    toolTriggerSelect.value = toolTriggerFilter;
+    toolTriggerSelect.disabled =
+      toolSnapshotsAll.length === 0 && !toolUsesRemote;
+  };
+
+  const rebuildToolSampleIndex = () => {
+    toolSampleIndex = [];
     for (const file of toolSnapshots) {
-      toolSampleOffsets.push(running);
-      running += file.session.samples.length;
+      const samples = file.session.samples;
+      for (let i = 0; i < samples.length; i += 1) {
+        const sample = samples[i];
+        const trigger = normalizeTrigger(sample);
+        const matchesTrigger =
+          toolTriggerFilter === 'all'
+            ? true
+            : toolTriggerFilter === 'auto'
+              ? trigger !== 'manual'
+              : trigger === toolTriggerFilter;
+        if (!matchesTrigger) continue;
+        toolSampleIndex.push({ file, index: i });
+      }
     }
-    toolTotalSamples = running;
+    toolTotalSamples = toolSampleIndex.length;
   };
 
   const buildToolApiUrl = (path: string): URL => {
@@ -254,6 +315,9 @@ export function createLabelingTool(
     const url = buildToolApiUrl('/snapshots/random');
     if (toolModeFilter !== 'all') {
       url.searchParams.set('mode', toolModeFilter);
+    }
+    if (toolTriggerFilter !== 'all') {
+      url.searchParams.set('trigger', toolTriggerFilter);
     }
     const res = await fetch(url.toString());
     if (!res.ok) {
@@ -293,11 +357,16 @@ export function createLabelingTool(
     return session;
   };
 
-  const applyToolModeFilter = async () => {
+  const applyToolFilters = async () => {
     if (toolUsesRemote) {
       const filterLabel =
         toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
-      toolInputStatus.textContent = `Source: Online\nFilter: ${filterLabel}`;
+      const triggerText =
+        toolTriggerFilter === 'all'
+          ? 'All Triggers'
+          : triggerLabel(toolTriggerFilter);
+      toolInputStatus.textContent =
+        `Source: Online\n` + `Filter: ${filterLabel} / ${triggerText}`;
       if (!toolActive) return;
       await showNextToolSample();
       return;
@@ -310,13 +379,17 @@ export function createLabelingTool(
         return modeId === toolModeFilter;
       });
     }
-    rebuildToolSampleOffsets();
+    rebuildToolSampleIndex();
     const filterLabel =
       toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
+    const triggerText =
+      toolTriggerFilter === 'all'
+        ? 'All Triggers'
+        : triggerLabel(toolTriggerFilter);
     toolInputStatus.textContent =
       `Source: Local\n` +
       `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
-      `Filter: ${filterLabel} (${toolTotalSamples} samples).`;
+      `Filter: ${filterLabel} / ${triggerText} (${toolTotalSamples} samples).`;
     await showNextToolSample();
   };
 
@@ -363,16 +436,13 @@ export function createLabelingTool(
       return;
     }
     const pick = Math.floor(Math.random() * toolTotalSamples);
-    let fileIndex = toolSampleOffsets.findIndex((offset, idx) => {
-      const nextOffset =
-        idx + 1 < toolSampleOffsets.length
-          ? toolSampleOffsets[idx + 1]
-          : toolTotalSamples;
-      return pick >= offset && pick < nextOffset;
-    });
-    if (fileIndex < 0) fileIndex = toolSnapshots.length - 1;
-    const file = toolSnapshots[fileIndex];
-    const indexInFile = pick - toolSampleOffsets[fileIndex];
+    const target = toolSampleIndex[pick];
+    if (!target) {
+      updateToolSampleStatus('Sample: -');
+      return;
+    }
+    const file = target.file;
+    const indexInFile = target.index;
     const sample = file.session.samples[indexInFile];
     const rawBoard = sample.board;
     const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
@@ -431,7 +501,8 @@ export function createLabelingTool(
         0,
       );
       refreshToolModeOptions();
-      await applyToolModeFilter();
+      refreshToolTriggerOptions();
+      await applyToolFilters();
       updateToolActionStatus(`Loaded ${toolSnapshotsAll.length} files.`);
     } catch {
       toolInputStatus.textContent = 'Folder selection cancelled.';
@@ -440,11 +511,17 @@ export function createLabelingTool(
 
   toolModeSelect.addEventListener('change', async () => {
     toolModeFilter = toolModeSelect.value;
-    await applyToolModeFilter();
+    await applyToolFilters();
+  });
+
+  toolTriggerSelect.addEventListener('change', async () => {
+    toolTriggerFilter = toolTriggerSelect.value as TriggerFilter;
+    await applyToolFilters();
   });
 
   if (toolUsesRemote) {
     refreshToolModeOptions();
+    refreshToolTriggerOptions();
   }
 
   toolOutputButton.addEventListener('click', async () => {
@@ -548,7 +625,8 @@ export function createLabelingTool(
       toolActive = true;
       if (toolUsesRemote) {
         refreshToolModeOptions();
-        await applyToolModeFilter();
+        refreshToolTriggerOptions();
+        await applyToolFilters();
       } else {
         await renderToolSample();
       }

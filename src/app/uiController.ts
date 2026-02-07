@@ -1,6 +1,7 @@
 import { isGeneratorType } from '../core/generators';
 import type { Settings } from '../core/settings';
 import type { SettingsStore } from '../core/settingsStore';
+import type { Board, PieceKind } from '../core/types';
 import type { GameScreen } from '../ui/screens/gameScreen';
 import type { MenuScreen } from '../ui/screens/menuScreen';
 import type { SnapshotService } from './snapshotService';
@@ -33,6 +34,7 @@ type UiControllerOptions = {
   settingsStore: SettingsStore;
   modeController: ModeController;
   useRemoteUpload: boolean;
+  getSnapshotState: () => { board: Board; hold: PieceKind | null };
   onPauseInputChange: (paused: boolean) => void;
   onMenuClick: () => void;
   onStartGame: () => void;
@@ -46,6 +48,7 @@ export function createUiController(options: UiControllerOptions): UiController {
     settingsStore,
     modeController,
     useRemoteUpload,
+    getSnapshotState,
     onPauseInputChange,
     onMenuClick,
     onStartGame,
@@ -93,7 +96,6 @@ export function createUiController(options: UiControllerOptions): UiController {
       game.folderStatus.style.display = 'none';
       game.recordRow.style.display = 'none';
       game.recordStatus.textContent = 'Auto upload enabled.';
-      return;
     }
 
     game.folderButton.addEventListener('click', async () => {
@@ -108,6 +110,12 @@ export function createUiController(options: UiControllerOptions): UiController {
     });
     game.discardButton.addEventListener('click', () => {
       snapshotService?.discard();
+    });
+
+    game.manualButton.addEventListener('click', () => {
+      if (!snapshotService) return;
+      const { board, hold } = getSnapshotState();
+      snapshotService.handleManual(board, hold);
     });
   };
 

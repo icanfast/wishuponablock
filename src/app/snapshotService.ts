@@ -3,11 +3,13 @@ import {
   SnapshotRecorder,
   downloadSnapshotSession,
   saveSnapshotSessionToDirectory,
+  type SnapshotTrigger,
   type SnapshotModeInfo,
   type SnapshotSession,
 } from '../core/snapshotRecorder';
 import type { UploadClient } from '../core/uploadClient';
 import type { Board, PieceKind } from '../core/types';
+import type { IdentityService } from './identityService';
 
 export type SnapshotUiState = {
   folderStatus: string;
@@ -24,6 +26,7 @@ type SnapshotServiceOptions = {
   cols: number;
   uploadClient: UploadClient;
   useRemoteUpload: boolean;
+  identityService: IdentityService;
   onStateChange?: (state: SnapshotUiState) => void;
 };
 
@@ -39,6 +42,7 @@ export type SnapshotService = {
   discard: () => void;
   handleLock: (board: Board, hold: PieceKind | null) => void;
   handleHold: (board: Board, hold: PieceKind | null) => void;
+  handleManual: (board: Board, hold: PieceKind | null) => void;
   dispose: () => void;
 };
 
@@ -52,20 +56,55 @@ const getDirectoryPicker = () =>
 export function createSnapshotService(
   options: SnapshotServiceOptions,
 ): SnapshotService {
-  const { settingsStore, rows, cols, uploadClient, useRemoteUpload } = options;
+  const {
+    settingsStore,
+    rows,
+    cols,
+    uploadClient,
+    useRemoteUpload,
+    identityService,
+  } = options;
   const recorder = new SnapshotRecorder();
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
   let folderStatus = 'No folder selected.';
   let currentComment = '';
   let currentMode: SnapshotModeInfo = { id: 'default', options: {} };
   let lastSnapshotKey: string | null = null;
+  let recordStatusOverride: { message: string; timeoutId: number } | null =
+    null;
 
   const notify = () => {
     options.onStateChange?.(getState());
   };
 
+  const applyIdentityMeta = () => {
+    const meta = recorder.sessionMeta;
+    if (!meta) return;
+    meta.device_id = identityService.getDeviceId();
+    const userId = identityService.getUserId();
+    if (userId) {
+      meta.user_id = userId;
+    } else {
+      delete meta.user_id;
+    }
+  };
+
   const setFolderStatus = (text: string) => {
     folderStatus = text;
+    notify();
+  };
+
+  const setRecordStatusTransient = (message: string, durationMs = 2000) => {
+    if (recordStatusOverride) {
+      window.clearTimeout(recordStatusOverride.timeoutId);
+    }
+    recordStatusOverride = {
+      message,
+      timeoutId: window.setTimeout(() => {
+        recordStatusOverride = null;
+        notify();
+      }, durationMs),
+    };
     notify();
   };
 
@@ -80,7 +119,9 @@ export function createSnapshotService(
       folderStatus,
       recordButtonLabel,
       discardVisible: isRecording,
-      recordStatus: isRecording ? `Samples: ${recorder.sampleCount}` : 'Idle',
+      recordStatus:
+        recordStatusOverride?.message ??
+        (isRecording ? `Samples: ${recorder.sampleCount}` : 'Idle'),
       isRecording,
       sampleCount: recorder.sampleCount,
     };
@@ -164,6 +205,7 @@ export function createSnapshotService(
       currentComment,
       currentMode,
     );
+    applyIdentityMeta();
     notify();
   };
 
@@ -197,17 +239,28 @@ export function createSnapshotService(
   const enqueueSnapshotSample = (
     board: Board,
     hold: PieceKind | null,
-    reason: string,
+    reason: SnapshotTrigger,
   ) => {
-    if (!recorder.isRecording) return;
+    if (!recorder.isRecording) {
+      if (reason === 'manual') {
+        console.warn('[Snapshot] Manual capture ignored (not recording).');
+      }
+      return;
+    }
     const key = buildSnapshotKey(board, hold);
-    if (key === lastSnapshotKey) {
+    if (reason !== 'manual' && key === lastSnapshotKey) {
       console.warn(`[Snapshot] Skipping duplicate (${reason}).`);
       return;
     }
     lastSnapshotKey = key;
-    const sample = recorder.record(board, hold, { store: !useRemoteUpload });
+    const sample = recorder.record(board, hold, {
+      store: !useRemoteUpload,
+      trigger: reason,
+    });
     notify();
+    if (reason === 'manual' && !useRemoteUpload) {
+      setRecordStatusTransient('Board saved manually.');
+    }
     if (!sample || !useRemoteUpload) return;
     const session = recorder.sessionMeta;
     if (!session) return;
@@ -237,6 +290,15 @@ export function createSnapshotService(
   };
 
   window.addEventListener('beforeunload', beforeUnload);
+  uploadClient.setOnSnapshotUploaded((record) => {
+    const meta = record.meta as { trigger?: string } | undefined;
+    if (meta?.trigger === 'manual') {
+      setRecordStatusTransient('Board saved manually.');
+    }
+  });
+  const unsubscribeIdentity = identityService.subscribe(() => {
+    applyIdentityMeta();
+  });
 
   notify();
 
@@ -259,8 +321,11 @@ export function createSnapshotService(
     discard,
     handleLock: (board, hold) => enqueueSnapshotSample(board, hold, 'lock'),
     handleHold: (board, hold) => enqueueSnapshotSample(board, hold, 'hold'),
+    handleManual: (board, hold) => enqueueSnapshotSample(board, hold, 'manual'),
     dispose: () => {
       window.removeEventListener('beforeunload', beforeUnload);
+      uploadClient.setOnSnapshotUploaded(null);
+      unsubscribeIdentity();
     },
   };
 }

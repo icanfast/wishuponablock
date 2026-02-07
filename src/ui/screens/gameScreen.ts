@@ -32,6 +32,7 @@ export type GameScreen = {
   recordButton: HTMLButtonElement;
   discardButton: HTMLButtonElement;
   recordStatus: HTMLDivElement;
+  manualButton: HTMLButtonElement;
   menuButton: HTMLButtonElement;
 };
 
@@ -281,6 +282,22 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
   });
   settingsPanel.appendChild(recordStatus);
 
+  const manualButton = document.createElement('button');
+  manualButton.textContent = 'Capture Now';
+  Object.assign(manualButton.style, {
+    marginTop: '6px',
+    width: '100%',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+    pointerEvents: 'auto',
+  });
+  settingsPanel.appendChild(manualButton);
+
   const menuButton = makeOverlayButton('MENU');
   Object.assign(menuButton.style, {
     position: 'absolute',
@@ -304,6 +321,7 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
     recordButton,
     discardButton,
     recordStatus,
+    manualButton,
     menuButton,
   };
 }

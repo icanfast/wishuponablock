@@ -31,6 +31,8 @@ export class UploadClient {
   private mode: UploadMode;
   private baseUrl: string;
   private flushing = false;
+  private onSnapshotUploaded: ((record: SnapshotUploadRecord) => void) | null =
+    null;
 
   constructor(options: UploadClientOptions) {
     this.mode = options.mode;
@@ -39,6 +41,12 @@ export class UploadClient {
 
   get isRemote(): boolean {
     return this.mode !== 'local';
+  }
+
+  setOnSnapshotUploaded(
+    listener: ((record: SnapshotUploadRecord) => void) | null,
+  ): void {
+    this.onSnapshotUploaded = listener;
   }
 
   async enqueueSnapshot(record: SnapshotUploadRecord): Promise<void> {
@@ -99,6 +107,9 @@ export class UploadClient {
     console.info(
       `[Upload] OK ${url} (${res.status}) in ${elapsed.toFixed(1)}ms`,
     );
+    if (item.type === 'snapshot' && this.onSnapshotUploaded) {
+      this.onSnapshotUploaded(item.payload as SnapshotUploadRecord);
+    }
   }
 }
 

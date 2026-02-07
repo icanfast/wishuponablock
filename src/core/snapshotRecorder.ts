@@ -8,6 +8,8 @@ export interface SnapshotSessionMeta {
   protocolVersion: number;
   rows: number;
   cols: number;
+  device_id?: string;
+  user_id?: string;
   pieceOrder?: readonly string[];
   settings: Pick<Settings, 'game' | 'generator'>;
   mode?: SnapshotModeInfo;
@@ -19,6 +21,7 @@ export interface SnapshotSample {
   timeMs: number;
   board: number[][];
   hold?: number;
+  trigger?: SnapshotTrigger;
 }
 
 export interface SnapshotSession {
@@ -30,6 +33,8 @@ export interface SnapshotModeInfo {
   id: string;
   options?: Record<string, unknown>;
 }
+
+export type SnapshotTrigger = 'lock' | 'hold' | 'manual';
 
 const PIECE_TO_INDEX = new Map(PIECES.map((k, i) => [k, i + 1]));
 
@@ -106,7 +111,7 @@ export class SnapshotRecorder {
   record(
     board: Board,
     hold: PieceKind | null,
-    options: { store?: boolean } = {},
+    options: { store?: boolean; trigger?: SnapshotTrigger } = {},
   ): SnapshotSample | null {
     if (!this.active) return null;
     const timeMs = performance.now() - this.startedAtMs;
@@ -115,6 +120,7 @@ export class SnapshotRecorder {
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
       hold: encodePiece(hold),
+      ...(options.trigger ? { trigger: options.trigger } : {}),
     };
     this.nextIndex += 1;
     if (options.store ?? true) {

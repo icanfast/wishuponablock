@@ -134,15 +134,30 @@ export default {
           return jsonResponse({ error: 'Method not allowed.' }, 405);
         }
         const mode = url.searchParams.get('mode') ?? 'all';
+        const trigger = url.searchParams.get('trigger') ?? 'all';
         let sql = 'SELECT id, created_at, meta, board FROM snapshots';
         const params: unknown[] = [];
+        const clauses: string[] = [];
         if (mode !== 'all') {
           if (mode === 'unknown') {
-            sql += " WHERE json_extract(meta, '$.session.mode.id') IS NULL";
+            clauses.push("json_extract(meta, '$.session.mode.id') IS NULL");
           } else {
-            sql += " WHERE json_extract(meta, '$.session.mode.id') = ?";
+            clauses.push("json_extract(meta, '$.session.mode.id') = ?");
             params.push(mode);
           }
+        }
+        if (trigger !== 'all') {
+          if (trigger === 'auto') {
+            clauses.push(
+              "(json_extract(meta, '$.trigger') IS NULL OR json_extract(meta, '$.trigger') IN ('lock','hold'))",
+            );
+          } else {
+            clauses.push("json_extract(meta, '$.trigger') = ?");
+            params.push(trigger);
+          }
+        }
+        if (clauses.length > 0) {
+          sql += ` WHERE ${clauses.join(' AND ')}`;
         }
         sql += ' ORDER BY RANDOM() LIMIT 1';
         const result = await env.DB.prepare(sql)

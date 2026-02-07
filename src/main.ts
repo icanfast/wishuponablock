@@ -13,6 +13,7 @@ import { createGameRuntime, type GameRuntime } from './app/runtime';
 import { createUploadService } from './app/uploadService';
 import { createModeController } from './app/modeController';
 import { createInputService } from './app/inputService';
+import { createIdentityService } from './app/identityService';
 import { createSoundService } from './app/soundService';
 import { createSessionController } from './app/sessionController';
 import { createScreenManager } from './app/screenManager';
@@ -190,6 +191,7 @@ async function boot() {
   };
 
   const inputService = createInputService({ settings });
+  const identityService = createIdentityService();
   const inputSource = inputService.getInputSource();
 
   const soundService = createSoundService({ settings });
@@ -276,6 +278,10 @@ async function boot() {
     settingsStore,
     modeController,
     useRemoteUpload,
+    getSnapshotState: () => {
+      const game = session.getGame();
+      return { board: game.state.board, hold: game.state.hold };
+    },
     onPauseInputChange: (paused) => runtime?.setPausedByInput(paused),
     onMenuClick: () => setScreen('menu'),
     onStartGame: () => setScreen('game'),
@@ -294,6 +300,7 @@ async function boot() {
     cols: COLS,
     uploadClient,
     useRemoteUpload,
+    identityService,
     onStateChange: uiController.syncSnapshotUi,
   });
   snapshotService.setModeInfo({
@@ -374,6 +381,16 @@ async function boot() {
   };
 
   void screenManager.setActive('menu');
+
+  const identityConsole = window as Window & {
+    wubSetUserId?: (value: string | null) => void;
+    wubSetSuperuser?: () => void;
+    wubClearUserId?: () => void;
+  };
+  identityConsole.wubSetUserId = (value) => identityService.setUserId(value);
+  identityConsole.wubSetSuperuser = () =>
+    identityService.setUserId('superuser');
+  identityConsole.wubClearUserId = () => identityService.setUserId(null);
 }
 
 boot().catch((e) => console.error(e));

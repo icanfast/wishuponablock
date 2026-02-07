@@ -22,6 +22,7 @@ export type ToolScreen = {
   inputButton: HTMLButtonElement;
   inputStatus: HTMLDivElement;
   modeSelect: HTMLSelectElement;
+  triggerSelect: HTMLSelectElement;
   outputButton: HTMLButtonElement;
   outputStatus: HTMLDivElement;
   sampleStatus: HTMLDivElement;
@@ -152,7 +153,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   toolPanel.appendChild(toolInputStatus);
 
   const toolModeLabel = document.createElement('div');
-  toolModeLabel.textContent = 'Mode Filter';
+  toolModeLabel.textContent = 'Game Mode';
   Object.assign(toolModeLabel.style, {
     marginTop: '10px',
     fontSize: '12px',
@@ -172,6 +173,28 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     fontSize: '12px',
   });
   toolPanel.appendChild(toolModeSelect);
+
+  const toolTriggerLabel = document.createElement('div');
+  toolTriggerLabel.textContent = 'Capture Trigger';
+  Object.assign(toolTriggerLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolTriggerLabel);
+
+  const toolTriggerSelect = document.createElement('select');
+  Object.assign(toolTriggerSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolTriggerSelect);
 
   const toolOutputButton = document.createElement('button');
   toolOutputButton.textContent = 'Select Output Folder';
@@ -349,6 +372,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     inputButton: toolInputButton,
     inputStatus: toolInputStatus,
     modeSelect: toolModeSelect,
+    triggerSelect: toolTriggerSelect,
     outputButton: toolOutputButton,
     outputStatus: toolOutputStatus,
     sampleStatus: toolSampleStatus,
