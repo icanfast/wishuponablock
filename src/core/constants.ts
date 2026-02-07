@@ -84,7 +84,8 @@ export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 
 export const GAME_PROTOCOL_VERSION = 2;
 
-export const ML_MODEL_URL = '/models/model_v1.json';
+const BASE_URL = import.meta.env.BASE_URL ?? '/';
+export const ML_MODEL_URL = `${BASE_URL}models/model_v1.json`;
 
 export const SPAWN_X = 3;
 export const SPAWN_Y = -1;

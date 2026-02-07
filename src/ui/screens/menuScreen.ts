@@ -1029,7 +1029,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
   });
 
   const githubIcon = document.createElement('img');
-  githubIcon.src = '/assets/GitHub_Invertocat_White_Clearspace.svg';
+  githubIcon.src = `${import.meta.env.BASE_URL}assets/GitHub_Invertocat_White_Clearspace.svg`;
   githubIcon.alt = 'GitHub';
   Object.assign(githubIcon.style, {
     width: '36px',

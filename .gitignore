@@ -15,6 +15,7 @@ dist-ssr
 *.local
 codebase.md
 ublock_problem.txt
+google7f51bc0b98e22a0e.html
 
 # ML artifacts
 tools/ml/.venv/
