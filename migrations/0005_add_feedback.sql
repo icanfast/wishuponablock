@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  feedback TEXT NOT NULL,
+  contact TEXT
+);

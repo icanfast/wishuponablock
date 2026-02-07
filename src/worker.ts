@@ -86,6 +86,40 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
   return okResponse();
 };
 
+const handleFeedback = async (
+  env: Env,
+  payload: unknown,
+): Promise<Response> => {
+  if (!payload || typeof payload !== 'object') {
+    return jsonResponse({ error: 'Invalid payload.' }, 400);
+  }
+  const record = payload as {
+    createdAt?: string;
+    feedback?: string;
+    contact?: string | null;
+  };
+
+  const feedback =
+    typeof record.feedback === 'string' ? record.feedback.trim() : '';
+  if (!feedback) {
+    return jsonResponse({ error: 'Missing feedback.' }, 400);
+  }
+  const contact =
+    typeof record.contact === 'string' ? record.contact.trim() : '';
+  const createdAt =
+    typeof record.createdAt === 'string'
+      ? record.createdAt
+      : new Date().toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO feedback (created_at, feedback, contact) VALUES (?, ?, ?)`,
+  )
+    .bind(createdAt, feedback, contact || null)
+    .run();
+
+  return okResponse();
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -146,6 +180,14 @@ export default {
       }
       const payload = await request.json().catch(() => null);
       return handleLabels(env, payload);
+    }
+
+    if (url.pathname.startsWith('/api/feedback')) {
+      if (request.method !== 'POST') {
+        return jsonResponse({ error: 'Method not allowed.' }, 405);
+      }
+      const payload = await request.json().catch(() => null);
+      return handleFeedback(env, payload);
     }
 
     return env.ASSETS.fetch(request);

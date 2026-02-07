@@ -776,12 +776,13 @@ async function boot() {
   });
 
   const updateVolumeLabel = (value: number) => {
-    volumeValue.textContent = `${Math.round(value * 100)}%`;
+    volumeValue.textContent = String(Math.round(value * 100));
   };
   updateVolumeLabel(settings.audio.masterVolume);
 
   volumeSlider.addEventListener('input', () => {
     const value = Math.max(0, Math.min(1, Number(volumeSlider.value) / 100));
+    updateVolumeLabel(value);
     settingsStore.apply({ audio: { masterVolume: value } });
   });
 
@@ -1828,6 +1829,7 @@ async function boot() {
   const cheesePanel = makeMenuPanel();
   const charcuteriePanel = makeMenuPanel();
   const toolsPanel = makeMenuPanel();
+  const feedbackPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
   Object.assign(playPanel.style, {
@@ -1855,6 +1857,12 @@ async function boot() {
   Object.assign(toolsPanel.style, {
     minHeight: '240px',
     display: 'none',
+  });
+  Object.assign(feedbackPanel.style, {
+    minHeight: '260px',
+    width: '320px',
+    display: 'none',
+    textAlign: 'left',
   });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
@@ -2505,6 +2513,82 @@ async function boot() {
   toolsPanel.appendChild(wishButton);
   toolsPanel.appendChild(toolsBackButton);
 
+  const feedbackTitle = document.createElement('div');
+  feedbackTitle.textContent = 'FEEDBACK';
+  Object.assign(feedbackTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '6px',
+  });
+
+  const feedbackBody = document.createElement('textarea');
+  feedbackBody.placeholder = 'Your feedback and suggestions...';
+  Object.assign(feedbackBody.style, {
+    width: '100%',
+    minHeight: '120px',
+    resize: 'vertical',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+  });
+
+  const feedbackContact = document.createElement('input');
+  feedbackContact.type = 'text';
+  feedbackContact.placeholder = 'Your contact (optional)';
+  Object.assign(feedbackContact.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+  });
+
+  const feedbackButtons = document.createElement('div');
+  Object.assign(feedbackButtons.style, {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: '8px',
+    marginTop: '8px',
+  });
+
+  const feedbackBackButton = makeMenuButton('BACK');
+  const feedbackSendButton = makeMenuButton('SEND');
+  Object.assign(feedbackBackButton.style, {
+    flex: '1',
+  });
+  Object.assign(feedbackSendButton.style, {
+    flex: '1',
+  });
+
+  const updateFeedbackSendState = () => {
+    const canSend = feedbackBody.value.trim().length > 0;
+    feedbackSendButton.disabled = !canSend;
+    feedbackSendButton.style.opacity = canSend ? '1' : '0.55';
+    feedbackSendButton.style.cursor = canSend ? 'pointer' : 'default';
+  };
+  updateFeedbackSendState();
+
+  feedbackBody.addEventListener('input', () => {
+    updateFeedbackSendState();
+  });
+
+  feedbackButtons.appendChild(feedbackBackButton);
+  feedbackButtons.appendChild(feedbackSendButton);
+
+  feedbackPanel.appendChild(feedbackTitle);
+  feedbackPanel.appendChild(feedbackBody);
+  feedbackPanel.appendChild(feedbackContact);
+  feedbackPanel.appendChild(feedbackButtons);
+
   menuLayer.appendChild(menuMainWrapper);
   playMenuRow.appendChild(playPanel);
   if (SHOW_DEV_TOOLS) {
@@ -2516,6 +2600,7 @@ async function boot() {
   menuLayer.appendChild(cheesePanel);
   menuLayer.appendChild(charcuteriePanel);
   menuLayer.appendChild(toolsPanel);
+  menuLayer.appendChild(feedbackPanel);
   uiLayer.appendChild(menuLayer);
   uiLayer.appendChild(charcuterieSpinner);
 
@@ -2529,6 +2614,19 @@ async function boot() {
     justifyContent: 'center',
     pointerEvents: 'auto',
   });
+
+  const feedbackMenuButton = makeMenuButton('LEAVE FEEDBACK');
+  Object.assign(feedbackMenuButton.style, {
+    position: 'absolute',
+    left: '50%',
+    bottom: `${OUTER_MARGIN + 54}px`,
+    transform: 'translateX(-50%)',
+    width: '200px',
+    borderColor: '#bda56a',
+    boxShadow: '0 0 0 1px rgba(189, 165, 106, 0.3)',
+    pointerEvents: 'auto',
+  });
+  uiLayer.appendChild(feedbackMenuButton);
 
   const githubLink = document.createElement('a');
   githubLink.href = 'https://github.com/icanfast/wishuponablock';
@@ -2619,7 +2717,8 @@ async function boot() {
       | 'about'
       | 'cheese'
       | 'charcuterie'
-      | 'tools',
+      | 'tools'
+      | 'feedback',
   ) => {
     menuMainWrapper.style.display = panel === 'main' ? 'flex' : 'none';
     playMenuRow.style.display = panel === 'play' ? 'flex' : 'none';
@@ -2628,6 +2727,8 @@ async function boot() {
     cheesePanel.style.display = panel === 'cheese' ? 'flex' : 'none';
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
+    feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
+    feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
   };
 
   updatePaused = () => {
@@ -2675,6 +2776,9 @@ async function boot() {
     holdLabel.style.display = inGame || inTool ? 'block' : 'none';
     toolLayer.style.display = inTool ? 'block' : 'none';
     footer.style.display = inMenu ? 'flex' : 'none';
+    if (!inMenu) {
+      feedbackMenuButton.style.display = 'none';
+    }
     pausedByMenu = !inGame;
     updatePaused();
     if (inGame) {
@@ -2715,6 +2819,7 @@ async function boot() {
   });
   toolsButton.addEventListener('click', () => showMenuPanel('tools'));
   aboutButton.addEventListener('click', () => showMenuPanel('about'));
+  feedbackMenuButton.addEventListener('click', () => showMenuPanel('feedback'));
 
   const startCheese = (lines: number) => {
     selectedMode = getMode('cheese');
@@ -2769,6 +2874,42 @@ async function boot() {
 
   wishButton.addEventListener('click', () => setScreen('tool'));
   toolsBackButton.addEventListener('click', () => showMenuPanel('main'));
+  feedbackBackButton.addEventListener('click', () => showMenuPanel('main'));
+  feedbackSendButton.addEventListener('click', async () => {
+    const feedback = feedbackBody.value.trim();
+    if (!feedback) {
+      updateFeedbackSendState();
+      return;
+    }
+    if (!useRemoteUpload) {
+      console.warn('[Feedback] Remote upload disabled.');
+      return;
+    }
+    feedbackSendButton.disabled = true;
+    feedbackSendButton.textContent = 'SENDING...';
+    try {
+      const res = await fetch(`${uploadBaseUrl}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          createdAt: new Date().toISOString(),
+          feedback,
+          contact: feedbackContact.value.trim() || null,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Feedback failed (${res.status})`);
+      }
+      feedbackBody.value = '';
+      feedbackContact.value = '';
+      updateFeedbackSendState();
+    } catch (err) {
+      console.warn('[Feedback] Upload failed.', err);
+      updateFeedbackSendState();
+    } finally {
+      feedbackSendButton.textContent = 'SEND';
+    }
+  });
 
   const menuButton = makeMenuButton('MENU');
   Object.assign(menuButton.style, {
