@@ -1,0 +1,556 @@
+import { getMode } from '../../core/modes';
+import type { SnapshotSession } from '../../core/snapshotRecorder';
+import type { UploadClient } from '../../core/uploadClient';
+import { PIECES, type Board, type PieceKind } from '../../core/types';
+import { createToolScreen } from '../screens/toolScreen';
+import type { ToolController } from './toolHost';
+import type { ToolCanvas } from './toolCanvas';
+
+type LabelingToolOptions = {
+  toolUsesRemote: boolean;
+  uploadClient: UploadClient;
+  uploadBaseUrl: string;
+  canvas: ToolCanvas;
+  onBack: () => void;
+};
+
+export function createLabelingTool(
+  options: LabelingToolOptions,
+): ToolController {
+  const { toolUsesRemote, uploadClient, uploadBaseUrl, canvas, onBack } =
+    options;
+
+  const toolUi = createToolScreen({ toolUsesRemote });
+  const toolInputButton = toolUi.inputButton;
+  const toolInputStatus = toolUi.inputStatus;
+  const toolModeSelect = toolUi.modeSelect;
+  const toolOutputButton = toolUi.outputButton;
+  const toolOutputStatus = toolUi.outputStatus;
+  const toolSampleStatus = toolUi.sampleStatus;
+  const toolActionStatus = toolUi.actionStatus;
+  const toolBackButton = toolUi.backButton;
+  const toolNextButton = toolUi.nextButton;
+  const toolPieceButtons = toolUi.pieceButtons;
+
+  let toolOutputDirHandle: FileSystemDirectoryHandle | null = null;
+  let toolSnapshotsAll: Array<{ name: string; session: SnapshotSession }> = [];
+  let toolSnapshots: Array<{ name: string; session: SnapshotSession }> = [];
+  let toolTotalSamples = 0;
+  let toolTotalSamplesAll = 0;
+  let toolSampleOffsets: number[] = [];
+  let toolModeFilter = 'all';
+  let toolActive = false;
+  let currentSample: {
+    file: { name: string; session: SnapshotSession };
+    index: number;
+    board: Board;
+    raw: number[][];
+    hold: PieceKind | null;
+  } | null = null;
+  let selectedLabels: PieceKind[] = [];
+  let toolBusy = false;
+  let labelIndex: Record<string, number> = {};
+
+  const updateLabelButtons = () => {
+    for (const [piece, btn] of toolPieceButtons) {
+      const selected = selectedLabels.includes(piece);
+      btn.style.borderColor = selected ? '#ffffff' : '#1f2a37';
+      btn.style.boxShadow = selected
+        ? '0 0 0 1px rgba(255,255,255,0.5)'
+        : 'none';
+    }
+  };
+
+  const clearLabelSelection = () => {
+    selectedLabels = [];
+    updateLabelButtons();
+  };
+
+  for (const [piece, btn] of toolPieceButtons) {
+    btn.addEventListener('click', () => {
+      const idx = selectedLabels.indexOf(piece);
+      if (idx >= 0) {
+        selectedLabels.splice(idx, 1);
+      } else {
+        selectedLabels.push(piece);
+      }
+      updateLabelButtons();
+    });
+  }
+
+  const decodeBoard = (raw: number[][], order?: readonly string[]): Board => {
+    const resolvedOrder = order ?? PIECES;
+    return raw.map((row) =>
+      row.map((value) => {
+        if (value <= 0) return null;
+        const piece = resolvedOrder[value - 1] ?? PIECES[value - 1];
+        return piece as PieceKind;
+      }),
+    );
+  };
+
+  const decodeHold = (
+    hold: number | undefined,
+    order?: readonly string[],
+  ): PieceKind | null => {
+    if (!hold || hold <= 0) return null;
+    const resolvedOrder = order ?? PIECES;
+    const piece = resolvedOrder[hold - 1] ?? PIECES[hold - 1];
+    return (piece as PieceKind) ?? null;
+  };
+
+  const encodeBoardString = (raw: number[][]): string =>
+    raw.map((row) => row.join('')).join('/');
+
+  const requestDirectoryAccess = async (
+    handle: FileSystemDirectoryHandle,
+    mode: 'read' | 'readwrite',
+  ): Promise<boolean> => {
+    let permission: PermissionState = 'granted';
+    if (handle.queryPermission) {
+      permission = await handle.queryPermission({ mode });
+    }
+    if (permission !== 'granted' && handle.requestPermission) {
+      permission = await handle.requestPermission({ mode });
+    }
+    return permission === 'granted';
+  };
+
+  const writeFileInDir = async (
+    dir: FileSystemDirectoryHandle,
+    name: string,
+    contents: string,
+  ): Promise<void> => {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(contents);
+    await writable.close();
+  };
+
+  const appendJsonl = async (
+    dir: FileSystemDirectoryHandle,
+    name: string,
+    line: string,
+  ): Promise<void> => {
+    const handle = await dir.getFileHandle(name, { create: true });
+    const file = await handle.getFile();
+    const existing = await file.text();
+    const prefix = existing && !existing.endsWith('\n') ? '\n' : '';
+    const next = `${existing}${prefix}${line}\n`;
+    await writeFileInDir(dir, name, next);
+  };
+
+  const loadLabelIndex = async (): Promise<void> => {
+    if (toolUsesRemote) {
+      labelIndex = {};
+      return;
+    }
+    if (!toolOutputDirHandle) return;
+    try {
+      const handle = await toolOutputDirHandle.getFileHandle(
+        'labeling_index.json',
+        { create: true },
+      );
+      const file = await handle.getFile();
+      const text = await file.text();
+      labelIndex = text ? (JSON.parse(text) as Record<string, number>) : {};
+    } catch {
+      labelIndex = {};
+    }
+  };
+
+  const saveLabelIndex = async (): Promise<void> => {
+    if (toolUsesRemote) return;
+    if (!toolOutputDirHandle) return;
+    await writeFileInDir(
+      toolOutputDirHandle,
+      'labeling_index.json',
+      JSON.stringify(labelIndex),
+    );
+  };
+
+  const updateToolSampleStatus = (text: string) => {
+    toolSampleStatus.textContent = text;
+  };
+
+  const updateToolActionStatus = (text: string) => {
+    toolActionStatus.textContent = text;
+  };
+
+  const getModeLabel = (id: string): string => {
+    if (id === 'unknown') return 'Unknown';
+    if (id === 'default' || id === 'cheese' || id === 'charcuterie') {
+      return getMode(id).label.toUpperCase();
+    }
+    return id.toUpperCase();
+  };
+
+  const refreshToolModeOptions = () => {
+    toolModeSelect.innerHTML = '';
+    const addOption = (value: string, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolModeSelect.appendChild(option);
+    };
+
+    addOption('all', 'All Modes');
+    if (toolUsesRemote) {
+      const knownModes = ['default', 'cheese', 'charcuterie'];
+      for (const modeId of knownModes) {
+        addOption(modeId, getModeLabel(modeId));
+      }
+      addOption('unknown', 'Unknown');
+      toolModeSelect.value = toolModeFilter;
+      toolModeSelect.disabled = false;
+      return;
+    }
+    const counts = new Map<string, number>();
+    for (const file of toolSnapshotsAll) {
+      const modeId = file.session.meta.mode?.id ?? 'unknown';
+      counts.set(
+        modeId,
+        (counts.get(modeId) ?? 0) + file.session.samples.length,
+      );
+    }
+
+    const modeIds = Array.from(counts.keys()).sort((a, b) => {
+      if (a === 'unknown') return 1;
+      if (b === 'unknown') return -1;
+      return a.localeCompare(b);
+    });
+    for (const modeId of modeIds) {
+      const label = `${getModeLabel(modeId)} (${counts.get(modeId) ?? 0})`;
+      addOption(modeId, label);
+    }
+
+    if (toolModeFilter !== 'all' && !counts.has(toolModeFilter)) {
+      toolModeFilter = 'all';
+    }
+    toolModeSelect.value = toolModeFilter;
+    toolModeSelect.disabled = toolSnapshotsAll.length === 0;
+  };
+
+  const rebuildToolSampleOffsets = () => {
+    toolSampleOffsets = [];
+    let running = 0;
+    for (const file of toolSnapshots) {
+      toolSampleOffsets.push(running);
+      running += file.session.samples.length;
+    }
+    toolTotalSamples = running;
+  };
+
+  const buildToolApiUrl = (path: string): URL => {
+    const base = uploadBaseUrl.replace(/\/+$/, '');
+    return new URL(`${base}${path}`, window.location.origin);
+  };
+
+  const fetchRemoteSample = async (): Promise<SnapshotSession | null> => {
+    const url = buildToolApiUrl('/snapshots/random');
+    if (toolModeFilter !== 'all') {
+      url.searchParams.set('mode', toolModeFilter);
+    }
+    const res = await fetch(url.toString());
+    if (!res.ok) {
+      return null;
+    }
+    const payload = (await res.json()) as {
+      id?: number | string;
+      createdAt?: string;
+      meta?: {
+        session?: SnapshotSession['meta'];
+        sample?: Record<string, unknown>;
+      };
+      board?: number[][];
+    };
+    const sessionMeta = payload.meta?.session;
+    if (!sessionMeta || !payload.board) return null;
+    const sampleMeta = payload.meta?.sample ?? {};
+    const readNumber = (value: unknown, fallback = 0): number => {
+      return typeof value === 'number' && Number.isFinite(value)
+        ? value
+        : fallback;
+    };
+    const holdValue =
+      typeof sampleMeta.hold === 'number' && Number.isFinite(sampleMeta.hold)
+        ? sampleMeta.hold
+        : undefined;
+    const sample = {
+      index: readNumber(sampleMeta.index),
+      timeMs: readNumber(sampleMeta.timeMs),
+      board: payload.board,
+      hold: holdValue,
+    };
+    const session: SnapshotSession = {
+      meta: sessionMeta,
+      samples: [sample],
+    };
+    return session;
+  };
+
+  const applyToolModeFilter = async () => {
+    if (toolUsesRemote) {
+      const filterLabel =
+        toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
+      toolInputStatus.textContent = `Source: Online\nFilter: ${filterLabel}`;
+      if (!toolActive) return;
+      await showNextToolSample();
+      return;
+    }
+    if (toolModeFilter === 'all') {
+      toolSnapshots = toolSnapshotsAll;
+    } else {
+      toolSnapshots = toolSnapshotsAll.filter((file) => {
+        const modeId = file.session.meta.mode?.id ?? 'unknown';
+        return modeId === toolModeFilter;
+      });
+    }
+    rebuildToolSampleOffsets();
+    const filterLabel =
+      toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
+    toolInputStatus.textContent =
+      `Source: Local\n` +
+      `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
+      `Filter: ${filterLabel} (${toolTotalSamples} samples).`;
+    await showNextToolSample();
+  };
+
+  const showNextToolSample = async (): Promise<void> => {
+    if (toolUsesRemote) {
+      const session = await fetchRemoteSample();
+      if (!session || session.samples.length === 0) {
+        currentSample = null;
+        updateToolSampleStatus('Sample: -');
+        if (toolActive) {
+          canvas.clear();
+        }
+        return;
+      }
+      const sample = session.samples[0];
+      const rawBoard = sample.board;
+      const board = decodeBoard(rawBoard, session.meta.pieceOrder);
+      const hold = decodeHold(sample.hold, session.meta.pieceOrder);
+      const fileName = `remote:${session.meta.id ?? 'unknown'}`;
+      currentSample = {
+        file: { name: fileName, session },
+        index: sample.index,
+        board,
+        raw: rawBoard,
+        hold,
+      };
+      const key = `${fileName}#${sample.index}`;
+      labelIndex[key] = (labelIndex[key] ?? 0) + 1;
+      updateToolSampleStatus(
+        `Source: ${fileName} Sample: ${sample.index} Shown: ${labelIndex[key]}`,
+      );
+      clearLabelSelection();
+      if (toolActive) {
+        canvas.render(board, hold);
+      }
+      return;
+    }
+    if (toolSnapshots.length === 0 || toolTotalSamples === 0) {
+      currentSample = null;
+      updateToolSampleStatus('Sample: -');
+      if (toolActive) {
+        canvas.clear();
+      }
+      return;
+    }
+    const pick = Math.floor(Math.random() * toolTotalSamples);
+    let fileIndex = toolSampleOffsets.findIndex((offset, idx) => {
+      const nextOffset =
+        idx + 1 < toolSampleOffsets.length
+          ? toolSampleOffsets[idx + 1]
+          : toolTotalSamples;
+      return pick >= offset && pick < nextOffset;
+    });
+    if (fileIndex < 0) fileIndex = toolSnapshots.length - 1;
+    const file = toolSnapshots[fileIndex];
+    const indexInFile = pick - toolSampleOffsets[fileIndex];
+    const sample = file.session.samples[indexInFile];
+    const rawBoard = sample.board;
+    const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
+    const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
+    currentSample = {
+      file,
+      index: indexInFile,
+      board,
+      raw: rawBoard,
+      hold,
+    };
+    const key = `${file.name}#${indexInFile}`;
+    labelIndex[key] = (labelIndex[key] ?? 0) + 1;
+    await saveLabelIndex();
+    updateToolSampleStatus(
+      `File: ${file.name} Sample: ${indexInFile} Shown: ${labelIndex[key]}`,
+    );
+    clearLabelSelection();
+    if (toolActive) {
+      canvas.render(board, hold);
+    }
+  };
+
+  toolInputButton.addEventListener('click', async () => {
+    if (toolUsesRemote) return;
+    const picker = (
+      window as Window & {
+        showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+      }
+    ).showDirectoryPicker;
+    if (!picker) {
+      toolInputStatus.textContent = 'Folder access not supported.';
+      return;
+    }
+    try {
+      const root = await picker();
+      const granted = await requestDirectoryAccess(root, 'read');
+      if (!granted) {
+        toolInputStatus.textContent = 'Folder access denied.';
+        return;
+      }
+      const files: Array<{ name: string; session: SnapshotSession }> = [];
+      for await (const entry of root.values()) {
+        if (entry.kind !== 'file') continue;
+        if (!entry.name.endsWith('.json')) continue;
+        const file = await entry.getFile();
+        const text = await file.text();
+        const session = JSON.parse(text) as SnapshotSession;
+        if (!session?.samples?.length) continue;
+        files.push({ name: entry.name, session });
+      }
+      files.sort((a, b) => a.name.localeCompare(b.name));
+      toolSnapshotsAll = files;
+      toolTotalSamplesAll = toolSnapshotsAll.reduce(
+        (sum, file) => sum + file.session.samples.length,
+        0,
+      );
+      refreshToolModeOptions();
+      await applyToolModeFilter();
+      updateToolActionStatus(`Loaded ${toolSnapshotsAll.length} files.`);
+    } catch {
+      toolInputStatus.textContent = 'Folder selection cancelled.';
+    }
+  });
+
+  toolModeSelect.addEventListener('change', async () => {
+    toolModeFilter = toolModeSelect.value;
+    await applyToolModeFilter();
+  });
+
+  if (toolUsesRemote) {
+    refreshToolModeOptions();
+  }
+
+  toolOutputButton.addEventListener('click', async () => {
+    if (toolUsesRemote) return;
+    const picker = (
+      window as Window & {
+        showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+      }
+    ).showDirectoryPicker;
+    if (!picker) {
+      toolOutputStatus.textContent = 'Folder access not supported.';
+      return;
+    }
+    try {
+      toolOutputDirHandle = await picker();
+      const granted = await requestDirectoryAccess(
+        toolOutputDirHandle,
+        'readwrite',
+      );
+      if (!granted) {
+        toolOutputStatus.textContent = 'Folder access denied.';
+        toolOutputDirHandle = null;
+        return;
+      }
+      await loadLabelIndex();
+      toolOutputStatus.textContent = `Output: ${toolOutputDirHandle.name}`;
+      updateToolActionStatus(`Output set: ${toolOutputDirHandle.name}`);
+    } catch {
+      toolOutputStatus.textContent = 'Folder selection cancelled.';
+    }
+  });
+
+  toolNextButton.addEventListener('click', async () => {
+    if (toolBusy) return;
+    if (!currentSample) {
+      updateToolSampleStatus('Sample: -');
+      return;
+    }
+    if (!uploadClient.isRemote && !toolOutputDirHandle) {
+      toolOutputStatus.textContent = 'Select output folder first.';
+      return;
+    }
+    toolBusy = true;
+    try {
+      const key = `${currentSample.file.name}#${currentSample.index}`;
+      const record = {
+        createdAt: new Date().toISOString(),
+        source: {
+          file: currentSample.file.name,
+          sessionId: currentSample.file.session.meta.id,
+          sampleIndex: currentSample.index,
+          shownCount: labelIndex[key] ?? 1,
+        },
+        board: encodeBoardString(currentSample.raw),
+        hold: currentSample.hold,
+        labels: [...selectedLabels],
+      };
+      if (uploadClient.isRemote) {
+        await uploadClient.enqueueLabel({
+          createdAt: record.createdAt,
+          data: record,
+        });
+        updateToolActionStatus(
+          `Uploaded label for ${currentSample.file.name} #${currentSample.index}`,
+        );
+      } else {
+        await appendJsonl(
+          toolOutputDirHandle!,
+          'labels.jsonl',
+          JSON.stringify(record),
+        );
+        updateToolActionStatus(
+          `Saved label for ${currentSample.file.name} #${currentSample.index}`,
+        );
+      }
+      await showNextToolSample();
+    } finally {
+      toolBusy = false;
+    }
+  });
+
+  toolBackButton.addEventListener('click', () => onBack());
+
+  const renderToolSample = async () => {
+    if (!currentSample) {
+      if (toolUsesRemote || toolSnapshots.length > 0) {
+        await showNextToolSample();
+      } else {
+        canvas.clear();
+      }
+      return;
+    }
+    canvas.render(currentSample.board, currentSample.hold);
+  };
+
+  return {
+    id: 'labeling',
+    label: 'Wish Upon a Block',
+    root: toolUi.root,
+    enter: async () => {
+      toolActive = true;
+      if (toolUsesRemote) {
+        refreshToolModeOptions();
+        await applyToolModeFilter();
+      } else {
+        await renderToolSample();
+      }
+    },
+    leave: () => {
+      toolActive = false;
+    },
+  };
+}

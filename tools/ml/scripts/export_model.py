@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+ML_ROOT = Path(__file__).resolve().parents[1]
+
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
     ckpt = torch.load(path, map_location="cpu")
@@ -64,7 +66,7 @@ def main() -> int:
     parser.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint.")
     parser.add_argument(
         "--out",
-        default="ml/exports/model.json",
+        default=str(ML_ROOT / "exports" / "model.json"),
         help="Output path for JSON export.",
     )
     args = parser.parse_args()

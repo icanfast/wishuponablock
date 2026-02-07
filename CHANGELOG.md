@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+- Refactored runtime/UI flow and extracted services to reduce "main.ts" entry complexity.
+- UI polish and UX tweaks across menus, labeling, and feedback flow.
+- Repository cleanup (entry points, worker location, data/tools layout).
+
 ## 0.2.0
 - Added ML generator, training/labeling tooling, and snapshot/label pipelines.
 - Expanded game modes and generators (charcuterie, cheese options, new bags).

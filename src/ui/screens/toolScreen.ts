@@ -1,0 +1,360 @@
+import {
+  BOARD_CELL_PX,
+  BOARD_WIDTH,
+  BOARD_X,
+  BOARD_Y,
+  HOLD_WIDTH,
+  HOLD_X,
+  HOLD_Y,
+  OUTER_MARGIN,
+  PANEL_GAP,
+  PLAY_HEIGHT,
+  ROWS,
+  SETTINGS_PANEL_WIDTH,
+  SETTINGS_X,
+  SETTINGS_Y,
+} from '../../core/constants';
+import { PIECES, type PieceKind } from '../../core/types';
+import { TETROMINOES } from '../../core/tetromino';
+
+export type ToolScreen = {
+  root: HTMLDivElement;
+  inputButton: HTMLButtonElement;
+  inputStatus: HTMLDivElement;
+  modeSelect: HTMLSelectElement;
+  outputButton: HTMLButtonElement;
+  outputStatus: HTMLDivElement;
+  sampleStatus: HTMLDivElement;
+  actionStatus: HTMLDivElement;
+  backButton: HTMLButtonElement;
+  nextButton: HTMLButtonElement;
+  pieceButtons: Map<PieceKind, HTMLButtonElement>;
+};
+
+type ToolScreenOptions = {
+  toolUsesRemote: boolean;
+};
+
+const PIECE_COLORS: Record<PieceKind, string> = {
+  I: '#4dd3ff',
+  O: '#ffd84d',
+  T: '#c77dff',
+  S: '#6eea6e',
+  Z: '#ff6b6b',
+  J: '#4d7cff',
+  L: '#ffa94d',
+};
+
+export function createToolScreen(options: ToolScreenOptions): ToolScreen {
+  const { toolUsesRemote } = options;
+
+  const toolLayer = document.createElement('div');
+  Object.assign(toolLayer.style, {
+    position: 'absolute',
+    inset: '0',
+    pointerEvents: 'none',
+    display: 'block',
+  });
+
+  const toolColumn = document.createElement('div');
+  Object.assign(toolColumn.style, {
+    position: 'absolute',
+    left: `${SETTINGS_X}px`,
+    top: `${SETTINGS_Y}px`,
+    width: `${SETTINGS_PANEL_WIDTH}px`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  toolLayer.appendChild(toolColumn);
+
+  const holdLabel = document.createElement('div');
+  holdLabel.textContent = 'HOLD';
+  Object.assign(holdLabel.style, {
+    position: 'absolute',
+    left: `${HOLD_X}px`,
+    top: `${HOLD_Y + 6}px`,
+    width: `${HOLD_WIDTH}px`,
+    color: '#b6c2d4',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.5px',
+    textAlign: 'center',
+    pointerEvents: 'none',
+  });
+  toolLayer.appendChild(holdLabel);
+
+  const toolPanelMaxHeight = Math.max(
+    0,
+    PLAY_HEIGHT - SETTINGS_Y - OUTER_MARGIN - 48,
+  );
+  const toolPanel = document.createElement('div');
+  Object.assign(toolPanel.style, {
+    width: '100%',
+    maxHeight: `${toolPanelMaxHeight}px`,
+    overflowY: 'auto',
+    padding: '8px',
+    background: '#121a24',
+    color: '#e2e8f0',
+    border: '2px solid #0b0f14',
+    borderRadius: '6px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    pointerEvents: 'auto',
+  });
+  toolColumn.appendChild(toolPanel);
+
+  const toolInfo = document.createElement('div');
+  toolInfo.textContent =
+    "How to use:\nSelect all the pieces you would want to fall in this situation, then click 'Next'\n\n" +
+    'Your answers will be saved and used to train ML piece generator models.';
+  Object.assign(toolInfo.style, {
+    color: '#b6c2d4',
+    fontSize: '13px',
+    lineHeight: '1.4',
+    textAlign: 'center',
+    whiteSpace: 'pre-line',
+    pointerEvents: 'none',
+  });
+  toolColumn.appendChild(toolInfo);
+
+  const toolTitle = document.createElement('div');
+  toolTitle.textContent = 'WISH UPON A BLOCK';
+  Object.assign(toolTitle.style, {
+    marginBottom: '8px',
+    color: '#b6c2d4',
+    letterSpacing: '0.5px',
+  });
+  toolPanel.appendChild(toolTitle);
+
+  const toolInputButton = document.createElement('button');
+  toolInputButton.textContent = 'Select Snapshot Folder';
+  Object.assign(toolInputButton.style, {
+    width: '100%',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolInputButton);
+
+  const toolInputStatus = document.createElement('div');
+  Object.assign(toolInputStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+    whiteSpace: 'pre-line',
+  });
+  toolInputStatus.textContent = 'Source: Local (select folder).';
+  toolPanel.appendChild(toolInputStatus);
+
+  const toolModeLabel = document.createElement('div');
+  toolModeLabel.textContent = 'Mode Filter';
+  Object.assign(toolModeLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolModeLabel);
+
+  const toolModeSelect = document.createElement('select');
+  Object.assign(toolModeSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolModeSelect);
+
+  const toolOutputButton = document.createElement('button');
+  toolOutputButton.textContent = 'Select Output Folder';
+  Object.assign(toolOutputButton.style, {
+    width: '100%',
+    marginTop: '10px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolOutputButton);
+
+  const toolOutputStatus = document.createElement('div');
+  Object.assign(toolOutputStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolOutputStatus.textContent = 'No output folder.';
+  toolPanel.appendChild(toolOutputStatus);
+
+  if (toolUsesRemote) {
+    toolInputButton.style.display = 'none';
+    toolOutputButton.style.display = 'none';
+    toolOutputStatus.style.display = 'none';
+    toolInputStatus.textContent = 'Source: Online';
+  }
+
+  const toolSampleStatus = document.createElement('div');
+  Object.assign(toolSampleStatus.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolSampleStatus.textContent = 'Sample: -';
+  toolPanel.appendChild(toolSampleStatus);
+
+  const toolActionStatus = document.createElement('div');
+  Object.assign(toolActionStatus.style, {
+    marginTop: '6px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+  });
+  toolActionStatus.textContent = '';
+  toolPanel.appendChild(toolActionStatus);
+
+  const toolBackButton = document.createElement('button');
+  toolBackButton.textContent = 'BACK TO MENU';
+  Object.assign(toolBackButton.style, {
+    width: '100%',
+    marginTop: '12px',
+    background: '#0b0f14',
+    color: '#b6c2d4',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+  });
+  toolPanel.appendChild(toolBackButton);
+
+  const toolPieceCellPx = Math.max(10, Math.round(BOARD_CELL_PX / 2));
+  const toolPiecePreviewPx = toolPieceCellPx * 4;
+  const toolPieceButtonHeight = toolPiecePreviewPx + 10;
+  const toolPieceButtonWidth = toolPiecePreviewPx + 8;
+  const toolPieceGap = 6;
+  const toolPieceRowWidth =
+    PIECES.length * toolPieceButtonWidth + (PIECES.length - 1) * toolPieceGap;
+  const toolPieceRowLeft = BOARD_X + (BOARD_WIDTH - toolPieceRowWidth) / 2;
+  const toolPieceRowTop = BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP;
+
+  const toolPieceRow = document.createElement('div');
+  Object.assign(toolPieceRow.style, {
+    position: 'absolute',
+    left: `${toolPieceRowLeft}px`,
+    top: `${toolPieceRowTop}px`,
+    width: `${toolPieceRowWidth}px`,
+    display: 'flex',
+    gap: `${toolPieceGap}px`,
+    alignItems: 'center',
+    pointerEvents: 'auto',
+  });
+  toolLayer.appendChild(toolPieceRow);
+
+  const toolNextButton = document.createElement('button');
+  toolNextButton.textContent = 'NEXT';
+  Object.assign(toolNextButton.style, {
+    position: 'absolute',
+    left: `${BOARD_X}px`,
+    top: `${toolPieceRowTop + toolPieceButtonHeight + 8}px`,
+    width: `${BOARD_WIDTH}px`,
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '10px 12px',
+    fontSize: '13px',
+    cursor: 'pointer',
+    pointerEvents: 'auto',
+  });
+  toolLayer.appendChild(toolNextButton);
+
+  const toolPieceButtons = new Map<PieceKind, HTMLButtonElement>();
+
+  const drawPiecePreview = (
+    canvas: HTMLCanvasElement,
+    piece: PieceKind,
+  ): void => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const color = PIECE_COLORS[piece];
+    const pad = Math.max(1, Math.floor(toolPieceCellPx / 6));
+    const shape = TETROMINOES[piece][0];
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of shape) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    }
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    const dx = (4 - width) / 2 - minX;
+    const dy = (4 - height) / 2 - minY;
+
+    for (const [x, y] of shape) {
+      const px = (x + dx) * toolPieceCellPx;
+      const py = (y + dy) * toolPieceCellPx;
+      ctx.fillStyle = color;
+      ctx.fillRect(
+        px + pad,
+        py + pad,
+        toolPieceCellPx - pad * 2,
+        toolPieceCellPx - pad * 2,
+      );
+    }
+  };
+
+  for (const piece of PIECES) {
+    const btn = document.createElement('button');
+    Object.assign(btn.style, {
+      flex: '1',
+      minWidth: `${toolPieceButtonWidth}px`,
+      height: `${toolPieceButtonHeight}px`,
+      background: '#0b0f14',
+      color: '#0b0f14',
+      border: '2px solid #1f2a37',
+      borderRadius: '6px',
+      padding: '4px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      cursor: 'pointer',
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = toolPiecePreviewPx;
+    canvas.height = toolPiecePreviewPx;
+    canvas.style.display = 'block';
+    drawPiecePreview(canvas, piece);
+    btn.appendChild(canvas);
+    toolPieceRow.appendChild(btn);
+    toolPieceButtons.set(piece, btn);
+  }
+
+  return {
+    root: toolLayer,
+    inputButton: toolInputButton,
+    inputStatus: toolInputStatus,
+    modeSelect: toolModeSelect,
+    outputButton: toolOutputButton,
+    outputStatus: toolOutputStatus,
+    sampleStatus: toolSampleStatus,
+    actionStatus: toolActionStatus,
+    backButton: toolBackButton,
+    nextButton: toolNextButton,
+    pieceButtons: toolPieceButtons,
+  };
+}

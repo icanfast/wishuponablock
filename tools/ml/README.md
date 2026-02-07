@@ -12,26 +12,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Place your labeling output at `ml/data/raw/labels.jsonl` (copy from the tool's output folder).
+2. Place your labeling output at `tools/ml/data/raw/labels.jsonl` (copy from the tool's output folder).
    The converter also accepts a single JSON array file if you export one later.
 
 3. Convert to the intermediate training format:
 
 ```bash
-python ml/scripts/convert_labels.py \
-  --in ml/data/raw/labels.jsonl \
-  --out ml/data/processed/labels_v1.jsonl
+python tools/ml/scripts/convert_labels.py \
+  --in tools/ml/data/raw/labels.jsonl \
+  --out tools/ml/data/processed/labels_v1.jsonl
 ```
 
-The intermediate format is documented in `ml/schema.md`.
+The intermediate format is documented in `tools/ml/schema.md`.
 The converter now includes `session_id`, which is used for session-aware
 train/validation splits.
 
 ## Training (baseline)
 
 ```bash
-python ml/scripts/train.py \
-  --data ml/data/processed/labels_v1.jsonl \
+python tools/ml/scripts/train.py \
+  --data tools/ml/data/processed/labels_v1.jsonl \
   --epochs 10 \
   --batch-size 128
 ```
@@ -41,7 +41,7 @@ Options:
 - `--method multilabel|soft_targets` - training objective (default: multilabel).
 - `--soft-decay 0.7` - decay factor for soft-target weights.
 - `--mirror-prob 0.0` - probability of mirroring a sample (labels remapped).
-- `--checkpoint-dir ml/checkpoints` - where to save checkpoints.
+- `--checkpoint-dir tools/ml/checkpoints` - where to save checkpoints.
 - `--checkpoint-every 10` - save a checkpoint every N epochs (0 disables).
 - `--no-hold` - drop the hold piece feature.
 
@@ -51,9 +51,9 @@ processed file, so keep that field in your converted data.
 ## Export
 
 ```bash
-python ml/scripts/export_model.py \
-  --checkpoint ml/checkpoints/epoch_10.pt \
-  --out ml/exports/model.json
+python tools/ml/scripts/export_model.py \
+  --checkpoint tools/ml/checkpoints/epoch_10.pt \
+  --out tools/ml/exports/model.json
 ```
 
 ## Layout

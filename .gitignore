@@ -8,23 +8,24 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-snapshots/*
-!snapshots/.gitkeep
+data/snapshots/*
+!data/snapshots/.gitkeep
 dist
 dist-ssr
 *.local
 codebase.md
+ublock_problem.txt
 
 # ML artifacts
-ml/.venv/
-ml/__pycache__/
-ml/**/*.pyc
-ml/data/raw/
-ml/data/interim/
-ml/data/processed/
-ml/runs/
-ml/checkpoints/
-ml/exports/
+tools/ml/.venv/
+tools/ml/__pycache__/
+tools/ml/**/*.pyc
+tools/ml/data/raw/
+tools/ml/data/interim/
+tools/ml/data/processed/
+tools/ml/runs/
+tools/ml/checkpoints/
+tools/ml/exports/
 
 # Editor directories and files
 .vscode/*

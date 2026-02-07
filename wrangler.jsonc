@@ -2,7 +2,8 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "wishuponablock",
   "compatibility_date": "2026-02-05",
-  "main": "./src/worker.ts",
+  "main": "./src/entry/worker.ts",
+  "migrations_dir": "./tools/db/migrations",
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
