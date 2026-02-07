@@ -85,7 +85,13 @@ export function createGameSession(
 
   const setConfig = (nextSettings: Settings) => {
     currentSettings = nextSettings;
-    game.setConfig(nextSettings.game);
+    const butterfinger = nextSettings.butterfinger;
+    game.setConfig({
+      ...nextSettings.game,
+      lockNudgeRate: butterfinger.enabled ? butterfinger.lockNudgeRate : 0,
+      gravityDropRate: butterfinger.enabled ? butterfinger.gravityDropRate : 0,
+      lockRotateRate: butterfinger.enabled ? butterfinger.lockRotateRate : 0,
+    });
   };
 
   return {

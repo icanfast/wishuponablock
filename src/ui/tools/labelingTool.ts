@@ -116,6 +116,10 @@ export function createLabelingTool(
     return permission === 'granted';
   };
 
+  const isFileHandle = (
+    handle: FileSystemHandle,
+  ): handle is FileSystemFileHandle => handle.kind === 'file';
+
   const writeFileInDir = async (
     dir: FileSystemDirectoryHandle,
     name: string,
@@ -412,7 +416,7 @@ export function createLabelingTool(
       }
       const files: Array<{ name: string; session: SnapshotSession }> = [];
       for await (const entry of root.values()) {
-        if (entry.kind !== 'file') continue;
+        if (!isFileHandle(entry)) continue;
         if (!entry.name.endsWith('.json')) continue;
         const file = await entry.getFile();
         const text = await file.text();

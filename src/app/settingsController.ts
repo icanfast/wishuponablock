@@ -50,21 +50,7 @@ export function createSettingsController(
       return;
     }
 
-    sessionController.applyConfig({
-      ...next,
-      game: {
-        ...next.game,
-        lockNudgeRate: next.butterfinger.enabled
-          ? next.butterfinger.lockNudgeRate
-          : 0,
-        gravityDropRate: next.butterfinger.enabled
-          ? next.butterfinger.gravityDropRate
-          : 0,
-        lockRotateRate: next.butterfinger.enabled
-          ? next.butterfinger.lockRotateRate
-          : 0,
-      },
-    });
+    sessionController.applyConfig(next);
     uiController.syncGeneratorSelection(next.generator.type);
   };
 

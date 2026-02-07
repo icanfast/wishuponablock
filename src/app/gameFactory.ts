@@ -123,7 +123,7 @@ export function createGameSessionFactory(
     initialMode,
     initialModeOptions,
     buildGame: createGame,
-    createRunner: (g, mode, options, onRestart) =>
+    createRunner: (g, _mode, _options, onRestart) =>
       new GameRunner(g, {
         fixedStepMs: runnerOptions.fixedStepMs,
         maxElapsedMs: runnerOptions.maxElapsedMs,

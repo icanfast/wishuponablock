@@ -1,4 +1,4 @@
-import type { Application, TickerCallback } from 'pixi.js';
+import type { Application, Ticker } from 'pixi.js';
 import type { GameSession } from '../core/gameSession';
 import type { InputSource } from '../core/runner';
 import type { PixiRenderer } from '../render/pixiRenderer';
@@ -29,7 +29,7 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
   let pausedByInput = false;
   let pausedByMenu = true;
   let pausedByModel = false;
-  let paused =
+  let paused: boolean =
     pausedByVisibility || pausedByInput || pausedByMenu || pausedByModel;
   let resumePending = false;
 
@@ -49,7 +49,7 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
     if (!paused) resumePending = true;
   };
 
-  const tick: TickerCallback = (t) => {
+  const tick = (t: Ticker) => {
     if (paused) {
       updateGameOverLabel();
       return;
