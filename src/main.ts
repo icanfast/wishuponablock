@@ -15,6 +15,9 @@ import {
   PANEL_GAP,
   PLAY_HEIGHT,
   PLAY_WIDTH,
+  QUEUE_WIDTH,
+  QUEUE_X,
+  QUEUE_Y,
   ROWS,
   SETTINGS_X,
   SETTINGS_Y,
@@ -48,6 +51,7 @@ import { makeBoard } from './core/board';
 import { TETROMINOES } from './core/tetromino';
 import { loadWubModel, type LoadedModel } from './core/wubModel';
 import { UploadClient, type UploadMode } from './core/uploadClient';
+import pkg from '../package.json';
 
 function hasWebGL(): boolean {
   const c = document.createElement('canvas');
@@ -55,6 +59,7 @@ function hasWebGL(): boolean {
 }
 
 async function boot() {
+  const APP_VERSION = pkg.version;
   if (!hasWebGL()) {
     document.body.innerHTML = `<div style="padding:16px;color:#fff;background:#000;height:100vh">
       WebGL is disabled/unavailable. Enable hardware acceleration.
@@ -157,16 +162,33 @@ async function boot() {
   holdLabel.textContent = 'HOLD';
   Object.assign(holdLabel.style, {
     position: 'absolute',
-    left: `${HOLD_X + 8}px`,
+    left: `${HOLD_X}px`,
     top: `${HOLD_Y + 6}px`,
     width: `${HOLD_WIDTH}px`,
     color: '#b6c2d4',
     fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
     fontSize: '13px',
     letterSpacing: '0.5px',
+    textAlign: 'center',
     pointerEvents: 'none',
   });
   uiLayer.appendChild(holdLabel);
+
+  const nextLabel = document.createElement('div');
+  nextLabel.textContent = 'NEXT';
+  Object.assign(nextLabel.style, {
+    position: 'absolute',
+    left: `${QUEUE_X}px`,
+    top: `${QUEUE_Y + 6}px`,
+    width: `${QUEUE_WIDTH}px`,
+    color: '#b6c2d4',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.5px',
+    textAlign: 'center',
+    pointerEvents: 'none',
+  });
+  uiLayer.appendChild(nextLabel);
 
   const gameOverLabel = document.createElement('div');
   gameOverLabel.textContent = 'GAME OVER';
@@ -727,6 +749,11 @@ async function boot() {
     if (isGeneratorType(value)) {
       settingsStore.apply({ generator: { type: value } });
     }
+    select.blur();
+  });
+  select.addEventListener('keydown', (event) => {
+    event.preventDefault();
+    select.blur();
   });
 
   settingsPanel.appendChild(label);
@@ -1267,9 +1294,25 @@ async function boot() {
     ctx.fillStyle = 'transparent';
     const color = PIECE_COLORS[piece];
     const pad = Math.max(1, Math.floor(toolPieceCellPx / 6));
-    for (const [x, y] of TETROMINOES[piece][0]) {
-      const px = x * toolPieceCellPx;
-      const py = y * toolPieceCellPx;
+    const shape = TETROMINOES[piece][0];
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of shape) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    }
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    const dx = (4 - width) / 2 - minX;
+    const dy = (4 - height) / 2 - minY;
+
+    for (const [x, y] of shape) {
+      const px = (x + dx) * toolPieceCellPx;
+      const py = (y + dy) * toolPieceCellPx;
       ctx.fillStyle = color;
       ctx.fillRect(
         px + pad,
@@ -2622,6 +2665,9 @@ async function boot() {
     bottom: `${OUTER_MARGIN}px`,
     display: 'flex',
     justifyContent: 'center',
+    alignItems: 'center',
+    flexDirection: 'column',
+    gap: '6px',
     pointerEvents: 'auto',
   });
 
@@ -2629,7 +2675,7 @@ async function boot() {
   Object.assign(feedbackMenuButton.style, {
     position: 'absolute',
     left: '50%',
-    bottom: `${OUTER_MARGIN + 54}px`,
+    bottom: `${OUTER_MARGIN + 84}px`,
     transform: 'translateX(-50%)',
     width: '200px',
     borderColor: '#bda56a',
@@ -2662,6 +2708,16 @@ async function boot() {
 
   githubLink.appendChild(githubIcon);
   footer.appendChild(githubLink);
+
+  const versionLabel = document.createElement('div');
+  versionLabel.textContent = `v${APP_VERSION}`;
+  Object.assign(versionLabel.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    pointerEvents: 'none',
+  });
+  footer.appendChild(versionLabel);
   uiLayer.appendChild(footer);
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
@@ -2738,7 +2794,11 @@ async function boot() {
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
     feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
-    feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
+    if (menuLayer.style.display !== 'flex') {
+      feedbackMenuButton.style.display = 'none';
+    } else {
+      feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
+    }
   };
 
   updatePaused = () => {
@@ -2784,6 +2844,7 @@ async function boot() {
     settingsPanel.style.display = inGame ? 'block' : 'none';
     menuButton.style.display = inGame ? 'block' : 'none';
     holdLabel.style.display = inGame || inTool ? 'block' : 'none';
+    nextLabel.style.display = inGame ? 'block' : 'none';
     toolLayer.style.display = inTool ? 'block' : 'none';
     footer.style.display = inMenu ? 'flex' : 'none';
     if (!inMenu) {

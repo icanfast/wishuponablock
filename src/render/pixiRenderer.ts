@@ -8,12 +8,15 @@ import {
   HOLD_INNER_Y,
   HOLD_LABEL_HEIGHT,
   HOLD_PANEL_HEIGHT,
+  HOLD_ROWS,
   HOLD_WIDTH,
   HOLD_X,
   HOLD_Y,
   NEXT_COUNT,
   QUEUE_COLS,
   QUEUE_GAP_PX,
+  QUEUE_LABEL_HEIGHT,
+  QUEUE_PREVIEW_ROWS,
   QUEUE_PREVIEW_HEIGHT,
   QUEUE_X,
   QUEUE_Y,
@@ -135,7 +138,14 @@ export class PixiRenderer {
     if (!hold) return;
 
     const offsetX = Math.floor((HOLD_COLS - 4) / 2) * cell;
-    this.drawPreviewPiece(hold, HOLD_X + offsetX, HOLD_INNER_Y, cell);
+    this.drawPreviewPiece(
+      hold,
+      HOLD_X + offsetX,
+      HOLD_INNER_Y,
+      cell,
+      4,
+      HOLD_ROWS,
+    );
   }
 
   private renderQueue(state: GameState): void {
@@ -144,7 +154,9 @@ export class PixiRenderer {
     if (count === 0) return;
 
     const panelHeight =
-      count * QUEUE_PREVIEW_HEIGHT + (count - 1) * QUEUE_GAP_PX;
+      QUEUE_LABEL_HEIGHT +
+      count * QUEUE_PREVIEW_HEIGHT +
+      (count - 1) * QUEUE_GAP_PX;
     const panelWidth = QUEUE_COLS * cell;
 
     gfx
@@ -156,13 +168,24 @@ export class PixiRenderer {
       )
       .fill(BORDER_COLOR);
     gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, panelHeight).fill(0x0b0f14);
+    gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, QUEUE_LABEL_HEIGHT).fill(0x121a24);
 
     const offsetX = Math.floor((QUEUE_COLS - 4) / 2) * cell;
 
     for (let i = 0; i < count; i++) {
       const kind = state.next[i];
-      const boxY = QUEUE_Y + i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX);
-      this.drawPreviewPiece(kind, QUEUE_X + offsetX, boxY, cell);
+      const boxY =
+        QUEUE_Y +
+        QUEUE_LABEL_HEIGHT +
+        i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX);
+      this.drawPreviewPiece(
+        kind,
+        QUEUE_X + offsetX,
+        boxY,
+        cell,
+        4,
+        QUEUE_PREVIEW_ROWS,
+      );
     }
   }
 
@@ -183,7 +206,14 @@ export class PixiRenderer {
     if (!state.hold) return;
 
     const offsetX = Math.floor((HOLD_COLS - 4) / 2) * cell;
-    this.drawPreviewPiece(state.hold, HOLD_X + offsetX, HOLD_INNER_Y, cell);
+    this.drawPreviewPiece(
+      state.hold,
+      HOLD_X + offsetX,
+      HOLD_INNER_Y,
+      cell,
+      4,
+      HOLD_ROWS,
+    );
   }
 
   private drawPreviewPiece(
@@ -191,11 +221,16 @@ export class PixiRenderer {
     originX: number,
     originY: number,
     cell: number,
+    boxCols = 4,
+    boxRows = 4,
   ): void {
     const color = COLORS[kind];
     const shape = TETROMINOES[kind][0];
+    const bounds = getShapeBounds(shape);
+    const dx = (boxCols - bounds.width) / 2 - bounds.minX;
+    const dy = (boxRows - bounds.height) / 2 - bounds.minY;
     for (const [x, y] of shape) {
-      drawCell(this.gfx, originX, originY, cell, x, y, color);
+      drawCell(this.gfx, originX, originY, cell, x + dx, y + dy, color);
     }
   }
 }
@@ -220,4 +255,27 @@ function dim(color: number, factor: number): number {
   const g = ((color >> 8) & 0xff) * factor;
   const b = (color & 0xff) * factor;
   return ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
+}
+
+function getShapeBounds(shape: ReadonlyArray<readonly [number, number]>): {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+} {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of shape) {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  const width = maxX - minX + 1;
+  const height = maxY - minY + 1;
+  return { minX, maxX, minY, maxY, width, height };
 }
