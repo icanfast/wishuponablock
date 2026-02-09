@@ -902,6 +902,7 @@ input[type=number] {
     lineHeight: '1.4',
     textAlign: 'center',
     fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    marginTop: '6px',
   });
 
   const menuMainWrapper = document.createElement('div');
@@ -911,6 +912,18 @@ input[type=number] {
     alignItems: 'center',
     gap: '12px',
   });
+  const menuTitle = document.createElement('div');
+  menuTitle.textContent = 'WISH UPON A BLOCK';
+  Object.assign(menuTitle.style, {
+    color: '#e2e8f0',
+    fontSize: '30px',
+    letterSpacing: '2px',
+    textAlign: 'center',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    transform: 'translateY(-110px)',
+    marginBottom: '-60px',
+  });
+  menuMainWrapper.appendChild(menuTitle);
   menuMainWrapper.appendChild(menuMainPanel);
   menuMainWrapper.appendChild(dataNotice);
 
