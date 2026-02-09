@@ -912,20 +912,23 @@ input[type=number] {
     alignItems: 'center',
     gap: '12px',
   });
+  menuMainWrapper.appendChild(menuMainPanel);
+  menuMainWrapper.appendChild(dataNotice);
+
   const menuTitle = document.createElement('div');
   menuTitle.textContent = 'WISH UPON A BLOCK';
   Object.assign(menuTitle.style, {
+    position: 'absolute',
+    left: '50%',
+    top: '50%',
+    transform: 'translate(-50%, -240px)',
     color: '#e2e8f0',
     fontSize: '30px',
     letterSpacing: '2px',
     textAlign: 'center',
     fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
-    transform: 'translateY(-110px)',
-    marginBottom: '-60px',
+    pointerEvents: 'none',
   });
-  menuMainWrapper.appendChild(menuTitle);
-  menuMainWrapper.appendChild(menuMainPanel);
-  menuMainWrapper.appendChild(dataNotice);
 
   const playTitle = document.createElement('div');
   playTitle.textContent = 'PLAY';
@@ -1356,6 +1359,7 @@ input[type=number] {
     pointerEvents: 'auto',
   });
   menuLayer.appendChild(menuMainWrapper);
+  menuLayer.appendChild(menuTitle);
   playMenuRow.appendChild(playPanel);
   if (showDevTools) {
     playMenuRow.appendChild(butterfingerPanel);
@@ -1456,6 +1460,7 @@ input[type=number] {
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
     feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
+    menuTitle.style.display = panel === 'options' ? 'none' : 'block';
   };
 
   const showMain = () => show('main');
