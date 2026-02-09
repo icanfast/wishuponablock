@@ -169,6 +169,14 @@ export function createUiController(options: UiControllerOptions): UiController {
       ? 'inline-block'
       : 'none';
     game.recordStatus.textContent = state.recordStatus;
+    game.recordButton.disabled = !state.enabled;
+    game.folderButton.disabled = !state.enabled;
+    game.manualButton.disabled = !state.enabled;
+    if (!state.enabled) {
+      game.discardButton.disabled = true;
+    } else {
+      game.discardButton.disabled = false;
+    }
   };
 
   const syncGeneratorSelection = (value: string) => {

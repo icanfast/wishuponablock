@@ -17,6 +17,10 @@ type LabelingToolOptions = {
   onBack: () => void;
 };
 
+type Playstyle = 'beginner' | 'advanced';
+
+const PLAYSTYLE_STORAGE_KEY = 'wub.labeler.playstyle';
+
 export function createLabelingTool(
   options: LabelingToolOptions,
 ): ToolController {
@@ -28,6 +32,7 @@ export function createLabelingTool(
   const toolUi = createToolScreen({ toolUsesRemote });
   const toolInputButton = toolUi.inputButton;
   const toolInputStatus = toolUi.inputStatus;
+  const toolPlaystyleSelect = toolUi.playstyleSelect;
   const toolModeSelect = toolUi.modeSelect;
   const toolTriggerSelect = toolUi.triggerSelect;
   const toolOutputButton = toolUi.outputButton;
@@ -46,6 +51,7 @@ export function createLabelingTool(
   let toolModeFilter = 'all';
   let toolTriggerFilter: TriggerFilter = 'all';
   let toolActive = false;
+  let playstyle: Playstyle = 'beginner';
   let currentSample: {
     file: { name: string; session: SnapshotSession };
     index: number;
@@ -211,6 +217,38 @@ export function createLabelingTool(
 
   const updateToolActionStatus = (text: string) => {
     toolActionStatus.textContent = text;
+  };
+
+  const loadPlaystyle = (): Playstyle => {
+    try {
+      const stored = localStorage.getItem(PLAYSTYLE_STORAGE_KEY);
+      if (stored === 'advanced') return 'advanced';
+      return 'beginner';
+    } catch {
+      return 'beginner';
+    }
+  };
+
+  const savePlaystyle = (value: Playstyle) => {
+    try {
+      localStorage.setItem(PLAYSTYLE_STORAGE_KEY, value);
+    } catch {
+      // Ignore storage errors.
+    }
+  };
+
+  const initPlaystyleSelect = () => {
+    const addOption = (value: Playstyle, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolPlaystyleSelect.appendChild(option);
+    };
+    toolPlaystyleSelect.innerHTML = '';
+    addOption('beginner', 'Beginner');
+    addOption('advanced', 'Advanced');
+    playstyle = loadPlaystyle();
+    toolPlaystyleSelect.value = playstyle;
   };
 
   const getModeLabel = (id: string): string => {
@@ -524,6 +562,13 @@ export function createLabelingTool(
     refreshToolTriggerOptions();
   }
 
+  initPlaystyleSelect();
+  toolPlaystyleSelect.addEventListener('change', () => {
+    playstyle =
+      toolPlaystyleSelect.value === 'advanced' ? 'advanced' : 'beginner';
+    savePlaystyle(playstyle);
+  });
+
   toolOutputButton.addEventListener('click', async () => {
     if (toolUsesRemote) return;
     const picker = (
@@ -578,6 +623,9 @@ export function createLabelingTool(
         board: encodeBoardString(currentSample.raw),
         hold: currentSample.hold,
         labels: [...selectedLabels],
+        label_context: {
+          playstyle,
+        },
       };
       if (uploadClient.isRemote) {
         await uploadClient.enqueueLabel({

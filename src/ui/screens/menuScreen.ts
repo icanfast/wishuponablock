@@ -1,4 +1,9 @@
-import { DEFAULT_KEY_BINDINGS, OUTER_MARGIN } from '../../core/constants';
+import {
+  DEFAULT_ARR_MS,
+  DEFAULT_DAS_MS,
+  DEFAULT_KEY_BINDINGS,
+  OUTER_MARGIN,
+} from '../../core/constants';
 import type { Settings } from '../../core/settings';
 import type { SettingsStore } from '../../core/settingsStore';
 
@@ -65,6 +70,25 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     document.head.appendChild(style);
   };
   ensureSpinnerStyle();
+
+  const ensureNumberInputStyle = () => {
+    const styleId = 'wab-number-input-style';
+    if (document.getElementById(styleId)) return;
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type=number] {
+  appearance: textfield;
+}
+`;
+    document.head.appendChild(style);
+  };
+  ensureNumberInputStyle();
 
   const root = document.createElement('div');
   Object.assign(root.style, {
@@ -166,7 +190,11 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
   const playMenuRow = document.createElement('div');
 
   Object.assign(playPanel.style, { minHeight: '240px', display: 'flex' });
-  Object.assign(optionsPanel.style, { minHeight: '240px', display: 'none' });
+  Object.assign(optionsPanel.style, {
+    minHeight: '240px',
+    width: '420px',
+    display: 'none',
+  });
   Object.assign(aboutPanel.style, {
     minHeight: '260px',
     width: '300px',
@@ -215,6 +243,29 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     marginBottom: '4px',
   });
 
+  const optionsContentRow = document.createElement('div');
+  Object.assign(optionsContentRow.style, {
+    display: 'flex',
+    gap: '16px',
+    alignItems: 'flex-start',
+  });
+
+  const optionsLeftColumn = document.createElement('div');
+  Object.assign(optionsLeftColumn.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    flex: '1',
+  });
+
+  const optionsRightColumn = document.createElement('div');
+  Object.assign(optionsRightColumn.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    flex: '1',
+  });
+
   const controlsTitle = document.createElement('div');
   controlsTitle.textContent = 'CONTROLS';
   Object.assign(controlsTitle.style, {
@@ -232,12 +283,22 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     gap: '8px',
   });
 
+  const audioTitle = document.createElement('div');
+  audioTitle.textContent = 'AUDIO';
+  Object.assign(audioTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '10px',
+    marginBottom: '4px',
+  });
+
   const volumeLabel = document.createElement('div');
   volumeLabel.textContent = 'Master Volume';
   Object.assign(volumeLabel.style, {
-    marginTop: '12px',
     marginBottom: '6px',
     color: '#b6c2d4',
+    fontSize: '11px',
   });
 
   const volumeRow = document.createElement('div');
@@ -247,12 +308,32 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     gap: '8px',
   });
 
-  const volumeValue = document.createElement('span');
+  const volumeValue = document.createElement('input');
+  volumeValue.type = 'number';
+  volumeValue.min = '0';
+  volumeValue.max = '100';
+  volumeValue.step = '0.1';
+  volumeValue.inputMode = 'decimal';
   Object.assign(volumeValue.style, {
-    color: '#8fa0b8',
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
     fontSize: '12px',
-    minWidth: '32px',
+    width: '52px',
     textAlign: 'right',
+    padding: '4px 6px',
+    MozAppearance: 'textfield',
+  });
+  volumeValue.addEventListener('wheel', (event) => {
+    if (document.activeElement === volumeValue) {
+      event.preventDefault();
+    }
+  });
+  volumeValue.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+    }
   });
 
   const volumeSlider = document.createElement('input');
@@ -265,8 +346,13 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     accentColor: '#6ea8ff',
   });
 
+  const formatNumber = (value: number): string => {
+    const rounded = Math.round(value * 10) / 10;
+    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  };
+
   const updateVolumeLabel = (value: number) => {
-    volumeValue.textContent = String(Math.round(value * 100));
+    volumeValue.value = formatNumber(value * 100);
   };
 
   volumeSlider.addEventListener('input', () => {
@@ -275,10 +361,271 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     settingsStore.apply({ audio: { masterVolume: value } });
   });
 
+  const applyVolumeInput = (commit: boolean) => {
+    const raw = Number(volumeValue.value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = Math.min(100, Math.max(0, raw));
+    const value = clamped / 100;
+    volumeSlider.value = String(Math.round(clamped));
+    if (commit) {
+      updateVolumeLabel(value);
+    }
+    settingsStore.apply({ audio: { masterVolume: value } });
+  };
+
+  volumeValue.addEventListener('input', () => applyVolumeInput(false));
+  volumeValue.addEventListener('change', () => applyVolumeInput(true));
+  volumeValue.addEventListener('blur', () => applyVolumeInput(true));
+
   volumeRow.appendChild(volumeSlider);
   volumeRow.appendChild(volumeValue);
 
-  const controlsResetButton = makeMenuButton('RESET CONTROLS');
+  const gameplayTitle = document.createElement('div');
+  gameplayTitle.textContent = 'GAMEPLAY';
+  Object.assign(gameplayTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '10px',
+    marginBottom: '4px',
+  });
+
+  const makeMsSlider = (
+    labelText: string,
+    options: { min: number; max: number; step: number },
+  ) => {
+    const wrapper = document.createElement('div');
+    Object.assign(wrapper.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '6px',
+    });
+
+    const label = document.createElement('div');
+    label.textContent = labelText;
+    Object.assign(label.style, {
+      color: '#b6c2d4',
+      fontSize: '11px',
+      letterSpacing: '0.3px',
+    });
+
+    const row = document.createElement('div');
+    Object.assign(row.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+    });
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = String(options.min);
+    slider.max = String(options.max);
+    slider.step = String(options.step);
+    Object.assign(slider.style, {
+      flex: '1',
+      accentColor: '#6ea8ff',
+    });
+
+    const value = document.createElement('input');
+    value.type = 'number';
+    value.min = String(options.min);
+    value.max = String(options.max);
+    value.step = String(options.step);
+    value.inputMode = 'numeric';
+    Object.assign(value.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '11px',
+      width: '52px',
+      textAlign: 'right',
+      padding: '4px 6px',
+      MozAppearance: 'textfield',
+    });
+    value.addEventListener('wheel', (event) => {
+      if (document.activeElement === value) {
+        event.preventDefault();
+      }
+    });
+    value.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+        event.preventDefault();
+      }
+    });
+
+    row.appendChild(slider);
+    row.appendChild(value);
+    wrapper.appendChild(label);
+    wrapper.appendChild(row);
+
+    return { wrapper, slider, value, options };
+  };
+
+  const dasControl = makeMsSlider('DAS (ms)', {
+    min: 0,
+    max: 300,
+    step: 1,
+  });
+  const arrControl = makeMsSlider('ARR (ms)', {
+    min: 0,
+    max: 100,
+    step: 1,
+  });
+
+  const gameplayResetButton = makeMenuButton('RESET DEFAULTS');
+  Object.assign(gameplayResetButton.style, {
+    marginTop: '4px',
+  });
+
+  const clamp = (value: number, min: number, max: number): number =>
+    Math.min(max, Math.max(min, value));
+
+  const applyInputPatch = (patch: Partial<Settings['input']>) => {
+    const current = settingsStore.get().input;
+    settingsStore.apply({
+      input: {
+        ...current,
+        ...patch,
+      },
+    });
+  };
+
+  const updateMsControl = (
+    control: {
+      slider: HTMLInputElement;
+      value: HTMLInputElement;
+      options: { min: number; max: number; step: number };
+    },
+    nextValue: number,
+  ) => {
+    const clamped = clamp(
+      Math.round(nextValue),
+      control.options.min,
+      control.options.max,
+    );
+    control.slider.value = String(clamped);
+    control.value.value = String(clamped);
+  };
+
+  dasControl.slider.addEventListener('input', () => {
+    const value = Number(dasControl.slider.value);
+    updateMsControl(dasControl, value);
+    applyInputPatch({ dasMs: value });
+  });
+
+  arrControl.slider.addEventListener('input', () => {
+    const value = Number(arrControl.slider.value);
+    updateMsControl(arrControl, value);
+    applyInputPatch({ arrMs: value });
+  });
+
+  gameplayResetButton.addEventListener('click', () => {
+    applyInputPatch({
+      dasMs: DEFAULT_DAS_MS,
+      arrMs: DEFAULT_ARR_MS,
+    });
+  });
+
+  const applyMsInput = (
+    control: {
+      slider: HTMLInputElement;
+      value: HTMLInputElement;
+      options: { min: number; max: number; step: number };
+    },
+    patch: (value: number) => void,
+    commit: boolean,
+  ) => {
+    const raw = Number(control.value.value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = clamp(raw, control.options.min, control.options.max);
+    control.slider.value = String(Math.round(clamped));
+    if (commit) {
+      control.value.value = String(Math.round(clamped));
+    }
+    patch(clamped);
+  };
+
+  dasControl.value.addEventListener('input', () => {
+    applyMsInput(
+      dasControl,
+      (value) => applyInputPatch({ dasMs: value }),
+      false,
+    );
+  });
+  dasControl.value.addEventListener('change', () => {
+    applyMsInput(
+      dasControl,
+      (value) => applyInputPatch({ dasMs: value }),
+      true,
+    );
+  });
+  dasControl.value.addEventListener('blur', () => {
+    applyMsInput(
+      dasControl,
+      (value) => applyInputPatch({ dasMs: value }),
+      true,
+    );
+  });
+
+  arrControl.value.addEventListener('input', () => {
+    applyMsInput(
+      arrControl,
+      (value) => applyInputPatch({ arrMs: value }),
+      false,
+    );
+  });
+  arrControl.value.addEventListener('change', () => {
+    applyMsInput(
+      arrControl,
+      (value) => applyInputPatch({ arrMs: value }),
+      true,
+    );
+  });
+  arrControl.value.addEventListener('blur', () => {
+    applyMsInput(
+      arrControl,
+      (value) => applyInputPatch({ arrMs: value }),
+      true,
+    );
+  });
+
+  const dataTitle = document.createElement('div');
+  dataTitle.textContent = 'DATA';
+  Object.assign(dataTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '10px',
+    marginBottom: '4px',
+  });
+
+  const shareRow = document.createElement('label');
+  Object.assign(shareRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    color: '#b6c2d4',
+  });
+
+  const shareLabel = document.createElement('span');
+  shareLabel.textContent = 'Share snapshots';
+
+  const shareToggle = document.createElement('input');
+  shareToggle.type = 'checkbox';
+  Object.assign(shareToggle.style, {
+    accentColor: '#6ea8ff',
+  });
+
+  shareToggle.addEventListener('change', () => {
+    settingsStore.apply({ privacy: { shareSnapshots: shareToggle.checked } });
+  });
+
+  shareRow.appendChild(shareLabel);
+  shareRow.appendChild(shareToggle);
+
+  const controlsResetButton = makeMenuButton('RESET DEFAULTS');
   Object.assign(controlsResetButton.style, {
     marginTop: '6px',
   });
@@ -289,11 +636,32 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
   });
 
   optionsPanel.appendChild(optionsTitle);
-  optionsPanel.appendChild(volumeLabel);
-  optionsPanel.appendChild(volumeRow);
-  optionsPanel.appendChild(controlsTitle);
-  optionsPanel.appendChild(controlsList);
-  optionsPanel.appendChild(controlsResetButton);
+  optionsPanel.appendChild(optionsContentRow);
+  optionsContentRow.appendChild(optionsLeftColumn);
+  optionsContentRow.appendChild(optionsRightColumn);
+
+  optionsLeftColumn.appendChild(controlsTitle);
+  optionsLeftColumn.appendChild(controlsList);
+  optionsLeftColumn.appendChild(controlsResetButton);
+
+  const volumeWrapper = document.createElement('div');
+  Object.assign(volumeWrapper.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  volumeWrapper.appendChild(volumeLabel);
+  volumeWrapper.appendChild(volumeRow);
+
+  optionsRightColumn.appendChild(audioTitle);
+  optionsRightColumn.appendChild(volumeWrapper);
+  optionsRightColumn.appendChild(gameplayTitle);
+  optionsRightColumn.appendChild(dasControl.wrapper);
+  optionsRightColumn.appendChild(arrControl.wrapper);
+  optionsRightColumn.appendChild(gameplayResetButton);
+  optionsRightColumn.appendChild(dataTitle);
+  optionsRightColumn.appendChild(shareRow);
+
   optionsPanel.appendChild(optionsBackButton);
 
   const aboutTitle = document.createElement('div');
@@ -1153,8 +1521,11 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     const nextVolume = Math.round(settings.audio.masterVolume * 100);
     if (Number(volumeSlider.value) !== nextVolume) {
       volumeSlider.value = String(nextVolume);
-      updateVolumeLabel(settings.audio.masterVolume);
     }
+    updateVolumeLabel(settings.audio.masterVolume);
+    updateMsControl(dasControl, settings.input.dasMs);
+    updateMsControl(arrControl, settings.input.arrMs);
+    shareToggle.checked = settings.privacy.shareSnapshots;
     updateKeybindButtons(settings.input.bindings);
     updateButterfingerUI(settings.butterfinger);
   };

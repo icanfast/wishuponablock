@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+- Added DAS and ARR settings.
+- Added opt-out of data collection checkbox.
+- Rearranged the settings panel.
+- Added playstyle selector to labeling screen.
+
 ## 0.2.1
 - Refactored runtime/UI flow and extracted services to reduce "main.ts" entry complexity.
 - UI polish and UX tweaks across menus, labeling, and feedback flow.

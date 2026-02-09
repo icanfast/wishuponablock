@@ -18,6 +18,7 @@ export type SnapshotUiState = {
   recordStatus: string;
   isRecording: boolean;
   sampleCount: number;
+  enabled: boolean;
 };
 
 type SnapshotServiceOptions = {
@@ -72,6 +73,7 @@ export function createSnapshotService(
   let lastSnapshotKey: string | null = null;
   let recordStatusOverride: { message: string; timeoutId: number } | null =
     null;
+  let snapshotsEnabled = settingsStore.get().privacy.shareSnapshots;
 
   const notify = () => {
     options.onStateChange?.(getState());
@@ -109,21 +111,30 @@ export function createSnapshotService(
   };
 
   const getState = (): SnapshotUiState => {
-    const isRecording = recorder.isRecording;
-    const recordButtonLabel = isRecording
-      ? snapshotDirHandle
-        ? 'Stop & Save'
-        : 'Stop & Download'
-      : 'Start Recording';
+    const isRecording = snapshotsEnabled && recorder.isRecording;
+    const recordButtonLabel = snapshotsEnabled
+      ? isRecording
+        ? snapshotDirHandle
+          ? 'Stop & Save'
+          : 'Stop & Download'
+        : 'Start Recording'
+      : 'Snapshots Disabled';
     return {
-      folderStatus,
+      folderStatus: snapshotsEnabled
+        ? folderStatus
+        : 'Snapshots disabled in Options.',
       recordButtonLabel,
       discardVisible: isRecording,
       recordStatus:
         recordStatusOverride?.message ??
-        (isRecording ? `Samples: ${recorder.sampleCount}` : 'Idle'),
+        (snapshotsEnabled
+          ? isRecording
+            ? `Samples: ${recorder.sampleCount}`
+            : 'Idle'
+          : 'Snapshots disabled in Options.'),
       isRecording,
-      sampleCount: recorder.sampleCount,
+      sampleCount: snapshotsEnabled ? recorder.sampleCount : 0,
+      enabled: snapshotsEnabled,
     };
   };
 
@@ -141,6 +152,10 @@ export function createSnapshotService(
   };
 
   const ensureDirectory = async (): Promise<boolean> => {
+    if (!snapshotsEnabled) {
+      setFolderStatus('Snapshots disabled in Options.');
+      return false;
+    }
     const picker = getDirectoryPicker();
     if (!picker) {
       setFolderStatus('Folder access not supported in this browser.');
@@ -196,6 +211,10 @@ export function createSnapshotService(
   };
 
   const start = () => {
+    if (!snapshotsEnabled) {
+      notify();
+      return;
+    }
     if (recorder.isRecording) return;
     lastSnapshotKey = null;
     recorder.start(
@@ -241,6 +260,7 @@ export function createSnapshotService(
     hold: PieceKind | null,
     reason: SnapshotTrigger,
   ) => {
+    if (!snapshotsEnabled) return;
     if (!recorder.isRecording) {
       if (reason === 'manual') {
         console.warn('[Snapshot] Manual capture ignored (not recording).');
@@ -299,6 +319,16 @@ export function createSnapshotService(
   const unsubscribeIdentity = identityService.subscribe(() => {
     applyIdentityMeta();
   });
+  const unsubscribeSettings = settingsStore.subscribe((settings) => {
+    const nextEnabled = settings.privacy.shareSnapshots;
+    if (nextEnabled === snapshotsEnabled) return;
+    snapshotsEnabled = nextEnabled;
+    if (!snapshotsEnabled && recorder.isRecording) {
+      recorder.stop();
+      lastSnapshotKey = null;
+    }
+    notify();
+  });
 
   notify();
 
@@ -326,6 +356,7 @@ export function createSnapshotService(
       window.removeEventListener('beforeunload', beforeUnload);
       uploadClient.setOnSnapshotUploaded(null);
       unsubscribeIdentity();
+      unsubscribeSettings();
     },
   };
 }

@@ -26,6 +26,8 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Snapshot Explorer — 4
 - Unsupervised learning (press "Hold" = don't want that = negative signal?) — 2
 - Opt-out of data collection toggle — 5
+- Labeling sessions id — 5
+- Different generators for pro and noob — 4
 
 ## Personalization
 - User authentication + profile + stats — 2

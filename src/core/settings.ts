@@ -13,6 +13,7 @@ import {
   DEFAULT_KEY_BINDINGS,
   DEFAULT_LOCK_DELAY_MS,
   DEFAULT_MASTER_VOLUME,
+  DEFAULT_SHARE_SNAPSHOTS,
   DEFAULT_SOFT_DROP_MS,
   SETTINGS_STORAGE_KEY,
 } from './constants';
@@ -32,11 +33,16 @@ export interface Settings {
   input: InputConfig;
   generator: GeneratorSettings;
   audio: AudioSettings;
+  privacy: PrivacySettings;
   butterfinger: ButterfingerSettings;
 }
 
 export interface AudioSettings {
   masterVolume: number;
+}
+
+export interface PrivacySettings {
+  shareSnapshots: boolean;
 }
 
 export interface ButterfingerSettings {
@@ -66,6 +72,9 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   audio: {
     masterVolume: DEFAULT_MASTER_VOLUME,
+  },
+  privacy: {
+    shareSnapshots: DEFAULT_SHARE_SNAPSHOTS,
   },
   butterfinger: {
     enabled: DEFAULT_BUTTERFINGER_ENABLED,
@@ -148,6 +157,15 @@ function mergeAudio(
   };
 }
 
+function mergePrivacy(
+  base: PrivacySettings,
+  patch?: Partial<PrivacySettings>,
+): PrivacySettings {
+  return {
+    shareSnapshots: bool(patch?.shareSnapshots) ?? base.shareSnapshots,
+  };
+}
+
 function mergeButterfinger(
   base: ButterfingerSettings,
   patch?: Partial<ButterfingerSettings>,
@@ -172,6 +190,7 @@ export function mergeSettings(
     input: mergeInput(base.input, patch.input),
     generator: mergeGenerator(base.generator, patch.generator),
     audio: mergeAudio(base.audio, patch.audio),
+    privacy: mergePrivacy(base.privacy, patch.privacy),
     butterfinger: mergeButterfinger(base.butterfinger, patch.butterfinger),
   };
 }

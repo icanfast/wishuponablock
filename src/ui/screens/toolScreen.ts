@@ -21,6 +21,7 @@ export type ToolScreen = {
   root: HTMLDivElement;
   inputButton: HTMLButtonElement;
   inputStatus: HTMLDivElement;
+  playstyleSelect: HTMLSelectElement;
   modeSelect: HTMLSelectElement;
   triggerSelect: HTMLSelectElement;
   outputButton: HTMLButtonElement;
@@ -151,6 +152,28 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   });
   toolInputStatus.textContent = 'Source: Local (select folder).';
   toolPanel.appendChild(toolInputStatus);
+
+  const toolPlaystyleLabel = document.createElement('div');
+  toolPlaystyleLabel.textContent = 'Playstyle';
+  Object.assign(toolPlaystyleLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolPlaystyleLabel);
+
+  const toolPlaystyleSelect = document.createElement('select');
+  Object.assign(toolPlaystyleSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolPlaystyleSelect);
 
   const toolModeLabel = document.createElement('div');
   toolModeLabel.textContent = 'Game Mode';
@@ -371,6 +394,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     root: toolLayer,
     inputButton: toolInputButton,
     inputStatus: toolInputStatus,
+    playstyleSelect: toolPlaystyleSelect,
     modeSelect: toolModeSelect,
     triggerSelect: toolTriggerSelect,
     outputButton: toolOutputButton,

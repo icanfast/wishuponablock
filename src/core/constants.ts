@@ -60,6 +60,7 @@ export const DEFAULT_HARD_LOCK_DELAY_MS = 2000;
 export const DEFAULT_DAS_MS = 150;
 export const DEFAULT_ARR_MS = 0;
 export const DEFAULT_MASTER_VOLUME = 0.5;
+export const DEFAULT_SHARE_SNAPSHOTS = true;
 export const DEFAULT_BUTTERFINGER_ENABLED = false;
 export const DEFAULT_BUTTERFINGER_MISS_RATE = 0;
 export const DEFAULT_BUTTERFINGER_WRONG_DIR_RATE = 0;
