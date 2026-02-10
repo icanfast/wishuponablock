@@ -381,13 +381,11 @@ export function createLabelingTool(
         toolBuildSelect.disabled = false;
         return;
       }
-      const builds = remoteBuildCounts
-        .slice()
-        .sort((a, b) => {
-          if (a.build === 'unknown') return 1;
-          if (b.build === 'unknown') return -1;
-          return a.build.localeCompare(b.build);
-        });
+      const builds = remoteBuildCounts.slice().sort((a, b) => {
+        if (a.build === 'unknown') return 1;
+        if (b.build === 'unknown') return -1;
+        return a.build.localeCompare(b.build);
+      });
       for (const entry of builds) {
         const label = `${entry.build} (${entry.count})`;
         addOption(entry.build, label);
