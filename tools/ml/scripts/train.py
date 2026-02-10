@@ -62,8 +62,14 @@ def split_by_session(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train a baseline WUB model.")
-    parser.add_argument("--data", required=True, help="Path to labels_v1.jsonl.")
+    parser.add_argument(
+        "--data",
+        required=True,
+        nargs="+",
+        help="One or more paths to labels_v1.jsonl.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--min-epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=1337)
@@ -71,7 +77,7 @@ def main() -> int:
     parser.add_argument(
         "--method",
         choices=["multilabel", "soft_targets"],
-        default="multilabel",
+        default="soft_targets",
         help="Training objective to use.",
     )
     parser.add_argument(
@@ -99,6 +105,28 @@ def main() -> int:
         help="Save a checkpoint every N epochs (0 to disable).",
     )
     parser.add_argument(
+        "--save-best",
+        action="store_true",
+        help="Save best checkpoint as best.pt (by val loss).",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to checkpoint to resume model weights from.",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop after N epochs without val loss improvement (0 disables).",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Required improvement in val loss to reset patience.",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -108,7 +136,7 @@ def main() -> int:
     device = torch.device(args.device)
 
     base_dataset = LabelsDataset(
-        Path(args.data),
+        [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
     )
@@ -122,12 +150,12 @@ def main() -> int:
     )
 
     train_ds = LabelsDataset(
-        Path(args.data),
+        [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=args.mirror_prob,
     )
     val_ds = LabelsDataset(
-        Path(args.data),
+        [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
     )
@@ -154,6 +182,14 @@ def main() -> int:
         extra_features=features.feature_dim,
     )
     model.to(device)
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        state = ckpt.get("model_state") if isinstance(ckpt, dict) else None
+        if state:
+            model.load_state_dict(state)
+            print(f"Loaded model weights from {args.resume}")
+        else:
+            print(f"Warning: no model_state in {args.resume}")
 
     if args.method == "multilabel":
         trainer = MultiLabelTraining(num_classes=7)
@@ -161,6 +197,8 @@ def main() -> int:
         trainer = SoftTargetsTraining(num_classes=7, decay=args.soft_decay)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    best_val_loss = None
+    epochs_since_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -211,6 +249,15 @@ def main() -> int:
             f"val_acc={val_acc / max(1, val_batches):.4f}"
         )
 
+        current_val = val_loss / max(1, val_batches)
+        improved = False
+        if best_val_loss is None or current_val < (best_val_loss - args.early_stop_min_delta):
+            best_val_loss = current_val
+            epochs_since_improve = 0
+            improved = True
+        else:
+            epochs_since_improve += 1
+
         if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
             ckpt_dir = Path(args.checkpoint_dir)
             ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -228,6 +275,35 @@ def main() -> int:
                 },
                 ckpt_path,
             )
+
+        if args.save_best and improved:
+            ckpt_dir = Path(args.checkpoint_dir)
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            best_path = ckpt_dir / "best.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "train_loss": train_loss / max(1, train_batches),
+                    "train_acc": train_acc / max(1, train_batches),
+                    "val_loss": current_val,
+                    "val_acc": val_acc / max(1, val_batches),
+                    "args": vars(args),
+                },
+                best_path,
+            )
+
+        if (
+            args.early_stop_patience > 0
+            and epoch >= args.min_epochs
+            and epochs_since_improve >= args.early_stop_patience
+        ):
+            print(
+                "Early stopping: no val loss improvement for "
+                f"{epochs_since_improve} epochs."
+            )
+            break
 
     return 0
 

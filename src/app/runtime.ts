@@ -2,6 +2,7 @@ import type { Application, Ticker } from 'pixi.js';
 import type { GameSession } from '../core/gameSession';
 import type { InputSource } from '../core/runner';
 import type { PixiRenderer } from '../render/pixiRenderer';
+import type { GameState } from '../core/types';
 
 export type GameRuntime = {
   setInputSource: (source: InputSource) => void;
@@ -19,6 +20,7 @@ type GameRuntimeOptions = {
   renderer: PixiRenderer;
   inputSource: InputSource;
   onGameOver: (visible: boolean) => void;
+  onFrame?: (state: GameState) => void;
 };
 
 export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
@@ -63,6 +65,7 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
     const runner = session.getRunner();
     runner.tick(t.elapsedMS, inputSource);
     renderer.render(runner.state);
+    options.onFrame?.(runner.state);
     updateGameOverLabel();
   };
 
@@ -90,6 +93,7 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
   const renderNow = () => {
     const runner = session.getRunner();
     renderer.render(runner.state);
+    options.onFrame?.(runner.state);
     updateGameOverLabel();
   };
 

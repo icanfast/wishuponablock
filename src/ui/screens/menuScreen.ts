@@ -23,7 +23,9 @@ export type MenuScreenOptions = {
   version: string;
   charcuterieDefaultSimCount?: number;
   tools: Array<{ id: string; label: string }>;
-  onStartDefault: () => void;
+  onStartPractice: () => void;
+  onStartSprint: () => void;
+  onStartClassic: () => void;
   onStartCheese: (lines: number) => void;
   onStartCharcuterie: (
     pieces: number,
@@ -49,7 +51,9 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     version,
     charcuterieDefaultSimCount = 10000,
     tools,
-    onStartDefault,
+    onStartPractice,
+    onStartSprint,
+    onStartClassic,
     onStartCheese,
     onStartCharcuterie,
     onOpenTool,
@@ -590,6 +594,162 @@ input[type=number] {
     );
   });
 
+  const graphicsTitle = document.createElement('div');
+  graphicsTitle.textContent = 'GRAPHICS';
+  Object.assign(graphicsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '10px',
+    marginBottom: '4px',
+  });
+
+  const gridlineLabel = document.createElement('div');
+  gridlineLabel.textContent = 'Gridlines Opacity';
+  Object.assign(gridlineLabel.style, {
+    marginBottom: '6px',
+    color: '#b6c2d4',
+    fontSize: '11px',
+  });
+
+  const gridlineRow = document.createElement('div');
+  Object.assign(gridlineRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  });
+
+  const gridlineValue = document.createElement('input');
+  gridlineValue.type = 'number';
+  gridlineValue.min = '0';
+  gridlineValue.max = '100';
+  gridlineValue.step = '1';
+  gridlineValue.inputMode = 'numeric';
+  Object.assign(gridlineValue.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    width: '52px',
+    textAlign: 'right',
+    padding: '4px 6px',
+    MozAppearance: 'textfield',
+  });
+  gridlineValue.addEventListener('wheel', (event) => {
+    if (document.activeElement === gridlineValue) {
+      event.preventDefault();
+    }
+  });
+  gridlineValue.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+    }
+  });
+
+  const gridlineSlider = document.createElement('input');
+  gridlineSlider.type = 'range';
+  gridlineSlider.min = '0';
+  gridlineSlider.max = '100';
+  gridlineSlider.step = '1';
+  Object.assign(gridlineSlider.style, {
+    flex: '1',
+    accentColor: '#6ea8ff',
+  });
+
+  const updateGridlineLabel = (value: number) => {
+    gridlineValue.value = String(Math.round(value * 100));
+  };
+
+  gridlineSlider.addEventListener('input', () => {
+    const value = Math.max(0, Math.min(1, Number(gridlineSlider.value) / 100));
+    updateGridlineLabel(value);
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, gridlineOpacity: value },
+    });
+  });
+
+  const applyGridlineInput = (commit: boolean) => {
+    const raw = Number(gridlineValue.value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = Math.max(0, Math.min(100, raw));
+    const value = clamped / 100;
+    gridlineSlider.value = String(Math.round(clamped));
+    if (commit) {
+      updateGridlineLabel(value);
+    }
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, gridlineOpacity: value },
+    });
+  };
+
+  gridlineValue.addEventListener('input', () => applyGridlineInput(false));
+  gridlineValue.addEventListener('change', () => applyGridlineInput(true));
+  gridlineValue.addEventListener('blur', () => applyGridlineInput(true));
+
+  gridlineRow.appendChild(gridlineSlider);
+  gridlineRow.appendChild(gridlineValue);
+
+  const highContrastRow = document.createElement('label');
+  Object.assign(highContrastRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    color: '#b6c2d4',
+    marginTop: '6px',
+  });
+
+  const highContrastLabel = document.createElement('span');
+  highContrastLabel.textContent = 'High Contrast';
+
+  const highContrastToggle = document.createElement('input');
+  highContrastToggle.type = 'checkbox';
+  Object.assign(highContrastToggle.style, {
+    accentColor: '#6ea8ff',
+  });
+
+  highContrastToggle.addEventListener('change', () => {
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, highContrast: highContrastToggle.checked },
+    });
+  });
+
+  highContrastRow.appendChild(highContrastLabel);
+  highContrastRow.appendChild(highContrastToggle);
+
+  const colorblindRow = document.createElement('label');
+  Object.assign(colorblindRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    color: '#b6c2d4',
+    marginTop: '6px',
+  });
+
+  const colorblindLabel = document.createElement('span');
+  colorblindLabel.textContent = 'Colorblind Mode';
+
+  const colorblindToggle = document.createElement('input');
+  colorblindToggle.type = 'checkbox';
+  Object.assign(colorblindToggle.style, {
+    accentColor: '#6ea8ff',
+  });
+
+  colorblindToggle.addEventListener('change', () => {
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, colorblindMode: colorblindToggle.checked },
+    });
+  });
+
+  colorblindRow.appendChild(colorblindLabel);
+  colorblindRow.appendChild(colorblindToggle);
+
   const dataTitle = document.createElement('div');
   dataTitle.textContent = 'DATA';
   Object.assign(dataTitle.style, {
@@ -659,6 +819,11 @@ input[type=number] {
   optionsRightColumn.appendChild(dasControl.wrapper);
   optionsRightColumn.appendChild(arrControl.wrapper);
   optionsRightColumn.appendChild(gameplayResetButton);
+  optionsRightColumn.appendChild(graphicsTitle);
+  optionsRightColumn.appendChild(gridlineLabel);
+  optionsRightColumn.appendChild(gridlineRow);
+  optionsRightColumn.appendChild(highContrastRow);
+  optionsRightColumn.appendChild(colorblindRow);
   optionsRightColumn.appendChild(dataTitle);
   optionsRightColumn.appendChild(shareRow);
 
@@ -939,7 +1104,9 @@ input[type=number] {
     marginBottom: '4px',
   });
 
-  const defaultButton = makeMenuButton('DEFAULT');
+  const practiceButton = makeMenuButton('PRACTICE');
+  const sprintButton = makeMenuButton('SPRINT');
+  const classicButton = makeMenuButton('CLASSIC');
   const cheeseModeButton = makeMenuButton('CHEESE');
   const charcuterieModeButton = makeMenuButton('CHARCUTERIE');
   const playBackButton = makeMenuButton('BACK');
@@ -948,7 +1115,9 @@ input[type=number] {
   });
 
   playPanel.appendChild(playTitle);
-  playPanel.appendChild(defaultButton);
+  playPanel.appendChild(practiceButton);
+  playPanel.appendChild(sprintButton);
+  playPanel.appendChild(classicButton);
   playPanel.appendChild(cheeseModeButton);
   playPanel.appendChild(charcuterieModeButton);
   playPanel.appendChild(playBackButton);
@@ -1471,7 +1640,9 @@ input[type=number] {
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 
-  defaultButton.addEventListener('click', () => onStartDefault());
+  practiceButton.addEventListener('click', () => onStartPractice());
+  sprintButton.addEventListener('click', () => onStartSprint());
+  classicButton.addEventListener('click', () => onStartClassic());
   cheeseModeButton.addEventListener('click', () => show('cheese'));
   charcuterieModeButton.addEventListener('click', () => show('charcuterie'));
 
@@ -1543,6 +1714,13 @@ input[type=number] {
     updateVolumeLabel(settings.audio.masterVolume);
     updateMsControl(dasControl, settings.input.dasMs);
     updateMsControl(arrControl, settings.input.arrMs);
+    const nextGridline = Math.round(settings.graphics.gridlineOpacity * 100);
+    if (Number(gridlineSlider.value) !== nextGridline) {
+      gridlineSlider.value = String(nextGridline);
+    }
+    updateGridlineLabel(settings.graphics.gridlineOpacity);
+    highContrastToggle.checked = settings.graphics.highContrast;
+    colorblindToggle.checked = settings.graphics.colorblindMode;
     shareToggle.checked = settings.privacy.shareSnapshots;
     updateKeybindButtons(settings.input.bindings);
     updateButterfingerUI(settings.butterfinger);

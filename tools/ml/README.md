@@ -13,25 +13,13 @@ pip install -r requirements.txt
 ```
 
 2. Place your labeling output at `tools/ml/data/raw/labels.jsonl` (copy from the tool's output folder).
-   The converter also accepts a single JSON array file if you export one later.
-
-3. Convert to the intermediate training format:
-
-```bash
-python tools/ml/scripts/convert_labels.py \
-  --in tools/ml/data/raw/labels.jsonl \
-  --out tools/ml/data/processed/labels_v1.jsonl
-```
-
-The intermediate format is documented in `tools/ml/schema.md`.
-The converter now includes `session_id`, which is used for session-aware
-train/validation splits.
+   This raw format is now accepted directly by the training pipeline.
 
 ## Training (baseline)
 
 ```bash
 python tools/ml/scripts/train.py \
-  --data tools/ml/data/processed/labels_v1.jsonl \
+  --data tools/ml/data/raw/labels.jsonl \
   --epochs 10 \
   --batch-size 128
 ```
@@ -45,8 +33,8 @@ Options:
 - `--checkpoint-every 10` - save a checkpoint every N epochs (0 disables).
 - `--no-hold` - drop the hold piece feature.
 
-Note: training uses a session-based split when `session_id` is present in the
-processed file, so keep that field in your converted data.
+Note: training uses a session-based split when `session_id` is present. For
+labels exported by the in-game tool, we also infer it from `source.sessionId`.
 
 ## Export
 

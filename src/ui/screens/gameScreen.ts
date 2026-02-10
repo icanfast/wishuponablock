@@ -24,6 +24,12 @@ export type GameScreen = {
   root: HTMLDivElement;
   generatorSelect: HTMLSelectElement;
   modelStatusLabel: HTMLDivElement;
+  sprintPanel: HTMLDivElement;
+  sprintTimerValue: HTMLDivElement;
+  sprintLinesValue: HTMLDivElement;
+  classicPanel: HTMLDivElement;
+  classicLevelValue: HTMLDivElement;
+  classicScoreValue: HTMLDivElement;
   gameOverLabel: HTMLDivElement;
   recordRow: HTMLDivElement;
   commentInput: HTMLInputElement;
@@ -193,6 +199,87 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
   });
   settingsPanel.appendChild(modelStatusLabel);
 
+  const sprintPanel = document.createElement('div');
+  Object.assign(sprintPanel.style, {
+    marginTop: '10px',
+    padding: '8px',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    display: 'none',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+
+  const sprintTitle = document.createElement('div');
+  sprintTitle.textContent = 'SPRINT';
+  Object.assign(sprintTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    letterSpacing: '0.5px',
+    marginBottom: '6px',
+  });
+  sprintPanel.appendChild(sprintTitle);
+
+  const makeSprintRow = (labelText: string) => {
+    const row = document.createElement('div');
+    Object.assign(row.style, {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: '4px',
+    });
+    const label = document.createElement('div');
+    label.textContent = labelText;
+    Object.assign(label.style, {
+      color: '#b6c2d4',
+    });
+    const value = document.createElement('div');
+    Object.assign(value.style, {
+      color: '#e2e8f0',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    });
+    row.appendChild(label);
+    row.appendChild(value);
+    return { row, value };
+  };
+
+  const sprintTimerRow = makeSprintRow('Time');
+  const sprintLinesRow = makeSprintRow('Lines Left');
+  sprintPanel.appendChild(sprintTimerRow.row);
+  sprintPanel.appendChild(sprintLinesRow.row);
+
+  settingsPanel.appendChild(sprintPanel);
+
+  const classicPanel = document.createElement('div');
+  Object.assign(classicPanel.style, {
+    marginTop: '10px',
+    padding: '8px',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    display: 'none',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+
+  const classicTitle = document.createElement('div');
+  classicTitle.textContent = 'CLASSIC';
+  Object.assign(classicTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    letterSpacing: '0.5px',
+    marginBottom: '6px',
+  });
+  classicPanel.appendChild(classicTitle);
+
+  const classicLevelRow = makeSprintRow('Level');
+  const classicScoreRow = makeSprintRow('Score');
+  classicPanel.appendChild(classicLevelRow.row);
+  classicPanel.appendChild(classicScoreRow.row);
+
+  settingsPanel.appendChild(classicPanel);
+
   const recordLabel = document.createElement('div');
   recordLabel.textContent = 'Snapshots';
   Object.assign(recordLabel.style, {
@@ -313,6 +400,12 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
     root,
     generatorSelect: select,
     modelStatusLabel,
+    sprintPanel,
+    sprintTimerValue: sprintTimerRow.value,
+    sprintLinesValue: sprintLinesRow.value,
+    classicPanel,
+    classicLevelValue: classicLevelRow.value,
+    classicScoreValue: classicScoreRow.value,
     gameOverLabel,
     recordRow,
     commentInput,

@@ -16,14 +16,23 @@ import {
 } from '../../core/constants';
 import { PIECES, type PieceKind } from '../../core/types';
 import { TETROMINOES } from '../../core/tetromino';
+import { PIECE_COLORS, type PiecePalette } from '../../core/palette';
 
 export type ToolScreen = {
   root: HTMLDivElement;
+  panel: HTMLDivElement;
+  title: HTMLDivElement;
+  info: HTMLDivElement;
   inputButton: HTMLButtonElement;
   inputStatus: HTMLDivElement;
+  playstyleLabel: HTMLDivElement;
   playstyleSelect: HTMLSelectElement;
+  modeLabel: HTMLDivElement;
   modeSelect: HTMLSelectElement;
+  triggerLabel: HTMLDivElement;
   triggerSelect: HTMLSelectElement;
+  buildLabel: HTMLDivElement;
+  buildSelect: HTMLSelectElement;
   outputButton: HTMLButtonElement;
   outputStatus: HTMLDivElement;
   sampleStatus: HTMLDivElement;
@@ -31,24 +40,20 @@ export type ToolScreen = {
   backButton: HTMLButtonElement;
   nextButton: HTMLButtonElement;
   pieceButtons: Map<PieceKind, HTMLButtonElement>;
+  setPiecePalette: (palette: PiecePalette) => void;
 };
 
 type ToolScreenOptions = {
   toolUsesRemote: boolean;
 };
 
-const PIECE_COLORS: Record<PieceKind, string> = {
-  I: '#4dd3ff',
-  O: '#ffd84d',
-  T: '#c77dff',
-  S: '#6eea6e',
-  Z: '#ff6b6b',
-  J: '#4d7cff',
-  L: '#ffa94d',
-};
+const toHex = (color: number): string =>
+  `#${color.toString(16).padStart(6, '0')}`;
 
 export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   const { toolUsesRemote } = options;
+
+  let piecePalette: PiecePalette = PIECE_COLORS;
 
   const toolLayer = document.createElement('div');
   Object.assign(toolLayer.style, {
@@ -219,6 +224,28 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   });
   toolPanel.appendChild(toolTriggerSelect);
 
+  const toolBuildLabel = document.createElement('div');
+  toolBuildLabel.textContent = 'Build Version';
+  Object.assign(toolBuildLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolBuildLabel);
+
+  const toolBuildSelect = document.createElement('select');
+  Object.assign(toolBuildSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolBuildSelect);
+
   const toolOutputButton = document.createElement('button');
   toolOutputButton.textContent = 'Select Output Folder';
   Object.assign(toolOutputButton.style, {
@@ -325,6 +352,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   toolLayer.appendChild(toolNextButton);
 
   const toolPieceButtons = new Map<PieceKind, HTMLButtonElement>();
+  const toolPieceCanvases = new Map<PieceKind, HTMLCanvasElement>();
 
   const drawPiecePreview = (
     canvas: HTMLCanvasElement,
@@ -333,7 +361,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const color = PIECE_COLORS[piece];
+    const color = toHex(piecePalette[piece]);
     const pad = Math.max(1, Math.floor(toolPieceCellPx / 6));
     const shape = TETROMINOES[piece][0];
     let minX = Infinity;
@@ -388,15 +416,31 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     btn.appendChild(canvas);
     toolPieceRow.appendChild(btn);
     toolPieceButtons.set(piece, btn);
+    toolPieceCanvases.set(piece, canvas);
   }
+
+  const setPiecePalette = (palette: PiecePalette) => {
+    piecePalette = palette;
+    for (const [piece, canvas] of toolPieceCanvases) {
+      drawPiecePreview(canvas, piece);
+    }
+  };
 
   return {
     root: toolLayer,
+    panel: toolPanel,
+    title: toolTitle,
+    info: toolInfo,
     inputButton: toolInputButton,
     inputStatus: toolInputStatus,
+    playstyleLabel: toolPlaystyleLabel,
     playstyleSelect: toolPlaystyleSelect,
+    modeLabel: toolModeLabel,
     modeSelect: toolModeSelect,
+    triggerLabel: toolTriggerLabel,
     triggerSelect: toolTriggerSelect,
+    buildLabel: toolBuildLabel,
+    buildSelect: toolBuildSelect,
     outputButton: toolOutputButton,
     outputStatus: toolOutputStatus,
     sampleStatus: toolSampleStatus,
@@ -404,5 +448,6 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     backButton: toolBackButton,
     nextButton: toolNextButton,
     pieceButtons: toolPieceButtons,
+    setPiecePalette,
   };
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3
+- Added Sprint and Classic game modes.
+- Added Visual and Accessibility settings.
+- Added Grid Constructor tool. Grids constructed with it can be saved and afterwards labeled with Wish Upon a Block tool found under custom tag.
+- Added line clear SFX.
+- Re-trained the ml piece generator. It is now less repetitive while stacking while still helping out in a pickle.
+
 ## 0.2.2
 - Added DAS and ARR settings.
 - Added opt-out of data collection checkbox.

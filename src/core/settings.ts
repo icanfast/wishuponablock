@@ -9,6 +9,10 @@ import {
   DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
   DEFAULT_DAS_MS,
   DEFAULT_GRAVITY_MS,
+  DEFAULT_GRIDLINE_OPACITY,
+  DEFAULT_HIGH_CONTRAST,
+  DEFAULT_ML_INFERENCE,
+  DEFAULT_COLORBLIND_MODE,
   DEFAULT_HARD_LOCK_DELAY_MS,
   DEFAULT_KEY_BINDINGS,
   DEFAULT_LOCK_DELAY_MS,
@@ -17,7 +21,11 @@ import {
   DEFAULT_SOFT_DROP_MS,
   SETTINGS_STORAGE_KEY,
 } from './constants';
-import { type GeneratorSettings, isGeneratorType } from './generators';
+import {
+  type GeneratorSettings,
+  isGeneratorType,
+  isMlInferenceStrategy,
+} from './generators';
 import type { GameConfig } from './game';
 import type { InputConfig, KeyBindings } from '../input/controller';
 
@@ -34,6 +42,7 @@ export interface Settings {
   generator: GeneratorSettings;
   audio: AudioSettings;
   privacy: PrivacySettings;
+  graphics: GraphicsSettings;
   butterfinger: ButterfingerSettings;
 }
 
@@ -43,6 +52,12 @@ export interface AudioSettings {
 
 export interface PrivacySettings {
   shareSnapshots: boolean;
+}
+
+export interface GraphicsSettings {
+  gridlineOpacity: number;
+  highContrast: boolean;
+  colorblindMode: boolean;
 }
 
 export interface ButterfingerSettings {
@@ -69,12 +84,18 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   generator: {
     type: 'ml',
+    ml: { ...DEFAULT_ML_INFERENCE },
   },
   audio: {
     masterVolume: DEFAULT_MASTER_VOLUME,
   },
   privacy: {
     shareSnapshots: DEFAULT_SHARE_SNAPSHOTS,
+  },
+  graphics: {
+    gridlineOpacity: DEFAULT_GRIDLINE_OPACITY,
+    highContrast: DEFAULT_HIGH_CONTRAST,
+    colorblindMode: DEFAULT_COLORBLIND_MODE,
   },
   butterfinger: {
     enabled: DEFAULT_BUTTERFINGER_ENABLED,
@@ -145,6 +166,13 @@ function mergeGenerator(
 ): GeneratorSettings {
   return {
     type: isGeneratorType(patch?.type) ? patch.type : base.type,
+    ml: {
+      strategy: isMlInferenceStrategy(patch?.ml?.strategy)
+        ? patch.ml!.strategy
+        : base.ml.strategy,
+      temperature: num(patch?.ml?.temperature) ?? base.ml.temperature,
+      threshold: num(patch?.ml?.threshold) ?? base.ml.threshold,
+    },
   };
 }
 
@@ -163,6 +191,17 @@ function mergePrivacy(
 ): PrivacySettings {
   return {
     shareSnapshots: bool(patch?.shareSnapshots) ?? base.shareSnapshots,
+  };
+}
+
+function mergeGraphics(
+  base: GraphicsSettings,
+  patch?: Partial<GraphicsSettings>,
+): GraphicsSettings {
+  return {
+    gridlineOpacity: num(patch?.gridlineOpacity) ?? base.gridlineOpacity,
+    highContrast: bool(patch?.highContrast) ?? base.highContrast,
+    colorblindMode: bool(patch?.colorblindMode) ?? base.colorblindMode,
   };
 }
 
@@ -191,6 +230,7 @@ export function mergeSettings(
     generator: mergeGenerator(base.generator, patch.generator),
     audio: mergeAudio(base.audio, patch.audio),
     privacy: mergePrivacy(base.privacy, patch.privacy),
+    graphics: mergeGraphics(base.graphics, patch.graphics),
     butterfinger: mergeButterfinger(base.butterfinger, patch.butterfinger),
   };
 }

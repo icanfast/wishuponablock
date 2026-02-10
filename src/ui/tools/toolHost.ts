@@ -1,9 +1,12 @@
+import type { PiecePalette } from '../../core/palette';
+
 export type ToolController = {
   id: string;
   label: string;
   root: HTMLElement;
   enter: () => void | Promise<void>;
   leave: () => void;
+  setPiecePalette?: (palette: PiecePalette) => void;
 };
 
 export type ToolRegistryEntry = {

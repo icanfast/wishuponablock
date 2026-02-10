@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -28,10 +28,31 @@ def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
             yield json.loads(line)
 
 
+def normalize_paths(path: Path | str | Sequence[Path | str]) -> list[Path]:
+    if isinstance(path, (list, tuple)):
+        return [Path(p) for p in path]
+    return [Path(path)]
+
+
+def encode_row_occupancy(row: str) -> str:
+    out: list[str] = []
+    for ch in row:
+        if ch == ".":
+            out.append(".")
+        elif ch.isdigit():
+            out.append("." if int(ch) <= 0 else "#")
+        else:
+            out.append("#")
+    return "".join(out)
+
+
 def decode_board(rows: Any) -> list[str]:
-    if not isinstance(rows, list) or not all(isinstance(r, str) for r in rows):
-        raise ValueError("Board must be a list of strings.")
-    return list(rows)
+    if isinstance(rows, list) and all(isinstance(r, str) for r in rows):
+        return [encode_row_occupancy(r) for r in rows]
+    if isinstance(rows, str):
+        split_rows = rows.split("/")
+        return [encode_row_occupancy(r) for r in split_rows]
+    raise ValueError("Board must be a list of strings or '/'-delimited string.")
 
 
 def board_to_tensor(rows: list[str]) -> torch.Tensor:
@@ -65,12 +86,12 @@ def board_to_tensor(rows: list[str]) -> torch.Tensor:
 class LabelsDataset(Dataset[Sample]):
     def __init__(
         self,
-        path: Path | str,
+        path: Path | str | Sequence[Path | str],
         piece_order: list[str] | None = None,
         drop_empty_labels: bool = True,
         mirror_prob: float = 0.0,
     ) -> None:
-        self.path = Path(path)
+        self.paths = normalize_paths(path)
         self.pieces = piece_order or DEFAULT_PIECES
         self.piece_to_idx = {p: i for i, p in enumerate(self.pieces)}
         self.samples: list[Sample] = []
@@ -79,40 +100,52 @@ class LabelsDataset(Dataset[Sample]):
         self.input_channels = 3
         self.session_ids: list[str] = []
 
-        for record in iter_json_records(self.path):
-            try:
-                rows = decode_board(record.get("board"))
-                board = board_to_tensor(rows)
-            except Exception:
-                self.skipped += 1
-                continue
+        for source_path in self.paths:
+            for record in iter_json_records(source_path):
+                try:
+                    rows = decode_board(record.get("board"))
+                    board = board_to_tensor(rows)
+                except Exception:
+                    self.skipped += 1
+                    continue
 
-            hold = record.get("hold")
-            hold_idx = self.piece_to_idx.get(hold, -1) if hold else -1
+                hold = record.get("hold")
+                if isinstance(hold, (int, float)):
+                    hold_idx = int(hold) - 1
+                elif isinstance(hold, str):
+                    hold_idx = self.piece_to_idx.get(hold, -1)
+                else:
+                    hold_idx = -1
 
-            labels_raw = record.get("labels") or []
-            labels: list[int] = []
-            for label in labels_raw:
-                idx = self.piece_to_idx.get(label)
-                if idx is not None:
-                    labels.append(idx)
+                labels_raw = record.get("labels") or []
+                labels: list[int] = []
+                for label in labels_raw:
+                    idx = self.piece_to_idx.get(label)
+                    if idx is not None:
+                        labels.append(idx)
 
-            if drop_empty_labels and not labels:
-                self.skipped += 1
-                continue
+                if drop_empty_labels and not labels:
+                    self.skipped += 1
+                    continue
 
-            session_id = record.get("session_id")
-            if not isinstance(session_id, str) or not session_id:
-                session_id = f"unknown_{len(self.samples)}"
-            self.samples.append(
-                Sample(
-                    board=board,
-                    hold=hold_idx,
-                    labels=labels,
-                    session_id=session_id,
+                session_id = record.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    source = record.get("source")
+                    if isinstance(source, dict):
+                        source_id = source.get("sessionId")
+                        if isinstance(source_id, str) and source_id:
+                            session_id = source_id
+                if not isinstance(session_id, str) or not session_id:
+                    session_id = f"unknown_{len(self.samples)}"
+                self.samples.append(
+                    Sample(
+                        board=board,
+                        hold=hold_idx,
+                        labels=labels,
+                        session_id=session_id,
+                    )
                 )
-            )
-            self.session_ids.append(session_id)
+                self.session_ids.append(session_id)
 
     def __len__(self) -> int:
         return len(self.samples)

@@ -18,6 +18,7 @@ type SettingsControllerOptions = {
   sessionController: SessionController;
   modelService: ModelService;
   onModelStatus: (status: ModelStatus) => void;
+  onGraphicsChange?: (settings: Settings) => void;
 };
 
 export function createSettingsController(
@@ -31,6 +32,7 @@ export function createSettingsController(
     sessionController,
     modelService,
     onModelStatus,
+    onGraphicsChange,
   } = options;
   let generatorType = settingsStore.get().generator.type;
 
@@ -38,6 +40,7 @@ export function createSettingsController(
     soundService.applySettings(next);
     inputService.applySettings(next);
     uiController.syncMenuSettings(next);
+    onGraphicsChange?.(next);
 
     if (next.generator.type !== generatorType) {
       generatorType = next.generator.type;

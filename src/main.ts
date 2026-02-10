@@ -31,12 +31,14 @@ import {
 } from './app/snapshotService';
 import { createGameSessionFactory } from './app/gameFactory';
 import { PixiRenderer } from './render/pixiRenderer';
-import { type Board, type PieceKind } from './core/types';
+import { type Board, type PieceKind, type GameState } from './core/types';
 import { createMenuScreen, type MenuScreen } from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
 import { createToolHost, type ToolHost } from './ui/tools/toolHost';
 import { createLabelingTool } from './ui/tools/labelingTool';
+import { createConstructorTool } from './ui/tools/constructorTool';
 import { createToolCanvas } from './ui/tools/toolCanvas';
+import { getPiecePalette } from './core/palette';
 import pkg from '../package.json';
 
 function hasWebGL(): boolean {
@@ -176,7 +178,7 @@ async function boot() {
   void modelService.ensureLoaded();
   let menuUi: MenuScreen | null = null;
   const modeController = createModeController({
-    initialModeId: 'default',
+    initialModeId: 'practice',
   });
   const charcuterieDefaultSimCount = 10000;
   const charcuterieScoreWeights: CharcuterieScoreWeights = {
@@ -207,14 +209,41 @@ async function boot() {
     snapshotService?.restart();
   };
 
+  let pendingLineClearSound = false;
   const handlePieceLock = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
-    soundService.playLock();
-    snapshotService?.handleLock(board, hold);
+    if (!pendingLineClearSound) {
+      soundService.playLock();
+    }
+    pendingLineClearSound = false;
+    const state = session.getGame().state;
+    const linesLeft =
+      state.lineGoal != null
+        ? Math.max(0, state.lineGoal - state.totalLinesCleared)
+        : undefined;
+    snapshotService?.handleLock(board, hold, {
+      linesLeft,
+      level: state.level,
+      score: state.score,
+    });
+  };
+  const handleLineClear = (combo: number) => {
+    if (suppressLockEffects) return;
+    pendingLineClearSound = true;
+    soundService.playCombo(combo);
   };
   const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
-    snapshotService?.handleHold(board, hold);
+    const state = session.getGame().state;
+    const linesLeft =
+      state.lineGoal != null
+        ? Math.max(0, state.lineGoal - state.totalLinesCleared)
+        : undefined;
+    snapshotService?.handleHold(board, hold, {
+      linesLeft,
+      level: state.level,
+      score: state.score,
+    });
   };
 
   const initialModeState = modeController.getState();
@@ -225,6 +254,7 @@ async function boot() {
     modelService,
     onPieceLock: handlePieceLock,
     onHold: handleHoldSnapshot,
+    onLineClear: handleLineClear,
     onBeforeRestart: () => restartRecordingSession(),
     setLockEffectsSuppressed: (value) => {
       suppressLockEffects = value;
@@ -247,6 +277,12 @@ async function boot() {
 
   const gameRenderer = new PixiRenderer(gameGfx);
   const toolRenderer = new PixiRenderer(toolGfx);
+  gameRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
+  gameRenderer.setHighContrast(settings.graphics.highContrast);
+  gameRenderer.setColorblindMode(settings.graphics.colorblindMode);
+  toolRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
+  toolRenderer.setHighContrast(settings.graphics.highContrast);
+  toolRenderer.setColorblindMode(settings.graphics.colorblindMode);
   const toolCanvas = createToolCanvas(toolRenderer);
 
   const gameUi: GameScreen = createGameScreen({
@@ -254,6 +290,48 @@ async function boot() {
     initialGeneratorType: settings.generator.type,
   });
   gameScreen.appendChild(gameUi.root);
+
+  const formatSprintTime = (ms: number): string => {
+    const totalMs = Math.max(0, Math.floor(ms));
+    const minutes = Math.floor(totalMs / 60000);
+    const seconds = Math.floor((totalMs % 60000) / 1000);
+    const hundredths = Math.floor((totalMs % 1000) / 10);
+    return `${minutes}:${String(seconds).padStart(2, '0')}.${String(
+      hundredths,
+    ).padStart(2, '0')}`;
+  };
+
+  const updateSprintHud = (state: GameState) => {
+    if (!state.lineGoal) {
+      if (gameUi.sprintPanel.style.display !== 'none') {
+        gameUi.sprintPanel.style.display = 'none';
+      }
+      return;
+    }
+    if (gameUi.sprintPanel.style.display !== 'block') {
+      gameUi.sprintPanel.style.display = 'block';
+    }
+    const linesLeft = Math.max(0, state.lineGoal - state.totalLinesCleared);
+    gameUi.sprintTimerValue.textContent = formatSprintTime(state.timeMs);
+    gameUi.sprintLinesValue.textContent = String(linesLeft);
+  };
+
+  const updateClassicHud = (state: GameState) => {
+    if (!state.scoringEnabled) {
+      if (gameUi.classicPanel.style.display !== 'none') {
+        gameUi.classicPanel.style.display = 'none';
+      }
+      return;
+    }
+    if (gameUi.classicPanel.style.display !== 'block') {
+      gameUi.classicPanel.style.display = 'block';
+    }
+    const scoreFormatted = Math.trunc(state.score)
+      .toString()
+      .replace(/\B(?=(\d{3})+(?!\d))/g, "'");
+    gameUi.classicLevelValue.textContent = String(state.level);
+    gameUi.classicScoreValue.textContent = scoreFormatted;
+  };
 
   modelStatusLabel = gameUi.modelStatusLabel;
 
@@ -264,6 +342,10 @@ async function boot() {
     inputSource,
     onGameOver: (visible) => {
       gameUi.gameOverLabel.style.display = visible ? 'block' : 'none';
+    },
+    onFrame: (state) => {
+      updateSprintHud(state);
+      updateClassicHud(state);
     },
   });
   inputService.setOnInputSourceChange((source) => {
@@ -280,7 +362,18 @@ async function boot() {
     useRemoteUpload,
     getSnapshotState: () => {
       const game = session.getGame();
-      return { board: game.state.board, hold: game.state.hold };
+      const state = game.state;
+      const linesLeft =
+        state.lineGoal != null
+          ? Math.max(0, state.lineGoal - state.totalLinesCleared)
+          : undefined;
+      return {
+        board: state.board,
+        hold: state.hold,
+        linesLeft,
+        level: state.level,
+        score: state.score,
+      };
     },
     onPauseInputChange: (paused) => runtime?.setPausedByInput(paused),
     onMenuClick: () => setScreen('menu'),
@@ -301,6 +394,7 @@ async function boot() {
     uploadClient,
     useRemoteUpload,
     identityService,
+    buildVersion: APP_VERSION,
     onStateChange: uiController.syncSnapshotUi,
   });
   snapshotService.setModeInfo({
@@ -326,7 +420,24 @@ async function boot() {
     onBack: () => setScreen('menu'),
   });
   toolHost.register(labelingTool);
+  const constructorTool = createConstructorTool({
+    canvas: toolCanvas,
+    canvasElement: app.canvas,
+    uploadClient,
+    settingsStore,
+    identityService,
+    buildVersion: APP_VERSION,
+    onBack: () => setScreen('menu'),
+  });
+  toolHost.register(constructorTool);
   activeToolId = labelingTool.id;
+
+  const applyToolPalette = () => {
+    const palette = getPiecePalette(settingsStore.get().graphics);
+    labelingTool.setPiecePalette?.(palette);
+    constructorTool.setPiecePalette?.(palette);
+  };
+  applyToolPalette();
 
   menuUi = createMenuScreen({
     settingsStore,
@@ -349,6 +460,17 @@ async function boot() {
     sessionController,
     modelService,
     onModelStatus: updateModelStatusUI,
+    onGraphicsChange: (next) => {
+      gameRenderer.setGridlineOpacity(next.graphics.gridlineOpacity);
+      toolRenderer.setGridlineOpacity(next.graphics.gridlineOpacity);
+      gameRenderer.setHighContrast(next.graphics.highContrast);
+      toolRenderer.setHighContrast(next.graphics.highContrast);
+      gameRenderer.setColorblindMode(next.graphics.colorblindMode);
+      toolRenderer.setColorblindMode(next.graphics.colorblindMode);
+      const palette = getPiecePalette(next.graphics);
+      labelingTool.setPiecePalette?.(palette);
+      constructorTool.setPiecePalette?.(palette);
+    },
   });
   settingsController.start();
 

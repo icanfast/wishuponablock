@@ -135,6 +135,7 @@ export default {
         }
         const mode = url.searchParams.get('mode') ?? 'all';
         const trigger = url.searchParams.get('trigger') ?? 'all';
+        const build = url.searchParams.get('build') ?? 'all';
         let sql = 'SELECT id, created_at, meta, board FROM snapshots';
         const params: unknown[] = [];
         const clauses: string[] = [];
@@ -154,6 +155,16 @@ export default {
           } else {
             clauses.push("json_extract(meta, '$.trigger') = ?");
             params.push(trigger);
+          }
+        }
+        if (build !== 'all') {
+          if (build === 'unknown') {
+            clauses.push(
+              "json_extract(meta, '$.session.buildVersion') IS NULL",
+            );
+          } else {
+            clauses.push("json_extract(meta, '$.session.buildVersion') = ?");
+            params.push(build);
           }
         }
         if (clauses.length > 0) {

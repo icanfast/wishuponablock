@@ -5,18 +5,33 @@ import type { PieceGenerator } from './generator';
 import type { LoadedModel } from './wubModel';
 import { predictLogits, softmax } from './wubModel';
 
+type InferenceStrategy = 'clean_uniform' | 'threshold';
+
+type InferenceOptions = {
+  strategy?: InferenceStrategy;
+  temperature?: number;
+  threshold?: number;
+};
+
 export class ModelGenerator implements PieceGenerator {
   private rng: XorShift32;
   private model: LoadedModel | null;
   private pending: PieceKind | null = null;
+  private strategy: InferenceStrategy;
+  private temperature: number;
+  private threshold: number;
 
   constructor(
     seed: number,
     model: LoadedModel | null,
     modelPromise?: Promise<LoadedModel | null>,
+    options: InferenceOptions = {},
   ) {
     this.rng = new XorShift32(seed);
     this.model = model ?? null;
+    this.strategy = options.strategy ?? 'clean_uniform';
+    this.temperature = options.temperature ?? 1;
+    this.threshold = options.threshold ?? 0;
     modelPromise?.then((loaded) => {
       if (loaded) this.model = loaded;
     });
@@ -47,12 +62,17 @@ export class ModelGenerator implements PieceGenerator {
       return;
     }
     const logits = predictLogits(this.model, board, hold);
-    const probs = softmax(logits);
-    const blend = getCleanBlend(board);
-    if (blend > 0) {
-      const uniform = 1 / probs.length;
-      for (let i = 0; i < probs.length; i++) {
-        probs[i] = probs[i] * (1 - blend) + uniform * blend;
+    const probs =
+      this.strategy === 'threshold'
+        ? thresholdedSoftmax(logits, this.temperature, this.threshold)
+        : softmax(logits);
+    if (this.strategy === 'clean_uniform') {
+      const blend = getCleanBlend(board);
+      if (blend > 0) {
+        const uniform = 1 / probs.length;
+        for (let i = 0; i < probs.length; i++) {
+          probs[i] = probs[i] * (1 - blend) + uniform * blend;
+        }
       }
     }
     const pieces = this.model.pieces ?? PIECES;
@@ -77,6 +97,35 @@ export class ModelGenerator implements PieceGenerator {
     return probs.length - 1;
   }
 }
+
+const thresholdedSoftmax = (
+  logits: Float32Array,
+  temperature: number,
+  threshold: number,
+): Float32Array => {
+  const temp = temperature > 0 ? temperature : 1;
+  const scaled = new Float32Array(logits.length);
+  for (let i = 0; i < logits.length; i++) {
+    scaled[i] = logits[i] / temp;
+  }
+  const base = softmax(scaled);
+  if (threshold <= 0) return base;
+  const filtered = new Float32Array(base.length);
+  let sum = 0;
+  for (let i = 0; i < base.length; i++) {
+    if (base[i] >= threshold) {
+      filtered[i] = base[i];
+      sum += base[i];
+    }
+  }
+  if (sum <= 0) return base;
+  for (let i = 0; i < filtered.length; i++) {
+    if (filtered[i] > 0) {
+      filtered[i] /= sum;
+    }
+  }
+  return filtered;
+};
 
 const CLEAN_SCORE_THRESHOLD = 0.98;
 const CLEAN_HEIGHT_THRESHOLD = 4;

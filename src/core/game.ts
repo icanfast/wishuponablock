@@ -41,9 +41,13 @@ export interface GameConfig {
   lockNudgeRate?: number;
   gravityDropRate?: number;
   lockRotateRate?: number;
+  lineGoal?: number;
+  classicStartLevel?: number;
+  scoringEnabled?: boolean;
   generatorFactory?: (seed: number) => PieceGenerator;
   onPieceLock?: (board: Board, hold: PieceKind | null) => void;
   onHold?: (board: Board, hold: PieceKind | null) => void;
+  onLineClear?: (combo: number, clearedLines: number) => void;
 }
 
 export class Game {
@@ -67,6 +71,12 @@ export class Game {
   private gravityDropRate = 0;
   private lockRotateRate = 0;
   private butterfingerRng: XorShift32;
+  private lineGoal: number | null = null;
+  private classicStartLevel: number | null = null;
+  private scoringEnabled = false;
+  private softDropHeld = false;
+  private softDropSegmentCells = 0;
+  private softDropLastSegmentCells = 0;
 
   private gravityMs: number;
   private softDropMs: number;
@@ -74,6 +84,7 @@ export class Game {
   private hardLockDelayMs: number;
   private onPieceLock?: (board: Board, hold: PieceKind | null) => void;
   private onHold?: (board: Board, hold: PieceKind | null) => void;
+  private onLineClear?: (combo: number, clearedLines: number) => void;
 
   constructor(cfg: GameConfig) {
     this.rng = new XorShift32(cfg.seed);
@@ -85,8 +96,18 @@ export class Game {
     this.lockNudgeRate = clamp01(cfg.lockNudgeRate ?? 0);
     this.gravityDropRate = clamp01(cfg.gravityDropRate ?? 0);
     this.lockRotateRate = clamp01(cfg.lockRotateRate ?? 0);
+    this.lineGoal =
+      cfg.lineGoal != null && Number.isFinite(cfg.lineGoal)
+        ? Math.max(1, Math.trunc(cfg.lineGoal))
+        : null;
+    this.classicStartLevel =
+      cfg.classicStartLevel != null && Number.isFinite(cfg.classicStartLevel)
+        ? Math.max(0, Math.trunc(cfg.classicStartLevel))
+        : null;
+    this.scoringEnabled = Boolean(cfg.scoringEnabled);
     this.onPieceLock = cfg.onPieceLock;
     this.onHold = cfg.onHold;
+    this.onLineClear = cfg.onLineClear;
     this.butterfingerRng = new XorShift32(cfg.seed ^ 0x6d2b79f5);
 
     const makeGenerator = cfg.generatorFactory ?? ((seed) => new Bag7(seed));
@@ -105,9 +126,22 @@ export class Game {
       next: [],
       gameOver: false,
       gameWon: false,
+      combo: 0,
+      timeMs: 0,
+      totalLinesCleared: 0,
+      lineGoal: this.lineGoal,
+      level: this.getClassicLevel(0),
+      score: 0,
+      scoringEnabled: this.scoringEnabled,
     };
 
+    if (this.classicStartLevel != null) {
+      this.gravityMs = getClassicGravityMs(this.state.level);
+      this.dropIntervalMs = this.gravityMs;
+    }
+
     this.totalLinesCleared = 0;
+    this.state.totalLinesCleared = 0;
     this.resetCheeseState();
     this.resetInitialBlocks();
     this.updateNextView();
@@ -121,6 +155,13 @@ export class Game {
     this.hardLockAcc = 0;
     this.state.gameOver = false;
     this.state.gameWon = false;
+    this.state.combo = 0;
+    this.state.timeMs = 0;
+    this.totalLinesCleared = 0;
+    this.state.totalLinesCleared = 0;
+    this.state.level = this.getClassicLevel(0);
+    this.state.score = 0;
+    this.state.scoringEnabled = this.scoringEnabled;
     this.liftSpawnIfBlocked();
     this.recomputeGhost();
     if (collides(this.state.board, this.state.active)) {
@@ -143,6 +184,10 @@ export class Game {
       this.gravityDropRate = clamp01(cfg.gravityDropRate);
     if (cfg.lockRotateRate !== undefined)
       this.lockRotateRate = clamp01(cfg.lockRotateRate);
+    if (cfg.scoringEnabled !== undefined) {
+      this.scoringEnabled = Boolean(cfg.scoringEnabled);
+      this.state.scoringEnabled = this.scoringEnabled;
+    }
 
     // Keep current interval in sync if it was previously matching one of these.
     if (this.dropIntervalMs === prevGravity) {
@@ -155,6 +200,8 @@ export class Game {
   step(dtMs: number, input: InputFrame): void {
     if (this.state.gameOver || this.state.gameWon) return;
 
+    this.state.timeMs += Math.max(0, dtMs);
+    this.updateSoftDropState(input.softDrop);
     if (this.applyInput(input)) return;
     this.applyGravity(dtMs, input);
     this.applyLock(dtMs);
@@ -191,7 +238,7 @@ export class Game {
       while (this.gravityAcc >= this.dropIntervalMs) {
         this.gravityAcc -= this.dropIntervalMs;
 
-        if (!this.tryMoveDown()) {
+        if (!this.tryMoveDown(input.softDrop)) {
           // grounded: stop consuming extra "gravity" this tick
           this.gravityAcc = 0;
           break;
@@ -250,9 +297,19 @@ export class Game {
     this.state.next = [];
     this.state.gameOver = false;
     this.state.gameWon = false;
+    this.state.combo = 0;
+    this.state.timeMs = 0;
     this.resetCheeseState();
     this.resetInitialBlocks();
     this.totalLinesCleared = 0;
+    this.state.totalLinesCleared = 0;
+    this.state.lineGoal = this.lineGoal;
+    this.state.level = this.getClassicLevel(0);
+    this.state.score = 0;
+    this.state.scoringEnabled = this.scoringEnabled;
+    this.softDropHeld = false;
+    this.softDropSegmentCells = 0;
+    this.softDropLastSegmentCells = 0;
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
@@ -431,11 +488,14 @@ export class Game {
     }
   }
 
-  private tryMoveDown(): boolean {
+  private tryMoveDown(countSoftDrop = false): boolean {
     if (
       !collides(this.state.board, this.state.active, this.state.active.r, 0, 1)
     ) {
       this.state.active.y += 1;
+      if (countSoftDrop && this.softDropHeld) {
+        this.softDropSegmentCells += 1;
+      }
       this.lockAcc = 0;
       this.recomputeGhost();
       return true;
@@ -454,6 +514,9 @@ export class Game {
     const d = dropDistance(this.state.board, this.state.active);
     if (d > 0) {
       this.state.active.y += d;
+      if (this.softDropHeld) {
+        this.softDropSegmentCells += d;
+      }
       this.lockAcc = 0;
       this.gravityAcc = 0;
       this.recomputeGhost();
@@ -466,20 +529,49 @@ export class Game {
     const hasAboveTop = cellsOf(this.state.active).some(([, y]) => y < 0);
     merge(this.state.board, this.state.active);
     const cleared = clearLines(this.state.board);
+    const prevLevel = this.state.level;
     if (cleared.length > 0) {
       this.applyCheeseClears(cleared);
       this.applyInitialBlockClears(cleared);
+      this.state.combo += 1;
+      this.onLineClear?.(this.state.combo, cleared.length);
+    } else {
+      this.state.combo = 0;
     }
     this.totalLinesCleared += cleared.length;
+    this.state.totalLinesCleared = this.totalLinesCleared;
+    if (this.classicStartLevel != null) {
+      const nextLevel = this.getClassicLevel(this.totalLinesCleared);
+      if (nextLevel !== prevLevel) {
+        this.state.level = nextLevel;
+        const prevGravity = this.gravityMs;
+        this.gravityMs = getClassicGravityMs(nextLevel);
+        if (this.dropIntervalMs === prevGravity) {
+          this.adjustDropInterval(this.gravityMs);
+        }
+      }
+    }
+    if (this.scoringEnabled) {
+      this.state.score += this.getLineClearScore(cleared.length);
+    }
+    this.consumeSoftDropScore();
     this.onPieceLock?.(this.state.board, this.state.hold);
 
     this.gravityAcc = 0;
     this.lockAcc = 0;
     this.state.canHold = true;
     this.hardLockAcc = 0;
+    this.softDropHeld = false;
+    this.softDropSegmentCells = 0;
+    this.softDropLastSegmentCells = 0;
 
     if (hasAboveTop) {
       this.state.gameOver = true;
+      return;
+    }
+
+    if (this.lineGoal != null && this.totalLinesCleared >= this.lineGoal) {
+      this.state.gameWon = true;
       return;
     }
 
@@ -505,6 +597,59 @@ export class Game {
     const k = this.generator.next();
     this.updateNextView();
     this.spawnActive(k);
+  }
+
+  private updateSoftDropState(softDrop: boolean): void {
+    if (softDrop && !this.softDropHeld) {
+      this.softDropHeld = true;
+      this.softDropSegmentCells = 0;
+      return;
+    }
+    if (!softDrop && this.softDropHeld) {
+      this.softDropHeld = false;
+      this.softDropLastSegmentCells = this.softDropSegmentCells;
+      this.softDropSegmentCells = 0;
+    }
+  }
+
+  private consumeSoftDropScore(): number {
+    const value = this.softDropHeld
+      ? this.softDropSegmentCells
+      : this.softDropLastSegmentCells;
+    this.softDropSegmentCells = 0;
+    this.softDropLastSegmentCells = 0;
+    this.softDropHeld = false;
+    return value;
+  }
+
+  private getClassicLevel(lines: number): number {
+    if (this.classicStartLevel == null) return 0;
+    const start = this.classicStartLevel;
+    const startLines = start * 10;
+    const transition = Math.min(
+      startLines + 10,
+      Math.max(100, startLines - 50),
+    );
+    if (lines < transition) return start;
+    return start + 1 + Math.floor((lines - transition) / 10);
+  }
+
+  private getLineClearScore(linesCleared: number): number {
+    if (!this.scoringEnabled) return 0;
+    if (linesCleared <= 0) return 0;
+    const multiplier = this.state.level + 1;
+    switch (linesCleared) {
+      case 1:
+        return 40 * multiplier;
+      case 2:
+        return 100 * multiplier;
+      case 3:
+        return 300 * multiplier;
+      case 4:
+        return 1200 * multiplier;
+      default:
+        return 0;
+    }
   }
 
   private doHold(): void {
@@ -537,6 +682,9 @@ export class Game {
 
   private spawnActive(k: PieceKind): void {
     this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
+    this.softDropHeld = false;
+    this.softDropSegmentCells = 0;
+    this.softDropLastSegmentCells = 0;
     this.liftSpawnIfBlocked();
     this.recomputeGhost();
     if (collides(this.state.board, this.state.active)) {
@@ -641,4 +789,22 @@ export class Game {
 
 function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
+}
+
+const NES_FPS = 60.0988;
+const NES_FRAME_MS = 1000 / NES_FPS;
+
+function getClassicFrames(level: number): number {
+  const l = Math.max(0, Math.trunc(level));
+  const table = [48, 43, 38, 33, 28, 23, 18, 13, 8, 6];
+  if (l <= 9) return table[l];
+  if (l <= 12) return 5;
+  if (l <= 15) return 4;
+  if (l <= 18) return 3;
+  if (l <= 28) return 2;
+  return 1;
+}
+
+function getClassicGravityMs(level: number): number {
+  return getClassicFrames(level) * NES_FRAME_MS;
 }

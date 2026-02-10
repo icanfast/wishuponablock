@@ -23,6 +23,13 @@ export interface GameState {
   next: PieceKind[]; // preview window (derived from generator)
   gameOver: boolean;
   gameWon: boolean;
+  combo: number;
+  timeMs: number;
+  totalLinesCleared: number;
+  lineGoal: number | null;
+  level: number;
+  score: number;
+  scoringEnabled: boolean;
 }
 
 export interface InputFrame {

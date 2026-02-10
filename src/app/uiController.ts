@@ -13,7 +13,9 @@ export type UiController = {
   attachSnapshotService: (service: SnapshotService) => void;
   attachMenu: (menu: MenuScreen) => void;
   getMenuHandlers: () => {
-    onStartDefault: () => void;
+    onStartPractice: () => void;
+    onStartSprint: () => void;
+    onStartClassic: () => void;
     onStartCheese: (lines: number) => void;
     onStartCharcuterie: (
       pieces: number,
@@ -34,7 +36,13 @@ type UiControllerOptions = {
   settingsStore: SettingsStore;
   modeController: ModeController;
   useRemoteUpload: boolean;
-  getSnapshotState: () => { board: Board; hold: PieceKind | null };
+  getSnapshotState: () => {
+    board: Board;
+    hold: PieceKind | null;
+    linesLeft?: number;
+    level?: number;
+    score?: number;
+  };
   onPauseInputChange: (paused: boolean) => void;
   onMenuClick: () => void;
   onStartGame: () => void;
@@ -64,7 +72,8 @@ export function createUiController(options: UiControllerOptions): UiController {
     select.addEventListener('change', () => {
       const value = select.value;
       if (isGeneratorType(value)) {
-        settingsStore.apply({ generator: { type: value } });
+        const current = settingsStore.get().generator;
+        settingsStore.apply({ generator: { ...current, type: value } });
       }
       select.blur();
     });
@@ -114,8 +123,8 @@ export function createUiController(options: UiControllerOptions): UiController {
 
     game.manualButton.addEventListener('click', () => {
       if (!snapshotService) return;
-      const { board, hold } = getSnapshotState();
-      snapshotService.handleManual(board, hold);
+      const { board, hold, linesLeft } = getSnapshotState();
+      snapshotService.handleManual(board, hold, { linesLeft });
     });
   };
 
@@ -125,8 +134,16 @@ export function createUiController(options: UiControllerOptions): UiController {
   };
 
   const getMenuHandlers = () => ({
-    onStartDefault: () => {
-      modeController.startDefault();
+    onStartPractice: () => {
+      modeController.startPractice();
+      onStartGame();
+    },
+    onStartSprint: () => {
+      modeController.startSprint();
+      onStartGame();
+    },
+    onStartClassic: () => {
+      modeController.startClassic();
       onStartGame();
     },
     onStartCheese: (lines: number) => {

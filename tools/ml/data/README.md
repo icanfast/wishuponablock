@@ -1,6 +1,6 @@
 # Data Folders
 
-- `raw/` - raw labels exported by the in-game labeling tool.
-- `processed/` - training-ready JSONL produced by `tools/ml/scripts/convert_labels.py`.
+- `raw/` - raw labels exported by the in-game labeling tool (used directly for training).
+- `processed/` - legacy processed JSONL (no longer required).
 
 This repo ignores the contents of these folders by default.

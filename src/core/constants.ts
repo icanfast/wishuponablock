@@ -68,6 +68,14 @@ export const DEFAULT_BUTTERFINGER_EXTRA_TAP_RATE = 0;
 export const DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE = 0;
 export const DEFAULT_BUTTERFINGER_GRAVITY_DROP_RATE = 0;
 export const DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE = 0.5;
+export const DEFAULT_GRIDLINE_OPACITY = 0;
+export const DEFAULT_HIGH_CONTRAST = false;
+export const DEFAULT_COLORBLIND_MODE = false;
+export const DEFAULT_ML_INFERENCE = {
+  strategy: 'threshold',
+  temperature: 1.5,
+  threshold: 0.1,
+} as const;
 
 export const DEFAULT_KEY_BINDINGS = {
   moveLeft: 'ArrowLeft',
@@ -86,7 +94,7 @@ export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
 export const GAME_PROTOCOL_VERSION = 2;
 
 const BASE_URL = import.meta.env.BASE_URL ?? '/';
-export const ML_MODEL_URL = `${BASE_URL}models/model_v1.json`;
+export const ML_MODEL_URL = `${BASE_URL}models/model_v2.json`;
 
 export const SPAWN_X = 3;
 export const SPAWN_Y = -1;

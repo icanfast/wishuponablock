@@ -11,7 +11,9 @@ export type ModeController = {
     handler: ((mode: GameMode, options: ModeOptions) => void) | null,
   ) => void;
   setMode: (id: GameMode['id'], options: ModeOptions) => ModeState;
-  startDefault: () => ModeState;
+  startPractice: () => ModeState;
+  startSprint: () => ModeState;
+  startClassic: () => ModeState;
   startCheese: (lines: number) => ModeState;
   startCharcuterie: (
     pieces: number,
@@ -27,7 +29,7 @@ type ModeControllerOptions = {
 export function createModeController(
   options: ModeControllerOptions = {},
 ): ModeController {
-  let mode = getMode(options.initialModeId ?? 'default');
+  let mode = getMode(options.initialModeId ?? 'practice');
   let modeOptions: ModeOptions = { ...(options.initialOptions ?? {}) };
   let onModeChange: ((mode: GameMode, options: ModeOptions) => void) | null =
     null;
@@ -45,7 +47,9 @@ export function createModeController(
       onModeChange = handler;
     },
     setMode: (id, nextOptions) => apply(id, nextOptions),
-    startDefault: () => apply('default', {}),
+    startPractice: () => apply('practice', {}),
+    startSprint: () => apply('sprint', {}),
+    startClassic: () => apply('classic', {}),
     startCheese: (lines) => apply('cheese', { cheeseLines: lines }),
     startCharcuterie: (pieces, next) =>
       apply('charcuterie', {

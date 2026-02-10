@@ -5,6 +5,7 @@ import { BagInconvenient } from './bagInconvenient';
 import { RandomGenerator } from './randomGenerator';
 import { NesGenerator } from './nesGenerator';
 import { ModelGenerator } from './modelGenerator';
+import { DEFAULT_ML_INFERENCE } from './constants';
 import type { LoadedModel } from './wubModel';
 
 export const GENERATOR_TYPES = [
@@ -17,8 +18,16 @@ export const GENERATOR_TYPES = [
 ] as const;
 export type GeneratorType = (typeof GENERATOR_TYPES)[number];
 
+export type MlInferenceStrategy = 'clean_uniform' | 'threshold';
+export type MlInferenceConfig = {
+  strategy: MlInferenceStrategy;
+  temperature: number;
+  threshold: number;
+};
+
 export interface GeneratorSettings {
   type: GeneratorType;
+  ml: MlInferenceConfig;
 }
 
 export interface GeneratorFactoryOptions {
@@ -31,6 +40,12 @@ export function isGeneratorType(value: unknown): value is GeneratorType {
     typeof value === 'string' &&
     (GENERATOR_TYPES as readonly string[]).includes(value)
   );
+}
+
+export function isMlInferenceStrategy(
+  value: unknown,
+): value is MlInferenceStrategy {
+  return value === 'clean_uniform' || value === 'threshold';
 }
 
 export function createGeneratorFactory(
@@ -52,6 +67,7 @@ export function createGeneratorFactory(
           seed,
           options.mlModel ?? null,
           options.mlModelPromise,
+          settings.ml ?? DEFAULT_ML_INFERENCE,
         );
     case 'bag7':
     default:

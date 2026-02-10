@@ -9,16 +9,30 @@ export interface ModeOptions {
 }
 
 export interface GameMode {
-  id: 'default' | 'cheese' | 'charcuterie';
+  id: 'practice' | 'sprint' | 'classic' | 'cheese' | 'charcuterie';
   label: string;
+  lineGoal?: number;
+  classicStartLevel?: number;
+  scoringEnabled?: boolean;
   settingsPatch?: Partial<Settings>;
   onStart?: (game: Game, options: ModeOptions) => void;
 }
 
 export const MODES: GameMode[] = [
   {
-    id: 'default',
-    label: 'Default',
+    id: 'practice',
+    label: 'Practice',
+  },
+  {
+    id: 'sprint',
+    label: 'Sprint',
+    lineGoal: 40,
+  },
+  {
+    id: 'classic',
+    label: 'Classic',
+    classicStartLevel: 0,
+    scoringEnabled: true,
   },
   {
     id: 'cheese',
@@ -35,6 +49,13 @@ export const MODES: GameMode[] = [
   },
 ];
 
-export function getMode(id: GameMode['id']): GameMode {
-  return MODES.find((mode) => mode.id === id) ?? MODES[0];
+export function normalizeModeId(id: string): GameMode['id'] | null {
+  if (id === 'default') return 'practice';
+  const match = MODES.find((mode) => mode.id === id);
+  return match ? match.id : null;
+}
+
+export function getMode(id: string): GameMode {
+  const normalized = normalizeModeId(id);
+  return MODES.find((mode) => mode.id === normalized) ?? MODES[0];
 }

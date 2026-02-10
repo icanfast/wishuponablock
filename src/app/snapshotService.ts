@@ -1,4 +1,5 @@
 import type { SettingsStore } from '../core/settingsStore';
+import { ML_MODEL_URL } from '../core/constants';
 import {
   SnapshotRecorder,
   downloadSnapshotSession,
@@ -28,6 +29,7 @@ type SnapshotServiceOptions = {
   uploadClient: UploadClient;
   useRemoteUpload: boolean;
   identityService: IdentityService;
+  buildVersion?: string;
   onStateChange?: (state: SnapshotUiState) => void;
 };
 
@@ -41,9 +43,21 @@ export type SnapshotService = {
   stop: (options?: { promptForFolder?: boolean }) => Promise<void>;
   restart: () => void;
   discard: () => void;
-  handleLock: (board: Board, hold: PieceKind | null) => void;
-  handleHold: (board: Board, hold: PieceKind | null) => void;
-  handleManual: (board: Board, hold: PieceKind | null) => void;
+  handleLock: (
+    board: Board,
+    hold: PieceKind | null,
+    meta?: { linesLeft?: number; level?: number; score?: number },
+  ) => void;
+  handleHold: (
+    board: Board,
+    hold: PieceKind | null,
+    meta?: { linesLeft?: number; level?: number; score?: number },
+  ) => void;
+  handleManual: (
+    board: Board,
+    hold: PieceKind | null,
+    meta?: { linesLeft?: number; level?: number; score?: number },
+  ) => void;
   dispose: () => void;
 };
 
@@ -64,12 +78,13 @@ export function createSnapshotService(
     uploadClient,
     useRemoteUpload,
     identityService,
+    buildVersion,
   } = options;
   const recorder = new SnapshotRecorder();
   let snapshotDirHandle: FileSystemDirectoryHandle | null = null;
   let folderStatus = 'No folder selected.';
   let currentComment = '';
-  let currentMode: SnapshotModeInfo = { id: 'default', options: {} };
+  let currentMode: SnapshotModeInfo = { id: 'practice', options: {} };
   let lastSnapshotKey: string | null = null;
   let recordStatusOverride: { message: string; timeoutId: number } | null =
     null;
@@ -217,13 +232,21 @@ export function createSnapshotService(
     }
     if (recorder.isRecording) return;
     lastSnapshotKey = null;
-    recorder.start(
+    const session = recorder.start(
       settingsStore.get(),
       rows,
       cols,
       currentComment,
       currentMode,
     );
+    if (buildVersion) {
+      session.meta.buildVersion = buildVersion;
+    }
+    if (session.meta.settings.generator.type === 'ml') {
+      session.meta.model_url = ML_MODEL_URL;
+    } else {
+      delete session.meta.model_url;
+    }
     applyIdentityMeta();
     notify();
   };
@@ -259,6 +282,7 @@ export function createSnapshotService(
     board: Board,
     hold: PieceKind | null,
     reason: SnapshotTrigger,
+    meta?: { linesLeft?: number; level?: number; score?: number },
   ) => {
     if (!snapshotsEnabled) return;
     if (!recorder.isRecording) {
@@ -276,6 +300,9 @@ export function createSnapshotService(
     const sample = recorder.record(board, hold, {
       store: !useRemoteUpload,
       trigger: reason,
+      linesLeft: meta?.linesLeft,
+      level: meta?.level,
+      score: meta?.score,
     });
     notify();
     if (reason === 'manual' && !useRemoteUpload) {
@@ -292,6 +319,9 @@ export function createSnapshotService(
           index: sample.index,
           timeMs: sample.timeMs,
           hold: sample.hold,
+          ...(sample.linesLeft != null ? { linesLeft: sample.linesLeft } : {}),
+          ...(sample.level != null ? { level: sample.level } : {}),
+          ...(sample.score != null ? { score: sample.score } : {}),
         },
         trigger: reason,
       },
@@ -349,9 +379,12 @@ export function createSnapshotService(
     stop,
     restart,
     discard,
-    handleLock: (board, hold) => enqueueSnapshotSample(board, hold, 'lock'),
-    handleHold: (board, hold) => enqueueSnapshotSample(board, hold, 'hold'),
-    handleManual: (board, hold) => enqueueSnapshotSample(board, hold, 'manual'),
+    handleLock: (board, hold, meta) =>
+      enqueueSnapshotSample(board, hold, 'lock', meta),
+    handleHold: (board, hold, meta) =>
+      enqueueSnapshotSample(board, hold, 'hold', meta),
+    handleManual: (board, hold, meta) =>
+      enqueueSnapshotSample(board, hold, 'manual', meta),
     dispose: () => {
       window.removeEventListener('beforeunload', beforeUnload);
       uploadClient.setOnSnapshotUploaded(null);

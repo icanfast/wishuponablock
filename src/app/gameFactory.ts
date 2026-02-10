@@ -21,6 +21,7 @@ export type GameFactoryOptions = {
   modelService: ModelService;
   onPieceLock: (board: Board, hold: PieceKind | null) => void;
   onHold: (board: Board, hold: PieceKind | null) => void;
+  onLineClear?: (combo: number, clearedLines: number) => void;
   onBeforeRestart?: () => void;
   setLockEffectsSuppressed: (value: boolean) => void;
   charcuterie: {
@@ -47,6 +48,7 @@ export function createGameSessionFactory(
     modelService,
     onPieceLock,
     onHold,
+    onLineClear,
     onBeforeRestart,
     setLockEffectsSuppressed,
     charcuterie,
@@ -71,12 +73,16 @@ export function createGameSessionFactory(
       lockRotateRate: cfg.butterfinger.enabled
         ? cfg.butterfinger.lockRotateRate
         : 0,
+      lineGoal: mode.lineGoal,
+      classicStartLevel: mode.classicStartLevel,
+      scoringEnabled: mode.scoringEnabled,
       generatorFactory: createGeneratorFactory(merged.generator, {
         mlModel: modelService.getModel(),
         mlModelPromise: modelService.getModelPromise() ?? undefined,
       }),
       onPieceLock,
       onHold,
+      onLineClear,
     });
   };
 

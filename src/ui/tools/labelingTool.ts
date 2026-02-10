@@ -1,7 +1,8 @@
-import { getMode } from '../../core/modes';
+import { getMode, normalizeModeId } from '../../core/modes';
 import type {
   SnapshotSession,
   SnapshotSample,
+  SnapshotTrigger,
 } from '../../core/snapshotRecorder';
 import type { UploadClient } from '../../core/uploadClient';
 import { PIECES, type Board, type PieceKind } from '../../core/types';
@@ -27,7 +28,13 @@ export function createLabelingTool(
   const { toolUsesRemote, uploadClient, uploadBaseUrl, canvas, onBack } =
     options;
 
-  type TriggerFilter = 'all' | 'auto' | 'manual' | 'lock' | 'hold';
+  type TriggerFilter =
+    | 'all'
+    | 'auto'
+    | 'manual'
+    | 'lock'
+    | 'hold'
+    | 'constructor';
 
   const toolUi = createToolScreen({ toolUsesRemote });
   const toolInputButton = toolUi.inputButton;
@@ -35,6 +42,7 @@ export function createLabelingTool(
   const toolPlaystyleSelect = toolUi.playstyleSelect;
   const toolModeSelect = toolUi.modeSelect;
   const toolTriggerSelect = toolUi.triggerSelect;
+  const toolBuildSelect = toolUi.buildSelect;
   const toolOutputButton = toolUi.outputButton;
   const toolOutputStatus = toolUi.outputStatus;
   const toolSampleStatus = toolUi.sampleStatus;
@@ -50,6 +58,7 @@ export function createLabelingTool(
   let toolTotalSamplesAll = 0;
   let toolModeFilter = 'all';
   let toolTriggerFilter: TriggerFilter = 'all';
+  let toolBuildFilter = 'all';
   let toolActive = false;
   let playstyle: Playstyle = 'beginner';
   let currentSample: {
@@ -58,6 +67,11 @@ export function createLabelingTool(
     board: Board;
     raw: number[][];
     hold: PieceKind | null;
+    timeMs?: number;
+    trigger?: SnapshotSample['trigger'];
+    linesLeft?: number;
+    level?: number;
+    score?: number;
   } | null = null;
   let selectedLabels: PieceKind[] = [];
   let toolBusy = false;
@@ -74,6 +88,8 @@ export function createLabelingTool(
         return 'Lock';
       case 'hold':
         return 'Hold';
+      case 'constructor':
+        return 'Constructor';
       case 'auto':
         return 'Auto (lock/hold)';
       default:
@@ -83,7 +99,12 @@ export function createLabelingTool(
 
   const normalizeTrigger = (sample: SnapshotSample): TriggerFilter => {
     const trigger = sample.trigger;
-    if (trigger === 'manual' || trigger === 'lock' || trigger === 'hold') {
+    if (
+      trigger === 'manual' ||
+      trigger === 'lock' ||
+      trigger === 'hold' ||
+      trigger === 'constructor'
+    ) {
       return trigger;
     }
     return 'auto';
@@ -253,8 +274,15 @@ export function createLabelingTool(
 
   const getModeLabel = (id: string): string => {
     if (id === 'unknown') return 'Unknown';
-    if (id === 'default' || id === 'cheese' || id === 'charcuterie') {
-      return getMode(id).label.toUpperCase();
+    const normalized = normalizeModeId(id) ?? id;
+    if (
+      normalized === 'practice' ||
+      normalized === 'sprint' ||
+      normalized === 'classic' ||
+      normalized === 'cheese' ||
+      normalized === 'charcuterie'
+    ) {
+      return getMode(normalized).label.toUpperCase();
     }
     return id.toUpperCase();
   };
@@ -270,7 +298,13 @@ export function createLabelingTool(
 
     addOption('all', 'All Modes');
     if (toolUsesRemote) {
-      const knownModes = ['default', 'cheese', 'charcuterie'];
+      const knownModes = [
+        'practice',
+        'sprint',
+        'classic',
+        'cheese',
+        'charcuterie',
+      ];
       for (const modeId of knownModes) {
         addOption(modeId, getModeLabel(modeId));
       }
@@ -317,11 +351,50 @@ export function createLabelingTool(
     addOption('all', 'All Triggers');
     addOption('auto', 'Auto (lock/hold)');
     addOption('manual', 'Manual');
+    addOption('constructor', 'Constructor');
     addOption('lock', 'Lock');
     addOption('hold', 'Hold');
     toolTriggerSelect.value = toolTriggerFilter;
     toolTriggerSelect.disabled =
       toolSnapshotsAll.length === 0 && !toolUsesRemote;
+  };
+
+  const refreshToolBuildOptions = () => {
+    toolBuildSelect.innerHTML = '';
+    const addOption = (value: string, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolBuildSelect.appendChild(option);
+    };
+
+    addOption('all', 'All Builds');
+    if (toolUsesRemote) {
+      addOption('unknown', 'Unknown');
+      toolBuildSelect.value = toolBuildFilter;
+      toolBuildSelect.disabled = false;
+      return;
+    }
+    const counts = new Map<string, number>();
+    for (const file of toolSnapshotsAll) {
+      const build = file.session.meta.buildVersion ?? 'unknown';
+      counts.set(build, (counts.get(build) ?? 0) + file.session.samples.length);
+    }
+    const builds = Array.from(counts.keys()).sort((a, b) => {
+      if (a === 'unknown') return 1;
+      if (b === 'unknown') return -1;
+      return a.localeCompare(b);
+    });
+    for (const build of builds) {
+      const label = `${build} (${counts.get(build) ?? 0})`;
+      addOption(build, label);
+    }
+
+    if (toolBuildFilter !== 'all' && !counts.has(toolBuildFilter)) {
+      toolBuildFilter = 'all';
+    }
+    toolBuildSelect.value = toolBuildFilter;
+    toolBuildSelect.disabled = toolSnapshotsAll.length === 0;
   };
 
   const rebuildToolSampleIndex = () => {
@@ -335,7 +408,7 @@ export function createLabelingTool(
           toolTriggerFilter === 'all'
             ? true
             : toolTriggerFilter === 'auto'
-              ? trigger !== 'manual'
+              ? trigger === 'lock' || trigger === 'hold'
               : trigger === toolTriggerFilter;
         if (!matchesTrigger) continue;
         toolSampleIndex.push({ file, index: i });
@@ -357,6 +430,9 @@ export function createLabelingTool(
     if (toolTriggerFilter !== 'all') {
       url.searchParams.set('trigger', toolTriggerFilter);
     }
+    if (toolBuildFilter !== 'all') {
+      url.searchParams.set('build', toolBuildFilter);
+    }
     const res = await fetch(url.toString());
     if (!res.ok) {
       return null;
@@ -367,6 +443,7 @@ export function createLabelingTool(
       meta?: {
         session?: SnapshotSession['meta'];
         sample?: Record<string, unknown>;
+        trigger?: string;
       };
       board?: number[][];
     };
@@ -378,6 +455,22 @@ export function createLabelingTool(
         ? value
         : fallback;
     };
+    const readOptionalNumber = (value: unknown): number | undefined => {
+      return typeof value === 'number' && Number.isFinite(value)
+        ? value
+        : undefined;
+    };
+    const readTrigger = (value: unknown): SnapshotTrigger | undefined => {
+      if (
+        value === 'lock' ||
+        value === 'hold' ||
+        value === 'manual' ||
+        value === 'constructor'
+      ) {
+        return value;
+      }
+      return undefined;
+    };
     const holdValue =
       typeof sampleMeta.hold === 'number' && Number.isFinite(sampleMeta.hold)
         ? sampleMeta.hold
@@ -387,6 +480,10 @@ export function createLabelingTool(
       timeMs: readNumber(sampleMeta.timeMs),
       board: payload.board,
       hold: holdValue,
+      trigger: readTrigger(payload.meta?.trigger),
+      linesLeft: readOptionalNumber(sampleMeta.linesLeft),
+      level: readOptionalNumber(sampleMeta.level),
+      score: readOptionalNumber(sampleMeta.score),
     };
     const session: SnapshotSession = {
       meta: sessionMeta,
@@ -403,8 +500,11 @@ export function createLabelingTool(
         toolTriggerFilter === 'all'
           ? 'All Triggers'
           : triggerLabel(toolTriggerFilter);
+      const buildText =
+        toolBuildFilter === 'all' ? 'All Builds' : toolBuildFilter;
       toolInputStatus.textContent =
-        `Source: Online\n` + `Filter: ${filterLabel} / ${triggerText}`;
+        `Source: Online\n` +
+        `Filter: ${filterLabel} / ${triggerText} / ${buildText}`;
       if (!toolActive) return;
       await showNextToolSample();
       return;
@@ -417,6 +517,12 @@ export function createLabelingTool(
         return modeId === toolModeFilter;
       });
     }
+    if (toolBuildFilter !== 'all') {
+      toolSnapshots = toolSnapshots.filter((file) => {
+        const build = file.session.meta.buildVersion ?? 'unknown';
+        return build === toolBuildFilter;
+      });
+    }
     rebuildToolSampleIndex();
     const filterLabel =
       toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
@@ -424,10 +530,12 @@ export function createLabelingTool(
       toolTriggerFilter === 'all'
         ? 'All Triggers'
         : triggerLabel(toolTriggerFilter);
+    const buildText =
+      toolBuildFilter === 'all' ? 'All Builds' : toolBuildFilter;
     toolInputStatus.textContent =
       `Source: Local\n` +
       `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
-      `Filter: ${filterLabel} / ${triggerText} (${toolTotalSamples} samples).`;
+      `Filter: ${filterLabel} / ${triggerText} / ${buildText} (${toolTotalSamples} samples).`;
     await showNextToolSample();
   };
 
@@ -453,6 +561,11 @@ export function createLabelingTool(
         board,
         raw: rawBoard,
         hold,
+        timeMs: sample.timeMs,
+        trigger: sample.trigger,
+        linesLeft: sample.linesLeft,
+        level: sample.level,
+        score: sample.score,
       };
       const key = `${fileName}#${sample.index}`;
       labelIndex[key] = (labelIndex[key] ?? 0) + 1;
@@ -491,6 +604,11 @@ export function createLabelingTool(
       board,
       raw: rawBoard,
       hold,
+      timeMs: sample.timeMs,
+      trigger: sample.trigger,
+      linesLeft: sample.linesLeft,
+      level: sample.level,
+      score: sample.score,
     };
     const key = `${file.name}#${indexInFile}`;
     labelIndex[key] = (labelIndex[key] ?? 0) + 1;
@@ -540,6 +658,7 @@ export function createLabelingTool(
       );
       refreshToolModeOptions();
       refreshToolTriggerOptions();
+      refreshToolBuildOptions();
       await applyToolFilters();
       updateToolActionStatus(`Loaded ${toolSnapshotsAll.length} files.`);
     } catch {
@@ -557,9 +676,15 @@ export function createLabelingTool(
     await applyToolFilters();
   });
 
+  toolBuildSelect.addEventListener('change', async () => {
+    toolBuildFilter = toolBuildSelect.value;
+    await applyToolFilters();
+  });
+
   if (toolUsesRemote) {
     refreshToolModeOptions();
     refreshToolTriggerOptions();
+    refreshToolBuildOptions();
   }
 
   initPlaystyleSelect();
@@ -612,6 +737,15 @@ export function createLabelingTool(
     toolBusy = true;
     try {
       const key = `${currentSample.file.name}#${currentSample.index}`;
+      const sessionMeta = currentSample.file.session.meta;
+      const sampleMeta = {
+        index: currentSample.index,
+        timeMs: currentSample.timeMs,
+        trigger: currentSample.trigger,
+        linesLeft: currentSample.linesLeft,
+        level: currentSample.level,
+        score: currentSample.score,
+      };
       const record = {
         createdAt: new Date().toISOString(),
         source: {
@@ -619,6 +753,10 @@ export function createLabelingTool(
           sessionId: currentSample.file.session.meta.id,
           sampleIndex: currentSample.index,
           shownCount: labelIndex[key] ?? 1,
+        },
+        snapshot_meta: {
+          session: sessionMeta,
+          sample: sampleMeta,
         },
         board: encodeBoardString(currentSample.raw),
         hold: currentSample.hold,
@@ -669,6 +807,7 @@ export function createLabelingTool(
     id: 'labeling',
     label: 'Wish Upon a Block',
     root: toolUi.root,
+    setPiecePalette: toolUi.setPiecePalette,
     enter: async () => {
       toolActive = true;
       if (toolUsesRemote) {

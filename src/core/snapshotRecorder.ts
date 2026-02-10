@@ -6,10 +6,12 @@ export interface SnapshotSessionMeta {
   id: string;
   createdAt: string;
   protocolVersion: number;
+  buildVersion?: string;
   rows: number;
   cols: number;
   device_id?: string;
   user_id?: string;
+  model_url?: string;
   pieceOrder?: readonly string[];
   settings: Pick<Settings, 'game' | 'generator'>;
   mode?: SnapshotModeInfo;
@@ -22,6 +24,9 @@ export interface SnapshotSample {
   board: number[][];
   hold?: number;
   trigger?: SnapshotTrigger;
+  linesLeft?: number;
+  level?: number;
+  score?: number;
 }
 
 export interface SnapshotSession {
@@ -34,7 +39,7 @@ export interface SnapshotModeInfo {
   options?: Record<string, unknown>;
 }
 
-export type SnapshotTrigger = 'lock' | 'hold' | 'manual';
+export type SnapshotTrigger = 'lock' | 'hold' | 'manual' | 'constructor';
 
 const PIECE_TO_INDEX = new Map(PIECES.map((k, i) => [k, i + 1]));
 
@@ -111,16 +116,37 @@ export class SnapshotRecorder {
   record(
     board: Board,
     hold: PieceKind | null,
-    options: { store?: boolean; trigger?: SnapshotTrigger } = {},
+    options: {
+      store?: boolean;
+      trigger?: SnapshotTrigger;
+      linesLeft?: number;
+      level?: number;
+      score?: number;
+    } = {},
   ): SnapshotSample | null {
     if (!this.active) return null;
     const timeMs = performance.now() - this.startedAtMs;
+    const linesLeft =
+      options.linesLeft != null && Number.isFinite(options.linesLeft)
+        ? Math.max(0, Math.trunc(options.linesLeft))
+        : undefined;
+    const level =
+      options.level != null && Number.isFinite(options.level)
+        ? Math.max(0, Math.trunc(options.level))
+        : undefined;
+    const score =
+      options.score != null && Number.isFinite(options.score)
+        ? Math.max(0, Math.trunc(options.score))
+        : undefined;
     const sample: SnapshotSample = {
       index: this.nextIndex,
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
       hold: encodePiece(hold),
       ...(options.trigger ? { trigger: options.trigger } : {}),
+      ...(linesLeft != null ? { linesLeft } : {}),
+      ...(level != null ? { level } : {}),
+      ...(score != null ? { score } : {}),
     };
     this.nextIndex += 1;
     if (options.store ?? true) {
