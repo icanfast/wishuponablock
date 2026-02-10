@@ -196,7 +196,7 @@ input[type=number] {
   Object.assign(playPanel.style, { minHeight: '240px', display: 'flex' });
   Object.assign(optionsPanel.style, {
     minHeight: '240px',
-    width: '420px',
+    width: '700px',
     display: 'none',
   });
   Object.assign(aboutPanel.style, {
@@ -259,11 +259,19 @@ input[type=number] {
     display: 'flex',
     flexDirection: 'column',
     gap: '8px',
-    flex: '1',
+    flex: '1.3',
   });
 
   const optionsRightColumn = document.createElement('div');
   Object.assign(optionsRightColumn.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    flex: '1',
+  });
+
+  const optionsMiddleColumn = document.createElement('div');
+  Object.assign(optionsMiddleColumn.style, {
     display: 'flex',
     flexDirection: 'column',
     gap: '8px',
@@ -793,11 +801,14 @@ input[type=number] {
   const optionsBackButton = makeMenuButton('BACK');
   Object.assign(optionsBackButton.style, {
     marginTop: 'auto',
+    width: '240px',
+    alignSelf: 'center',
   });
 
   optionsPanel.appendChild(optionsTitle);
   optionsPanel.appendChild(optionsContentRow);
   optionsContentRow.appendChild(optionsLeftColumn);
+  optionsContentRow.appendChild(optionsMiddleColumn);
   optionsContentRow.appendChild(optionsRightColumn);
 
   optionsLeftColumn.appendChild(controlsTitle);
@@ -813,19 +824,20 @@ input[type=number] {
   volumeWrapper.appendChild(volumeLabel);
   volumeWrapper.appendChild(volumeRow);
 
+  optionsMiddleColumn.appendChild(gameplayTitle);
+  optionsMiddleColumn.appendChild(dasControl.wrapper);
+  optionsMiddleColumn.appendChild(arrControl.wrapper);
+  optionsMiddleColumn.appendChild(gameplayResetButton);
+  optionsMiddleColumn.appendChild(dataTitle);
+  optionsMiddleColumn.appendChild(shareRow);
+
   optionsRightColumn.appendChild(audioTitle);
   optionsRightColumn.appendChild(volumeWrapper);
-  optionsRightColumn.appendChild(gameplayTitle);
-  optionsRightColumn.appendChild(dasControl.wrapper);
-  optionsRightColumn.appendChild(arrControl.wrapper);
-  optionsRightColumn.appendChild(gameplayResetButton);
   optionsRightColumn.appendChild(graphicsTitle);
   optionsRightColumn.appendChild(gridlineLabel);
   optionsRightColumn.appendChild(gridlineRow);
   optionsRightColumn.appendChild(highContrastRow);
   optionsRightColumn.appendChild(colorblindRow);
-  optionsRightColumn.appendChild(dataTitle);
-  optionsRightColumn.appendChild(shareRow);
 
   optionsPanel.appendChild(optionsBackButton);
 
@@ -1619,7 +1631,10 @@ input[type=number] {
     return Math.trunc(value);
   };
 
+  let activePanel: MenuPanel = 'main';
+
   const show = (panel: MenuPanel) => {
+    activePanel = panel;
     menuMainWrapper.style.display = panel === 'main' ? 'flex' : 'none';
     playMenuRow.style.display = panel === 'play' ? 'flex' : 'none';
     optionsPanel.style.display = panel === 'options' ? 'flex' : 'none';
@@ -1682,6 +1697,20 @@ input[type=number] {
   charcuterieBackButton.addEventListener('click', () => show('play'));
   toolsBackButton.addEventListener('click', showMain);
   feedbackBackButton.addEventListener('click', showMain);
+
+  window.addEventListener('keydown', (event) => {
+    if (event.code !== 'Escape') return;
+    if (root.style.display === 'none') return;
+    if (rebindingKey) return;
+    if (activePanel === 'main') return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (activePanel === 'cheese' || activePanel === 'charcuterie') {
+      show('play');
+      return;
+    }
+    showMain();
+  });
 
   feedbackSendButton.addEventListener('click', async () => {
     const feedback = feedbackBody.value.trim();

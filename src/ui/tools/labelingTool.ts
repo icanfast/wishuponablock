@@ -80,6 +80,8 @@ export function createLabelingTool(
     file: { name: string; session: SnapshotSession };
     index: number;
   }> = [];
+  let remoteBuildCounts: Array<{ build: string; count: number }> | null = null;
+  let remoteBuildLoading = false;
   const triggerLabel = (trigger: TriggerFilter): string => {
     switch (trigger) {
       case 'manual':
@@ -370,7 +372,32 @@ export function createLabelingTool(
 
     addOption('all', 'All Builds');
     if (toolUsesRemote) {
-      addOption('unknown', 'Unknown');
+      if (!remoteBuildCounts) {
+        addOption('unknown', 'Unknown');
+        if (!remoteBuildLoading) {
+          void fetchRemoteBuildCounts();
+        }
+        toolBuildSelect.value = toolBuildFilter;
+        toolBuildSelect.disabled = false;
+        return;
+      }
+      const builds = remoteBuildCounts
+        .slice()
+        .sort((a, b) => {
+          if (a.build === 'unknown') return 1;
+          if (b.build === 'unknown') return -1;
+          return a.build.localeCompare(b.build);
+        });
+      for (const entry of builds) {
+        const label = `${entry.build} (${entry.count})`;
+        addOption(entry.build, label);
+      }
+      if (
+        toolBuildFilter !== 'all' &&
+        !builds.some((entry) => entry.build === toolBuildFilter)
+      ) {
+        toolBuildFilter = 'all';
+      }
       toolBuildSelect.value = toolBuildFilter;
       toolBuildSelect.disabled = false;
       return;
@@ -395,6 +422,36 @@ export function createLabelingTool(
     }
     toolBuildSelect.value = toolBuildFilter;
     toolBuildSelect.disabled = toolSnapshotsAll.length === 0;
+  };
+
+  const fetchRemoteBuildCounts = async () => {
+    remoteBuildLoading = true;
+    try {
+      const url = buildToolApiUrl('/snapshots/builds');
+      const res = await fetch(url.toString());
+      if (!res.ok) {
+        remoteBuildCounts = null;
+        return;
+      }
+      const payload = (await res.json()) as {
+        builds?: Array<{ build?: string; count?: number }>;
+      };
+      remoteBuildCounts = (payload.builds ?? []).map((entry) => ({
+        build:
+          typeof entry.build === 'string' && entry.build.trim()
+            ? entry.build
+            : 'unknown',
+        count:
+          typeof entry.count === 'number' && Number.isFinite(entry.count)
+            ? entry.count
+            : 0,
+      }));
+    } catch {
+      remoteBuildCounts = null;
+    } finally {
+      remoteBuildLoading = false;
+      refreshToolBuildOptions();
+    }
   };
 
   const rebuildToolSampleIndex = () => {

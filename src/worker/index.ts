@@ -129,6 +129,36 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/snapshots')) {
+      if (url.pathname.startsWith('/api/snapshots/builds')) {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Method not allowed.' }, 405);
+        }
+        const sql = `
+          SELECT
+            COALESCE(json_extract(meta, '$.session.buildVersion'), 'unknown') AS build,
+            COUNT(*) AS count
+          FROM snapshots
+          GROUP BY build
+        `;
+        const result = await env.DB.prepare(sql).all();
+        const builds = (result?.results ?? [])
+          .map((row) => ({
+            build:
+              typeof row.build === 'string' && row.build.trim()
+                ? row.build
+                : 'unknown',
+            count:
+              typeof row.count === 'number' && Number.isFinite(row.count)
+                ? row.count
+                : 0,
+          }))
+          .sort((a, b) => {
+            if (a.build === 'unknown') return 1;
+            if (b.build === 'unknown') return -1;
+            return a.build.localeCompare(b.build);
+          });
+        return jsonResponse({ builds });
+      }
       if (url.pathname.startsWith('/api/snapshots/random')) {
         if (request.method !== 'GET') {
           return jsonResponse({ error: 'Method not allowed.' }, 405);
