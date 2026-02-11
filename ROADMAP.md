@@ -24,8 +24,8 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Different generators for pro and noob — 2 // lowered priority, too much data required
 - Replace softmax with threshold + flatter normalization - 3
 - Labeling gameification — 5
-- Data quality (versioning, intent, hygene) — 5
+- Data quality (versioning, source vs labeling intent discrepancy, label balancing) — 5
 
 ## Personalization
-- User authentication + profile + stats — 2
-- Personalized ML generators (this is a big one, but also a big one, you know...) — 2
+- User authentication + profile + stats — 3
+- Personalized ML generators (this is a big one, but also a big one, you know...) — 3

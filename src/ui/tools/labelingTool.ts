@@ -818,6 +818,9 @@ export function createLabelingTool(
         labels: [...selectedLabels],
         label_context: {
           playstyle,
+          mode_filter: toolModeFilter,
+          trigger_filter: toolTriggerFilter,
+          build_filter: toolBuildFilter,
         },
       };
       if (uploadClient.isRemote) {
