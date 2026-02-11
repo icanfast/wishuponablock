@@ -1,0 +1,49 @@
+{
+  "createdAt": "2026-02-11T10:09:26.389Z",
+  "source": {
+    "file": "remote:20260211023737",
+    "sessionId": "20260211023737",
+    "sampleIndex": 854,
+    "shownCount": 1
+  },
+  "snapshot_meta": {
+    "session": {
+      "id": "20260211023737",
+      "createdAt": "2026-02-11T01:37:37.331Z",
+      "protocolVersion": 2,
+      "rows": 20,
+      "cols": 10,
+      "settings": {
+        "game": {
+          "gravityMs": 800,
+          "softDropMs": 0,
+          "lockDelayMs": 500,
+          "hardLockDelayMs": 2000
+        },
+        "generator": {
+          "type": "ml",
+          "ml": {
+            "strategy": "threshold",
+            "temperature": 1.5,
+            "threshold": 0.1
+          }
+        }
+      },
+      "mode": { "id": "practice", "options": {} },
+      "buildVersion": "0.2.3",
+      "model_url": "/models/model_v2.json",
+      "device_id": "6bf0d205-0327-4af0-93ac-f09bec0d9c20"
+    },
+    "sample": {
+      "index": 854,
+      "timeMs": 759702,
+      "trigger": "lock",
+      "level": 0,
+      "score": 0
+    }
+  },
+  "board": "0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/0000000000/1660000000/1655111100/1635536660/1333335560/2272235550",
+  "hold": "S",
+  "labels": ["J", "T", "I", "O", "Z", "L"],
+  "label_context": { "playstyle": "beginner" }
+}

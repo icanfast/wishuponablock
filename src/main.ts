@@ -134,6 +134,7 @@ async function boot() {
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
+  let requestStartGame: () => void = () => {};
   let runtime: GameRuntime | null = null;
   const modelService = createModelService({ modelUrl: ML_MODEL_URL });
   modelService.setStatusListener((status) => {
@@ -377,7 +378,7 @@ async function boot() {
     },
     onPauseInputChange: (paused) => runtime?.setPausedByInput(paused),
     onMenuClick: () => setScreen('menu'),
-    onStartGame: () => setScreen('game'),
+    onStartGame: () => requestStartGame(),
     onOpenTool: (id) => {
       activeToolId = id;
       setScreen('tool');
@@ -500,6 +501,30 @@ async function boot() {
 
   setScreen = (screen: 'menu' | 'game' | 'tool') => {
     void screenManager.setActive(screen);
+  };
+
+  let startingGame = false;
+  const startGameWithModelReady = async (): Promise<void> => {
+    if (startingGame) return;
+    startingGame = true;
+    try {
+      const isMl = settingsStore.get().generator.type === 'ml';
+      if (isMl) {
+        if (modelService.getStatus() !== 'ready') {
+          const loaded = await modelService.ensureLoaded();
+          if (!loaded) {
+            updateModelStatusUI(modelService.getStatus());
+            return;
+          }
+        }
+      }
+      await screenManager.setActive('game');
+    } finally {
+      startingGame = false;
+    }
+  };
+  requestStartGame = () => {
+    void startGameWithModelReady();
   };
 
   void screenManager.setActive('menu');

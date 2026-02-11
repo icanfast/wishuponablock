@@ -162,6 +162,13 @@ export class Game {
     this.state.level = this.getClassicLevel(0);
     this.state.score = 0;
     this.state.scoringEnabled = this.scoringEnabled;
+    if (this.generator.onLock) {
+      this.generator.onLock(this.state.board, this.state.hold);
+      const first = this.generator.next();
+      this.updateNextView();
+      this.spawnActive(first);
+      return;
+    }
     this.liftSpawnIfBlocked();
     this.recomputeGhost();
     if (collides(this.state.board, this.state.active)) {
