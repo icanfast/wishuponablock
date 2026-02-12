@@ -134,12 +134,17 @@ function summarizePayload(item: QueueItem): Record<string, unknown> {
   const payload = item.payload as
     | {
         data?: {
-          source?: { sessionId?: string; sampleIndex?: number };
+          source?: {
+            sessionId?: string;
+            sampleIndex?: number;
+            snapshotId?: number;
+          };
         };
       }
     | undefined;
   return {
     type: 'label',
+    snapshotId: payload?.data?.source?.snapshotId ?? null,
     sessionId: payload?.data?.source?.sessionId ?? null,
     sampleIndex: payload?.data?.source?.sampleIndex ?? null,
   };

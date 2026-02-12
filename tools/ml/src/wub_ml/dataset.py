@@ -17,6 +17,7 @@ class Sample:
     hold: int
     labels: list[int]
     session_id: str
+    sample_index: int | None
 
 
 def iter_json_records(path: Path) -> Iterable[dict[str, Any]]:
@@ -90,6 +91,7 @@ class LabelsDataset(Dataset[Sample]):
         piece_order: list[str] | None = None,
         drop_empty_labels: bool = True,
         mirror_prob: float = 0.0,
+        virtual_session_size: int = 100,
     ) -> None:
         self.paths = normalize_paths(path)
         self.pieces = piece_order or DEFAULT_PIECES
@@ -97,6 +99,7 @@ class LabelsDataset(Dataset[Sample]):
         self.samples: list[Sample] = []
         self.skipped = 0
         self.mirror_prob = max(0.0, min(1.0, float(mirror_prob)))
+        self.virtual_session_size = max(0, int(virtual_session_size))
         self.input_channels = 3
         self.session_ids: list[str] = []
 
@@ -137,15 +140,22 @@ class LabelsDataset(Dataset[Sample]):
                             session_id = source_id
                 if not isinstance(session_id, str) or not session_id:
                     session_id = f"unknown_{len(self.samples)}"
+                sample_index = read_sample_index(record)
+                split_session_id = build_virtual_session_id(
+                    session_id,
+                    sample_index,
+                    self.virtual_session_size,
+                )
                 self.samples.append(
                     Sample(
                         board=board,
                         hold=hold_idx,
                         labels=labels,
-                        session_id=session_id,
+                        session_id=split_session_id,
+                        sample_index=sample_index,
                     )
                 )
-                self.session_ids.append(session_id)
+                self.session_ids.append(split_session_id)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -175,6 +185,7 @@ def mirror_sample(sample: Sample) -> Sample:
         hold=hold,
         labels=labels,
         session_id=sample.session_id,
+        sample_index=sample.sample_index,
     )
 
 
@@ -184,3 +195,57 @@ def mirror_piece_index(idx: int) -> int:
         return idx
     mapping = {0: 0, 1: 1, 2: 2, 3: 4, 4: 3, 5: 6, 6: 5}
     return mapping.get(idx, idx)
+
+
+def read_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def read_sample_index(record: dict[str, Any]) -> int | None:
+    direct = read_int(record.get("sample_index"))
+    if direct is not None:
+        return direct
+
+    source = record.get("source")
+    if isinstance(source, dict):
+        from_source = read_int(source.get("sampleIndex"))
+        if from_source is not None:
+            return from_source
+
+    snapshot_meta = record.get("snapshot_meta")
+    if isinstance(snapshot_meta, dict):
+        sample = snapshot_meta.get("sample")
+        if isinstance(sample, dict):
+            from_meta = read_int(sample.get("index"))
+            if from_meta is not None:
+                return from_meta
+    return None
+
+
+def build_virtual_session_id(
+    session_id: str,
+    sample_index: int | None,
+    virtual_session_size: int,
+) -> str:
+    if virtual_session_size <= 0 or sample_index is None:
+        return session_id
+    if sample_index < 0:
+        return session_id
+    batch_id = sample_index // virtual_session_size
+    return f"{session_id}::b{batch_id}"

@@ -67,6 +67,7 @@ export function createLabelingTool(
     board: Board;
     raw: number[][];
     hold: PieceKind | null;
+    snapshotId?: number;
     timeMs?: number;
     trigger?: SnapshotSample['trigger'];
     linesLeft?: number;
@@ -477,7 +478,10 @@ export function createLabelingTool(
     return new URL(`${base}${path}`, window.location.origin);
   };
 
-  const fetchRemoteSample = async (): Promise<SnapshotSession | null> => {
+  const fetchRemoteSample = async (): Promise<{
+    snapshotId: number | null;
+    session: SnapshotSession;
+  } | null> => {
     const url = buildToolApiUrl('/snapshots/random');
     if (toolModeFilter !== 'all') {
       url.searchParams.set('mode', toolModeFilter);
@@ -544,7 +548,16 @@ export function createLabelingTool(
       meta: sessionMeta,
       samples: [sample],
     };
-    return session;
+    const snapshotId =
+      typeof payload.id === 'number' && Number.isFinite(payload.id)
+        ? payload.id
+        : typeof payload.id === 'string' && payload.id.trim()
+          ? Number.parseInt(payload.id, 10)
+          : null;
+    return {
+      snapshotId: Number.isFinite(snapshotId) ? snapshotId : null,
+      session,
+    };
   };
 
   const applyToolFilters = async () => {
@@ -596,8 +609,8 @@ export function createLabelingTool(
 
   const showNextToolSample = async (): Promise<void> => {
     if (toolUsesRemote) {
-      const session = await fetchRemoteSample();
-      if (!session || session.samples.length === 0) {
+      const remote = await fetchRemoteSample();
+      if (!remote || remote.session.samples.length === 0) {
         currentSample = null;
         updateToolSampleStatus('Sample: -');
         if (toolActive) {
@@ -605,6 +618,7 @@ export function createLabelingTool(
         }
         return;
       }
+      const session = remote.session;
       const sample = session.samples[0];
       const rawBoard = sample.board;
       const board = decodeBoard(rawBoard, session.meta.pieceOrder);
@@ -616,6 +630,7 @@ export function createLabelingTool(
         board,
         raw: rawBoard,
         hold,
+        snapshotId: remote.snapshotId ?? undefined,
         timeMs: sample.timeMs,
         trigger: sample.trigger,
         linesLeft: sample.linesLeft,
@@ -807,6 +822,7 @@ export function createLabelingTool(
           file: currentSample.file.name,
           sessionId: currentSample.file.session.meta.id,
           sampleIndex: currentSample.index,
+          snapshotId: currentSample.snapshotId,
           shownCount: labelIndex[key] ?? 1,
         },
         snapshot_meta: {

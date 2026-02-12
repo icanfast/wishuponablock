@@ -32,6 +32,12 @@ def main() -> int:
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--no-hold", action="store_true")
+    parser.add_argument(
+        "--virtual-session-size",
+        type=int,
+        default=100,
+        help="Chunk size for virtual session split (0 disables chunking).",
+    )
 
     parser.add_argument("--aug-epochs", type=int, default=500)
     parser.add_argument("--aug-min-epochs", type=int, default=50)
@@ -82,6 +88,8 @@ def main() -> int:
         str(args.val_split),
         "--batch-size",
         str(args.batch_size),
+        "--virtual-session-size",
+        str(args.virtual_session_size),
         "--method",
         args.method,
         "--soft-decay",
@@ -155,6 +163,7 @@ def main() -> int:
         "seed": args.seed,
         "val_split": args.val_split,
         "batch_size": args.batch_size,
+        "virtual_session_size": args.virtual_session_size,
         "method": args.method,
         "soft_decay": args.soft_decay,
         "no_hold": args.no_hold,

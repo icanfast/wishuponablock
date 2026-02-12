@@ -130,6 +130,12 @@ def main() -> int:
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--virtual-session-size",
+        type=int,
+        default=100,
+        help="Chunk size for virtual session split (0 disables chunking).",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -139,6 +145,7 @@ def main() -> int:
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
+        virtual_session_size=args.virtual_session_size,
     )
     if len(base_dataset) == 0:
         raise SystemExit("No samples found after filtering.")
@@ -153,11 +160,13 @@ def main() -> int:
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=args.mirror_prob,
+        virtual_session_size=args.virtual_session_size,
     )
     val_ds = LabelsDataset(
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
+        virtual_session_size=args.virtual_session_size,
     )
 
     train_ds = torch.utils.data.Subset(train_ds, train_indices)

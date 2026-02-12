@@ -13,6 +13,26 @@ type Env = {
   ASSETS: { fetch: (request: Request) => Promise<Response> };
 };
 
+const BUILD_COUNTS_CACHE_TTL_MS = 30_000;
+const SNAPSHOT_BOUNDS_CACHE_TTL_MS = 10_000;
+const VIRTUAL_SESSION_SIZE = 100;
+
+type BuildCountsCache = {
+  expiresAt: number;
+  builds: Array<{ build: string; count: number }>;
+};
+
+let buildCountsCache: BuildCountsCache | null = null;
+
+const snapshotBoundsCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    minId: number;
+    maxId: number;
+  }
+>();
+
 const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
     status,
@@ -44,6 +64,150 @@ const asInt = (value: unknown): number | null => {
     if (Number.isFinite(parsed)) return Math.trunc(parsed);
   }
   return null;
+};
+
+const asCount = (value: unknown): number => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, Math.trunc(value));
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, Math.trunc(parsed));
+    }
+  }
+  return 0;
+};
+
+type SnapshotFilterSql = {
+  where: string;
+  params: unknown[];
+};
+
+const buildSnapshotFilterSql = (
+  mode: string,
+  trigger: string,
+  build: string,
+): SnapshotFilterSql => {
+  const params: unknown[] = [];
+  const clauses: string[] = [];
+  if (mode !== 'all') {
+    if (mode === 'unknown') {
+      clauses.push('idx.mode_id IS NULL');
+    } else {
+      clauses.push('idx.mode_id = ?');
+      params.push(mode);
+    }
+  }
+  if (trigger !== 'all') {
+    if (trigger === 'auto') {
+      clauses.push("(idx.trigger IS NULL OR idx.trigger IN ('lock','hold'))");
+    } else {
+      clauses.push('idx.trigger = ?');
+      params.push(trigger);
+    }
+  }
+  if (build !== 'all') {
+    if (build === 'unknown') {
+      clauses.push('idx.build_version IS NULL');
+    } else {
+      clauses.push('idx.build_version = ?');
+      params.push(build);
+    }
+  }
+  return {
+    where: clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '',
+    params,
+  };
+};
+
+const appendFilterClause = (
+  filter: SnapshotFilterSql,
+  clause: string,
+): SnapshotFilterSql => ({
+  where: filter.where ? `${filter.where} AND ${clause}` : ` WHERE ${clause}`,
+  params: [...filter.params],
+});
+
+const randomInt = (min: number, max: number): number => {
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+};
+
+const snapshotFilterCacheKey = (mode: string, trigger: string, build: string) =>
+  `${mode}|${trigger}|${build}`;
+
+const readSnapshotByFilter = async (
+  env: Env,
+  filter: SnapshotFilterSql,
+  filterKey: string,
+): Promise<Record<string, unknown> | null> => {
+  const now = Date.now();
+  let minId: number | null = null;
+  let maxId: number | null = null;
+  const cachedBounds = snapshotBoundsCache.get(filterKey);
+  if (cachedBounds && cachedBounds.expiresAt > now) {
+    minId = cachedBounds.minId;
+    maxId = cachedBounds.maxId;
+  } else {
+    const boundsSql = `
+      SELECT
+        MIN(idx.snapshot_id) AS min_id,
+        MAX(idx.snapshot_id) AS max_id
+      FROM snapshots_idx idx
+      ${filter.where}
+    `;
+    const boundsResult = await env.DB.prepare(boundsSql)
+      .bind(...filter.params)
+      .all();
+    const boundsRow = boundsResult?.results?.[0];
+    minId = asInt(boundsRow?.min_id);
+    maxId = asInt(boundsRow?.max_id);
+    if (minId != null && maxId != null) {
+      if (snapshotBoundsCache.size > 128) {
+        snapshotBoundsCache.clear();
+      }
+      snapshotBoundsCache.set(filterKey, {
+        minId,
+        maxId,
+        expiresAt: now + SNAPSHOT_BOUNDS_CACHE_TTL_MS,
+      });
+    }
+  }
+
+  if (minId == null || maxId == null) {
+    return null;
+  }
+
+  const pivot = randomInt(minId, maxId);
+  const seekWherePrefix = filter.where ? `${filter.where} AND` : ' WHERE';
+  const seekFromPivotSql = `
+    SELECT s.id, s.created_at, s.meta, s.board
+    FROM snapshots_idx idx
+    JOIN snapshots s ON s.id = idx.snapshot_id
+    ${seekWherePrefix} idx.snapshot_id >= ?
+    ORDER BY idx.snapshot_id
+    LIMIT 1
+  `;
+  let result = await env.DB.prepare(seekFromPivotSql)
+    .bind(...filter.params, pivot)
+    .all();
+  let row = result?.results?.[0];
+  if (!row) {
+    const wrapSql = `
+      SELECT s.id, s.created_at, s.meta, s.board
+      FROM snapshots_idx idx
+      JOIN snapshots s ON s.id = idx.snapshot_id
+      ${seekWherePrefix} idx.snapshot_id < ?
+      ORDER BY idx.snapshot_id DESC
+      LIMIT 1
+    `;
+    result = await env.DB.prepare(wrapSql)
+      .bind(...filter.params, pivot)
+      .all();
+    row = result?.results?.[0];
+  }
+  return row ?? null;
 };
 
 type SnapshotMetaPayload = {
@@ -132,26 +296,33 @@ const handleSnapshots = async (
   const metaJson = JSON.stringify(record.meta);
   const boardJson = JSON.stringify(record.board);
 
-  await env.DB.prepare(
+  const insertResult = (await env.DB.prepare(
     `INSERT INTO snapshots (created_at, meta, board) VALUES (?, ?, ?)`,
   )
     .bind(createdAt, metaJson, boardJson)
-    .run();
+    .run()) as { meta?: { last_row_id?: unknown } };
 
-  const idResult = await env.DB.prepare(
-    `SELECT id FROM snapshots
-     WHERE created_at = ? AND meta = ? AND board = ?
-     ORDER BY id DESC
-     LIMIT 1`,
-  )
-    .bind(createdAt, metaJson, boardJson)
-    .all();
-  const snapshotId = asInt(idResult?.results?.[0]?.id);
+  let snapshotId = asInt(insertResult?.meta?.last_row_id);
+  if (snapshotId == null) {
+    const idResult = await env.DB.prepare(
+      `SELECT id FROM snapshots
+       WHERE created_at = ? AND meta = ? AND board = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+    )
+      .bind(createdAt, metaJson, boardJson)
+      .all();
+    snapshotId = asInt(idResult?.results?.[0]?.id);
+  }
   if (snapshotId == null) {
     return jsonResponse({ error: 'Snapshot saved, but indexing failed.' }, 500);
   }
 
   const idx = extractSnapshotIndexData(record.meta);
+  const batchId =
+    idx.sampleIndex != null && idx.sampleIndex >= 0
+      ? Math.floor(idx.sampleIndex / VIRTUAL_SESSION_SIZE)
+      : null;
   await env.DB.prepare(
     `INSERT OR REPLACE INTO snapshots_idx (
       snapshot_id,
@@ -167,15 +338,18 @@ const handleSnapshots = async (
       generator_strategy,
       trigger,
       sample_index,
+      batch_id,
       sample_time_ms,
       sample_hold,
       lines_left,
       level,
       score,
+      label_count,
+      last_labeled_at,
       model_url,
       device_id,
       user_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       snapshotId,
@@ -191,11 +365,14 @@ const handleSnapshots = async (
       idx.generatorStrategy,
       idx.trigger,
       idx.sampleIndex,
+      batchId,
       idx.sampleTimeMs,
       idx.sampleHold,
       idx.linesLeft,
       idx.level,
       idx.score,
+      0,
+      null,
       idx.modelUrl,
       idx.deviceId,
       idx.userId,
@@ -203,6 +380,67 @@ const handleSnapshots = async (
     .run();
 
   return okResponse();
+};
+
+const resolveLabelSnapshotRef = async (
+  env: Env,
+  data: unknown,
+): Promise<{
+  snapshotId: number | null;
+  sessionId: string | null;
+  sampleIndex: number | null;
+  batchId: number | null;
+}> => {
+  const payload = (data ?? {}) as {
+    source?: {
+      snapshotId?: unknown;
+      snapshot_id?: unknown;
+      sessionId?: unknown;
+      sampleIndex?: unknown;
+    };
+  };
+  const source = payload.source;
+  const sessionId = asString(source?.sessionId);
+  const sampleIndex = asInt(source?.sampleIndex);
+  let snapshotId = asInt(source?.snapshotId) ?? asInt(source?.snapshot_id);
+  let batchId =
+    sampleIndex != null && sampleIndex >= 0
+      ? Math.floor(sampleIndex / VIRTUAL_SESSION_SIZE)
+      : null;
+
+  if (
+    snapshotId == null &&
+    sessionId &&
+    sampleIndex != null &&
+    Number.isFinite(sampleIndex)
+  ) {
+    const lookup = await env.DB.prepare(
+      `SELECT snapshot_id, batch_id
+       FROM snapshots_idx
+       WHERE session_id = ? AND sample_index = ?
+       ORDER BY snapshot_id DESC
+       LIMIT 1`,
+    )
+      .bind(sessionId, sampleIndex)
+      .all();
+    const row = lookup?.results?.[0];
+    snapshotId = asInt(row?.snapshot_id);
+    batchId = asInt(row?.batch_id) ?? batchId;
+  }
+
+  if (snapshotId != null && batchId == null) {
+    const lookup = await env.DB.prepare(
+      `SELECT batch_id
+       FROM snapshots_idx
+       WHERE snapshot_id = ?
+       LIMIT 1`,
+    )
+      .bind(snapshotId)
+      .all();
+    batchId = asInt(lookup?.results?.[0]?.batch_id);
+  }
+
+  return { snapshotId, sessionId, sampleIndex, batchId };
 };
 
 const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
@@ -219,10 +457,40 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
     typeof record.createdAt === 'string'
       ? record.createdAt
       : new Date().toISOString();
+  const resolved = await resolveLabelSnapshotRef(env, record.data);
 
-  await env.DB.prepare(`INSERT INTO labels (created_at, data) VALUES (?, ?)`)
-    .bind(createdAt, JSON.stringify(record.data))
+  await env.DB.prepare(
+    `INSERT INTO labels (
+      created_at,
+      data,
+      snapshot_id,
+      session_id,
+      sample_index,
+      batch_id
+    ) VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      createdAt,
+      JSON.stringify(record.data),
+      resolved.snapshotId,
+      resolved.sessionId,
+      resolved.sampleIndex,
+      resolved.batchId,
+    )
     .run();
+
+  if (resolved.snapshotId != null) {
+    await env.DB.prepare(
+      `UPDATE snapshots_idx
+       SET
+         label_count = COALESCE(label_count, 0) + 1,
+         last_labeled_at = ?
+       WHERE snapshot_id = ?`,
+    )
+      .bind(createdAt, resolved.snapshotId)
+      .run();
+    snapshotBoundsCache.clear();
+  }
 
   return okResponse();
 };
@@ -274,12 +542,16 @@ export default {
         if (request.method !== 'GET') {
           return jsonResponse({ error: 'Method not allowed.' }, 405);
         }
+        const now = Date.now();
+        if (buildCountsCache && buildCountsCache.expiresAt > now) {
+          return jsonResponse({ builds: buildCountsCache.builds });
+        }
         const sql = `
           SELECT
-            COALESCE(json_extract(meta, '$.session.buildVersion'), 'unknown') AS build,
+            COALESCE(build_version, 'unknown') AS build,
             COUNT(*) AS count
-          FROM snapshots
-          GROUP BY build
+          FROM snapshots_idx
+          GROUP BY COALESCE(build_version, 'unknown')
         `;
         const result = await env.DB.prepare(sql).all();
         const builds = (result?.results ?? [])
@@ -288,16 +560,17 @@ export default {
               typeof row.build === 'string' && row.build.trim()
                 ? row.build
                 : 'unknown',
-            count:
-              typeof row.count === 'number' && Number.isFinite(row.count)
-                ? row.count
-                : 0,
+            count: asCount(row.count),
           }))
           .sort((a, b) => {
             if (a.build === 'unknown') return 1;
             if (b.build === 'unknown') return -1;
             return a.build.localeCompare(b.build);
           });
+        buildCountsCache = {
+          expiresAt: now + BUILD_COUNTS_CACHE_TTL_MS,
+          builds,
+        };
         return jsonResponse({ builds });
       }
       if (url.pathname.startsWith('/api/snapshots/random')) {
@@ -307,45 +580,20 @@ export default {
         const mode = url.searchParams.get('mode') ?? 'all';
         const trigger = url.searchParams.get('trigger') ?? 'all';
         const build = url.searchParams.get('build') ?? 'all';
-        let sql = 'SELECT id, created_at, meta, board FROM snapshots';
-        const params: unknown[] = [];
-        const clauses: string[] = [];
-        if (mode !== 'all') {
-          if (mode === 'unknown') {
-            clauses.push("json_extract(meta, '$.session.mode.id') IS NULL");
-          } else {
-            clauses.push("json_extract(meta, '$.session.mode.id') = ?");
-            params.push(mode);
-          }
+        const filter = buildSnapshotFilterSql(mode, trigger, build);
+        const filterKey = snapshotFilterCacheKey(mode, trigger, build);
+        const unlabeledFilter = appendFilterClause(
+          filter,
+          'COALESCE(idx.label_count, 0) = 0',
+        );
+        let row = await readSnapshotByFilter(
+          env,
+          unlabeledFilter,
+          `${filterKey}|unlabeled`,
+        );
+        if (!row) {
+          row = await readSnapshotByFilter(env, filter, `${filterKey}|all`);
         }
-        if (trigger !== 'all') {
-          if (trigger === 'auto') {
-            clauses.push(
-              "(json_extract(meta, '$.trigger') IS NULL OR json_extract(meta, '$.trigger') IN ('lock','hold'))",
-            );
-          } else {
-            clauses.push("json_extract(meta, '$.trigger') = ?");
-            params.push(trigger);
-          }
-        }
-        if (build !== 'all') {
-          if (build === 'unknown') {
-            clauses.push(
-              "json_extract(meta, '$.session.buildVersion') IS NULL",
-            );
-          } else {
-            clauses.push("json_extract(meta, '$.session.buildVersion') = ?");
-            params.push(build);
-          }
-        }
-        if (clauses.length > 0) {
-          sql += ` WHERE ${clauses.join(' AND ')}`;
-        }
-        sql += ' ORDER BY RANDOM() LIMIT 1';
-        const result = await env.DB.prepare(sql)
-          .bind(...params)
-          .all();
-        const row = result?.results?.[0];
         if (!row) {
           return jsonResponse({ error: 'No snapshots available.' }, 404);
         }

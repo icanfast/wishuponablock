@@ -33,8 +33,10 @@ Options:
 - `--checkpoint-every 10` - save a checkpoint every N epochs (0 disables).
 - `--no-hold` - drop the hold piece feature.
 
-Note: training uses a session-based split when `session_id` is present. For
-labels exported by the in-game tool, we also infer it from `source.sessionId`.
+Note: training uses a session-based split, with virtual session chunking enabled
+by default (`--virtual-session-size 100`). For labels exported by the in-game
+tool, session/sample IDs are inferred from `source.sessionId` and
+`source.sampleIndex` when available.
 
 ## Export
 

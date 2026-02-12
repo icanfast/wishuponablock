@@ -24,3 +24,4 @@ fields described below and ignores the rest.
 - `hold` is optional and may be `null`.
 - `labels` preserves the order the user selected pieces.
 - `session_id` is inferred from `source.sessionId` when available.
+- `sample_index` is inferred from `source.sampleIndex` when available.
