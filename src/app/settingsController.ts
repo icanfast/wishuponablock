@@ -5,6 +5,7 @@ import type { SoundService } from './soundService';
 import type { UiController } from './uiController';
 import type { SessionController } from './sessionController';
 import type { ModelService, ModelStatus } from './modelService';
+import { usesModelGenerator } from '../core/generators';
 
 export type SettingsController = {
   start: () => () => void;
@@ -44,7 +45,7 @@ export function createSettingsController(
 
     if (next.generator.type !== generatorType) {
       generatorType = next.generator.type;
-      if (next.generator.type === 'ml') {
+      if (usesModelGenerator(next.generator.type)) {
         void modelService.ensureLoaded();
       }
       onModelStatus(modelService.getStatus());

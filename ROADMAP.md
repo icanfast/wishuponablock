@@ -7,7 +7,7 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - For Wish Upon a Block generator maybe it is possible to display the most likely next piece. Will require completely new ML pipeline — 1
 - Bots — 2
 - RL bots and piece generators — 1
-- Change default softdrop from instant to increased gravity. Add softdrop slider — 5
+- Change default softdrop from instant to increased gravity. Add softdrop slider — 5 — DONE
 - Curse Upon a Block, a generator that gives you the worst piece — 5
 
 ## UI/UX

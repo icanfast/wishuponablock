@@ -5,6 +5,7 @@ import { BagInconvenient } from './bagInconvenient';
 import { RandomGenerator } from './randomGenerator';
 import { NesGenerator } from './nesGenerator';
 import { ModelGenerator } from './modelGenerator';
+import { CurseModelGenerator } from './curseModelGenerator';
 import { DEFAULT_ML_INFERENCE } from './constants';
 import type { LoadedModel } from './wubModel';
 
@@ -15,6 +16,7 @@ export const GENERATOR_TYPES = [
   'random',
   'nes',
   'ml',
+  'curse',
 ] as const;
 export type GeneratorType = (typeof GENERATOR_TYPES)[number];
 
@@ -48,6 +50,10 @@ export function isMlInferenceStrategy(
   return value === 'clean_uniform' || value === 'threshold';
 }
 
+export function usesModelGenerator(type: GeneratorType): boolean {
+  return type === 'ml' || type === 'curse';
+}
+
 export function createGeneratorFactory(
   settings: GeneratorSettings,
   options: GeneratorFactoryOptions = {},
@@ -68,6 +74,13 @@ export function createGeneratorFactory(
           options.mlModel ?? null,
           options.mlModelPromise,
           settings.ml ?? DEFAULT_ML_INFERENCE,
+        );
+    case 'curse':
+      return (seed) =>
+        new CurseModelGenerator(
+          seed,
+          options.mlModel ?? null,
+          options.mlModelPromise,
         );
     case 'bag7':
     default:

@@ -8,6 +8,7 @@ import {
   DEFAULT_BUTTERFINGER_MISS_RATE,
   DEFAULT_BUTTERFINGER_WRONG_DIR_RATE,
   DEFAULT_DAS_MS,
+  DEFAULT_GHOST_OPACITY,
   DEFAULT_GRAVITY_MS,
   DEFAULT_GRIDLINE_OPACITY,
   DEFAULT_HIGH_CONTRAST,
@@ -56,6 +57,7 @@ export interface PrivacySettings {
 
 export interface GraphicsSettings {
   gridlineOpacity: number;
+  ghostOpacity: number;
   highContrast: boolean;
   colorblindMode: boolean;
 }
@@ -94,6 +96,7 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   graphics: {
     gridlineOpacity: DEFAULT_GRIDLINE_OPACITY,
+    ghostOpacity: DEFAULT_GHOST_OPACITY,
     highContrast: DEFAULT_HIGH_CONTRAST,
     colorblindMode: DEFAULT_COLORBLIND_MODE,
   },
@@ -200,6 +203,7 @@ function mergeGraphics(
 ): GraphicsSettings {
   return {
     gridlineOpacity: num(patch?.gridlineOpacity) ?? base.gridlineOpacity,
+    ghostOpacity: num(patch?.ghostOpacity) ?? base.ghostOpacity,
     highContrast: bool(patch?.highContrast) ?? base.highContrast,
     colorblindMode: bool(patch?.colorblindMode) ?? base.colorblindMode,
   };

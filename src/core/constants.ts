@@ -54,13 +54,13 @@ export const PLAY_HEIGHT =
   OUTER_MARGIN;
 
 export const DEFAULT_GRAVITY_MS = 800;
-export const DEFAULT_SOFT_DROP_MS = 0;
+export const DEFAULT_SOFT_DROP_MS = 80;
 export const DEFAULT_LOCK_DELAY_MS = 500;
 export const DEFAULT_HARD_LOCK_DELAY_MS = 2000;
 export const CLASSIC_LOCK_DELAY_MS = 500;
 export const CLASSIC_HARD_LOCK_DELAY_MS = 500;
-export const DEFAULT_DAS_MS = 150;
-export const DEFAULT_ARR_MS = 0;
+export const DEFAULT_DAS_MS = 200;
+export const DEFAULT_ARR_MS = 50;
 export const DEFAULT_MASTER_VOLUME = 0.5;
 export const DEFAULT_SHARE_SNAPSHOTS = true;
 export const DEFAULT_BUTTERFINGER_ENABLED = false;
@@ -71,6 +71,7 @@ export const DEFAULT_BUTTERFINGER_LOCK_NUDGE_RATE = 0;
 export const DEFAULT_BUTTERFINGER_GRAVITY_DROP_RATE = 0;
 export const DEFAULT_BUTTERFINGER_LOCK_ROTATE_RATE = 0.5;
 export const DEFAULT_GRIDLINE_OPACITY = 0;
+export const DEFAULT_GHOST_OPACITY = 0.35;
 export const DEFAULT_HIGH_CONTRAST = false;
 export const DEFAULT_COLORBLIND_MODE = false;
 export const DEFAULT_ML_INFERENCE = {

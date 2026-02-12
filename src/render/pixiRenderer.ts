@@ -4,6 +4,7 @@ import {
   BOARD_X,
   BOARD_Y,
   COLS,
+  DEFAULT_GHOST_OPACITY,
   HOLD_COLS,
   HOLD_INNER_Y,
   HOLD_LABEL_HEIGHT,
@@ -53,11 +54,16 @@ export class PixiRenderer {
   ) {}
 
   private gridlineOpacity = 0;
+  private ghostOpacity = DEFAULT_GHOST_OPACITY;
   private highContrast = false;
   private colorblindMode = false;
 
   setGridlineOpacity(opacity: number): void {
     this.gridlineOpacity = Math.max(0, Math.min(1, opacity));
+  }
+
+  setGhostOpacity(opacity: number): void {
+    this.ghostOpacity = Math.max(0, Math.min(1, opacity));
   }
 
   setHighContrast(enabled: boolean): void {
@@ -133,11 +139,23 @@ export class PixiRenderer {
     if (state.gameOver || state.gameWon) return;
 
     // ghost
-    const ghostColor = dim(this.getPieceColor(state.active.k), 0.35);
+    const ghostColor = this.getPieceColor(state.active.k);
     const ghostPiece = { ...state.active, y: state.ghostY };
-    for (const [x, y] of cellsOf(ghostPiece)) {
-      if (y < 0) continue;
-      drawCell(gfx, boardX, boardY, cell, x, y, ghostColor, outlineColor);
+    if (this.ghostOpacity > 0) {
+      for (const [x, y] of cellsOf(ghostPiece)) {
+        if (y < 0) continue;
+        drawCell(
+          gfx,
+          boardX,
+          boardY,
+          cell,
+          x,
+          y,
+          ghostColor,
+          outlineColor,
+          this.ghostOpacity,
+        );
+      }
     }
 
     // active
@@ -197,10 +215,22 @@ export class PixiRenderer {
     }
 
     if (ghost) {
-      const ghostColor = dim(this.getPieceColor(ghost.k), 0.35);
-      for (const [x, y] of cellsOf(ghost)) {
-        if (y < 0) continue;
-        drawCell(gfx, boardX, boardY, cell, x, y, ghostColor, outlineColor);
+      const ghostColor = this.getPieceColor(ghost.k);
+      if (this.ghostOpacity > 0) {
+        for (const [x, y] of cellsOf(ghost)) {
+          if (y < 0) continue;
+          drawCell(
+            gfx,
+            boardX,
+            boardY,
+            cell,
+            x,
+            y,
+            ghostColor,
+            outlineColor,
+            this.ghostOpacity,
+          );
+        }
       }
     }
   }
@@ -375,23 +405,39 @@ function drawCell(
   y: number,
   color: number,
   outlineColor?: number,
+  alpha = 1,
 ): void {
   const px = boardX + x * cell;
   const py = boardY + y * cell;
   const pad = 2;
   if (outlineColor !== undefined) {
-    gfx
-      .rect(px + pad - 1, py + pad - 1, cell - pad * 2 + 2, cell - pad * 2 + 2)
-      .fill(outlineColor);
+    if (alpha >= 1) {
+      gfx
+        .rect(
+          px + pad - 1,
+          py + pad - 1,
+          cell - pad * 2 + 2,
+          cell - pad * 2 + 2,
+        )
+        .fill(outlineColor);
+    } else {
+      gfx
+        .rect(
+          px + pad - 1,
+          py + pad - 1,
+          cell - pad * 2 + 2,
+          cell - pad * 2 + 2,
+        )
+        .fill({ color: outlineColor, alpha });
+    }
   }
-  gfx.rect(px + pad, py + pad, cell - pad * 2, cell - pad * 2).fill(color);
-}
-
-function dim(color: number, factor: number): number {
-  const r = ((color >> 16) & 0xff) * factor;
-  const g = ((color >> 8) & 0xff) * factor;
-  const b = (color & 0xff) * factor;
-  return ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
+  if (alpha >= 1) {
+    gfx.rect(px + pad, py + pad, cell - pad * 2, cell - pad * 2).fill(color);
+  } else {
+    gfx
+      .rect(px + pad, py + pad, cell - pad * 2, cell - pad * 2)
+      .fill({ color, alpha });
+  }
 }
 
 function getShapeBounds(shape: ReadonlyArray<readonly [number, number]>): {

@@ -234,7 +234,9 @@ export class Game {
       return;
     }
 
-    const newInterval = input.softDrop ? this.softDropMs : this.gravityMs;
+    const newInterval = input.softDrop
+      ? this.getEffectiveSoftDropMs()
+      : this.gravityMs;
 
     // adjust accumulator when interval changes to avoid "retroactive" drops
     this.adjustDropInterval(newInterval);
@@ -257,6 +259,11 @@ export class Game {
         }
       }
     }
+  }
+
+  private getEffectiveSoftDropMs(): number {
+    if (this.softDropMs <= 0) return this.softDropMs;
+    return Math.min(this.softDropMs, this.gravityMs);
   }
 
   private applyLock(dtMs: number): void {

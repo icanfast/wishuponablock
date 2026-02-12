@@ -6,7 +6,7 @@ import {
   PLAY_WIDTH,
   ROWS,
 } from './core/constants';
-import { GENERATOR_TYPES } from './core/generators';
+import { GENERATOR_TYPES, usesModelGenerator } from './core/generators';
 import type { GameSession } from './core/gameSession';
 import { createSettingsStore } from './core/settingsStore';
 import { createGameRuntime, type GameRuntime } from './app/runtime';
@@ -140,10 +140,14 @@ async function boot() {
   modelService.setStatusListener((status) => {
     updateModelStatusUI(status);
   });
+  const getModelGeneratorLabel = (): string => {
+    const type = settingsStore.get().generator.type;
+    return type === 'curse' ? 'Curse Upon a Block' : 'Wish Upon a Block';
+  };
   const updateModelStatusUI = (status: ModelStatus): void => {
     if (!modelStatusLabel) return;
-    const isMl = settingsStore.get().generator.type === 'ml';
-    if (!isMl) {
+    const generatorType = settingsStore.get().generator.type;
+    if (!usesModelGenerator(generatorType)) {
       modelStatusLabel.textContent = '';
       modelStatusLabel.style.display = 'none';
       if (pausedByModel) {
@@ -152,20 +156,21 @@ async function boot() {
       }
       return;
     }
+    const generatorLabel = getModelGeneratorLabel();
     modelStatusLabel.style.display = 'block';
-    let text = 'ML generator: idle (RNG fallback)';
+    let text = `${generatorLabel}: idle (RNG fallback)`;
     let color = '#f4b266';
     let shouldPause = false;
     if (status === 'ready') {
-      text = 'ML generator: loaded';
+      text = `${generatorLabel}: loaded`;
       color = '#8fd19e';
       shouldPause = false;
     } else if (status === 'loading') {
-      text = 'ML generator: loading (RNG fallback)';
+      text = `${generatorLabel}: loading (RNG fallback)`;
       color = '#f4b266';
       shouldPause = false;
     } else if (status === 'failed') {
-      text = 'ML generator: failed to load model';
+      text = `${generatorLabel}: failed to load model`;
       color = '#f28b82';
       shouldPause = true;
     }
@@ -279,9 +284,11 @@ async function boot() {
   const gameRenderer = new PixiRenderer(gameGfx);
   const toolRenderer = new PixiRenderer(toolGfx);
   gameRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
+  gameRenderer.setGhostOpacity(settings.graphics.ghostOpacity);
   gameRenderer.setHighContrast(settings.graphics.highContrast);
   gameRenderer.setColorblindMode(settings.graphics.colorblindMode);
   toolRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
+  toolRenderer.setGhostOpacity(settings.graphics.ghostOpacity);
   toolRenderer.setHighContrast(settings.graphics.highContrast);
   toolRenderer.setColorblindMode(settings.graphics.colorblindMode);
   const toolCanvas = createToolCanvas(toolRenderer);
@@ -464,6 +471,8 @@ async function boot() {
     onGraphicsChange: (next) => {
       gameRenderer.setGridlineOpacity(next.graphics.gridlineOpacity);
       toolRenderer.setGridlineOpacity(next.graphics.gridlineOpacity);
+      gameRenderer.setGhostOpacity(next.graphics.ghostOpacity);
+      toolRenderer.setGhostOpacity(next.graphics.ghostOpacity);
       gameRenderer.setHighContrast(next.graphics.highContrast);
       toolRenderer.setHighContrast(next.graphics.highContrast);
       gameRenderer.setColorblindMode(next.graphics.colorblindMode);
@@ -508,8 +517,8 @@ async function boot() {
     if (startingGame) return;
     startingGame = true;
     try {
-      const isMl = settingsStore.get().generator.type === 'ml';
-      if (isMl) {
+      const generatorType = settingsStore.get().generator.type;
+      if (usesModelGenerator(generatorType)) {
         if (modelService.getStatus() !== 'ready') {
           const loaded = await modelService.ensureLoaded();
           if (!loaded) {

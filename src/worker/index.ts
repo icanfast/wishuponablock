@@ -32,6 +32,81 @@ const okResponse = (): Response =>
     },
   });
 
+const asString = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() ? value.trim() : null;
+
+const asInt = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return null;
+};
+
+type SnapshotMetaPayload = {
+  session?: {
+    id?: unknown;
+    createdAt?: unknown;
+    protocolVersion?: unknown;
+    rows?: unknown;
+    cols?: unknown;
+    mode?: {
+      id?: unknown;
+    };
+    buildVersion?: unknown;
+    settings?: {
+      generator?: {
+        type?: unknown;
+        ml?: {
+          strategy?: unknown;
+        };
+      };
+    };
+    model_url?: unknown;
+    device_id?: unknown;
+    user_id?: unknown;
+  };
+  sample?: {
+    index?: unknown;
+    timeMs?: unknown;
+    hold?: unknown;
+    linesLeft?: unknown;
+    level?: unknown;
+    score?: unknown;
+  };
+  trigger?: unknown;
+};
+
+const extractSnapshotIndexData = (meta: Record<string, unknown>) => {
+  const typed = meta as SnapshotMetaPayload;
+  const session = typed.session;
+  const sample = typed.sample;
+  return {
+    sessionId: asString(session?.id),
+    sessionCreatedAt: asString(session?.createdAt),
+    protocolVersion: asInt(session?.protocolVersion),
+    rows: asInt(session?.rows),
+    cols: asInt(session?.cols),
+    modeId: asString(session?.mode?.id),
+    buildVersion: asString(session?.buildVersion),
+    generatorType: asString(session?.settings?.generator?.type),
+    generatorStrategy: asString(session?.settings?.generator?.ml?.strategy),
+    trigger: asString(typed.trigger),
+    sampleIndex: asInt(sample?.index),
+    sampleTimeMs: asInt(sample?.timeMs),
+    sampleHold: asInt(sample?.hold),
+    linesLeft: asInt(sample?.linesLeft),
+    level: asInt(sample?.level),
+    score: asInt(sample?.score),
+    modelUrl: asString(session?.model_url),
+    deviceId: asString(session?.device_id),
+    userId: asString(session?.user_id),
+  };
+};
+
 const handleSnapshots = async (
   env: Env,
   payload: unknown,
@@ -54,11 +129,77 @@ const handleSnapshots = async (
     typeof record.createdAt === 'string'
       ? record.createdAt
       : new Date().toISOString();
+  const metaJson = JSON.stringify(record.meta);
+  const boardJson = JSON.stringify(record.board);
 
   await env.DB.prepare(
     `INSERT INTO snapshots (created_at, meta, board) VALUES (?, ?, ?)`,
   )
-    .bind(createdAt, JSON.stringify(record.meta), JSON.stringify(record.board))
+    .bind(createdAt, metaJson, boardJson)
+    .run();
+
+  const idResult = await env.DB.prepare(
+    `SELECT id FROM snapshots
+     WHERE created_at = ? AND meta = ? AND board = ?
+     ORDER BY id DESC
+     LIMIT 1`,
+  )
+    .bind(createdAt, metaJson, boardJson)
+    .all();
+  const snapshotId = asInt(idResult?.results?.[0]?.id);
+  if (snapshotId == null) {
+    return jsonResponse({ error: 'Snapshot saved, but indexing failed.' }, 500);
+  }
+
+  const idx = extractSnapshotIndexData(record.meta);
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO snapshots_idx (
+      snapshot_id,
+      created_at,
+      session_id,
+      session_created_at,
+      protocol_version,
+      rows,
+      cols,
+      mode_id,
+      build_version,
+      generator_type,
+      generator_strategy,
+      trigger,
+      sample_index,
+      sample_time_ms,
+      sample_hold,
+      lines_left,
+      level,
+      score,
+      model_url,
+      device_id,
+      user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      snapshotId,
+      createdAt,
+      idx.sessionId,
+      idx.sessionCreatedAt,
+      idx.protocolVersion,
+      idx.rows,
+      idx.cols,
+      idx.modeId,
+      idx.buildVersion,
+      idx.generatorType,
+      idx.generatorStrategy,
+      idx.trigger,
+      idx.sampleIndex,
+      idx.sampleTimeMs,
+      idx.sampleHold,
+      idx.linesLeft,
+      idx.level,
+      idx.score,
+      idx.modelUrl,
+      idx.deviceId,
+      idx.userId,
+    )
     .run();
 
   return okResponse();

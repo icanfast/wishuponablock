@@ -5,6 +5,8 @@ import { GameRunner, type InputSource } from '../core/runner';
 import { dropDistance } from '../core/piece';
 import type { GameState, InputFrame, PieceKind } from '../core/types';
 import type { PieceGenerator } from '../core/generator';
+import { inferCurseDistribution } from '../core/curseInference';
+import { softmax } from '../core/wubModel';
 
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
@@ -88,6 +90,41 @@ describe('Game', () => {
     );
     expect(anyLocked).toBe(false);
   });
+
+  it('timed soft drop increases gravity instead of hard dropping', () => {
+    const game = new Game({
+      seed: 2,
+      gravityMs: 1000,
+      softDropMs: 200,
+      lockDelayMs: 500,
+      generatorFactory: () => new FixedGenerator('O'),
+    });
+
+    const startY = game.state.active.y;
+    const d = dropDistance(game.state.board, game.state.active);
+    expect(d).toBeGreaterThan(1);
+
+    game.step(199, { ...EMPTY_INPUT, softDrop: true });
+    expect(game.state.active.y).toBe(startY);
+
+    game.step(1, { ...EMPTY_INPUT, softDrop: true });
+    expect(game.state.active.y).toBe(startY + 1);
+  });
+
+  it('soft drop cannot be slower than base gravity', () => {
+    const game = new Game({
+      seed: 3,
+      gravityMs: 100,
+      softDropMs: 400,
+      lockDelayMs: 500,
+      generatorFactory: () => new FixedGenerator('I'),
+    });
+
+    const startY = game.state.active.y;
+    game.step(100, { ...EMPTY_INPUT, softDrop: true });
+
+    expect(game.state.active.y).toBe(startY + 1);
+  });
 });
 
 describe('GameRunner', () => {
@@ -105,5 +142,25 @@ describe('GameRunner', () => {
     runner.tick(1000, input);
 
     expect(input.count).toBe(2);
+  });
+});
+
+describe('Curse inference', () => {
+  it('flips softmax probabilities and renormalizes', () => {
+    const logits = new Float32Array([4, 1, -2]);
+    const base = softmax(logits);
+    const cursed = inferCurseDistribution(logits);
+
+    const cursedSum = cursed[0] + cursed[1] + cursed[2];
+    expect(cursedSum).toBeCloseTo(1, 6);
+    expect(cursed[0]).toBeLessThan(cursed[1]);
+    expect(cursed[1]).toBeLessThan(cursed[2]);
+    expect(base[0]).toBeGreaterThan(base[1]);
+  });
+
+  it('keeps uniform logits uniform after inversion', () => {
+    const logits = new Float32Array([0, 0, 0, 0]);
+    const cursed = inferCurseDistribution(logits);
+    expect(Array.from(cursed)).toEqual([0.25, 0.25, 0.25, 0.25]);
   });
 });

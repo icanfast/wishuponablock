@@ -3,7 +3,6 @@
   "name": "wishuponablock",
   "compatibility_date": "2026-02-05",
   "main": "./src/entry/worker.ts",
-  "migrations_dir": "./tools/db/migrations",
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -13,7 +12,8 @@
     {
       "binding": "DB",
       "database_name": "wishuponablock-dev",
-      "database_id": "032328e1-972f-4fc5-8976-2a504b2b71a5"
+      "database_id": "032328e1-972f-4fc5-8976-2a504b2b71a5",
+      "migrations_dir": "./tools/db/migrations"
     }
   ]
 }

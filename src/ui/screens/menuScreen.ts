@@ -2,6 +2,7 @@ import {
   DEFAULT_ARR_MS,
   DEFAULT_DAS_MS,
   DEFAULT_KEY_BINDINGS,
+  DEFAULT_SOFT_DROP_MS,
   OUTER_MARGIN,
 } from '../../core/constants';
 import type { Settings } from '../../core/settings';
@@ -484,6 +485,11 @@ input[type=number] {
     max: 100,
     step: 1,
   });
+  const softDropControl = makeMsSlider('Soft Drop (ms, 0 = instant)', {
+    min: 0,
+    max: 200,
+    step: 10,
+  });
 
   const gameplayResetButton = makeMenuButton('RESET DEFAULTS');
   Object.assign(gameplayResetButton.style, {
@@ -503,6 +509,23 @@ input[type=number] {
     });
   };
 
+  const applyGamePatch = (patch: Partial<Settings['game']>) => {
+    const current = settingsStore.get().game;
+    settingsStore.apply({
+      game: {
+        ...current,
+        ...patch,
+      },
+    });
+  };
+
+  const quantizeToStep = (value: number, step: number): number => {
+    if (!Number.isFinite(step) || step <= 0) {
+      return Math.round(value);
+    }
+    return Math.round(value / step) * step;
+  };
+
   const updateMsControl = (
     control: {
       slider: HTMLInputElement;
@@ -512,7 +535,7 @@ input[type=number] {
     nextValue: number,
   ) => {
     const clamped = clamp(
-      Math.round(nextValue),
+      quantizeToStep(nextValue, control.options.step),
       control.options.min,
       control.options.max,
     );
@@ -532,10 +555,19 @@ input[type=number] {
     applyInputPatch({ arrMs: value });
   });
 
+  softDropControl.slider.addEventListener('input', () => {
+    const value = Number(softDropControl.slider.value);
+    updateMsControl(softDropControl, value);
+    applyGamePatch({ softDropMs: value });
+  });
+
   gameplayResetButton.addEventListener('click', () => {
     applyInputPatch({
       dasMs: DEFAULT_DAS_MS,
       arrMs: DEFAULT_ARR_MS,
+    });
+    applyGamePatch({
+      softDropMs: DEFAULT_SOFT_DROP_MS,
     });
   });
 
@@ -550,10 +582,14 @@ input[type=number] {
   ) => {
     const raw = Number(control.value.value);
     if (!Number.isFinite(raw)) return;
-    const clamped = clamp(raw, control.options.min, control.options.max);
-    control.slider.value = String(Math.round(clamped));
+    const clamped = clamp(
+      quantizeToStep(raw, control.options.step),
+      control.options.min,
+      control.options.max,
+    );
+    control.slider.value = String(clamped);
     if (commit) {
-      control.value.value = String(Math.round(clamped));
+      control.value.value = String(clamped);
     }
     patch(clamped);
   };
@@ -598,6 +634,28 @@ input[type=number] {
     applyMsInput(
       arrControl,
       (value) => applyInputPatch({ arrMs: value }),
+      true,
+    );
+  });
+
+  softDropControl.value.addEventListener('input', () => {
+    applyMsInput(
+      softDropControl,
+      (value) => applyGamePatch({ softDropMs: value }),
+      false,
+    );
+  });
+  softDropControl.value.addEventListener('change', () => {
+    applyMsInput(
+      softDropControl,
+      (value) => applyGamePatch({ softDropMs: value }),
+      true,
+    );
+  });
+  softDropControl.value.addEventListener('blur', () => {
+    applyMsInput(
+      softDropControl,
+      (value) => applyGamePatch({ softDropMs: value }),
       true,
     );
   });
@@ -699,6 +757,102 @@ input[type=number] {
 
   gridlineRow.appendChild(gridlineSlider);
   gridlineRow.appendChild(gridlineValue);
+
+  const ghostOpacityLabel = document.createElement('div');
+  ghostOpacityLabel.textContent = 'Ghost Piece Opacity';
+  Object.assign(ghostOpacityLabel.style, {
+    marginTop: '6px',
+    marginBottom: '6px',
+    color: '#b6c2d4',
+    fontSize: '11px',
+  });
+
+  const ghostOpacityRow = document.createElement('div');
+  Object.assign(ghostOpacityRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  });
+
+  const ghostOpacityValue = document.createElement('input');
+  ghostOpacityValue.type = 'number';
+  ghostOpacityValue.min = '0';
+  ghostOpacityValue.max = '100';
+  ghostOpacityValue.step = '1';
+  ghostOpacityValue.inputMode = 'numeric';
+  Object.assign(ghostOpacityValue.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    width: '52px',
+    textAlign: 'right',
+    padding: '4px 6px',
+    MozAppearance: 'textfield',
+  });
+  ghostOpacityValue.addEventListener('wheel', (event) => {
+    if (document.activeElement === ghostOpacityValue) {
+      event.preventDefault();
+    }
+  });
+  ghostOpacityValue.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+    }
+  });
+
+  const ghostOpacitySlider = document.createElement('input');
+  ghostOpacitySlider.type = 'range';
+  ghostOpacitySlider.min = '0';
+  ghostOpacitySlider.max = '100';
+  ghostOpacitySlider.step = '1';
+  Object.assign(ghostOpacitySlider.style, {
+    flex: '1',
+    accentColor: '#6ea8ff',
+  });
+
+  const updateGhostOpacityLabel = (value: number) => {
+    ghostOpacityValue.value = String(Math.round(value * 100));
+  };
+
+  ghostOpacitySlider.addEventListener('input', () => {
+    const value = Math.max(
+      0,
+      Math.min(1, Number(ghostOpacitySlider.value) / 100),
+    );
+    updateGhostOpacityLabel(value);
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, ghostOpacity: value },
+    });
+  });
+
+  const applyGhostOpacityInput = (commit: boolean) => {
+    const raw = Number(ghostOpacityValue.value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = Math.max(0, Math.min(100, raw));
+    const value = clamped / 100;
+    ghostOpacitySlider.value = String(Math.round(clamped));
+    if (commit) {
+      updateGhostOpacityLabel(value);
+    }
+    const current = settingsStore.get().graphics;
+    settingsStore.apply({
+      graphics: { ...current, ghostOpacity: value },
+    });
+  };
+
+  ghostOpacityValue.addEventListener('input', () =>
+    applyGhostOpacityInput(false),
+  );
+  ghostOpacityValue.addEventListener('change', () =>
+    applyGhostOpacityInput(true),
+  );
+  ghostOpacityValue.addEventListener('blur', () => applyGhostOpacityInput(true));
+
+  ghostOpacityRow.appendChild(ghostOpacitySlider);
+  ghostOpacityRow.appendChild(ghostOpacityValue);
 
   const highContrastRow = document.createElement('label');
   Object.assign(highContrastRow.style, {
@@ -827,6 +981,7 @@ input[type=number] {
   optionsMiddleColumn.appendChild(gameplayTitle);
   optionsMiddleColumn.appendChild(dasControl.wrapper);
   optionsMiddleColumn.appendChild(arrControl.wrapper);
+  optionsMiddleColumn.appendChild(softDropControl.wrapper);
   optionsMiddleColumn.appendChild(gameplayResetButton);
   optionsMiddleColumn.appendChild(dataTitle);
   optionsMiddleColumn.appendChild(shareRow);
@@ -836,6 +991,8 @@ input[type=number] {
   optionsRightColumn.appendChild(graphicsTitle);
   optionsRightColumn.appendChild(gridlineLabel);
   optionsRightColumn.appendChild(gridlineRow);
+  optionsRightColumn.appendChild(ghostOpacityLabel);
+  optionsRightColumn.appendChild(ghostOpacityRow);
   optionsRightColumn.appendChild(highContrastRow);
   optionsRightColumn.appendChild(colorblindRow);
 
@@ -1743,11 +1900,17 @@ input[type=number] {
     updateVolumeLabel(settings.audio.masterVolume);
     updateMsControl(dasControl, settings.input.dasMs);
     updateMsControl(arrControl, settings.input.arrMs);
+    updateMsControl(softDropControl, settings.game.softDropMs);
     const nextGridline = Math.round(settings.graphics.gridlineOpacity * 100);
     if (Number(gridlineSlider.value) !== nextGridline) {
       gridlineSlider.value = String(nextGridline);
     }
     updateGridlineLabel(settings.graphics.gridlineOpacity);
+    const nextGhostOpacity = Math.round(settings.graphics.ghostOpacity * 100);
+    if (Number(ghostOpacitySlider.value) !== nextGhostOpacity) {
+      ghostOpacitySlider.value = String(nextGhostOpacity);
+    }
+    updateGhostOpacityLabel(settings.graphics.ghostOpacity);
     highContrastToggle.checked = settings.graphics.highContrast;
     colorblindToggle.checked = settings.graphics.colorblindMode;
     shareToggle.checked = settings.privacy.shareSnapshots;

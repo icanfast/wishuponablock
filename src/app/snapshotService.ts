@@ -11,6 +11,7 @@ import {
 import type { UploadClient } from '../core/uploadClient';
 import type { Board, PieceKind } from '../core/types';
 import type { IdentityService } from './identityService';
+import { usesModelGenerator } from '../core/generators';
 
 export type SnapshotUiState = {
   folderStatus: string;
@@ -242,7 +243,7 @@ export function createSnapshotService(
     if (buildVersion) {
       session.meta.buildVersion = buildVersion;
     }
-    if (session.meta.settings.generator.type === 'ml') {
+    if (usesModelGenerator(session.meta.settings.generator.type)) {
       session.meta.model_url = ML_MODEL_URL;
     } else {
       delete session.meta.model_url;

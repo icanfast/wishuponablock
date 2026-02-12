@@ -76,6 +76,8 @@ const labelForGenerator = (type: GeneratorType): string => {
       return 'NES';
     case 'ml':
       return 'Wish Upon a Block';
+    case 'curse':
+      return 'Curse Upon a Block';
     default:
       return type;
   }
