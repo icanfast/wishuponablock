@@ -6,14 +6,14 @@
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "wishuponablock-dev",
       "database_id": "032328e1-972f-4fc5-8976-2a504b2b71a5",
-      "migrations_dir": "./tools/db/migrations"
-    }
-  ]
+      "migrations_dir": "./tools/db/migrations",
+    },
+  ],
 }

@@ -849,7 +849,9 @@ input[type=number] {
   ghostOpacityValue.addEventListener('change', () =>
     applyGhostOpacityInput(true),
   );
-  ghostOpacityValue.addEventListener('blur', () => applyGhostOpacityInput(true));
+  ghostOpacityValue.addEventListener('blur', () =>
+    applyGhostOpacityInput(true),
+  );
 
   ghostOpacityRow.appendChild(ghostOpacitySlider);
   ghostOpacityRow.appendChild(ghostOpacityValue);
