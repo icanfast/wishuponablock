@@ -18,12 +18,19 @@ type MenuPanel =
   | 'tools'
   | 'feedback';
 
+export type LabelingProgressState = {
+  buildVersion: string;
+  labeledBoards: number | null;
+  target: number;
+};
+
 export type MenuScreenOptions = {
   settingsStore: SettingsStore;
   showDevTools: boolean;
   version: string;
   charcuterieDefaultSimCount?: number;
   tools: Array<{ id: string; label: string }>;
+  labelingProgress?: LabelingProgressState | null;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -41,6 +48,7 @@ export type MenuScreen = {
   show: (panel: MenuPanel) => void;
   showMain: () => void;
   setTools: (tools: Array<{ id: string; label: string }>) => void;
+  setLabelingProgress: (progress: LabelingProgressState | null) => void;
   setCharcuterieSpinnerVisible: (visible: boolean) => void;
   syncSettings: (settings: Settings) => void;
 };
@@ -52,6 +60,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     version,
     charcuterieDefaultSimCount = 10000,
     tools,
+    labelingProgress = null,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -1576,6 +1585,49 @@ input[type=number] {
   Object.assign(toolsBackButton.style, { marginTop: 'auto' });
 
   toolsPanel.appendChild(toolsTitle);
+  const toolsProgressCard = document.createElement('div');
+  Object.assign(toolsProgressCard.style, {
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '10px',
+    textAlign: 'left',
+  });
+  const toolsProgressLabel = document.createElement('div');
+  Object.assign(toolsProgressLabel.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    letterSpacing: '0.4px',
+    marginBottom: '4px',
+  });
+  const toolsProgressValue = document.createElement('div');
+  Object.assign(toolsProgressValue.style, {
+    color: '#e2e8f0',
+    fontSize: '12px',
+    marginBottom: '8px',
+  });
+  const toolsProgressTrack = document.createElement('div');
+  Object.assign(toolsProgressTrack.style, {
+    width: '100%',
+    height: '8px',
+    background: '#121a24',
+    border: '1px solid #1f2a37',
+    borderRadius: '999px',
+    overflow: 'hidden',
+  });
+  const toolsProgressFill = document.createElement('div');
+  Object.assign(toolsProgressFill.style, {
+    height: '100%',
+    width: '0%',
+    background: '#6ea8ff',
+    transition: 'width 180ms ease-out',
+  });
+  toolsProgressTrack.appendChild(toolsProgressFill);
+  toolsProgressCard.appendChild(toolsProgressLabel);
+  toolsProgressCard.appendChild(toolsProgressValue);
+  toolsProgressCard.appendChild(toolsProgressTrack);
+  toolsPanel.appendChild(toolsProgressCard);
+
   const toolsList = document.createElement('div');
   Object.assign(toolsList.style, {
     display: 'flex',
@@ -1605,7 +1657,34 @@ input[type=number] {
     }
   };
 
+  const setLabelingProgress = (progress: LabelingProgressState | null) => {
+    const target = Math.max(1, Math.trunc(progress?.target ?? 2000));
+    const buildVersion =
+      progress?.buildVersion && progress.buildVersion.trim()
+        ? progress.buildVersion.trim()
+        : 'unknown';
+    if (
+      progress == null ||
+      progress.labeledBoards == null ||
+      !Number.isFinite(progress.labeledBoards)
+    ) {
+      toolsProgressLabel.textContent = `LABELING PROGRESS · ${buildVersion}`;
+      toolsProgressValue.textContent = `0 / ${target.toLocaleString()} (offline)`;
+      toolsProgressFill.style.width = '0%';
+      toolsProgressFill.style.background = '#6ea8ff';
+      return;
+    }
+    const labeledBoards = Math.max(0, Math.trunc(progress.labeledBoards));
+    const ratio = Math.min(1, labeledBoards / target);
+    const percent = Math.round(ratio * 100);
+    toolsProgressLabel.textContent = `LABELING PROGRESS · ${buildVersion}`;
+    toolsProgressValue.textContent = `${labeledBoards.toLocaleString()} / ${target.toLocaleString()} (${percent}%)`;
+    toolsProgressFill.style.width = `${ratio * 100}%`;
+    toolsProgressFill.style.background = ratio >= 1 ? '#8fd19e' : '#6ea8ff';
+  };
+
   setTools(tools);
+  setLabelingProgress(labelingProgress);
 
   const feedbackTitle = document.createElement('div');
   feedbackTitle.textContent = 'FEEDBACK';
@@ -1928,6 +2007,7 @@ input[type=number] {
     show,
     showMain,
     setTools,
+    setLabelingProgress,
     setCharcuterieSpinnerVisible: (visible) => {
       charcuterieSpinner.style.display = visible ? 'flex' : 'none';
     },

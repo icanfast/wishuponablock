@@ -3,7 +3,10 @@ import type { Settings } from '../core/settings';
 import type { SettingsStore } from '../core/settingsStore';
 import type { Board, PieceKind } from '../core/types';
 import type { GameScreen } from '../ui/screens/gameScreen';
-import type { MenuScreen } from '../ui/screens/menuScreen';
+import type {
+  LabelingProgressState,
+  MenuScreen,
+} from '../ui/screens/menuScreen';
 import type { SnapshotService } from './snapshotService';
 import type { SnapshotUiState } from './snapshotService';
 import type { ModeController } from './modeController';
@@ -26,6 +29,7 @@ export type UiController = {
   };
   syncMenuSettings: (settings: Settings) => void;
   setMenuTools: (tools: Array<{ id: string; label: string }>) => void;
+  setMenuLabelingProgress: (progress: LabelingProgressState | null) => void;
   showMenuMain: () => void;
   syncSnapshotUi: (state: SnapshotUiState) => void;
   syncGeneratorSelection: (value: string) => void;
@@ -175,6 +179,10 @@ export function createUiController(options: UiControllerOptions): UiController {
     menuScreen?.setTools(tools);
   };
 
+  const setMenuLabelingProgress = (progress: LabelingProgressState | null) => {
+    menuScreen?.setLabelingProgress(progress);
+  };
+
   const showMenuMain = () => {
     menuScreen?.showMain();
   };
@@ -209,6 +217,7 @@ export function createUiController(options: UiControllerOptions): UiController {
     getMenuHandlers,
     syncMenuSettings,
     setMenuTools,
+    setMenuLabelingProgress,
     showMenuMain,
     syncSnapshotUi,
     syncGeneratorSelection,

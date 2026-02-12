@@ -14,6 +14,7 @@ type Env = {
 };
 
 const BUILD_COUNTS_CACHE_TTL_MS = 30_000;
+const LABEL_PROGRESS_CACHE_TTL_MS = 30_000;
 const SNAPSHOT_BOUNDS_CACHE_TTL_MS = 10_000;
 const VIRTUAL_SESSION_SIZE = 100;
 
@@ -22,7 +23,13 @@ type BuildCountsCache = {
   builds: Array<{ build: string; count: number }>;
 };
 
+type LabelProgressCacheEntry = {
+  expiresAt: number;
+  labeledBoards: number;
+};
+
 let buildCountsCache: BuildCountsCache | null = null;
+const labelProgressByBuildCache = new Map<string, LabelProgressCacheEntry>();
 
 const snapshotBoundsCache = new Map<
   string,
@@ -379,6 +386,35 @@ const handleSnapshots = async (
     )
     .run();
 
+  buildCountsCache = null;
+  snapshotBoundsCache.clear();
+
+  return okResponse();
+};
+
+const handleSnapshotsBatch = async (
+  env: Env,
+  payload: unknown,
+): Promise<Response> => {
+  if (!Array.isArray(payload)) {
+    return jsonResponse({ error: 'Invalid payload.' }, 400);
+  }
+  if (payload.length === 0) {
+    return okResponse();
+  }
+  const maxBatchSize = 100;
+  if (payload.length > maxBatchSize) {
+    return jsonResponse(
+      { error: `Batch too large (max ${maxBatchSize}).` },
+      413,
+    );
+  }
+  for (const record of payload) {
+    const result = await handleSnapshots(env, record);
+    if (result.status !== 204) {
+      return result;
+    }
+  }
   return okResponse();
 };
 
@@ -491,8 +527,41 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
       .run();
     snapshotBoundsCache.clear();
   }
+  labelProgressByBuildCache.clear();
 
   return okResponse();
+};
+
+const readLabeledBoardCountForBuild = async (
+  env: Env,
+  build: string,
+): Promise<number> => {
+  const normalizedBuild = build.trim();
+  if (!normalizedBuild) return 0;
+
+  const now = Date.now();
+  const cached = labelProgressByBuildCache.get(normalizedBuild);
+  if (cached && cached.expiresAt > now) {
+    return cached.labeledBoards;
+  }
+
+  const result = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM snapshots_idx
+     WHERE build_version = ?
+       AND COALESCE(label_count, 0) > 0`,
+  )
+    .bind(normalizedBuild)
+    .all();
+  const labeledBoards = asCount(result?.results?.[0]?.count);
+  if (labelProgressByBuildCache.size > 128) {
+    labelProgressByBuildCache.clear();
+  }
+  labelProgressByBuildCache.set(normalizedBuild, {
+    expiresAt: now + LABEL_PROGRESS_CACHE_TTL_MS,
+    labeledBoards,
+  });
+  return labeledBoards;
 };
 
 const handleFeedback = async (
@@ -616,10 +685,24 @@ export default {
         return jsonResponse({ error: 'Method not allowed.' }, 405);
       }
       const payload = await request.json().catch(() => null);
+      if (Array.isArray(payload)) {
+        return handleSnapshotsBatch(env, payload);
+      }
       return handleSnapshots(env, payload);
     }
 
     if (url.pathname.startsWith('/api/labels')) {
+      if (url.pathname.startsWith('/api/labels/progress')) {
+        if (request.method !== 'GET') {
+          return jsonResponse({ error: 'Method not allowed.' }, 405);
+        }
+        const build = asString(url.searchParams.get('build'));
+        if (!build) {
+          return jsonResponse({ error: 'Missing build query param.' }, 400);
+        }
+        const labeledBoards = await readLabeledBoardCountForBuild(env, build);
+        return jsonResponse({ build, labeledBoards });
+      }
       if (request.method !== 'POST') {
         return jsonResponse({ error: 'Method not allowed.' }, 405);
       }

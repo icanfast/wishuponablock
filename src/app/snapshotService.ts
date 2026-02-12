@@ -8,7 +8,7 @@ import {
   type SnapshotModeInfo,
   type SnapshotSession,
 } from '../core/snapshotRecorder';
-import type { UploadClient } from '../core/uploadClient';
+import type { UploadClient, SnapshotUploadRecord } from '../core/uploadClient';
 import type { Board, PieceKind } from '../core/types';
 import type { IdentityService } from './identityService';
 import { usesModelGenerator } from '../core/generators';
@@ -59,8 +59,14 @@ export type SnapshotService = {
     hold: PieceKind | null,
     meta?: { linesLeft?: number; level?: number; score?: number },
   ) => void;
+  setRemoteSnapshotBankCount: (count: number | null) => void;
+  flushRemoteUploads: () => Promise<void>;
   dispose: () => void;
 };
+
+const REMOTE_SNAPSHOT_BATCH_SIZE = 20;
+const FULL_CAPTURE_THRESHOLD = 15_000;
+const HALF_CAPTURE_THRESHOLD = 25_000;
 
 const getDirectoryPicker = () =>
   (
@@ -90,6 +96,10 @@ export function createSnapshotService(
   let recordStatusOverride: { message: string; timeoutId: number } | null =
     null;
   let snapshotsEnabled = settingsStore.get().privacy.shareSnapshots;
+  const pendingRemoteSnapshots: SnapshotUploadRecord[] = [];
+  let remoteFlushInProgress = false;
+  let remoteSnapshotBankCount: number | null = null;
+  let activeRemoteSamplingStride = 1;
 
   const notify = () => {
     options.onStateChange?.(getState());
@@ -226,6 +236,43 @@ export function createSnapshotService(
     setFolderStatus(`Downloaded: ${session.meta.id}`);
   };
 
+  const normalizeCount = (value: number | null): number | null => {
+    if (value == null || !Number.isFinite(value)) return null;
+    return Math.max(0, Math.trunc(value));
+  };
+
+  const samplingStrideForCount = (count: number | null): number => {
+    if (count == null) return 1;
+    if (count < FULL_CAPTURE_THRESHOLD) return 1;
+    if (count < HALF_CAPTURE_THRESHOLD) return 2;
+    return 4;
+  };
+
+  const setRemoteSnapshotBankCount = (count: number | null): void => {
+    remoteSnapshotBankCount = normalizeCount(count);
+  };
+
+  const flushRemoteUploads = async (): Promise<void> => {
+    if (!useRemoteUpload) return;
+    if (remoteFlushInProgress) return;
+    remoteFlushInProgress = true;
+    try {
+      while (pendingRemoteSnapshots.length > 0) {
+        const batch = pendingRemoteSnapshots.splice(
+          0,
+          REMOTE_SNAPSHOT_BATCH_SIZE,
+        );
+        await uploadClient.enqueueSnapshotBatch(batch);
+      }
+      await uploadClient.flush();
+    } finally {
+      remoteFlushInProgress = false;
+      if (pendingRemoteSnapshots.length > 0) {
+        void flushRemoteUploads();
+      }
+    }
+  };
+
   const start = () => {
     if (!snapshotsEnabled) {
       notify();
@@ -248,15 +295,32 @@ export function createSnapshotService(
     } else {
       delete session.meta.model_url;
     }
+    activeRemoteSamplingStride = samplingStrideForCount(
+      remoteSnapshotBankCount,
+    );
+    if (useRemoteUpload) {
+      console.info(
+        `[Snapshot] build_count=${remoteSnapshotBankCount ?? 'unknown'} stride=${activeRemoteSamplingStride}`,
+      );
+    }
     applyIdentityMeta();
     notify();
   };
 
   const stop = async (options: { promptForFolder?: boolean } = {}) => {
-    if (!recorder.isRecording) return;
+    if (!recorder.isRecording) {
+      if (useRemoteUpload) {
+        await flushRemoteUploads();
+      }
+      return;
+    }
     const session = recorder.stop();
     notify();
     lastSnapshotKey = null;
+    if (useRemoteUpload) {
+      await flushRemoteUploads();
+      return;
+    }
     if (!session || session.samples.length === 0) return;
     await stopAndPersist(session, options);
   };
@@ -293,7 +357,7 @@ export function createSnapshotService(
       return;
     }
     const key = buildSnapshotKey(board, hold);
-    if (reason !== 'manual' && key === lastSnapshotKey) {
+    if (reason === 'lock' && key === lastSnapshotKey) {
       console.warn(`[Snapshot] Skipping duplicate (${reason}).`);
       return;
     }
@@ -310,9 +374,15 @@ export function createSnapshotService(
       setRecordStatusTransient('Board saved manually.');
     }
     if (!sample || !useRemoteUpload) return;
+    const isAutomaticTrigger = reason === 'lock';
+    const shouldUploadSample =
+      !isAutomaticTrigger ||
+      activeRemoteSamplingStride <= 1 ||
+      sample.index % activeRemoteSamplingStride === 0;
+    if (!shouldUploadSample) return;
     const session = recorder.sessionMeta;
     if (!session) return;
-    const payload = {
+    const payload: SnapshotUploadRecord = {
       createdAt: new Date().toISOString(),
       meta: {
         session,
@@ -331,12 +401,21 @@ export function createSnapshotService(
     console.info(
       `[Snapshot] ${reason} session=${session.id} index=${sample.index}`,
     );
-    void uploadClient.enqueueSnapshot(payload);
+    pendingRemoteSnapshots.push(payload);
+    const shouldFlushNow =
+      reason === 'manual' ||
+      pendingRemoteSnapshots.length >= REMOTE_SNAPSHOT_BATCH_SIZE;
+    if (shouldFlushNow) {
+      void flushRemoteUploads();
+    }
   };
 
   const beforeUnload = () => {
     if (recorder.isRecording) {
       recorder.stop();
+    }
+    if (useRemoteUpload) {
+      void flushRemoteUploads();
     }
   };
 
@@ -357,6 +436,9 @@ export function createSnapshotService(
     if (!snapshotsEnabled && recorder.isRecording) {
       recorder.stop();
       lastSnapshotKey = null;
+      if (useRemoteUpload) {
+        void flushRemoteUploads();
+      }
     }
     notify();
   });
@@ -386,7 +468,12 @@ export function createSnapshotService(
       enqueueSnapshotSample(board, hold, 'hold', meta),
     handleManual: (board, hold, meta) =>
       enqueueSnapshotSample(board, hold, 'manual', meta),
+    setRemoteSnapshotBankCount,
+    flushRemoteUploads,
     dispose: () => {
+      if (useRemoteUpload) {
+        void flushRemoteUploads();
+      }
       window.removeEventListener('beforeunload', beforeUnload);
       uploadClient.setOnSnapshotUploaded(null);
       unsubscribeIdentity();

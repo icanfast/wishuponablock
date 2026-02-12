@@ -4,6 +4,8 @@ export type SnapshotUploadRecord = {
   board: number[][];
 };
 
+export type SnapshotBatchUploadRecord = SnapshotUploadRecord[];
+
 export type LabelUploadRecord = {
   createdAt: string;
   data: unknown;
@@ -18,7 +20,7 @@ export type UploadClientOptions = {
 
 type QueueItem = {
   id?: number;
-  type: 'snapshot' | 'label';
+  type: 'snapshot' | 'snapshot_batch' | 'label';
   payload: unknown;
   createdAt: string;
 };
@@ -51,6 +53,13 @@ export class UploadClient {
 
   async enqueueSnapshot(record: SnapshotUploadRecord): Promise<void> {
     await this.enqueue({ type: 'snapshot', payload: record });
+  }
+
+  async enqueueSnapshotBatch(
+    records: SnapshotBatchUploadRecord,
+  ): Promise<void> {
+    if (!Array.isArray(records) || records.length === 0) return;
+    await this.enqueue({ type: 'snapshot_batch', payload: records });
   }
 
   async enqueueLabel(record: LabelUploadRecord): Promise<void> {
@@ -86,7 +95,7 @@ export class UploadClient {
 
   private async postItem(item: QueueItem): Promise<void> {
     const url =
-      item.type === 'snapshot'
+      item.type === 'snapshot' || item.type === 'snapshot_batch'
         ? `${this.baseUrl}/snapshots`
         : `${this.baseUrl}/labels`;
     const summary = summarizePayload(item);
@@ -110,10 +119,55 @@ export class UploadClient {
     if (item.type === 'snapshot' && this.onSnapshotUploaded) {
       this.onSnapshotUploaded(item.payload as SnapshotUploadRecord);
     }
+    if (item.type === 'snapshot_batch' && this.onSnapshotUploaded) {
+      const records = item.payload as SnapshotBatchUploadRecord;
+      for (const record of records) {
+        this.onSnapshotUploaded(record);
+      }
+    }
   }
 }
 
 function summarizePayload(item: QueueItem): Record<string, unknown> {
+  if (item.type === 'snapshot_batch') {
+    const records = Array.isArray(item.payload)
+      ? (item.payload as SnapshotBatchUploadRecord)
+      : [];
+    const count = records.length;
+    const first = count > 0 ? records[0] : undefined;
+    const last = count > 0 ? records[count - 1] : undefined;
+    const readSessionId = (
+      record: SnapshotUploadRecord | undefined,
+    ): string | null => {
+      if (!record || !record.meta || typeof record.meta !== 'object')
+        return null;
+      const meta = record.meta as {
+        session?: { id?: unknown };
+        sample?: { index?: unknown };
+      };
+      return typeof meta.session?.id === 'string' ? meta.session.id : null;
+    };
+    const readSampleIndex = (
+      record: SnapshotUploadRecord | undefined,
+    ): number | null => {
+      if (!record || !record.meta || typeof record.meta !== 'object')
+        return null;
+      const meta = record.meta as {
+        sample?: { index?: unknown };
+      };
+      const value = meta.sample?.index;
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      return null;
+    };
+    return {
+      type: 'snapshot_batch',
+      count,
+      firstSessionId: readSessionId(first),
+      firstSampleIndex: readSampleIndex(first),
+      lastSessionId: readSessionId(last),
+      lastSampleIndex: readSampleIndex(last),
+    };
+  }
   if (item.type === 'snapshot') {
     const payload = item.payload as
       | {

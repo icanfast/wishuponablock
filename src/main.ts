@@ -131,6 +131,7 @@ async function boot() {
   const uploadBaseUrl = uploadService.baseUrl;
   const useRemoteUpload = uploadService.useRemote;
   const toolUsesRemote = uploadService.toolUsesRemote;
+  const LABELING_PROGRESS_TARGET = 2000;
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
@@ -341,6 +342,7 @@ async function boot() {
     gameUi.classicScoreValue.textContent = scoreFormatted;
   };
 
+  let previousRunEnded = false;
   modelStatusLabel = gameUi.modelStatusLabel;
 
   runtime = createGameRuntime({
@@ -354,6 +356,11 @@ async function boot() {
     onFrame: (state) => {
       updateSprintHud(state);
       updateClassicHud(state);
+      const ended = state.gameOver || state.gameWon;
+      if (ended && !previousRunEnded) {
+        void snapshotService?.flushRemoteUploads();
+      }
+      previousRunEnded = ended;
     },
   });
   inputService.setOnInputSourceChange((source) => {
@@ -394,6 +401,25 @@ async function boot() {
       uploadService.sendFeedback(feedback, contact),
   });
   uiController.bindGameUi();
+
+  const refreshMenuLabelingProgress = async (): Promise<void> => {
+    if (!useRemoteUpload) {
+      uiController.setMenuLabelingProgress({
+        buildVersion: APP_VERSION,
+        labeledBoards: null,
+        target: LABELING_PROGRESS_TARGET,
+      });
+      return;
+    }
+    const labeledBoards = await uploadService
+      .getLabeledBoardCountForBuild(APP_VERSION)
+      .catch(() => null);
+    uiController.setMenuLabelingProgress({
+      buildVersion: APP_VERSION,
+      labeledBoards,
+      target: LABELING_PROGRESS_TARGET,
+    });
+  };
 
   snapshotService = createSnapshotService({
     settingsStore,
@@ -453,11 +479,17 @@ async function boot() {
     version: APP_VERSION,
     charcuterieDefaultSimCount,
     tools: toolHost.list(),
+    labelingProgress: {
+      buildVersion: APP_VERSION,
+      labeledBoards: null,
+      target: LABELING_PROGRESS_TARGET,
+    },
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
   uiController.attachMenu(menuUi);
   uiController.setMenuTools(toolHost.list());
+  void refreshMenuLabelingProgress();
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
   const settingsController = createSettingsController({
@@ -509,6 +541,9 @@ async function boot() {
   );
 
   setScreen = (screen: 'menu' | 'game' | 'tool') => {
+    if (screen === 'menu') {
+      void refreshMenuLabelingProgress();
+    }
     void screenManager.setActive(screen);
   };
 
@@ -517,6 +552,14 @@ async function boot() {
     if (startingGame) return;
     startingGame = true;
     try {
+      if (useRemoteUpload) {
+        const buildCount = await uploadService
+          .getSnapshotCountForBuild(APP_VERSION)
+          .catch(() => null);
+        snapshotService?.setRemoteSnapshotBankCount(buildCount);
+      } else {
+        snapshotService?.setRemoteSnapshotBankCount(null);
+      }
       const generatorType = settingsStore.get().generator.type;
       if (usesModelGenerator(generatorType)) {
         if (modelService.getStatus() !== 'ready') {
@@ -536,7 +579,7 @@ async function boot() {
     void startGameWithModelReady();
   };
 
-  void screenManager.setActive('menu');
+  setScreen('menu');
 
   const identityConsole = window as Window & {
     wubSetUserId?: (value: string | null) => void;
