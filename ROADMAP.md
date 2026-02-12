@@ -7,11 +7,11 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - For Wish Upon a Block generator maybe it is possible to display the most likely next piece. Will require completely new ML pipeline — 1
 - Bots — 2
 - RL bots and piece generators — 1
+- Change default softdrop from instant to increased gravity. Add softdrop slider — 5
 
 ## UI/UX
 - Patch Notes — 3
 - Background Music — 3
-- Logo for the main screen — 2
 - Favicon — 3
 - In game stats — PPS, Attack, Finesse — 5
 - More SFX - 2
@@ -24,7 +24,9 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Different generators for pro and noob — 2 // lowered priority, too much data required
 - Replace softmax with threshold + flatter normalization - 3
 - Labeling gameification — 5
+    - Progress bar towards next checkpoint
 - Data quality (versioning, source vs labeling intent discrepancy, label balancing) — 5
+- Show active piece in labeling (and log it) — 5
 
 ## Personalization
 - User authentication + profile + stats — 3

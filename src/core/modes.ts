@@ -1,5 +1,6 @@
 import type { Game } from './game';
 import type { Settings } from './settings';
+import { CLASSIC_HARD_LOCK_DELAY_MS, CLASSIC_LOCK_DELAY_MS } from './constants';
 
 export interface ModeOptions {
   cheeseLines?: number;
@@ -14,9 +15,19 @@ export interface GameMode {
   lineGoal?: number;
   classicStartLevel?: number;
   scoringEnabled?: boolean;
-  settingsPatch?: Partial<Settings>;
+  settingsPatch?: SettingsPatch;
   onStart?: (game: Game, options: ModeOptions) => void;
 }
+
+type SettingsPatch = Partial<Omit<Settings, 'game' | 'input' | 'generator'>> & {
+  game?: Partial<Settings['game']>;
+  input?: Partial<Settings['input']>;
+  generator?: Partial<Settings['generator']>;
+  audio?: Partial<Settings['audio']>;
+  privacy?: Partial<Settings['privacy']>;
+  graphics?: Partial<Settings['graphics']>;
+  butterfinger?: Partial<Settings['butterfinger']>;
+};
 
 export const MODES: GameMode[] = [
   {
@@ -33,6 +44,12 @@ export const MODES: GameMode[] = [
     label: 'Classic',
     classicStartLevel: 0,
     scoringEnabled: true,
+    settingsPatch: {
+      game: {
+        lockDelayMs: CLASSIC_LOCK_DELAY_MS,
+        hardLockDelayMs: CLASSIC_HARD_LOCK_DELAY_MS,
+      },
+    },
   },
   {
     id: 'cheese',
