@@ -8,6 +8,7 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Bots — 2
 - RL bots and piece generators — 1
 - Change default softdrop from instant to increased gravity. Add softdrop slider — 5
+- Curse Upon a Block, a generator that gives you the worst piece — 5
 
 ## UI/UX
 - Patch Notes — 3
@@ -16,6 +17,7 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - In game stats — PPS, Attack, Finesse — 5
 - More SFX - 2
 - UI rework + actual design — 1
+- Add ghost piece opacity slider — 5
 
 ## Labeling and ML
 - Snapshot Explorer — 5
