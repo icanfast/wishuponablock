@@ -7,15 +7,16 @@ export type ToolCanvas = {
     board: Board,
     hold: PieceKind | null,
     ghost?: ActivePiece | null,
+    active?: ActivePiece | null,
   ) => void;
   clear: () => void;
 };
 
 export function createToolCanvas(renderer: PixiRenderer): ToolCanvas {
   return {
-    render: (board, hold, ghost) => {
-      if (ghost) {
-        renderer.renderBoardPreview(board, hold, ghost);
+    render: (board, hold, ghost, active) => {
+      if (ghost || active) {
+        renderer.renderBoardPreview(board, hold, ghost ?? null, active ?? null);
       } else {
         renderer.renderBoardOnly(board, hold);
       }

@@ -1,7 +1,7 @@
 import { isGeneratorType } from '../core/generators';
 import type { Settings } from '../core/settings';
 import type { SettingsStore } from '../core/settingsStore';
-import type { Board, PieceKind } from '../core/types';
+import type { ActivePiece, Board, PieceKind } from '../core/types';
 import type { GameScreen } from '../ui/screens/gameScreen';
 import type {
   LabelingProgressState,
@@ -43,6 +43,7 @@ type UiControllerOptions = {
   getSnapshotState: () => {
     board: Board;
     hold: PieceKind | null;
+    active: ActivePiece;
     linesLeft?: number;
     level?: number;
     score?: number;
@@ -127,8 +128,14 @@ export function createUiController(options: UiControllerOptions): UiController {
 
     game.manualButton.addEventListener('click', () => {
       if (!snapshotService) return;
-      const { board, hold, linesLeft } = getSnapshotState();
-      snapshotService.handleManual(board, hold, { linesLeft });
+      const { board, hold, active, linesLeft, level, score } =
+        getSnapshotState();
+      snapshotService.handleManual(board, hold, {
+        active,
+        linesLeft,
+        level,
+        score,
+      });
     });
   };
 

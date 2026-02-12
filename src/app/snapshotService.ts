@@ -9,7 +9,7 @@ import {
   type SnapshotSession,
 } from '../core/snapshotRecorder';
 import type { UploadClient, SnapshotUploadRecord } from '../core/uploadClient';
-import type { Board, PieceKind } from '../core/types';
+import type { ActivePiece, Board, PieceKind } from '../core/types';
 import type { IdentityService } from './identityService';
 import { usesModelGenerator } from '../core/generators';
 
@@ -47,21 +47,28 @@ export type SnapshotService = {
   handleLock: (
     board: Board,
     hold: PieceKind | null,
-    meta?: { linesLeft?: number; level?: number; score?: number },
+    meta?: SnapshotCaptureMeta,
   ) => void;
   handleHold: (
     board: Board,
     hold: PieceKind | null,
-    meta?: { linesLeft?: number; level?: number; score?: number },
+    meta?: SnapshotCaptureMeta,
   ) => void;
   handleManual: (
     board: Board,
     hold: PieceKind | null,
-    meta?: { linesLeft?: number; level?: number; score?: number },
+    meta?: SnapshotCaptureMeta,
   ) => void;
   setRemoteSnapshotBankCount: (count: number | null) => void;
   flushRemoteUploads: () => Promise<void>;
   dispose: () => void;
+};
+
+type SnapshotCaptureMeta = {
+  active?: ActivePiece | null;
+  linesLeft?: number;
+  level?: number;
+  score?: number;
 };
 
 const REMOTE_SNAPSHOT_BATCH_SIZE = 20;
@@ -347,7 +354,7 @@ export function createSnapshotService(
     board: Board,
     hold: PieceKind | null,
     reason: SnapshotTrigger,
-    meta?: { linesLeft?: number; level?: number; score?: number },
+    meta?: SnapshotCaptureMeta,
   ) => {
     if (!snapshotsEnabled) return;
     if (!recorder.isRecording) {
@@ -364,6 +371,7 @@ export function createSnapshotService(
     lastSnapshotKey = key;
     const sample = recorder.record(board, hold, {
       store: !useRemoteUpload,
+      active: meta?.active,
       trigger: reason,
       linesLeft: meta?.linesLeft,
       level: meta?.level,
@@ -390,6 +398,7 @@ export function createSnapshotService(
           index: sample.index,
           timeMs: sample.timeMs,
           hold: sample.hold,
+          ...(sample.active ? { active: sample.active } : {}),
           ...(sample.linesLeft != null ? { linesLeft: sample.linesLeft } : {}),
           ...(sample.level != null ? { level: sample.level } : {}),
           ...(sample.score != null ? { score: sample.score } : {}),

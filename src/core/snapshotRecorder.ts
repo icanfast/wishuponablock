@@ -1,5 +1,5 @@
 import { GAME_PROTOCOL_VERSION } from './constants';
-import { PIECES, type Board, type PieceKind } from './types';
+import { PIECES, type ActivePiece, type Board, type PieceKind } from './types';
 import type { Settings } from './settings';
 
 export interface SnapshotSessionMeta {
@@ -23,6 +23,12 @@ export interface SnapshotSample {
   timeMs: number;
   board: number[][];
   hold?: number;
+  active?: {
+    k: number;
+    r: number;
+    x: number;
+    y: number;
+  };
   trigger?: SnapshotTrigger;
   linesLeft?: number;
   level?: number;
@@ -51,6 +57,23 @@ function encodeBoard(board: Board): number[][] {
 
 function encodePiece(cell: PieceKind | null): number {
   return cell ? (PIECE_TO_INDEX.get(cell) ?? 0) : 0;
+}
+
+function encodeActivePiece(active: ActivePiece | null | undefined):
+  | {
+      k: number;
+      r: number;
+      x: number;
+      y: number;
+    }
+  | undefined {
+  if (!active) return undefined;
+  return {
+    k: encodePiece(active.k),
+    r: Math.trunc(active.r),
+    x: Math.trunc(active.x),
+    y: Math.trunc(active.y),
+  };
 }
 
 function makeSessionId(now = new Date()): string {
@@ -118,6 +141,7 @@ export class SnapshotRecorder {
     hold: PieceKind | null,
     options: {
       store?: boolean;
+      active?: ActivePiece | null;
       trigger?: SnapshotTrigger;
       linesLeft?: number;
       level?: number;
@@ -138,11 +162,13 @@ export class SnapshotRecorder {
       options.score != null && Number.isFinite(options.score)
         ? Math.max(0, Math.trunc(options.score))
         : undefined;
+    const encodedActive = encodeActivePiece(options.active);
     const sample: SnapshotSample = {
       index: this.nextIndex,
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
       hold: encodePiece(hold),
+      ...(encodedActive ? { active: encodedActive } : {}),
       ...(options.trigger ? { trigger: options.trigger } : {}),
       ...(linesLeft != null ? { linesLeft } : {}),
       ...(level != null ? { level } : {}),

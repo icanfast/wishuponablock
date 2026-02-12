@@ -167,13 +167,14 @@ export class PixiRenderer {
   }
 
   renderBoardOnly(board: GameState['board'], hold?: PieceKind | null): void {
-    this.renderBoardPreview(board, hold, null);
+    this.renderBoardPreview(board, hold, null, null);
   }
 
   renderBoardPreview(
     board: GameState['board'],
     hold: PieceKind | null | undefined,
     ghost: ActivePiece | null,
+    active: ActivePiece | null = null,
   ): void {
     const { gfx, cell, boardX, boardY } = this;
     gfx.clear();
@@ -231,6 +232,14 @@ export class PixiRenderer {
             this.ghostOpacity,
           );
         }
+      }
+    }
+
+    if (active) {
+      const activeColor = this.getPieceColor(active.k);
+      for (const [x, y] of cellsOf(active)) {
+        if (y < 0) continue;
+        drawCell(gfx, boardX, boardY, cell, x, y, activeColor, outlineColor);
       }
     }
   }

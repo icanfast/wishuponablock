@@ -5,7 +5,12 @@ import type {
   SnapshotTrigger,
 } from '../../core/snapshotRecorder';
 import type { UploadClient } from '../../core/uploadClient';
-import { PIECES, type Board, type PieceKind } from '../../core/types';
+import {
+  PIECES,
+  type ActivePiece,
+  type Board,
+  type PieceKind,
+} from '../../core/types';
 import { createToolScreen } from '../screens/toolScreen';
 import type { ToolController } from './toolHost';
 import type { ToolCanvas } from './toolCanvas';
@@ -67,6 +72,7 @@ export function createLabelingTool(
     board: Board;
     raw: number[][];
     hold: PieceKind | null;
+    active?: ActivePiece | null;
     snapshotId?: number;
     timeMs?: number;
     trigger?: SnapshotSample['trigger'];
@@ -151,14 +157,64 @@ export function createLabelingTool(
     );
   };
 
+  const decodePiece = (
+    value: unknown,
+    order?: readonly string[],
+  ): PieceKind | null => {
+    const resolvedOrder = order ?? PIECES;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const idx = Math.trunc(value) - 1;
+      if (idx < 0) return null;
+      const piece = resolvedOrder[idx] ?? PIECES[idx];
+      return (piece as PieceKind) ?? null;
+    }
+    if (typeof value === 'string' && value.trim()) {
+      const normalized = value.trim().toUpperCase();
+      if (PIECES.includes(normalized as PieceKind)) {
+        return normalized as PieceKind;
+      }
+    }
+    return null;
+  };
+
   const decodeHold = (
     hold: number | undefined,
     order?: readonly string[],
   ): PieceKind | null => {
-    if (!hold || hold <= 0) return null;
-    const resolvedOrder = order ?? PIECES;
-    const piece = resolvedOrder[hold - 1] ?? PIECES[hold - 1];
-    return (piece as PieceKind) ?? null;
+    if (hold == null) return null;
+    return decodePiece(hold, order);
+  };
+
+  const decodeActive = (
+    active: unknown,
+    order?: readonly string[],
+  ): ActivePiece | null => {
+    if (!active || typeof active !== 'object') return null;
+    const source = active as {
+      k?: unknown;
+      r?: unknown;
+      x?: unknown;
+      y?: unknown;
+    };
+    const piece = decodePiece(source.k, order);
+    if (!piece) return null;
+    if (
+      typeof source.r !== 'number' ||
+      !Number.isFinite(source.r) ||
+      typeof source.x !== 'number' ||
+      !Number.isFinite(source.x) ||
+      typeof source.y !== 'number' ||
+      !Number.isFinite(source.y)
+    ) {
+      return null;
+    }
+    const r = (((Math.trunc(source.r) % 4) + 4) % 4) as 0 | 1 | 2 | 3;
+    return {
+      k: piece,
+      r,
+      x: Math.trunc(source.x),
+      y: Math.trunc(source.y),
+    };
   };
 
   const encodeBoardString = (raw: number[][]): string =>
@@ -534,11 +590,12 @@ export function createLabelingTool(
       typeof sampleMeta.hold === 'number' && Number.isFinite(sampleMeta.hold)
         ? sampleMeta.hold
         : undefined;
-    const sample = {
+    const sample: SnapshotSample = {
       index: readNumber(sampleMeta.index),
       timeMs: readNumber(sampleMeta.timeMs),
       board: payload.board,
       hold: holdValue,
+      active: sampleMeta.active as SnapshotSample['active'] | undefined,
       trigger: readTrigger(payload.meta?.trigger),
       linesLeft: readOptionalNumber(sampleMeta.linesLeft),
       level: readOptionalNumber(sampleMeta.level),
@@ -623,6 +680,7 @@ export function createLabelingTool(
       const rawBoard = sample.board;
       const board = decodeBoard(rawBoard, session.meta.pieceOrder);
       const hold = decodeHold(sample.hold, session.meta.pieceOrder);
+      const active = decodeActive(sample.active, session.meta.pieceOrder);
       const fileName = `remote:${session.meta.id ?? 'unknown'}`;
       currentSample = {
         file: { name: fileName, session },
@@ -630,6 +688,7 @@ export function createLabelingTool(
         board,
         raw: rawBoard,
         hold,
+        active,
         snapshotId: remote.snapshotId ?? undefined,
         timeMs: sample.timeMs,
         trigger: sample.trigger,
@@ -644,7 +703,7 @@ export function createLabelingTool(
       );
       clearLabelSelection();
       if (toolActive) {
-        canvas.render(board, hold);
+        canvas.render(board, hold, undefined, active);
       }
       return;
     }
@@ -668,12 +727,14 @@ export function createLabelingTool(
     const rawBoard = sample.board;
     const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
     const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
+    const active = decodeActive(sample.active, file.session.meta.pieceOrder);
     currentSample = {
       file,
       index: indexInFile,
       board,
       raw: rawBoard,
       hold,
+      active,
       timeMs: sample.timeMs,
       trigger: sample.trigger,
       linesLeft: sample.linesLeft,
@@ -688,7 +749,7 @@ export function createLabelingTool(
     );
     clearLabelSelection();
     if (toolActive) {
-      canvas.render(board, hold);
+      canvas.render(board, hold, undefined, active);
     }
   };
 
@@ -812,6 +873,7 @@ export function createLabelingTool(
         index: currentSample.index,
         timeMs: currentSample.timeMs,
         trigger: currentSample.trigger,
+        ...(currentSample.active ? { active: currentSample.active } : {}),
         linesLeft: currentSample.linesLeft,
         level: currentSample.level,
         score: currentSample.score,
@@ -874,7 +936,12 @@ export function createLabelingTool(
       }
       return;
     }
-    canvas.render(currentSample.board, currentSample.hold);
+    canvas.render(
+      currentSample.board,
+      currentSample.hold,
+      undefined,
+      currentSample.active ?? null,
+    );
   };
 
   return {

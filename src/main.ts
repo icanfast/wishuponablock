@@ -229,6 +229,7 @@ async function boot() {
         ? Math.max(0, state.lineGoal - state.totalLinesCleared)
         : undefined;
     snapshotService?.handleLock(board, hold, {
+      active: state.active,
       linesLeft,
       level: state.level,
       score: state.score,
@@ -247,6 +248,7 @@ async function boot() {
         ? Math.max(0, state.lineGoal - state.totalLinesCleared)
         : undefined;
     snapshotService?.handleHold(board, hold, {
+      active: state.active,
       linesLeft,
       level: state.level,
       score: state.score,
@@ -384,6 +386,7 @@ async function boot() {
           : undefined;
       return {
         board: state.board,
+        active: state.active,
         hold: state.hold,
         linesLeft,
         level: state.level,
