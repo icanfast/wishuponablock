@@ -1,4 +1,5 @@
 import { getMode, normalizeModeId } from '../../core/modes';
+import { SPAWN_X, SPAWN_Y } from '../../core/constants';
 import type {
   SnapshotSession,
   SnapshotSample,
@@ -91,6 +92,7 @@ export function createLabelingTool(
     raw: number[][];
     hold: PieceKind | null;
     active?: ActivePiece | null;
+    queuePieces: PieceKind[];
     snapshotId?: number;
     timeMs?: number;
     trigger?: SnapshotSample['trigger'];
@@ -231,23 +233,45 @@ export function createLabelingTool(
     };
     const piece = decodePiece(source.k, order);
     if (!piece) return null;
-    if (
-      typeof source.r !== 'number' ||
-      !Number.isFinite(source.r) ||
-      typeof source.x !== 'number' ||
-      !Number.isFinite(source.x) ||
-      typeof source.y !== 'number' ||
-      !Number.isFinite(source.y)
-    ) {
-      return null;
-    }
-    const r = (((Math.trunc(source.r) % 4) + 4) % 4) as 0 | 1 | 2 | 3;
+    // Labeling view normalizes active display to spawn pose for consistency.
     return {
       k: piece,
-      r,
-      x: Math.trunc(source.x),
-      y: Math.trunc(source.y),
+      r: 0,
+      x: SPAWN_X,
+      y: SPAWN_Y,
     };
+  };
+
+  const decodeQueuePieces = (
+    sample: SnapshotSample,
+    order?: readonly string[],
+  ): PieceKind[] => {
+    const oddsEntries = Array.isArray(sample.odds) ? sample.odds : [];
+    const fromOdds = oddsEntries
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const source = entry as { k?: unknown; p?: unknown };
+        const piece = decodePiece(source.k, order);
+        if (!piece) return null;
+        const probability =
+          typeof source.p === 'number' && Number.isFinite(source.p)
+            ? source.p
+            : 0;
+        if (probability <= 0) return null;
+        return { piece, probability };
+      })
+      .filter(
+        (entry): entry is { piece: PieceKind; probability: number } =>
+          entry != null,
+      )
+      .sort((a, b) => b.probability - a.probability)
+      .map((entry) => entry.piece);
+    if (fromOdds.length > 0) return fromOdds;
+
+    const nextPieces = Array.isArray(sample.next) ? sample.next : [];
+    return nextPieces
+      .map((value) => decodePiece(value, order))
+      .filter((value): value is PieceKind => value != null);
   };
 
   const encodeBoardString = (raw: number[][]): string =>
@@ -651,6 +675,42 @@ export function createLabelingTool(
       timeMs: readNumber(sampleMeta.timeMs),
       board: source.board,
       hold: holdValue,
+      next: Array.isArray(sampleMeta.next)
+        ? sampleMeta.next
+            .map((value) =>
+              typeof value === 'number' && Number.isFinite(value)
+                ? Math.trunc(value)
+                : null,
+            )
+            .filter((value): value is number => value != null)
+        : undefined,
+      odds: Array.isArray(sampleMeta.odds)
+        ? sampleMeta.odds
+            .map((value) => {
+              if (!value || typeof value !== 'object') return null;
+              const source = value as { k?: unknown; p?: unknown };
+              if (
+                typeof source.k !== 'number' ||
+                !Number.isFinite(source.k) ||
+                typeof source.p !== 'number' ||
+                !Number.isFinite(source.p)
+              ) {
+                return null;
+              }
+              return {
+                k: Math.trunc(source.k),
+                p: source.p,
+              };
+            })
+            .filter(
+              (
+                entry,
+              ): entry is {
+                k: number;
+                p: number;
+              } => entry != null,
+            )
+        : undefined,
       active: sampleMeta.active as SnapshotSample['active'] | undefined,
       trigger: readTrigger(source.meta?.trigger),
       linesLeft: readOptionalNumber(sampleMeta.linesLeft),
@@ -908,6 +968,7 @@ export function createLabelingTool(
       const board = decodeBoard(rawBoard, session.meta.pieceOrder);
       const hold = decodeHold(sample.hold, session.meta.pieceOrder);
       const active = decodeActive(sample.active, session.meta.pieceOrder);
+      const queuePieces = decodeQueuePieces(sample, session.meta.pieceOrder);
       const fileName = `remote:${session.meta.id ?? 'unknown'}`;
       const sessionId =
         remote.sessionId ??
@@ -929,6 +990,7 @@ export function createLabelingTool(
         raw: rawBoard,
         hold,
         active,
+        queuePieces,
         snapshotId: remote.snapshotId ?? undefined,
         timeMs: sample.timeMs,
         trigger: sample.trigger,
@@ -943,7 +1005,7 @@ export function createLabelingTool(
       );
       clearLabelSelection();
       if (toolActive) {
-        canvas.render(board, hold, undefined, active);
+        canvas.render(board, hold, undefined, active, queuePieces);
       }
       if (remoteSampleQueue.length < REMOTE_PREFETCH_MIN_QUEUE) {
         void ensureRemotePrefetch(REMOTE_PREFETCH_MIN_QUEUE);
@@ -997,6 +1059,7 @@ export function createLabelingTool(
     const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
     const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
     const active = decodeActive(sample.active, file.session.meta.pieceOrder);
+    const queuePieces = decodeQueuePieces(sample, file.session.meta.pieceOrder);
     const sessionId = file.session.meta.id ?? file.name;
     const batchId = sampleBatchId(indexInFile);
     pushRecentUnique(
@@ -1023,6 +1086,7 @@ export function createLabelingTool(
       raw: rawBoard,
       hold,
       active,
+      queuePieces,
       timeMs: sample.timeMs,
       trigger: sample.trigger,
       linesLeft: sample.linesLeft,
@@ -1037,7 +1101,7 @@ export function createLabelingTool(
     );
     clearLabelSelection();
     if (toolActive) {
-      canvas.render(board, hold, undefined, active);
+      canvas.render(board, hold, undefined, active, queuePieces);
     }
   };
 
@@ -1235,6 +1299,7 @@ export function createLabelingTool(
       currentSample.hold,
       undefined,
       currentSample.active ?? null,
+      currentSample.queuePieces,
     );
   };
 
