@@ -25,6 +25,7 @@ export type MlInferenceConfig = {
   strategy: MlInferenceStrategy;
   temperature: number;
   threshold: number;
+  postSharpness: number;
 };
 
 export interface GeneratorSettings {

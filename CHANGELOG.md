@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4
+
+- Added sliders for ghost opacity and softdrop speed.
+- Changed default gameplay settings (DAS, ARR, Softdrop speed) to be friendlier towards new players.
+- Added "Curse Upon a Block" generator. Acts like "Wish Upon a Block" generator in reverse.
+- Added CURRENT ACTIVE PIECE odds. These are not predictions for the next piece, we can't do it yet.
+- Added labeling progress bar for current patch.
+- Labeling tool now shows active piece and queue/odds for the snapshot whenever possible.
+- Re-trained the ml piece generator. Improved empty board suggestions, multiple edge cases and overall accuracy.
+
 ## 0.2.3
 
 - Added Sprint and Classic game modes.

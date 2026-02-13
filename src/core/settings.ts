@@ -175,6 +175,7 @@ function mergeGenerator(
         : base.ml.strategy,
       temperature: num(patch?.ml?.temperature) ?? base.ml.temperature,
       threshold: num(patch?.ml?.threshold) ?? base.ml.threshold,
+      postSharpness: num(patch?.ml?.postSharpness) ?? base.ml.postSharpness,
     },
   };
 }

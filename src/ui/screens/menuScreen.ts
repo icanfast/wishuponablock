@@ -1658,7 +1658,7 @@ input[type=number] {
   };
 
   const setLabelingProgress = (progress: LabelingProgressState | null) => {
-    const target = Math.max(1, Math.trunc(progress?.target ?? 2000));
+    const target = Math.max(1, Math.trunc(progress?.target ?? 1000));
     const buildVersion =
       progress?.buildVersion && progress.buildVersion.trim()
         ? progress.buildVersion.trim()

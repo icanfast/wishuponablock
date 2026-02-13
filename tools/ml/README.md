@@ -12,26 +12,35 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Place your labeling output at `tools/ml/data/raw/labels.jsonl` (copy from the tool's output folder).
-   This raw format is now accepted directly by the training pipeline.
+2. Prepare a merged training file (local JSONL + D1 CSV/JSONL):
+
+```bash
+python tools/ml/scripts/prepare_data.py \
+  --input \
+    data/snapshots/labeled/labels.jsonl \
+    data/online_labels/labels_v1.jsonl \
+    data/online_labels/labels_0_2_3.jsonl \
+    data/online_labels/online_labels_0_2_3.csv \
+  --out tools/ml/data/raw/labels_merged.jsonl
+```
 
 ## Training (baseline)
 
 ```bash
-python tools/ml/scripts/train.py \
-  --data tools/ml/data/raw/labels.jsonl \
-  --epochs 10 \
-  --batch-size 128
+python tools/ml/scripts/train_pipeline.py \
+  --data tools/ml/data/raw/labels_merged.jsonl \
+  --method soft_targets \
+  --soft-decay 0.7
 ```
 
 Options:
 
-- `--method multilabel|soft_targets` - training objective (default: multilabel).
+- `--method multilabel|soft_targets` - training objective (default: soft_targets).
 - `--soft-decay 0.7` - decay factor for soft-target weights.
 - `--mirror-prob 0.0` - probability of mirroring a sample (labels remapped).
-- `--checkpoint-dir tools/ml/checkpoints` - where to save checkpoints.
-- `--checkpoint-every 10` - save a checkpoint every N epochs (0 disables).
-- `--no-hold` - drop the hold piece feature.
+- `train.py` still exists for single-phase runs and accepts multiple `--data` files directly.
+- `prepare_data.py` dedupes by default (`--no-dedupe` to disable).
+- `--no-hold` drops the hold piece feature.
 
 Note: training uses a session-based split, with virtual session chunking enabled
 by default (`--virtual-session-size 100`). For labels exported by the in-game

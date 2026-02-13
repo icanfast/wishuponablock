@@ -11,6 +11,7 @@ type InferenceOptions = {
   strategy?: InferenceStrategy;
   temperature?: number;
   threshold?: number;
+  postSharpness?: number;
 };
 
 export class ModelGenerator implements PieceGenerator {
@@ -22,6 +23,7 @@ export class ModelGenerator implements PieceGenerator {
   private strategy: InferenceStrategy;
   private temperature: number;
   private threshold: number;
+  private postSharpness: number;
 
   constructor(
     seed: number,
@@ -34,6 +36,7 @@ export class ModelGenerator implements PieceGenerator {
     this.strategy = options.strategy ?? 'clean_uniform';
     this.temperature = options.temperature ?? 1;
     this.threshold = options.threshold ?? 0;
+    this.postSharpness = options.postSharpness ?? 1;
     modelPromise?.then((loaded) => {
       if (loaded) this.model = loaded;
     });
@@ -79,7 +82,12 @@ export class ModelGenerator implements PieceGenerator {
     const logits = predictLogits(this.model, board, hold);
     const probs =
       this.strategy === 'threshold'
-        ? thresholdedSoftmax(logits, this.temperature, this.threshold)
+        ? thresholdedSoftmax(
+            logits,
+            this.temperature,
+            this.threshold,
+            this.postSharpness,
+          )
         : softmax(logits);
     if (this.strategy === 'clean_uniform') {
       const blend = getCleanBlend(board);
@@ -121,8 +129,10 @@ const thresholdedSoftmax = (
   logits: Float32Array,
   temperature: number,
   threshold: number,
+  postSharpness: number,
 ): Float32Array => {
   const temp = temperature > 0 ? temperature : 1;
+  const sharpness = postSharpness > 0 ? postSharpness : 1;
   const scaled = new Float32Array(logits.length);
   for (let i = 0; i < logits.length; i++) {
     scaled[i] = logits[i] / temp;
@@ -141,6 +151,20 @@ const thresholdedSoftmax = (
   for (let i = 0; i < filtered.length; i++) {
     if (filtered[i] > 0) {
       filtered[i] /= sum;
+    }
+  }
+  if (Math.abs(sharpness - 1) < 1e-6) return filtered;
+  let sharpenedSum = 0;
+  for (let i = 0; i < filtered.length; i++) {
+    if (filtered[i] > 0) {
+      filtered[i] = filtered[i] ** sharpness;
+      sharpenedSum += filtered[i];
+    }
+  }
+  if (sharpenedSum <= 0) return filtered;
+  for (let i = 0; i < filtered.length; i++) {
+    if (filtered[i] > 0) {
+      filtered[i] /= sharpenedSum;
     }
   }
   return filtered;

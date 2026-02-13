@@ -133,7 +133,7 @@ async function boot() {
   const uploadBaseUrl = uploadService.baseUrl;
   const useRemoteUpload = uploadService.useRemote;
   const toolUsesRemote = uploadService.toolUsesRemote;
-  const LABELING_PROGRESS_TARGET = 2000;
+  const LABELING_PROGRESS_TARGET = 1000;
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};

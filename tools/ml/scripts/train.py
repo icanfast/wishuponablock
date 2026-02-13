@@ -28,19 +28,19 @@ def set_seed(seed: int) -> None:
 
 
 def split_by_session(
-    session_ids: list[str],
+    group_ids: list[str],
     val_split: float,
     seed: int,
 ) -> tuple[list[int], list[int]]:
     sessions: dict[str, list[int]] = {}
-    for idx, session_id in enumerate(session_ids):
-        sessions.setdefault(session_id, []).append(idx)
+    for idx, group_id in enumerate(group_ids):
+        sessions.setdefault(group_id, []).append(idx)
 
     session_list = list(sessions.keys())
     rng = random.Random(seed)
     rng.shuffle(session_list)
 
-    total = len(session_ids)
+    total = len(group_ids)
     target_val = int(total * val_split)
     val_indices: list[int] = []
     train_indices: list[int] = []
@@ -58,6 +58,17 @@ def split_by_session(
         train_indices, val_indices = val_indices, train_indices
 
     return train_indices, val_indices
+
+
+def build_split_group_id(
+    session_id: str,
+    sample_index: int | None,
+    session_chunk_size: int,
+) -> str:
+    if session_chunk_size <= 0 or sample_index is None or sample_index < 0:
+        return session_id
+    chunk_id = sample_index // session_chunk_size
+    return f"{session_id}::chunk{chunk_id}"
 
 
 def main() -> int:
@@ -131,10 +142,15 @@ def main() -> int:
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument(
+        "--session-chunk-size",
         "--virtual-session-size",
+        dest="session_chunk_size",
         type=int,
         default=100,
-        help="Chunk size for virtual session split (0 disables chunking).",
+        help=(
+            "Split groups by session_id + floor(sampleIndex/chunk_size). "
+            "Set 0 to split by session_id only."
+        ),
     )
     args = parser.parse_args()
 
@@ -145,13 +161,21 @@ def main() -> int:
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
-        virtual_session_size=args.virtual_session_size,
+        virtual_session_size=0,
     )
     if len(base_dataset) == 0:
         raise SystemExit("No samples found after filtering.")
 
+    split_group_ids = [
+        build_split_group_id(
+            sample.session_id,
+            sample.sample_index,
+            args.session_chunk_size,
+        )
+        for sample in base_dataset.samples
+    ]
     train_indices, val_indices = split_by_session(
-        base_dataset.session_ids,
+        split_group_ids,
         args.val_split,
         args.seed,
     )
@@ -160,13 +184,13 @@ def main() -> int:
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=args.mirror_prob,
-        virtual_session_size=args.virtual_session_size,
+        virtual_session_size=0,
     )
     val_ds = LabelsDataset(
         [Path(p) for p in args.data],
         drop_empty_labels=True,
         mirror_prob=0.0,
-        virtual_session_size=args.virtual_session_size,
+        virtual_session_size=0,
     )
 
     train_ds = torch.utils.data.Subset(train_ds, train_indices)
