@@ -752,6 +752,18 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
     .run();
 
   if (resolved.snapshotId != null) {
+    const snapshotMetaResult = await env.DB.prepare(
+      `SELECT build_version, label_count
+       FROM snapshots_idx
+       WHERE snapshot_id = ?
+       LIMIT 1`,
+    )
+      .bind(resolved.snapshotId)
+      .all();
+    const snapshotMetaRow = snapshotMetaResult?.results?.[0];
+    const previousLabelCount = asCount(snapshotMetaRow?.label_count);
+    const buildKey = asString(snapshotMetaRow?.build_version) ?? 'unknown';
+
     await env.DB.prepare(
       `UPDATE snapshots_idx
        SET
@@ -761,6 +773,21 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
     )
       .bind(createdAt, resolved.snapshotId)
       .run();
+
+    if (previousLabelCount === 0) {
+      try {
+        await env.DB.prepare(
+          `INSERT INTO label_progress_build (build_key, labeled_snapshot_count)
+           VALUES (?, 1)
+           ON CONFLICT(build_key) DO UPDATE
+           SET labeled_snapshot_count = labeled_snapshot_count + 1`,
+        )
+          .bind(buildKey)
+          .run();
+      } catch {
+        // Keep labeling resilient if migration has not been applied yet.
+      }
+    }
     snapshotBoundsCache.clear();
   }
   labelProgressByBuildCache.clear();
@@ -781,15 +808,29 @@ const readLabeledBoardCountForBuild = async (
     return cached.labeledBoards;
   }
 
-  const result = await env.DB.prepare(
-    `SELECT COUNT(*) AS count
-     FROM snapshots_idx
-     WHERE build_version = ?
-       AND COALESCE(label_count, 0) > 0`,
-  )
-    .bind(normalizedBuild)
-    .all();
-  const labeledBoards = asCount(result?.results?.[0]?.count);
+  let labeledBoards = 0;
+  try {
+    const result = await env.DB.prepare(
+      `SELECT labeled_snapshot_count AS count
+       FROM label_progress_build
+       WHERE build_key = ?
+       LIMIT 1`,
+    )
+      .bind(normalizedBuild)
+      .all();
+    labeledBoards = asCount(result?.results?.[0]?.count);
+  } catch {
+    // Fallback for pre-migration environments.
+    const result = await env.DB.prepare(
+      `SELECT COUNT(*) AS count
+       FROM snapshots_idx
+       WHERE build_version = ?
+         AND COALESCE(label_count, 0) > 0`,
+    )
+      .bind(normalizedBuild)
+      .all();
+    labeledBoards = asCount(result?.results?.[0]?.count);
+  }
   if (labelProgressByBuildCache.size > 128) {
     labelProgressByBuildCache.clear();
   }
