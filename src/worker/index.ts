@@ -186,22 +186,32 @@ const readSnapshotBounds = async (
     return { minId: cachedBounds.minId, maxId: cachedBounds.maxId };
   }
 
-  const boundsSql = `
-    SELECT
-      MIN(idx.snapshot_id) AS min_id,
-      MAX(idx.snapshot_id) AS max_id
+  const firstSql = `
+    SELECT idx.snapshot_id AS snapshot_id
     FROM snapshots_idx idx
     ${filter.where}
+    ORDER BY idx.snapshot_id ASC
+    LIMIT 1
   `;
-  const boundsResult = await env.DB.prepare(boundsSql)
+  const firstResult = await env.DB.prepare(firstSql)
     .bind(...filter.params)
     .all();
-  const boundsRow = boundsResult?.results?.[0];
-  const minId = asInt(boundsRow?.min_id);
-  const maxId = asInt(boundsRow?.max_id);
-  if (minId == null || maxId == null) {
+  const minId = asInt(firstResult?.results?.[0]?.snapshot_id);
+  if (minId == null) {
     return null;
   }
+
+  const lastSql = `
+    SELECT idx.snapshot_id AS snapshot_id
+    FROM snapshots_idx idx
+    ${filter.where}
+    ORDER BY idx.snapshot_id DESC
+    LIMIT 1
+  `;
+  const lastResult = await env.DB.prepare(lastSql)
+    .bind(...filter.params)
+    .all();
+  const maxId = asInt(lastResult?.results?.[0]?.snapshot_id) ?? minId;
 
   if (filterKey != null) {
     if (snapshotBoundsCache.size > 128) {
