@@ -98,6 +98,7 @@ const buildSnapshotFilterSql = (
   mode: string,
   trigger: string,
   build: string,
+  generator: string,
 ): SnapshotFilterSql => {
   const params: unknown[] = [];
   const clauses: string[] = [];
@@ -123,6 +124,14 @@ const buildSnapshotFilterSql = (
     } else {
       clauses.push('idx.build_version = ?');
       params.push(build);
+    }
+  }
+  if (generator !== 'all') {
+    if (generator === 'unknown') {
+      clauses.push('idx.generator_type IS NULL');
+    } else {
+      clauses.push('idx.generator_type = ?');
+      params.push(generator);
     }
   }
   return {
@@ -171,8 +180,12 @@ const randomInt = (min: number, max: number): number => {
   return min + Math.floor(Math.random() * (max - min + 1));
 };
 
-const snapshotFilterCacheKey = (mode: string, trigger: string, build: string) =>
-  `${mode}|${trigger}|${build}`;
+const snapshotFilterCacheKey = (
+  mode: string,
+  trigger: string,
+  build: string,
+  generator: string,
+) => `${mode}|${trigger}|${build}|${generator}`;
 
 const readSnapshotBounds = async (
   env: Env,
@@ -448,6 +461,7 @@ type LabelDataPayload = {
     mode_filter?: unknown;
     trigger_filter?: unknown;
     build_filter?: unknown;
+    generator_filter?: unknown;
   };
   labels?: unknown;
 };
@@ -1101,6 +1115,7 @@ export default {
         const mode = url.searchParams.get('mode') ?? 'all';
         const trigger = url.searchParams.get('trigger') ?? 'all';
         const build = url.searchParams.get('build') ?? 'all';
+        const generator = url.searchParams.get('generator') ?? 'all';
         const excludeSnapshotIds = parseCsvInts(
           url.searchParams.get('exclude_snapshot_ids') ??
             url.searchParams.get('excludeSnapshotIds'),
@@ -1110,8 +1125,18 @@ export default {
             url.searchParams.get('excludeSessionIds'),
         );
 
-        const filterKey = snapshotFilterCacheKey(mode, trigger, build);
-        const baseFilter = buildSnapshotFilterSql(mode, trigger, build);
+        const filterKey = snapshotFilterCacheKey(
+          mode,
+          trigger,
+          build,
+          generator,
+        );
+        const baseFilter = buildSnapshotFilterSql(
+          mode,
+          trigger,
+          build,
+          generator,
+        );
         const unlabeledFilter = appendFilterClause(
           baseFilter,
           'idx.label_count = 0',

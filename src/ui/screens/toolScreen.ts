@@ -44,6 +44,8 @@ export type ToolScreen = {
   triggerSelect: HTMLSelectElement;
   buildLabel: HTMLDivElement;
   buildSelect: HTMLSelectElement;
+  generatorLabel: HTMLDivElement;
+  generatorSelect: HTMLSelectElement;
   outputButton: HTMLButtonElement;
   outputStatus: HTMLDivElement;
   sampleStatus: HTMLDivElement;
@@ -294,6 +296,28 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
   });
   toolPanel.appendChild(toolBuildSelect);
 
+  const toolGeneratorLabel = document.createElement('div');
+  toolGeneratorLabel.textContent = 'Piece Generator';
+  Object.assign(toolGeneratorLabel.style, {
+    marginTop: '10px',
+    fontSize: '12px',
+    color: '#b6c2d4',
+  });
+  toolPanel.appendChild(toolGeneratorLabel);
+
+  const toolGeneratorSelect = document.createElement('select');
+  Object.assign(toolGeneratorSelect.style, {
+    width: '100%',
+    marginTop: '6px',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  toolPanel.appendChild(toolGeneratorSelect);
+
   const toolOutputButton = document.createElement('button');
   toolOutputButton.textContent = 'Select Output Folder';
   Object.assign(toolOutputButton.style, {
@@ -535,6 +559,8 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     triggerSelect: toolTriggerSelect,
     buildLabel: toolBuildLabel,
     buildSelect: toolBuildSelect,
+    generatorLabel: toolGeneratorLabel,
+    generatorSelect: toolGeneratorSelect,
     outputButton: toolOutputButton,
     outputStatus: toolOutputStatus,
     sampleStatus: toolSampleStatus,

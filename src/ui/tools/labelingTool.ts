@@ -1,4 +1,5 @@
 import { getMode, normalizeModeId } from '../../core/modes';
+import { GENERATOR_TYPES } from '../../core/generators';
 import { SPAWN_X, SPAWN_Y } from '../../core/constants';
 import { collides } from '../../core/piece';
 import type {
@@ -68,6 +69,7 @@ export function createLabelingTool(
   const toolModeSelect = toolUi.modeSelect;
   const toolTriggerSelect = toolUi.triggerSelect;
   const toolBuildSelect = toolUi.buildSelect;
+  const toolGeneratorSelect = toolUi.generatorSelect;
   const toolOutputButton = toolUi.outputButton;
   const toolOutputStatus = toolUi.outputStatus;
   const toolSampleStatus = toolUi.sampleStatus;
@@ -85,6 +87,7 @@ export function createLabelingTool(
   let toolTriggerFilter: TriggerFilter = 'all';
   const defaultBuildFilter = buildVersion?.trim() ? buildVersion : 'all';
   let toolBuildFilter = defaultBuildFilter;
+  let toolGeneratorFilter = 'all';
   let toolActive = false;
   let playstyle: Playstyle = 'beginner';
   let currentSample: {
@@ -430,6 +433,34 @@ export function createLabelingTool(
     return id.toUpperCase();
   };
 
+  const getGeneratorLabel = (id: string): string => {
+    switch (id) {
+      case 'bag7':
+        return '7-BAG';
+      case 'bag8i':
+        return '8-BAG (2I)';
+      case 'inconvenient':
+        return 'INCONVENIENT BAG';
+      case 'random':
+        return 'PURE RANDOM';
+      case 'nes':
+        return 'NES';
+      case 'ml':
+        return 'WISH UPON A BLOCK';
+      case 'curse':
+        return 'CURSE UPON A BLOCK';
+      case 'unknown':
+        return 'UNKNOWN';
+      default:
+        return id.toUpperCase();
+    }
+  };
+
+  const snapshotGeneratorId = (file: {
+    name: string;
+    session: SnapshotSession;
+  }): string => file.session.meta.settings.generator.type?.trim() || 'unknown';
+
   const refreshToolModeOptions = () => {
     toolModeSelect.innerHTML = '';
     const addOption = (value: string, label: string) => {
@@ -573,6 +604,58 @@ export function createLabelingTool(
     }
     toolBuildSelect.value = toolBuildFilter;
     toolBuildSelect.disabled = toolSnapshotsAll.length === 0;
+  };
+
+  const refreshToolGeneratorOptions = () => {
+    toolGeneratorSelect.innerHTML = '';
+    const addOption = (value: string, label: string) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      toolGeneratorSelect.appendChild(option);
+    };
+    const hasOption = (value: string): boolean =>
+      Array.from(toolGeneratorSelect.options).some(
+        (opt) => opt.value === value,
+      );
+
+    addOption('all', 'All Generators');
+    if (toolUsesRemote) {
+      for (const generator of GENERATOR_TYPES) {
+        addOption(generator, getGeneratorLabel(generator));
+      }
+      addOption('unknown', 'Unknown');
+      if (toolGeneratorFilter !== 'all' && !hasOption(toolGeneratorFilter)) {
+        toolGeneratorFilter = 'all';
+      }
+      toolGeneratorSelect.value = toolGeneratorFilter;
+      toolGeneratorSelect.disabled = false;
+      return;
+    }
+
+    const counts = new Map<string, number>();
+    for (const file of toolSnapshotsAll) {
+      const generator = snapshotGeneratorId(file);
+      counts.set(
+        generator,
+        (counts.get(generator) ?? 0) + file.session.samples.length,
+      );
+    }
+    const generatorIds = Array.from(counts.keys()).sort((a, b) => {
+      if (a === 'unknown') return 1;
+      if (b === 'unknown') return -1;
+      return a.localeCompare(b);
+    });
+    for (const generator of generatorIds) {
+      const label = `${getGeneratorLabel(generator)} (${counts.get(generator) ?? 0})`;
+      addOption(generator, label);
+    }
+
+    if (toolGeneratorFilter !== 'all' && !hasOption(toolGeneratorFilter)) {
+      toolGeneratorFilter = 'all';
+    }
+    toolGeneratorSelect.value = toolGeneratorFilter;
+    toolGeneratorSelect.disabled = toolSnapshotsAll.length === 0;
   };
 
   const fetchRemoteBuildCounts = async () => {
@@ -779,6 +862,9 @@ export function createLabelingTool(
     if (toolBuildFilter !== 'all') {
       url.searchParams.set('build', toolBuildFilter);
     }
+    if (toolGeneratorFilter !== 'all') {
+      url.searchParams.set('generator', toolGeneratorFilter);
+    }
     if (requestCount > 1) {
       url.searchParams.set('count', String(requestCount));
     }
@@ -892,9 +978,13 @@ export function createLabelingTool(
           : triggerLabel(toolTriggerFilter);
       const buildText =
         toolBuildFilter === 'all' ? 'All Builds' : toolBuildFilter;
+      const generatorText =
+        toolGeneratorFilter === 'all'
+          ? 'All Generators'
+          : getGeneratorLabel(toolGeneratorFilter);
       toolInputStatus.textContent =
         `Source: Online\n` +
-        `Filter: ${filterLabel} / ${triggerText} / ${buildText}`;
+        `Filter: ${filterLabel} / ${triggerText} / ${buildText} / ${generatorText}`;
       if (!toolActive) return;
       await ensureRemotePrefetch(1);
       await showNextToolSample();
@@ -914,6 +1004,12 @@ export function createLabelingTool(
         return build === toolBuildFilter;
       });
     }
+    if (toolGeneratorFilter !== 'all') {
+      toolSnapshots = toolSnapshots.filter((file) => {
+        const generator = snapshotGeneratorId(file);
+        return generator === toolGeneratorFilter;
+      });
+    }
     rebuildToolSampleIndex();
     const filterLabel =
       toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
@@ -923,10 +1019,14 @@ export function createLabelingTool(
         : triggerLabel(toolTriggerFilter);
     const buildText =
       toolBuildFilter === 'all' ? 'All Builds' : toolBuildFilter;
+    const generatorText =
+      toolGeneratorFilter === 'all'
+        ? 'All Generators'
+        : getGeneratorLabel(toolGeneratorFilter);
     toolInputStatus.textContent =
       `Source: Local\n` +
       `Loaded ${toolSnapshotsAll.length} files (${toolTotalSamplesAll} samples).\n` +
-      `Filter: ${filterLabel} / ${triggerText} / ${buildText} (${toolTotalSamples} samples).`;
+      `Filter: ${filterLabel} / ${triggerText} / ${buildText} / ${generatorText} (${toolTotalSamples} samples).`;
     await showNextToolSample();
   };
 
@@ -1179,6 +1279,7 @@ export function createLabelingTool(
       refreshToolModeOptions();
       refreshToolTriggerOptions();
       refreshToolBuildOptions();
+      refreshToolGeneratorOptions();
       await applyToolFilters();
       updateToolActionStatus(`Loaded ${toolSnapshotsAll.length} files.`);
     } catch {
@@ -1201,10 +1302,16 @@ export function createLabelingTool(
     await applyToolFilters();
   });
 
+  toolGeneratorSelect.addEventListener('change', async () => {
+    toolGeneratorFilter = toolGeneratorSelect.value;
+    await applyToolFilters();
+  });
+
   if (toolUsesRemote) {
     refreshToolModeOptions();
     refreshToolTriggerOptions();
     refreshToolBuildOptions();
+    refreshToolGeneratorOptions();
   }
 
   initPlaystyleSelect();
@@ -1288,6 +1395,7 @@ export function createLabelingTool(
           mode_filter: toolModeFilter,
           trigger_filter: toolTriggerFilter,
           build_filter: toolBuildFilter,
+          generator_filter: toolGeneratorFilter,
         },
       };
       if (uploadClient.isRemote) {
@@ -1354,6 +1462,7 @@ export function createLabelingTool(
       if (toolUsesRemote) {
         refreshToolModeOptions();
         refreshToolTriggerOptions();
+        refreshToolGeneratorOptions();
         await applyToolFilters();
       } else {
         await renderToolSample();
