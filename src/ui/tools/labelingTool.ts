@@ -19,6 +19,7 @@ type LabelingToolOptions = {
   toolUsesRemote: boolean;
   uploadClient: UploadClient;
   uploadBaseUrl: string;
+  buildVersion?: string;
   canvas: ToolCanvas;
   onBack: () => void;
 };
@@ -29,6 +30,7 @@ const PLAYSTYLE_STORAGE_KEY = 'wub.labeler.playstyle';
 const VIRTUAL_SESSION_SIZE = 100;
 const REMOTE_RECENT_SESSION_WINDOW = 4;
 const REMOTE_RECENT_SNAPSHOT_WINDOW = 6;
+const REMOTE_LABELED_SNAPSHOT_WINDOW = 128;
 const LOCAL_RECENT_SAMPLE_WINDOW = 6;
 const LOCAL_RECENT_SESSION_WINDOW = 3;
 const MAX_PICK_ATTEMPTS = 24;
@@ -36,8 +38,14 @@ const MAX_PICK_ATTEMPTS = 24;
 export function createLabelingTool(
   options: LabelingToolOptions,
 ): ToolController {
-  const { toolUsesRemote, uploadClient, uploadBaseUrl, canvas, onBack } =
-    options;
+  const {
+    toolUsesRemote,
+    uploadClient,
+    uploadBaseUrl,
+    buildVersion,
+    canvas,
+    onBack,
+  } = options;
 
   type TriggerFilter =
     | 'all'
@@ -69,7 +77,8 @@ export function createLabelingTool(
   let toolTotalSamplesAll = 0;
   let toolModeFilter = 'all';
   let toolTriggerFilter: TriggerFilter = 'all';
-  let toolBuildFilter = 'all';
+  const defaultBuildFilter = buildVersion?.trim() ? buildVersion : 'all';
+  let toolBuildFilter = defaultBuildFilter;
   let toolActive = false;
   let playstyle: Playstyle = 'beginner';
   let currentSample: {
@@ -97,6 +106,7 @@ export function createLabelingTool(
   let remoteBuildLoading = false;
   let recentRemoteSnapshotIds: number[] = [];
   let recentRemoteSessionIds: string[] = [];
+  let recentRemoteLabeledSnapshotIds: number[] = [];
   let recentLocalSampleKeys: string[] = [];
   let recentLocalSessionIds: string[] = [];
   let recentLocalBatchKeys: string[] = [];
@@ -453,11 +463,18 @@ export function createLabelingTool(
       option.textContent = label;
       toolBuildSelect.appendChild(option);
     };
+    const hasOption = (value: string): boolean =>
+      Array.from(toolBuildSelect.options).some((opt) => opt.value === value);
+    const ensureBuildOption = (value: string): void => {
+      if (!value || value === 'all' || hasOption(value)) return;
+      addOption(value, `${value} (0)`);
+    };
 
     addOption('all', 'All Builds');
     if (toolUsesRemote) {
       if (!remoteBuildCounts) {
         addOption('unknown', 'Unknown');
+        ensureBuildOption(defaultBuildFilter);
         if (!remoteBuildLoading) {
           void fetchRemoteBuildCounts();
         }
@@ -474,11 +491,12 @@ export function createLabelingTool(
         const label = `${entry.build} (${entry.count})`;
         addOption(entry.build, label);
       }
-      if (
-        toolBuildFilter !== 'all' &&
-        !builds.some((entry) => entry.build === toolBuildFilter)
-      ) {
-        toolBuildFilter = 'all';
+      ensureBuildOption(defaultBuildFilter);
+      if (toolBuildFilter !== 'all' && !hasOption(toolBuildFilter)) {
+        toolBuildFilter =
+          defaultBuildFilter !== 'all' && hasOption(defaultBuildFilter)
+            ? defaultBuildFilter
+            : 'all';
       }
       toolBuildSelect.value = toolBuildFilter;
       toolBuildSelect.disabled = false;
@@ -498,9 +516,13 @@ export function createLabelingTool(
       const label = `${build} (${counts.get(build) ?? 0})`;
       addOption(build, label);
     }
+    ensureBuildOption(defaultBuildFilter);
 
-    if (toolBuildFilter !== 'all' && !counts.has(toolBuildFilter)) {
-      toolBuildFilter = 'all';
+    if (toolBuildFilter !== 'all' && !hasOption(toolBuildFilter)) {
+      toolBuildFilter =
+        defaultBuildFilter !== 'all' && hasOption(defaultBuildFilter)
+          ? defaultBuildFilter
+          : 'all';
     }
     toolBuildSelect.value = toolBuildFilter;
     toolBuildSelect.disabled = toolSnapshotsAll.length === 0;
@@ -578,10 +600,17 @@ export function createLabelingTool(
     if (toolBuildFilter !== 'all') {
       url.searchParams.set('build', toolBuildFilter);
     }
-    if (recentRemoteSnapshotIds.length > 0) {
+    const excludeSnapshotIds: number[] = [];
+    for (const value of recentRemoteSnapshotIds) {
+      if (!excludeSnapshotIds.includes(value)) excludeSnapshotIds.push(value);
+    }
+    for (const value of recentRemoteLabeledSnapshotIds) {
+      if (!excludeSnapshotIds.includes(value)) excludeSnapshotIds.push(value);
+    }
+    if (excludeSnapshotIds.length > 0) {
       url.searchParams.set(
         'exclude_snapshot_ids',
-        recentRemoteSnapshotIds.join(','),
+        excludeSnapshotIds.join(','),
       );
     }
     if (recentRemoteSessionIds.length > 0) {
@@ -682,6 +711,7 @@ export function createLabelingTool(
   const applyToolFilters = async () => {
     recentRemoteSnapshotIds = [];
     recentRemoteSessionIds = [];
+    recentRemoteLabeledSnapshotIds = [];
     recentLocalSampleKeys = [];
     recentLocalSessionIds = [];
     recentLocalBatchKeys = [];
@@ -1045,6 +1075,12 @@ export function createLabelingTool(
           createdAt: record.createdAt,
           data: record,
         });
+        pushRecentUnique(
+          recentRemoteLabeledSnapshotIds,
+          currentSample.snapshotId ?? null,
+          REMOTE_LABELED_SNAPSHOT_WINDOW,
+        );
+        await uploadClient.flush();
         updateToolActionStatus(
           `Uploaded label for ${currentSample.file.name} #${currentSample.index}`,
         );

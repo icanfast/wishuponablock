@@ -453,6 +453,7 @@ async function boot() {
     toolUsesRemote,
     uploadClient,
     uploadBaseUrl,
+    buildVersion: APP_VERSION,
     canvas: toolCanvas,
     onBack: () => setScreen('menu'),
   });
