@@ -9,7 +9,12 @@ import {
   type SnapshotSession,
 } from '../core/snapshotRecorder';
 import type { UploadClient, SnapshotUploadRecord } from '../core/uploadClient';
-import type { ActivePiece, Board, PieceKind } from '../core/types';
+import type {
+  ActivePiece,
+  Board,
+  PieceKind,
+  PieceProbability,
+} from '../core/types';
 import type { IdentityService } from './identityService';
 import { usesModelGenerator } from '../core/generators';
 
@@ -66,6 +71,8 @@ export type SnapshotService = {
 
 type SnapshotCaptureMeta = {
   active?: ActivePiece | null;
+  next?: PieceKind[];
+  odds?: PieceProbability[];
   linesLeft?: number;
   level?: number;
   score?: number;
@@ -372,6 +379,8 @@ export function createSnapshotService(
     const sample = recorder.record(board, hold, {
       store: !useRemoteUpload,
       active: meta?.active,
+      next: meta?.next,
+      odds: meta?.odds,
       trigger: reason,
       linesLeft: meta?.linesLeft,
       level: meta?.level,
@@ -398,6 +407,8 @@ export function createSnapshotService(
           index: sample.index,
           timeMs: sample.timeMs,
           hold: sample.hold,
+          ...(sample.next?.length ? { next: sample.next } : {}),
+          ...(sample.odds?.length ? { odds: sample.odds } : {}),
           ...(sample.active ? { active: sample.active } : {}),
           ...(sample.linesLeft != null ? { linesLeft: sample.linesLeft } : {}),
           ...(sample.level != null ? { level: sample.level } : {}),

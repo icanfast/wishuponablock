@@ -31,6 +31,9 @@ const VIRTUAL_SESSION_SIZE = 100;
 const REMOTE_RECENT_SESSION_WINDOW = 4;
 const REMOTE_RECENT_SNAPSHOT_WINDOW = 6;
 const REMOTE_LABELED_SNAPSHOT_WINDOW = 128;
+const REMOTE_PREFETCH_BATCH_SIZE = 20;
+const REMOTE_PREFETCH_MIN_QUEUE = 6;
+const REMOTE_PREFETCH_MAX_QUEUE = 60;
 const LOCAL_RECENT_SAMPLE_WINDOW = 6;
 const LOCAL_RECENT_SESSION_WINDOW = 3;
 const MAX_PICK_ATTEMPTS = 24;
@@ -104,6 +107,15 @@ export function createLabelingTool(
   }> = [];
   let remoteBuildCounts: Array<{ build: string; count: number }> | null = null;
   let remoteBuildLoading = false;
+  let remoteSampleQueue: Array<{
+    snapshotId: number | null;
+    sessionId: string | null;
+    batchId: number | null;
+    sampleIndex: number;
+    session: SnapshotSession;
+  }> = [];
+  let remotePrefetchPromise: Promise<void> | null = null;
+  let remotePrefetchVersion = 0;
   let recentRemoteSnapshotIds: number[] = [];
   let recentRemoteSessionIds: string[] = [];
   let recentRemoteLabeledSnapshotIds: number[] = [];
@@ -583,51 +595,22 @@ export function createLabelingTool(
     return new URL(`${base}${path}`, window.location.origin);
   };
 
-  const fetchRemoteSample = async (): Promise<{
+  type RemoteSnapshotRecord = {
     snapshotId: number | null;
     sessionId: string | null;
     batchId: number | null;
     sampleIndex: number;
     session: SnapshotSession;
-  } | null> => {
-    const url = buildToolApiUrl('/snapshots/random');
-    if (toolModeFilter !== 'all') {
-      url.searchParams.set('mode', toolModeFilter);
-    }
-    if (toolTriggerFilter !== 'all') {
-      url.searchParams.set('trigger', toolTriggerFilter);
-    }
-    if (toolBuildFilter !== 'all') {
-      url.searchParams.set('build', toolBuildFilter);
-    }
-    const excludeSnapshotIds: number[] = [];
-    for (const value of recentRemoteSnapshotIds) {
-      if (!excludeSnapshotIds.includes(value)) excludeSnapshotIds.push(value);
-    }
-    for (const value of recentRemoteLabeledSnapshotIds) {
-      if (!excludeSnapshotIds.includes(value)) excludeSnapshotIds.push(value);
-    }
-    if (excludeSnapshotIds.length > 0) {
-      url.searchParams.set(
-        'exclude_snapshot_ids',
-        excludeSnapshotIds.join(','),
-      );
-    }
-    if (recentRemoteSessionIds.length > 0) {
-      url.searchParams.set(
-        'exclude_session_ids',
-        recentRemoteSessionIds.join(','),
-      );
-    }
-    const res = await fetch(url.toString());
-    if (!res.ok) {
-      return null;
-    }
-    const payload = (await res.json()) as {
+  };
+
+  const parseRemoteSnapshotRecord = (
+    payload: unknown,
+  ): RemoteSnapshotRecord | null => {
+    if (!payload || typeof payload !== 'object') return null;
+    const source = payload as {
       id?: number | string;
       sessionId?: string | null;
       batchId?: number | string | null;
-      createdAt?: string;
       meta?: {
         session?: SnapshotSession['meta'];
         sample?: Record<string, unknown>;
@@ -635,9 +618,9 @@ export function createLabelingTool(
       };
       board?: number[][];
     };
-    const sessionMeta = payload.meta?.session;
-    if (!sessionMeta || !payload.board) return null;
-    const sampleMeta = payload.meta?.sample ?? {};
+    const sessionMeta = source.meta?.session;
+    if (!sessionMeta || !source.board) return null;
+    const sampleMeta = source.meta?.sample ?? {};
     const readNumber = (value: unknown, fallback = 0): number => {
       return typeof value === 'number' && Number.isFinite(value)
         ? value
@@ -666,10 +649,10 @@ export function createLabelingTool(
     const sample: SnapshotSample = {
       index: readNumber(sampleMeta.index),
       timeMs: readNumber(sampleMeta.timeMs),
-      board: payload.board,
+      board: source.board,
       hold: holdValue,
       active: sampleMeta.active as SnapshotSample['active'] | undefined,
-      trigger: readTrigger(payload.meta?.trigger),
+      trigger: readTrigger(source.meta?.trigger),
       linesLeft: readOptionalNumber(sampleMeta.linesLeft),
       level: readOptionalNumber(sampleMeta.level),
       score: readOptionalNumber(sampleMeta.score),
@@ -679,22 +662,22 @@ export function createLabelingTool(
       samples: [sample],
     };
     const snapshotId =
-      typeof payload.id === 'number' && Number.isFinite(payload.id)
-        ? payload.id
-        : typeof payload.id === 'string' && payload.id.trim()
-          ? Number.parseInt(payload.id, 10)
+      typeof source.id === 'number' && Number.isFinite(source.id)
+        ? source.id
+        : typeof source.id === 'string' && source.id.trim()
+          ? Number.parseInt(source.id, 10)
           : null;
     const sessionId =
-      typeof payload.sessionId === 'string' && payload.sessionId.trim()
-        ? payload.sessionId
+      typeof source.sessionId === 'string' && source.sessionId.trim()
+        ? source.sessionId
         : typeof sessionMeta.id === 'string' && sessionMeta.id.trim()
           ? sessionMeta.id
           : null;
     const batchIdRaw =
-      typeof payload.batchId === 'number' && Number.isFinite(payload.batchId)
-        ? Math.trunc(payload.batchId)
-        : typeof payload.batchId === 'string' && payload.batchId.trim()
-          ? Number.parseInt(payload.batchId, 10)
+      typeof source.batchId === 'number' && Number.isFinite(source.batchId)
+        ? Math.trunc(source.batchId)
+        : typeof source.batchId === 'string' && source.batchId.trim()
+          ? Number.parseInt(source.batchId, 10)
           : null;
     const batchId = Number.isFinite(batchIdRaw)
       ? (batchIdRaw as number)
@@ -708,10 +691,123 @@ export function createLabelingTool(
     };
   };
 
+  const fetchRemoteSamples = async (
+    count: number,
+  ): Promise<RemoteSnapshotRecord[]> => {
+    const requestCount = Math.max(
+      1,
+      Math.min(REMOTE_PREFETCH_BATCH_SIZE, count),
+    );
+    const url = buildToolApiUrl('/snapshots/random');
+    if (toolModeFilter !== 'all') {
+      url.searchParams.set('mode', toolModeFilter);
+    }
+    if (toolTriggerFilter !== 'all') {
+      url.searchParams.set('trigger', toolTriggerFilter);
+    }
+    if (toolBuildFilter !== 'all') {
+      url.searchParams.set('build', toolBuildFilter);
+    }
+    if (requestCount > 1) {
+      url.searchParams.set('count', String(requestCount));
+    }
+
+    const excludeSnapshotIds: number[] = [];
+    const excludeSessionIds: string[] = [];
+    const pushUniqueNumber = (list: number[], value: number | null): void => {
+      if (value == null) return;
+      if (!list.includes(value)) list.push(value);
+    };
+    const pushUniqueString = (list: string[], value: string | null): void => {
+      if (!value) return;
+      if (!list.includes(value)) list.push(value);
+    };
+    for (const value of recentRemoteSnapshotIds) {
+      pushUniqueNumber(excludeSnapshotIds, value);
+    }
+    for (const value of recentRemoteLabeledSnapshotIds) {
+      pushUniqueNumber(excludeSnapshotIds, value);
+    }
+    for (const queued of remoteSampleQueue) {
+      pushUniqueNumber(excludeSnapshotIds, queued.snapshotId);
+      pushUniqueString(excludeSessionIds, queued.sessionId);
+    }
+    for (const value of recentRemoteSessionIds) {
+      pushUniqueString(excludeSessionIds, value);
+    }
+    if (excludeSnapshotIds.length > 0) {
+      url.searchParams.set(
+        'exclude_snapshot_ids',
+        excludeSnapshotIds.join(','),
+      );
+    }
+    if (excludeSessionIds.length > 0) {
+      url.searchParams.set('exclude_session_ids', excludeSessionIds.join(','));
+    }
+
+    const res = await fetch(url.toString());
+    if (!res.ok) return [];
+    const payload = (await res.json()) as unknown;
+    const items = (
+      payload &&
+      typeof payload === 'object' &&
+      'items' in payload &&
+      Array.isArray((payload as { items?: unknown }).items)
+        ? ((payload as { items: unknown[] }).items ?? [])
+        : [payload]
+    )
+      .map((entry) => parseRemoteSnapshotRecord(entry))
+      .filter((entry): entry is RemoteSnapshotRecord => entry != null);
+    return items;
+  };
+
+  const ensureRemotePrefetch = async (minRequired = 1): Promise<void> => {
+    if (remoteSampleQueue.length >= minRequired) return;
+    if (remotePrefetchPromise) {
+      await remotePrefetchPromise;
+      return;
+    }
+    const missing = Math.max(
+      minRequired - remoteSampleQueue.length,
+      REMOTE_PREFETCH_BATCH_SIZE,
+    );
+    const needed = Math.min(REMOTE_PREFETCH_MAX_QUEUE, missing);
+    const version = remotePrefetchVersion;
+    remotePrefetchPromise = (async () => {
+      const fetched = await fetchRemoteSamples(needed);
+      if (!fetched.length) return;
+      if (version !== remotePrefetchVersion) return;
+      const knownSnapshotIds = new Set<number>();
+      for (const row of remoteSampleQueue) {
+        if (row.snapshotId != null) knownSnapshotIds.add(row.snapshotId);
+      }
+      for (const row of fetched) {
+        if (
+          row.snapshotId != null &&
+          (knownSnapshotIds.has(row.snapshotId) ||
+            recentRemoteLabeledSnapshotIds.includes(row.snapshotId))
+        ) {
+          continue;
+        }
+        remoteSampleQueue.push(row);
+        if (row.snapshotId != null) {
+          knownSnapshotIds.add(row.snapshotId);
+        }
+        if (remoteSampleQueue.length >= REMOTE_PREFETCH_MAX_QUEUE) break;
+      }
+    })().finally(() => {
+      remotePrefetchPromise = null;
+    });
+    await remotePrefetchPromise;
+  };
+
   const applyToolFilters = async () => {
+    remotePrefetchVersion += 1;
+    remotePrefetchPromise = null;
     recentRemoteSnapshotIds = [];
     recentRemoteSessionIds = [];
     recentRemoteLabeledSnapshotIds = [];
+    remoteSampleQueue = [];
     recentLocalSampleKeys = [];
     recentLocalSessionIds = [];
     recentLocalBatchKeys = [];
@@ -729,6 +825,7 @@ export function createLabelingTool(
         `Source: Online\n` +
         `Filter: ${filterLabel} / ${triggerText} / ${buildText}`;
       if (!toolActive) return;
+      await ensureRemotePrefetch(1);
       await showNextToolSample();
       return;
     }
@@ -764,17 +861,36 @@ export function createLabelingTool(
 
   const showNextToolSample = async (): Promise<void> => {
     if (toolUsesRemote) {
-      let remote: Awaited<ReturnType<typeof fetchRemoteSample>> = null;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        remote = await fetchRemoteSample();
-        if (!remote) break;
-        const sessionId = remote.sessionId;
-        const snapshotId = remote.snapshotId;
+      await ensureRemotePrefetch(1);
+      let remote: RemoteSnapshotRecord | null = null;
+      while (remoteSampleQueue.length > 0) {
+        const candidate = remoteSampleQueue.shift() ?? null;
+        if (!candidate) continue;
         const seenSession =
-          sessionId != null && recentRemoteSessionIds.includes(sessionId);
+          candidate.sessionId != null &&
+          recentRemoteSessionIds.includes(candidate.sessionId);
         const seenSnapshot =
-          snapshotId != null && recentRemoteSnapshotIds.includes(snapshotId);
-        if (!seenSession && !seenSnapshot) {
+          candidate.snapshotId != null &&
+          (recentRemoteSnapshotIds.includes(candidate.snapshotId) ||
+            recentRemoteLabeledSnapshotIds.includes(candidate.snapshotId));
+        if (seenSession || seenSnapshot) continue;
+        remote = candidate;
+        break;
+      }
+      if (!remote) {
+        await ensureRemotePrefetch(1);
+        while (remoteSampleQueue.length > 0) {
+          const candidate = remoteSampleQueue.shift() ?? null;
+          if (!candidate) continue;
+          const seenSession =
+            candidate.sessionId != null &&
+            recentRemoteSessionIds.includes(candidate.sessionId);
+          const seenSnapshot =
+            candidate.snapshotId != null &&
+            (recentRemoteSnapshotIds.includes(candidate.snapshotId) ||
+              recentRemoteLabeledSnapshotIds.includes(candidate.snapshotId));
+          if (seenSession || seenSnapshot) continue;
+          remote = candidate;
           break;
         }
       }
@@ -828,6 +944,9 @@ export function createLabelingTool(
       clearLabelSelection();
       if (toolActive) {
         canvas.render(board, hold, undefined, active);
+      }
+      if (remoteSampleQueue.length < REMOTE_PREFETCH_MIN_QUEUE) {
+        void ensureRemotePrefetch(REMOTE_PREFETCH_MIN_QUEUE);
       }
       return;
     }

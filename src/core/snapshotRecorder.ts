@@ -1,5 +1,11 @@
 import { GAME_PROTOCOL_VERSION } from './constants';
-import { PIECES, type ActivePiece, type Board, type PieceKind } from './types';
+import {
+  PIECES,
+  type ActivePiece,
+  type Board,
+  type PieceKind,
+  type PieceProbability,
+} from './types';
 import type { Settings } from './settings';
 
 export interface SnapshotSessionMeta {
@@ -23,6 +29,11 @@ export interface SnapshotSample {
   timeMs: number;
   board: number[][];
   hold?: number;
+  next?: number[];
+  odds?: Array<{
+    k: number;
+    p: number;
+  }>;
   active?: {
     k: number;
     r: number;
@@ -57,6 +68,31 @@ function encodeBoard(board: Board): number[][] {
 
 function encodePiece(cell: PieceKind | null): number {
   return cell ? (PIECE_TO_INDEX.get(cell) ?? 0) : 0;
+}
+
+function encodeQueue(pieces: ReadonlyArray<PieceKind> | undefined): number[] {
+  if (!pieces?.length) return [];
+  return pieces
+    .map((piece) => encodePiece(piece))
+    .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function encodeOdds(
+  odds: ReadonlyArray<PieceProbability> | undefined,
+): Array<{ k: number; p: number }> {
+  if (!odds?.length) return [];
+  return odds
+    .map((entry) => {
+      const k = encodePiece(entry.piece);
+      const p = Number.isFinite(entry.probability)
+        ? Math.max(0, entry.probability)
+        : 0;
+      return {
+        k,
+        p: Math.round(p * 1_000_000) / 1_000_000,
+      };
+    })
+    .filter((entry) => entry.k > 0 && entry.p > 0);
 }
 
 function encodeActivePiece(active: ActivePiece | null | undefined):
@@ -142,6 +178,8 @@ export class SnapshotRecorder {
     options: {
       store?: boolean;
       active?: ActivePiece | null;
+      next?: ReadonlyArray<PieceKind>;
+      odds?: ReadonlyArray<PieceProbability>;
       trigger?: SnapshotTrigger;
       linesLeft?: number;
       level?: number;
@@ -163,11 +201,15 @@ export class SnapshotRecorder {
         ? Math.max(0, Math.trunc(options.score))
         : undefined;
     const encodedActive = encodeActivePiece(options.active);
+    const encodedQueue = encodeQueue(options.next);
+    const encodedOdds = encodeOdds(options.odds);
     const sample: SnapshotSample = {
       index: this.nextIndex,
       timeMs: Math.round(timeMs),
       board: encodeBoard(board),
       hold: encodePiece(hold),
+      ...(encodedQueue.length > 0 ? { next: encodedQueue } : {}),
+      ...(encodedOdds.length > 0 ? { odds: encodedOdds } : {}),
       ...(encodedActive ? { active: encodedActive } : {}),
       ...(options.trigger ? { trigger: options.trigger } : {}),
       ...(linesLeft != null ? { linesLeft } : {}),

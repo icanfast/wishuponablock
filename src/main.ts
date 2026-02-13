@@ -232,6 +232,8 @@ async function boot() {
         : undefined;
     snapshotService?.handleLock(board, hold, {
       active: state.active,
+      next: state.next,
+      odds: state.mlQueueProbabilities,
       linesLeft,
       level: state.level,
       score: state.score,
@@ -251,6 +253,8 @@ async function boot() {
         : undefined;
     snapshotService?.handleHold(board, hold, {
       active: state.active,
+      next: state.next,
+      odds: state.mlQueueProbabilities,
       linesLeft,
       level: state.level,
       score: state.score,
@@ -397,6 +401,8 @@ async function boot() {
         board: state.board,
         active: state.active,
         hold: state.hold,
+        next: state.next,
+        odds: state.mlQueueProbabilities,
         linesLeft,
         level: state.level,
         score: state.score,

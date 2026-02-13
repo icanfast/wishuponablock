@@ -1,7 +1,12 @@
 import { isGeneratorType } from '../core/generators';
 import type { Settings } from '../core/settings';
 import type { SettingsStore } from '../core/settingsStore';
-import type { ActivePiece, Board, PieceKind } from '../core/types';
+import type {
+  ActivePiece,
+  Board,
+  PieceKind,
+  PieceProbability,
+} from '../core/types';
 import type { GameScreen } from '../ui/screens/gameScreen';
 import type {
   LabelingProgressState,
@@ -44,6 +49,8 @@ type UiControllerOptions = {
     board: Board;
     hold: PieceKind | null;
     active: ActivePiece;
+    next: PieceKind[];
+    odds: PieceProbability[];
     linesLeft?: number;
     level?: number;
     score?: number;
@@ -128,10 +135,12 @@ export function createUiController(options: UiControllerOptions): UiController {
 
     game.manualButton.addEventListener('click', () => {
       if (!snapshotService) return;
-      const { board, hold, active, linesLeft, level, score } =
+      const { board, hold, active, next, odds, linesLeft, level, score } =
         getSnapshotState();
       snapshotService.handleManual(board, hold, {
         active,
+        next,
+        odds,
         linesLeft,
         level,
         score,
