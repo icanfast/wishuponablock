@@ -420,6 +420,57 @@ type SnapshotMetaPayload = {
   trigger?: unknown;
 };
 
+type LabelDataPayload = {
+  source?: {
+    snapshotId?: unknown;
+    snapshot_id?: unknown;
+    sessionId?: unknown;
+    sampleIndex?: unknown;
+    batchId?: unknown;
+    batch_id?: unknown;
+  };
+  snapshot_meta?: {
+    session?: {
+      buildVersion?: unknown;
+      mode?: { id?: unknown };
+      device_id?: unknown;
+      user_id?: unknown;
+    };
+    sample?: {
+      trigger?: unknown;
+      linesLeft?: unknown;
+      level?: unknown;
+      score?: unknown;
+    };
+  };
+  label_context?: {
+    playstyle?: unknown;
+    mode_filter?: unknown;
+    trigger_filter?: unknown;
+    build_filter?: unknown;
+  };
+  labels?: unknown;
+};
+
+const parseLabelValues = (
+  labels: unknown,
+): { labelCount: number; labelsCsv: string | null } => {
+  if (!Array.isArray(labels)) {
+    return { labelCount: 0, labelsCsv: null };
+  }
+  const values: string[] = [];
+  for (const raw of labels) {
+    if (typeof raw !== 'string') continue;
+    const value = raw.trim();
+    if (!value) continue;
+    values.push(value);
+  }
+  return {
+    labelCount: values.length,
+    labelsCsv: values.length > 0 ? values.join(',') : null,
+  };
+};
+
 const decodePieceCode = (value: unknown): number | null => {
   const code = asInt(value);
   if (code == null || code <= 0) return null;
@@ -729,9 +780,9 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
     typeof record.createdAt === 'string'
       ? record.createdAt
       : new Date().toISOString();
+  const dataJson = JSON.stringify(record.data);
   const resolved = await resolveLabelSnapshotRef(env, record.data);
-
-  await env.DB.prepare(
+  const labelInsertResult = (await env.DB.prepare(
     `INSERT INTO labels (
       created_at,
       data,
@@ -743,13 +794,17 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
   )
     .bind(
       createdAt,
-      JSON.stringify(record.data),
+      dataJson,
       resolved.snapshotId,
       resolved.sessionId,
       resolved.sampleIndex,
       resolved.batchId,
     )
-    .run();
+    .run()) as { meta?: { last_row_id?: unknown } };
+
+  const labelId = asInt(labelInsertResult?.meta?.last_row_id);
+  const labelData = record.data as LabelDataPayload;
+  const parsedLabelValues = parseLabelValues(labelData?.labels);
 
   if (resolved.snapshotId != null) {
     const snapshotMetaResult = await env.DB.prepare(
@@ -789,6 +844,96 @@ const handleLabels = async (env: Env, payload: unknown): Promise<Response> => {
       }
     }
     snapshotBoundsCache.clear();
+  }
+
+  if (labelId != null) {
+    const sourceMeta = labelData?.snapshot_meta;
+    const sourceSession = sourceMeta?.session;
+    const sourceSample = sourceMeta?.sample;
+    const sourceRef = labelData?.source;
+
+    let snapshotIdxSource: Record<string, unknown> | null = null;
+    if (resolved.snapshotId != null) {
+      const sourceLookup = await env.DB.prepare(
+        `SELECT
+           build_version,
+           mode_id,
+           trigger,
+           lines_left,
+           level,
+           score,
+           device_id,
+           user_id
+         FROM snapshots_idx
+         WHERE snapshot_id = ?
+         LIMIT 1`,
+      )
+        .bind(resolved.snapshotId)
+        .all();
+      snapshotIdxSource = sourceLookup?.results?.[0] ?? null;
+    }
+
+    try {
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO labels_idx (
+          label_id,
+          created_at,
+          snapshot_id,
+          session_id,
+          sample_index,
+          batch_id,
+          source_build_version,
+          source_mode_id,
+          source_trigger,
+          source_lines_left,
+          source_level,
+          source_score,
+          source_device_id,
+          source_user_id,
+          intent_playstyle,
+          intent_mode_filter,
+          intent_trigger_filter,
+          intent_build_filter,
+          label_count,
+          labels_csv
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(
+          labelId,
+          createdAt,
+          resolved.snapshotId ??
+            asInt(sourceRef?.snapshotId) ??
+            asInt(sourceRef?.snapshot_id),
+          resolved.sessionId ?? asString(sourceRef?.sessionId),
+          resolved.sampleIndex ?? asInt(sourceRef?.sampleIndex),
+          resolved.batchId ??
+            asInt(sourceRef?.batchId) ??
+            asInt(sourceRef?.batch_id),
+          asString(snapshotIdxSource?.build_version) ??
+            asString(sourceSession?.buildVersion),
+          asString(snapshotIdxSource?.mode_id) ??
+            asString(sourceSession?.mode?.id),
+          asString(snapshotIdxSource?.trigger) ??
+            asString(sourceSample?.trigger),
+          asInt(snapshotIdxSource?.lines_left) ??
+            asInt(sourceSample?.linesLeft),
+          asInt(snapshotIdxSource?.level) ?? asInt(sourceSample?.level),
+          asInt(snapshotIdxSource?.score) ?? asInt(sourceSample?.score),
+          asString(snapshotIdxSource?.device_id) ??
+            asString(sourceSession?.device_id),
+          asString(snapshotIdxSource?.user_id) ??
+            asString(sourceSession?.user_id),
+          asString(labelData?.label_context?.playstyle),
+          asString(labelData?.label_context?.mode_filter),
+          asString(labelData?.label_context?.trigger_filter),
+          asString(labelData?.label_context?.build_filter),
+          parsedLabelValues.labelCount,
+          parsedLabelValues.labelsCsv,
+        )
+        .run();
+    } catch {
+      // Keep label ingestion resilient if labels_idx migration has not been applied yet.
+    }
   }
   labelProgressByBuildCache.clear();
 

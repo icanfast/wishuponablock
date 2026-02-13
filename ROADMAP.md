@@ -1,14 +1,14 @@
 Here is the list of features in the backlog, with corresponding "impact score" (1-5) — the importance of the feature in my judgment. Generally the more the score, the sooner I'll get to it
 ## Gameplay
 - Replays — 2 // lowered priority, blocked by personalization
-- Refiew top-out behaviour. Make it more lenient like in tetrio/jstris — 5
+- Refiew top-out behaviour. Make it more lenient like in tetrio/jstris — 5 — Won't fix, it is ok as is
 - Wish Upon a Bag — a less intrusive ML piece generator that shuffles the next 7 bag to try and help — 4
-- For Wish Upon a Block generator display the probabilities with which the piece was generated, basically the network outputs — 5
+- For Wish Upon a Block generator display the probabilities with which the piece was generated, basically the network outputs — 5 — DONE
 - For Wish Upon a Block generator maybe it is possible to display the most likely next piece. Will require completely new ML pipeline — 1
 - Bots — 2
 - RL bots and piece generators — 1
 - Change default softdrop from instant to increased gravity. Add softdrop slider — 5 — DONE
-- Curse Upon a Block, a generator that gives you the worst piece — 5
+- Curse Upon a Block, a generator that gives you the worst piece — 5 — DONE
 
 ## UI/UX
 - Patch Notes — 3
@@ -28,7 +28,8 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Labeling gameification — 5
     - Progress bar towards next checkpoint — DONE
 - Data quality (versioning, source vs labeling intent discrepancy, label balancing) — 5
-- Show active piece in labeling (and log it) — 5
+- Show active piece in labeling (and log it) — 5 — DONE
+- Show queue/odds in labeling tool, and log them — 5 — DONE
 
 ## Personalization
 - User authentication + profile + stats — 3

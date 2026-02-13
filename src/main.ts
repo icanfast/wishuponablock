@@ -311,7 +311,7 @@ async function boot() {
     transformOrigin: 'top left',
   });
   gameScreen.appendChild(gameUi.root);
-  gameUi.setQueueOddsMode(settings.generator.type === 'ml');
+  gameUi.setQueueOddsMode(usesModelGenerator(settings.generator.type));
 
   const formatSprintTime = (ms: number): string => {
     const totalMs = Math.max(0, Math.floor(ms));
@@ -369,7 +369,9 @@ async function boot() {
     onFrame: (state) => {
       updateSprintHud(state);
       updateClassicHud(state);
-      gameUi.setQueueOddsMode(settingsStore.get().generator.type === 'ml');
+      gameUi.setQueueOddsMode(
+        usesModelGenerator(settingsStore.get().generator.type),
+      );
       gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
       if (ended && !previousRunEnded) {
