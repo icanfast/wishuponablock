@@ -608,6 +608,20 @@ const handleSnapshots = async (
     )
     .run();
 
+  const buildKey = idx.buildVersion ?? 'unknown';
+  try {
+    await env.DB.prepare(
+      `INSERT INTO snapshot_build_counts (build_key, snapshot_count)
+       VALUES (?, 1)
+       ON CONFLICT(build_key) DO UPDATE
+       SET snapshot_count = snapshot_count + 1`,
+    )
+      .bind(buildKey)
+      .run();
+  } catch {
+    // Keep snapshot ingestion resilient if build-count migration has not been applied yet.
+  }
+
   buildCountsCache = null;
   snapshotBoundsCache.clear();
 
@@ -837,27 +851,49 @@ export default {
         if (buildCountsCache && buildCountsCache.expiresAt > now) {
           return jsonResponse({ builds: buildCountsCache.builds });
         }
-        const sql = `
-          SELECT
-            COALESCE(build_version, 'unknown') AS build,
-            COUNT(*) AS count
-          FROM snapshots_idx
-          GROUP BY COALESCE(build_version, 'unknown')
-        `;
-        const result = await env.DB.prepare(sql).all();
-        const builds = (result?.results ?? [])
-          .map((row) => ({
-            build:
-              typeof row.build === 'string' && row.build.trim()
-                ? row.build
-                : 'unknown',
-            count: asCount(row.count),
-          }))
-          .sort((a, b) => {
-            if (a.build === 'unknown') return 1;
-            if (b.build === 'unknown') return -1;
-            return a.build.localeCompare(b.build);
-          });
+        let builds: Array<{ build: string; count: number }> = [];
+        try {
+          const result = await env.DB.prepare(
+            `SELECT build_key AS build, snapshot_count AS count
+             FROM snapshot_build_counts`,
+          ).all();
+          builds = (result?.results ?? [])
+            .map((row) => ({
+              build:
+                typeof row.build === 'string' && row.build.trim()
+                  ? row.build
+                  : 'unknown',
+              count: asCount(row.count),
+            }))
+            .sort((a, b) => {
+              if (a.build === 'unknown') return 1;
+              if (b.build === 'unknown') return -1;
+              return a.build.localeCompare(b.build);
+            });
+        } catch {
+          // Fallback for pre-migration environments.
+          const fallbackSql = `
+            SELECT
+              COALESCE(build_version, 'unknown') AS build,
+              COUNT(*) AS count
+            FROM snapshots_idx
+            GROUP BY COALESCE(build_version, 'unknown')
+          `;
+          const result = await env.DB.prepare(fallbackSql).all();
+          builds = (result?.results ?? [])
+            .map((row) => ({
+              build:
+                typeof row.build === 'string' && row.build.trim()
+                  ? row.build
+                  : 'unknown',
+              count: asCount(row.count),
+            }))
+            .sort((a, b) => {
+              if (a.build === 'unknown') return 1;
+              if (b.build === 'unknown') return -1;
+              return a.build.localeCompare(b.build);
+            });
+        }
         buildCountsCache = {
           expiresAt: now + BUILD_COUNTS_CACHE_TTL_MS,
           builds,
