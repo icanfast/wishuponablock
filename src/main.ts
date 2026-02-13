@@ -48,6 +48,7 @@ function hasWebGL(): boolean {
 
 async function boot() {
   const APP_VERSION = pkg.version;
+  const GAME_SCREEN_Y_OFFSET = 20;
   if (!hasWebGL()) {
     document.body.innerHTML = `<div style="padding:16px;color:#fff;background:#000;height:100vh">
       WebGL is disabled/unavailable. Enable hardware acceleration.
@@ -85,6 +86,7 @@ async function boot() {
 
   const gameGfx = new Graphics();
   const toolGfx = new Graphics();
+  gameGfx.y = GAME_SCREEN_Y_OFFSET;
   gameGfx.visible = false;
   toolGfx.visible = false;
   app.stage.addChild(gameGfx);
@@ -300,7 +302,12 @@ async function boot() {
     generatorTypes: GENERATOR_TYPES,
     initialGeneratorType: settings.generator.type,
   });
+  Object.assign(gameUi.root.style, {
+    transform: `translateY(${GAME_SCREEN_Y_OFFSET}px)`,
+    transformOrigin: 'top left',
+  });
   gameScreen.appendChild(gameUi.root);
+  gameUi.setQueueOddsMode(settings.generator.type === 'ml');
 
   const formatSprintTime = (ms: number): string => {
     const totalMs = Math.max(0, Math.floor(ms));
@@ -358,6 +365,8 @@ async function boot() {
     onFrame: (state) => {
       updateSprintHud(state);
       updateClassicHud(state);
+      gameUi.setQueueOddsMode(settingsStore.get().generator.type === 'ml');
+      gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
       if (ended && !previousRunEnded) {
         void snapshotService?.flushRemoteUploads();

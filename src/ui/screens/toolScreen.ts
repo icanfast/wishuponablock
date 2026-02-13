@@ -9,6 +9,9 @@ import {
   OUTER_MARGIN,
   PANEL_GAP,
   PLAY_HEIGHT,
+  QUEUE_WIDTH,
+  QUEUE_X,
+  QUEUE_Y,
   ROWS,
   SETTINGS_PANEL_WIDTH,
   SETTINGS_X,
@@ -90,6 +93,22 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     pointerEvents: 'none',
   });
   toolLayer.appendChild(holdLabel);
+
+  const nextLabel = document.createElement('div');
+  nextLabel.textContent = 'NEXT';
+  Object.assign(nextLabel.style, {
+    position: 'absolute',
+    left: `${QUEUE_X}px`,
+    top: `${QUEUE_Y + 6}px`,
+    width: `${QUEUE_WIDTH}px`,
+    color: '#b6c2d4',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.5px',
+    textAlign: 'center',
+    pointerEvents: 'none',
+  });
+  toolLayer.appendChild(nextLabel);
 
   const toolPanelMaxHeight = Math.max(
     0,

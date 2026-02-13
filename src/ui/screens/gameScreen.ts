@@ -1,15 +1,18 @@
 import {
   BOARD_CELL_PX,
-  BOARD_X,
   BOARD_Y,
   COLS,
   GAME_OVER_Y,
   HOLD_WIDTH,
   HOLD_X,
   HOLD_Y,
+  NEXT_COUNT,
   OUTER_MARGIN,
   PANEL_GAP,
   PLAY_HEIGHT,
+  QUEUE_GAP_PX,
+  QUEUE_LABEL_HEIGHT,
+  QUEUE_PREVIEW_HEIGHT,
   QUEUE_WIDTH,
   QUEUE_X,
   QUEUE_Y,
@@ -19,6 +22,7 @@ import {
   SETTINGS_Y,
 } from '../../core/constants';
 import type { GeneratorType } from '../../core/generators';
+import type { PieceProbability } from '../../core/types';
 
 export type GameScreen = {
   root: HTMLDivElement;
@@ -40,6 +44,8 @@ export type GameScreen = {
   recordStatus: HTMLDivElement;
   manualButton: HTMLButtonElement;
   menuButton: HTMLButtonElement;
+  setQueueOddsMode: (enabled: boolean) => void;
+  setMlQueueProbabilities: (values: PieceProbability[]) => void;
 };
 
 type GameScreenOptions = {
@@ -127,6 +133,25 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
     pointerEvents: 'none',
   });
   root.appendChild(nextLabel);
+
+  const queueProbabilityLabels = Array.from({ length: NEXT_COUNT }, (_, i) => {
+    const label = document.createElement('div');
+    Object.assign(label.style, {
+      position: 'absolute',
+      left: `${QUEUE_X}px`,
+      top: `${QUEUE_Y + QUEUE_LABEL_HEIGHT + i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX) + QUEUE_PREVIEW_HEIGHT - 16}px`,
+      width: `${QUEUE_WIDTH}px`,
+      color: '#8fa0b8',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+      fontSize: '11px',
+      letterSpacing: '0.2px',
+      textAlign: 'center',
+      pointerEvents: 'none',
+      display: 'none',
+    });
+    root.appendChild(label);
+    return label;
+  });
 
   const gameOverLabel = document.createElement('div');
   gameOverLabel.textContent = 'GAME OVER';
@@ -390,13 +415,60 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
   const menuButton = makeOverlayButton('MENU');
   Object.assign(menuButton.style, {
     position: 'absolute',
-    left: `${BOARD_X}px`,
+    left: '50%',
+    transform: 'translateX(-50%)',
     top: `${BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP}px`,
     width: `${COLS * BOARD_CELL_PX}px`,
     pointerEvents: 'auto',
     zIndex: '2',
   });
   root.appendChild(menuButton);
+
+  const formatProbabilityPercent = (probability: number): string => {
+    const value = Number.isFinite(probability) ? Math.max(0, probability) : 0;
+    const percent = value * 100;
+    const withOneDecimal = percent.toFixed(1);
+    const compact = withOneDecimal.replace(/\.0$/, '');
+    return `${compact}%`;
+  };
+
+  const setMlQueueProbabilities = (values: PieceProbability[]) => {
+    if (!values.length) {
+      for (const label of queueProbabilityLabels) {
+        label.style.display = 'none';
+        label.textContent = '';
+      }
+      return;
+    }
+    const sorted = values
+      .slice()
+      .sort((a, b) => b.probability - a.probability)
+      .slice(0, NEXT_COUNT);
+    const queueFixedSlotCount = 4;
+    const fixedContentHeight =
+      queueFixedSlotCount * QUEUE_PREVIEW_HEIGHT +
+      (queueFixedSlotCount - 1) * QUEUE_GAP_PX;
+    const defaultStep = QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX;
+    const compressedStep =
+      (fixedContentHeight - QUEUE_PREVIEW_HEIGHT) / Math.max(1, NEXT_COUNT - 1);
+    const itemStep = Math.min(defaultStep, compressedStep);
+    for (let i = 0; i < queueProbabilityLabels.length; i += 1) {
+      const label = queueProbabilityLabels[i];
+      const entry = sorted[i];
+      if (!entry) {
+        label.style.display = 'none';
+        label.textContent = '';
+        continue;
+      }
+      label.style.top = `${QUEUE_Y + QUEUE_LABEL_HEIGHT + i * itemStep + QUEUE_PREVIEW_HEIGHT - 16}px`;
+      label.textContent = formatProbabilityPercent(entry.probability);
+      label.style.display = 'block';
+    }
+  };
+
+  const setQueueOddsMode = (enabled: boolean) => {
+    nextLabel.textContent = enabled ? 'PIECE ODDS' : 'NEXT';
+  };
 
   return {
     root,
@@ -418,5 +490,7 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
     recordStatus,
     manualButton,
     menuButton,
+    setQueueOddsMode,
+    setMlQueueProbabilities,
   };
 }

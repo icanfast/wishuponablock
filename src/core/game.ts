@@ -124,6 +124,7 @@ export class Game {
       hold: null,
       canHold: true,
       next: [],
+      mlQueueProbabilities: [],
       gameOver: false,
       gameWon: false,
       combo: 0,
@@ -144,6 +145,7 @@ export class Game {
     this.state.totalLinesCleared = 0;
     this.resetCheeseState();
     this.resetInitialBlocks();
+    this.updateMlQueueProbabilities();
     this.updateNextView();
     this.spawnActive(first);
   }
@@ -165,10 +167,12 @@ export class Game {
     if (this.generator.onLock) {
       this.generator.onLock(this.state.board, this.state.hold);
       const first = this.generator.next();
+      this.updateMlQueueProbabilities();
       this.updateNextView();
       this.spawnActive(first);
       return;
     }
+    this.state.mlQueueProbabilities = [];
     this.liftSpawnIfBlocked();
     this.recomputeGhost();
     if (collides(this.state.board, this.state.active)) {
@@ -309,6 +313,7 @@ export class Game {
     this.state.hold = null;
     this.state.canHold = true;
     this.state.next = [];
+    this.state.mlQueueProbabilities = [];
     this.state.gameOver = false;
     this.state.gameWon = false;
     this.state.combo = 0;
@@ -331,6 +336,7 @@ export class Game {
 
     this.generator.onLock?.(this.state.board, null);
     const first = this.generator.next();
+    this.updateMlQueueProbabilities();
     this.updateNextView();
     this.spawnActive(first);
   }
@@ -609,6 +615,7 @@ export class Game {
 
   private spawnNext(): void {
     const k = this.generator.next();
+    this.updateMlQueueProbabilities();
     this.updateNextView();
     this.spawnActive(k);
   }
@@ -676,6 +683,7 @@ export class Game {
 
     if (held == null) {
       this.state.hold = current;
+      this.generator.onLock?.(this.state.board, this.state.hold);
       this.spawnNext();
       this.onHold?.(this.state.board, this.state.hold);
       return;
@@ -692,6 +700,23 @@ export class Game {
 
   private updateNextView(): void {
     this.state.next = this.generator.peek(NEXT_COUNT);
+  }
+
+  private updateMlQueueProbabilities(): void {
+    const distribution = this.generator.getLastSampleDistribution?.();
+    if (!distribution?.length) {
+      this.state.mlQueueProbabilities = [];
+      return;
+    }
+    this.state.mlQueueProbabilities = distribution
+      .map((entry) => ({
+        piece: entry.piece,
+        probability: Number.isFinite(entry.probability)
+          ? Math.max(0, entry.probability)
+          : 0,
+      }))
+      .filter((entry) => entry.probability > 0)
+      .sort((a, b) => b.probability - a.probability);
   }
 
   private spawnActive(k: PieceKind): void {

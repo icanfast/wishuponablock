@@ -1,4 +1,4 @@
-import type { Board, PieceKind } from './types';
+import type { Board, PieceKind, PieceProbability } from './types';
 import { PIECES } from './types';
 import { XorShift32 } from './rng';
 import type { PieceGenerator } from './generator';
@@ -17,6 +17,8 @@ export class ModelGenerator implements PieceGenerator {
   private rng: XorShift32;
   private model: LoadedModel | null;
   private pending: PieceKind | null = null;
+  private pendingDistribution: PieceProbability[] | null = null;
+  private lastSampleDistribution: PieceProbability[] | null = null;
   private strategy: InferenceStrategy;
   private temperature: number;
   private threshold: number;
@@ -40,14 +42,21 @@ export class ModelGenerator implements PieceGenerator {
   reset(seed: number): void {
     this.rng = new XorShift32(seed);
     this.pending = null;
+    this.pendingDistribution = null;
+    this.lastSampleDistribution = null;
   }
 
   next(): PieceKind {
     if (this.pending) {
       const next = this.pending;
       this.pending = null;
+      this.lastSampleDistribution = this.pendingDistribution
+        ? this.pendingDistribution.map((entry) => ({ ...entry }))
+        : null;
+      this.pendingDistribution = null;
       return next;
     }
+    this.lastSampleDistribution = null;
     return this.sampleFallback();
   }
 
@@ -56,9 +65,15 @@ export class ModelGenerator implements PieceGenerator {
     return [];
   }
 
+  getLastSampleDistribution(): PieceProbability[] | null {
+    if (!this.lastSampleDistribution) return null;
+    return this.lastSampleDistribution.map((entry) => ({ ...entry }));
+  }
+
   onLock(board: Board, hold: PieceKind | null): void {
     if (!this.model) {
       this.pending = null;
+      this.pendingDistribution = null;
       return;
     }
     const logits = predictLogits(this.model, board, hold);
@@ -76,6 +91,10 @@ export class ModelGenerator implements PieceGenerator {
       }
     }
     const pieces = this.model.pieces ?? PIECES;
+    this.pendingDistribution = pieces.map((piece, index) => ({
+      piece,
+      probability: Number.isFinite(probs[index]) ? probs[index] : 0,
+    }));
     this.pending = pieces[this.sampleIndex(probs)] ?? PIECES[0];
   }
 

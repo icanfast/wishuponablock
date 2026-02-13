@@ -7,6 +7,11 @@ export type Vec2 = readonly [number, number];
 export type Cell = PieceKind | null;
 export type Board = Cell[][];
 
+export interface PieceProbability {
+  piece: PieceKind;
+  probability: number;
+}
+
 export interface ActivePiece {
   k: PieceKind;
   r: Rotation;
@@ -21,6 +26,7 @@ export interface GameState {
   hold: PieceKind | null;
   canHold: boolean;
   next: PieceKind[]; // preview window (derived from generator)
+  mlQueueProbabilities: PieceProbability[];
   gameOver: boolean;
   gameWon: boolean;
   combo: number;

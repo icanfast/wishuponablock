@@ -44,6 +44,7 @@ const BORDER_COLOR = 0x1f2a37;
 const BORDER_COLOR_HIGH = 0x334155;
 const BOARD_BORDER = 3;
 const PANEL_BORDER = 3;
+const QUEUE_FIXED_SLOT_COUNT = 4;
 
 export class PixiRenderer {
   constructor(
@@ -115,7 +116,11 @@ export class PixiRenderer {
 
     this.renderGridlines();
     this.renderHold(state);
-    this.renderQueue(state);
+    const queuePieces =
+      state.mlQueueProbabilities.length > 0
+        ? state.mlQueueProbabilities.map((entry) => entry.piece)
+        : state.next;
+    this.renderQueue(queuePieces);
 
     // settled blocks
     const outlineColor = this.getOutlineColor();
@@ -166,8 +171,12 @@ export class PixiRenderer {
     }
   }
 
-  renderBoardOnly(board: GameState['board'], hold?: PieceKind | null): void {
-    this.renderBoardPreview(board, hold, null, null);
+  renderBoardOnly(
+    board: GameState['board'],
+    hold?: PieceKind | null,
+    queuePieces: ReadonlyArray<PieceKind> = [],
+  ): void {
+    this.renderBoardPreview(board, hold, null, null, queuePieces);
   }
 
   renderBoardPreview(
@@ -175,6 +184,7 @@ export class PixiRenderer {
     hold: PieceKind | null | undefined,
     ghost: ActivePiece | null,
     active: ActivePiece | null = null,
+    queuePieces: ReadonlyArray<PieceKind> = [],
   ): void {
     const { gfx, cell, boardX, boardY } = this;
     gfx.clear();
@@ -196,6 +206,7 @@ export class PixiRenderer {
     if (hold !== undefined) {
       this.renderHoldPiece(hold);
     }
+    this.renderQueue(queuePieces);
 
     const outlineColor = this.getOutlineColor();
     for (let y = 0; y < ROWS; y++) {
@@ -275,15 +286,14 @@ export class PixiRenderer {
     );
   }
 
-  private renderQueue(state: GameState): void {
+  private renderQueue(queuePieces: ReadonlyArray<PieceKind>): void {
     const { gfx, cell } = this;
-    const count = Math.min(state.next.length, NEXT_COUNT);
-    if (count === 0) return;
+    const count = Math.min(queuePieces.length, NEXT_COUNT);
+    const fixedContentHeight =
+      QUEUE_FIXED_SLOT_COUNT * QUEUE_PREVIEW_HEIGHT +
+      (QUEUE_FIXED_SLOT_COUNT - 1) * QUEUE_GAP_PX;
 
-    const panelHeight =
-      QUEUE_LABEL_HEIGHT +
-      count * QUEUE_PREVIEW_HEIGHT +
-      (count - 1) * QUEUE_GAP_PX;
+    const panelHeight = QUEUE_LABEL_HEIGHT + fixedContentHeight;
     const panelWidth = QUEUE_COLS * cell;
     const borderColor = this.getBorderColor();
     const panelFill = this.getPanelFill();
@@ -301,13 +311,14 @@ export class PixiRenderer {
     gfx.rect(QUEUE_X, QUEUE_Y, panelWidth, QUEUE_LABEL_HEIGHT).fill(labelFill);
 
     const offsetX = Math.floor((QUEUE_COLS - 4) / 2) * cell;
+    const defaultStep = QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX;
+    const compressedStep =
+      (fixedContentHeight - QUEUE_PREVIEW_HEIGHT) / Math.max(1, NEXT_COUNT - 1);
+    const itemStep = Math.min(defaultStep, compressedStep);
 
     for (let i = 0; i < count; i++) {
-      const kind = state.next[i];
-      const boxY =
-        QUEUE_Y +
-        QUEUE_LABEL_HEIGHT +
-        i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX);
+      const kind = queuePieces[i];
+      const boxY = QUEUE_Y + QUEUE_LABEL_HEIGHT + i * itemStep;
       this.drawPreviewPiece(
         kind,
         QUEUE_X + offsetX,
