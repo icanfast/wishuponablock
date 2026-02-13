@@ -26,7 +26,7 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 - Different generators for pro and noob — 2 // lowered priority, too much data required
 - Replace softmax with threshold + flatter normalization - 3
 - Labeling gameification — 5
-    - Progress bar towards next checkpoint
+    - Progress bar towards next checkpoint — DONE
 - Data quality (versioning, source vs labeling intent discrepancy, label balancing) — 5
 - Show active piece in labeling (and log it) — 5
 

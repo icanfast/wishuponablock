@@ -26,6 +26,12 @@ type LabelingToolOptions = {
 type Playstyle = 'beginner' | 'advanced';
 
 const PLAYSTYLE_STORAGE_KEY = 'wub.labeler.playstyle';
+const VIRTUAL_SESSION_SIZE = 100;
+const REMOTE_RECENT_SESSION_WINDOW = 4;
+const REMOTE_RECENT_SNAPSHOT_WINDOW = 6;
+const LOCAL_RECENT_SAMPLE_WINDOW = 6;
+const LOCAL_RECENT_SESSION_WINDOW = 3;
+const MAX_PICK_ATTEMPTS = 24;
 
 export function createLabelingTool(
   options: LabelingToolOptions,
@@ -89,6 +95,11 @@ export function createLabelingTool(
   }> = [];
   let remoteBuildCounts: Array<{ build: string; count: number }> | null = null;
   let remoteBuildLoading = false;
+  let recentRemoteSnapshotIds: number[] = [];
+  let recentRemoteSessionIds: string[] = [];
+  let recentLocalSampleKeys: string[] = [];
+  let recentLocalSessionIds: string[] = [];
+  let recentLocalBatchKeys: string[] = [];
   const triggerLabel = (trigger: TriggerFilter): string => {
     switch (trigger) {
       case 'manual':
@@ -219,6 +230,22 @@ export function createLabelingTool(
 
   const encodeBoardString = (raw: number[][]): string =>
     raw.map((row) => row.join('')).join('/');
+
+  const sampleBatchId = (index: number): number | null => {
+    if (!Number.isFinite(index)) return null;
+    if (index < 0) return null;
+    return Math.floor(index / VIRTUAL_SESSION_SIZE);
+  };
+
+  const pushRecentUnique = <T>(
+    list: T[],
+    value: T | null | undefined,
+    limit: number,
+  ): void => {
+    if (value == null) return;
+    const next = [value, ...list.filter((entry) => entry !== value)];
+    list.splice(0, list.length, ...next.slice(0, Math.max(1, limit)));
+  };
 
   const requestDirectoryAccess = async (
     handle: FileSystemDirectoryHandle,
@@ -536,6 +563,9 @@ export function createLabelingTool(
 
   const fetchRemoteSample = async (): Promise<{
     snapshotId: number | null;
+    sessionId: string | null;
+    batchId: number | null;
+    sampleIndex: number;
     session: SnapshotSession;
   } | null> => {
     const url = buildToolApiUrl('/snapshots/random');
@@ -548,12 +578,26 @@ export function createLabelingTool(
     if (toolBuildFilter !== 'all') {
       url.searchParams.set('build', toolBuildFilter);
     }
+    if (recentRemoteSnapshotIds.length > 0) {
+      url.searchParams.set(
+        'exclude_snapshot_ids',
+        recentRemoteSnapshotIds.join(','),
+      );
+    }
+    if (recentRemoteSessionIds.length > 0) {
+      url.searchParams.set(
+        'exclude_session_ids',
+        recentRemoteSessionIds.join(','),
+      );
+    }
     const res = await fetch(url.toString());
     if (!res.ok) {
       return null;
     }
     const payload = (await res.json()) as {
       id?: number | string;
+      sessionId?: string | null;
+      batchId?: number | string | null;
       createdAt?: string;
       meta?: {
         session?: SnapshotSession['meta'];
@@ -611,13 +655,37 @@ export function createLabelingTool(
         : typeof payload.id === 'string' && payload.id.trim()
           ? Number.parseInt(payload.id, 10)
           : null;
+    const sessionId =
+      typeof payload.sessionId === 'string' && payload.sessionId.trim()
+        ? payload.sessionId
+        : typeof sessionMeta.id === 'string' && sessionMeta.id.trim()
+          ? sessionMeta.id
+          : null;
+    const batchIdRaw =
+      typeof payload.batchId === 'number' && Number.isFinite(payload.batchId)
+        ? Math.trunc(payload.batchId)
+        : typeof payload.batchId === 'string' && payload.batchId.trim()
+          ? Number.parseInt(payload.batchId, 10)
+          : null;
+    const batchId = Number.isFinite(batchIdRaw)
+      ? (batchIdRaw as number)
+      : sampleBatchId(sample.index);
     return {
       snapshotId: Number.isFinite(snapshotId) ? snapshotId : null,
+      sessionId,
+      batchId,
+      sampleIndex: sample.index,
       session,
     };
   };
 
   const applyToolFilters = async () => {
+    recentRemoteSnapshotIds = [];
+    recentRemoteSessionIds = [];
+    recentLocalSampleKeys = [];
+    recentLocalSessionIds = [];
+    recentLocalBatchKeys = [];
+
     if (toolUsesRemote) {
       const filterLabel =
         toolModeFilter === 'all' ? 'All Modes' : getModeLabel(toolModeFilter);
@@ -666,7 +734,20 @@ export function createLabelingTool(
 
   const showNextToolSample = async (): Promise<void> => {
     if (toolUsesRemote) {
-      const remote = await fetchRemoteSample();
+      let remote: Awaited<ReturnType<typeof fetchRemoteSample>> = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        remote = await fetchRemoteSample();
+        if (!remote) break;
+        const sessionId = remote.sessionId;
+        const snapshotId = remote.snapshotId;
+        const seenSession =
+          sessionId != null && recentRemoteSessionIds.includes(sessionId);
+        const seenSnapshot =
+          snapshotId != null && recentRemoteSnapshotIds.includes(snapshotId);
+        if (!seenSession && !seenSnapshot) {
+          break;
+        }
+      }
       if (!remote || remote.session.samples.length === 0) {
         currentSample = null;
         updateToolSampleStatus('Sample: -');
@@ -682,6 +763,19 @@ export function createLabelingTool(
       const hold = decodeHold(sample.hold, session.meta.pieceOrder);
       const active = decodeActive(sample.active, session.meta.pieceOrder);
       const fileName = `remote:${session.meta.id ?? 'unknown'}`;
+      const sessionId =
+        remote.sessionId ??
+        (typeof session.meta.id === 'string' ? session.meta.id : null);
+      pushRecentUnique(
+        recentRemoteSnapshotIds,
+        remote.snapshotId,
+        REMOTE_RECENT_SNAPSHOT_WINDOW,
+      );
+      pushRecentUnique(
+        recentRemoteSessionIds,
+        sessionId,
+        REMOTE_RECENT_SESSION_WINDOW,
+      );
       currentSample = {
         file: { name: fileName, session },
         index: sample.index,
@@ -715,8 +809,34 @@ export function createLabelingTool(
       }
       return;
     }
-    const pick = Math.floor(Math.random() * toolTotalSamples);
-    const target = toolSampleIndex[pick];
+    let target: (typeof toolSampleIndex)[number] | undefined;
+    for (let attempt = 0; attempt < MAX_PICK_ATTEMPTS; attempt += 1) {
+      const pick = Math.floor(Math.random() * toolTotalSamples);
+      const candidate = toolSampleIndex[pick];
+      if (!candidate) continue;
+      const file = candidate.file;
+      const sessionId = file.session.meta.id ?? file.name;
+      const sampleIndex = candidate.index;
+      const key = `${file.name}#${sampleIndex}`;
+      const batchId = sampleBatchId(sampleIndex);
+      const batchKey =
+        batchId == null ? null : `${sessionId}::b${Math.trunc(batchId)}`;
+      const seenSample = recentLocalSampleKeys.includes(key);
+      const seenSession = recentLocalSessionIds.includes(sessionId);
+      const seenBatch =
+        batchKey != null && recentLocalBatchKeys.includes(batchKey);
+      if (!seenSample && !seenSession && !seenBatch) {
+        target = candidate;
+        break;
+      }
+      if (!target && !seenSample) {
+        target = candidate;
+      }
+    }
+    if (!target) {
+      const pick = Math.floor(Math.random() * toolTotalSamples);
+      target = toolSampleIndex[pick];
+    }
     if (!target) {
       updateToolSampleStatus('Sample: -');
       return;
@@ -728,6 +848,25 @@ export function createLabelingTool(
     const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
     const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
     const active = decodeActive(sample.active, file.session.meta.pieceOrder);
+    const sessionId = file.session.meta.id ?? file.name;
+    const batchId = sampleBatchId(indexInFile);
+    pushRecentUnique(
+      recentLocalSampleKeys,
+      `${file.name}#${indexInFile}`,
+      LOCAL_RECENT_SAMPLE_WINDOW,
+    );
+    pushRecentUnique(
+      recentLocalSessionIds,
+      sessionId,
+      LOCAL_RECENT_SESSION_WINDOW,
+    );
+    if (batchId != null) {
+      pushRecentUnique(
+        recentLocalBatchKeys,
+        `${sessionId}::b${batchId}`,
+        LOCAL_RECENT_SAMPLE_WINDOW,
+      );
+    }
     currentSample = {
       file,
       index: indexInFile,

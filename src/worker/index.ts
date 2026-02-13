@@ -136,6 +136,42 @@ const appendFilterClause = (
   params: [...filter.params],
 });
 
+const appendFilterClauseWithParams = (
+  filter: SnapshotFilterSql,
+  clause: string,
+  params: unknown[],
+): SnapshotFilterSql => ({
+  where: filter.where ? `${filter.where} AND ${clause}` : ` WHERE ${clause}`,
+  params: [...filter.params, ...params],
+});
+
+const parseCsvInts = (value: string | null, maxItems = 12): number[] => {
+  if (!value) return [];
+  const out: number[] = [];
+  for (const part of value.split(',')) {
+    if (out.length >= maxItems) break;
+    const parsed = asInt(part);
+    if (parsed == null) continue;
+    if (parsed <= 0) continue;
+    if (out.includes(parsed)) continue;
+    out.push(parsed);
+  }
+  return out;
+};
+
+const parseCsvStrings = (value: string | null, maxItems = 12): string[] => {
+  if (!value) return [];
+  const out: string[] = [];
+  for (const part of value.split(',')) {
+    if (out.length >= maxItems) break;
+    const normalized = part.trim();
+    if (!normalized) continue;
+    if (out.includes(normalized)) continue;
+    out.push(normalized);
+  }
+  return out;
+};
+
 const randomInt = (min: number, max: number): number => {
   if (max <= min) return min;
   return min + Math.floor(Math.random() * (max - min + 1));
@@ -147,13 +183,14 @@ const snapshotFilterCacheKey = (mode: string, trigger: string, build: string) =>
 const readSnapshotByFilter = async (
   env: Env,
   filter: SnapshotFilterSql,
-  filterKey: string,
+  filterKey: string | null,
 ): Promise<Record<string, unknown> | null> => {
   const now = Date.now();
   let minId: number | null = null;
   let maxId: number | null = null;
-  const cachedBounds = snapshotBoundsCache.get(filterKey);
-  if (cachedBounds && cachedBounds.expiresAt > now) {
+  const cachedBounds =
+    filterKey != null ? snapshotBoundsCache.get(filterKey) : undefined;
+  if (filterKey != null && cachedBounds && cachedBounds.expiresAt > now) {
     minId = cachedBounds.minId;
     maxId = cachedBounds.maxId;
   } else {
@@ -170,7 +207,7 @@ const readSnapshotByFilter = async (
     const boundsRow = boundsResult?.results?.[0];
     minId = asInt(boundsRow?.min_id);
     maxId = asInt(boundsRow?.max_id);
-    if (minId != null && maxId != null) {
+    if (filterKey != null && minId != null && maxId != null) {
       if (snapshotBoundsCache.size > 128) {
         snapshotBoundsCache.clear();
       }
@@ -189,7 +226,13 @@ const readSnapshotByFilter = async (
   const pivot = randomInt(minId, maxId);
   const seekWherePrefix = filter.where ? `${filter.where} AND` : ' WHERE';
   const seekFromPivotSql = `
-    SELECT s.id, s.created_at, s.meta, s.board
+    SELECT
+      s.id,
+      s.created_at,
+      s.meta,
+      s.board,
+      idx.session_id,
+      idx.batch_id
     FROM snapshots_idx idx
     JOIN snapshots s ON s.id = idx.snapshot_id
     ${seekWherePrefix} idx.snapshot_id >= ?
@@ -202,7 +245,13 @@ const readSnapshotByFilter = async (
   let row = result?.results?.[0];
   if (!row) {
     const wrapSql = `
-      SELECT s.id, s.created_at, s.meta, s.board
+      SELECT
+        s.id,
+        s.created_at,
+        s.meta,
+        s.board,
+        idx.session_id,
+        idx.batch_id
       FROM snapshots_idx idx
       JOIN snapshots s ON s.id = idx.snapshot_id
       ${seekWherePrefix} idx.snapshot_id < ?
@@ -649,7 +698,35 @@ export default {
         const mode = url.searchParams.get('mode') ?? 'all';
         const trigger = url.searchParams.get('trigger') ?? 'all';
         const build = url.searchParams.get('build') ?? 'all';
-        const filter = buildSnapshotFilterSql(mode, trigger, build);
+        const excludeSnapshotIds = parseCsvInts(
+          url.searchParams.get('exclude_snapshot_ids') ??
+            url.searchParams.get('excludeSnapshotIds'),
+        );
+        const excludeSessionIds = parseCsvStrings(
+          url.searchParams.get('exclude_session_ids') ??
+            url.searchParams.get('excludeSessionIds'),
+        );
+
+        const hasExclusions =
+          excludeSnapshotIds.length > 0 || excludeSessionIds.length > 0;
+
+        let filter = buildSnapshotFilterSql(mode, trigger, build);
+        if (excludeSnapshotIds.length > 0) {
+          const placeholders = excludeSnapshotIds.map(() => '?').join(', ');
+          filter = appendFilterClauseWithParams(
+            filter,
+            `idx.snapshot_id NOT IN (${placeholders})`,
+            excludeSnapshotIds,
+          );
+        }
+        if (excludeSessionIds.length > 0) {
+          const placeholders = excludeSessionIds.map(() => '?').join(', ');
+          filter = appendFilterClauseWithParams(
+            filter,
+            `(idx.session_id IS NULL OR idx.session_id NOT IN (${placeholders}))`,
+            excludeSessionIds,
+          );
+        }
         const filterKey = snapshotFilterCacheKey(mode, trigger, build);
         const unlabeledFilter = appendFilterClause(
           filter,
@@ -658,10 +735,34 @@ export default {
         let row = await readSnapshotByFilter(
           env,
           unlabeledFilter,
-          `${filterKey}|unlabeled`,
+          hasExclusions ? null : `${filterKey}|unlabeled`,
         );
         if (!row) {
-          row = await readSnapshotByFilter(env, filter, `${filterKey}|all`);
+          row = await readSnapshotByFilter(
+            env,
+            filter,
+            hasExclusions ? null : `${filterKey}|all`,
+          );
+        }
+
+        if (!row && hasExclusions) {
+          const baseFilter = buildSnapshotFilterSql(mode, trigger, build);
+          const baseUnlabeledFilter = appendFilterClause(
+            baseFilter,
+            'COALESCE(idx.label_count, 0) = 0',
+          );
+          row = await readSnapshotByFilter(
+            env,
+            baseUnlabeledFilter,
+            `${filterKey}|unlabeled`,
+          );
+          if (!row) {
+            row = await readSnapshotByFilter(
+              env,
+              baseFilter,
+              `${filterKey}|all`,
+            );
+          }
         }
         if (!row) {
           return jsonResponse({ error: 'No snapshots available.' }, 404);
@@ -677,6 +778,11 @@ export default {
         return jsonResponse({
           id: row.id,
           createdAt: row.created_at,
+          sessionId:
+            typeof row.session_id === 'string' && row.session_id.trim()
+              ? row.session_id
+              : null,
+          batchId: asInt(row.batch_id),
           meta,
           board,
         });
