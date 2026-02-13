@@ -87,7 +87,7 @@ export function createLabelingTool(
   let toolTriggerFilter: TriggerFilter = 'all';
   const defaultBuildFilter = buildVersion?.trim() ? buildVersion : 'all';
   let toolBuildFilter = defaultBuildFilter;
-  let toolGeneratorFilter = 'all';
+  let toolGeneratorFilter = 'ml';
   let toolActive = false;
   let playstyle: Playstyle = 'beginner';
   let currentSample: {
