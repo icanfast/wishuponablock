@@ -6,8 +6,12 @@ import {
   HOLD_WIDTH,
   HOLD_X,
   HOLD_Y,
+  NEXT_COUNT,
   OUTER_MARGIN,
   PANEL_GAP,
+  QUEUE_GAP_PX,
+  QUEUE_LABEL_HEIGHT,
+  QUEUE_PREVIEW_HEIGHT,
   PLAY_HEIGHT,
   QUEUE_WIDTH,
   QUEUE_X,
@@ -17,7 +21,11 @@ import {
   SETTINGS_X,
   SETTINGS_Y,
 } from '../../core/constants';
-import { PIECES, type PieceKind } from '../../core/types';
+import {
+  PIECES,
+  type PieceKind,
+  type PieceProbability,
+} from '../../core/types';
 import { TETROMINOES } from '../../core/tetromino';
 import { PIECE_COLORS, type PiecePalette } from '../../core/palette';
 
@@ -44,6 +52,8 @@ export type ToolScreen = {
   nextButton: HTMLButtonElement;
   pieceButtons: Map<PieceKind, HTMLButtonElement>;
   setPiecePalette: (palette: PiecePalette) => void;
+  setQueueOddsMode: (enabled: boolean) => void;
+  setQueueProbabilities: (values: PieceProbability[]) => void;
 };
 
 type ToolScreenOptions = {
@@ -109,6 +119,25 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     pointerEvents: 'none',
   });
   toolLayer.appendChild(nextLabel);
+
+  const queueProbabilityLabels = Array.from({ length: NEXT_COUNT }, (_, i) => {
+    const label = document.createElement('div');
+    Object.assign(label.style, {
+      position: 'absolute',
+      left: `${QUEUE_X}px`,
+      top: `${QUEUE_Y + QUEUE_LABEL_HEIGHT + i * (QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX) + QUEUE_PREVIEW_HEIGHT - 16}px`,
+      width: `${QUEUE_WIDTH}px`,
+      color: '#8fa0b8',
+      fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+      fontSize: '11px',
+      letterSpacing: '0.2px',
+      textAlign: 'center',
+      pointerEvents: 'none',
+      display: 'none',
+    });
+    toolLayer.appendChild(label);
+    return label;
+  });
 
   const toolPanelMaxHeight = Math.max(
     0,
@@ -445,6 +474,52 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     }
   };
 
+  const formatProbabilityPercent = (probability: number): string => {
+    const value = Number.isFinite(probability) ? Math.max(0, probability) : 0;
+    const percent = value * 100;
+    const withOneDecimal = percent.toFixed(1);
+    const compact = withOneDecimal.replace(/\.0$/, '');
+    return `${compact}%`;
+  };
+
+  const setQueueProbabilities = (values: PieceProbability[]) => {
+    if (!values.length) {
+      for (const label of queueProbabilityLabels) {
+        label.style.display = 'none';
+        label.textContent = '';
+      }
+      return;
+    }
+    const sorted = values
+      .slice()
+      .sort((a, b) => b.probability - a.probability)
+      .slice(0, NEXT_COUNT);
+    const queueFixedSlotCount = 4;
+    const fixedContentHeight =
+      queueFixedSlotCount * QUEUE_PREVIEW_HEIGHT +
+      (queueFixedSlotCount - 1) * QUEUE_GAP_PX;
+    const defaultStep = QUEUE_PREVIEW_HEIGHT + QUEUE_GAP_PX;
+    const compressedStep =
+      (fixedContentHeight - QUEUE_PREVIEW_HEIGHT) / Math.max(1, NEXT_COUNT - 1);
+    const itemStep = Math.min(defaultStep, compressedStep);
+    for (let i = 0; i < queueProbabilityLabels.length; i += 1) {
+      const label = queueProbabilityLabels[i];
+      const entry = sorted[i];
+      if (!entry) {
+        label.style.display = 'none';
+        label.textContent = '';
+        continue;
+      }
+      label.style.top = `${QUEUE_Y + QUEUE_LABEL_HEIGHT + i * itemStep + QUEUE_PREVIEW_HEIGHT - 16}px`;
+      label.textContent = formatProbabilityPercent(entry.probability);
+      label.style.display = 'block';
+    }
+  };
+
+  const setQueueOddsMode = (enabled: boolean) => {
+    nextLabel.textContent = enabled ? 'PIECE ODDS' : 'NEXT';
+  };
+
   return {
     root: toolLayer,
     panel: toolPanel,
@@ -468,5 +543,7 @@ export function createToolScreen(options: ToolScreenOptions): ToolScreen {
     nextButton: toolNextButton,
     pieceButtons: toolPieceButtons,
     setPiecePalette,
+    setQueueOddsMode,
+    setQueueProbabilities,
   };
 }

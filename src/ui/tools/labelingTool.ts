@@ -1,5 +1,6 @@
 import { getMode, normalizeModeId } from '../../core/modes';
 import { SPAWN_X, SPAWN_Y } from '../../core/constants';
+import { collides } from '../../core/piece';
 import type {
   SnapshotSession,
   SnapshotSample,
@@ -11,6 +12,7 @@ import {
   type ActivePiece,
   type Board,
   type PieceKind,
+  type PieceProbability,
 } from '../../core/types';
 import { createToolScreen } from '../screens/toolScreen';
 import type { ToolController } from './toolHost';
@@ -93,6 +95,7 @@ export function createLabelingTool(
     hold: PieceKind | null;
     active?: ActivePiece | null;
     queuePieces: PieceKind[];
+    queueOdds: PieceProbability[];
     snapshotId?: number;
     timeMs?: number;
     trigger?: SnapshotSample['trigger'];
@@ -222,6 +225,7 @@ export function createLabelingTool(
 
   const decodeActive = (
     active: unknown,
+    board: Board,
     order?: readonly string[],
   ): ActivePiece | null => {
     if (!active || typeof active !== 'object') return null;
@@ -234,20 +238,24 @@ export function createLabelingTool(
     const piece = decodePiece(source.k, order);
     if (!piece) return null;
     // Labeling view normalizes active display to spawn pose for consistency.
-    return {
+    const normalized: ActivePiece = {
       k: piece,
       r: 0,
       x: SPAWN_X,
       y: SPAWN_Y,
     };
+    if (!collides(board, normalized, normalized.r, 0, 1)) {
+      normalized.y += 1;
+    }
+    return normalized;
   };
 
-  const decodeQueuePieces = (
+  const decodeQueueOdds = (
     sample: SnapshotSample,
     order?: readonly string[],
-  ): PieceKind[] => {
+  ): PieceProbability[] => {
     const oddsEntries = Array.isArray(sample.odds) ? sample.odds : [];
-    const fromOdds = oddsEntries
+    return oddsEntries
       .map((entry) => {
         if (!entry || typeof entry !== 'object') return null;
         const source = entry as { k?: unknown; p?: unknown };
@@ -255,17 +263,20 @@ export function createLabelingTool(
         if (!piece) return null;
         const probability =
           typeof source.p === 'number' && Number.isFinite(source.p)
-            ? source.p
+            ? Math.max(0, source.p)
             : 0;
         if (probability <= 0) return null;
         return { piece, probability };
       })
-      .filter(
-        (entry): entry is { piece: PieceKind; probability: number } =>
-          entry != null,
-      )
-      .sort((a, b) => b.probability - a.probability)
-      .map((entry) => entry.piece);
+      .filter((entry): entry is PieceProbability => entry != null)
+      .sort((a, b) => b.probability - a.probability);
+  };
+
+  const decodeQueuePieces = (
+    sample: SnapshotSample,
+    order?: readonly string[],
+  ): PieceKind[] => {
+    const fromOdds = decodeQueueOdds(sample, order).map((entry) => entry.piece);
     if (fromOdds.length > 0) return fromOdds;
 
     const nextPieces = Array.isArray(sample.next) ? sample.next : [];
@@ -959,6 +970,8 @@ export function createLabelingTool(
         updateToolSampleStatus('Sample: -');
         if (toolActive) {
           canvas.clear();
+          toolUi.setQueueOddsMode(false);
+          toolUi.setQueueProbabilities([]);
         }
         return;
       }
@@ -967,8 +980,13 @@ export function createLabelingTool(
       const rawBoard = sample.board;
       const board = decodeBoard(rawBoard, session.meta.pieceOrder);
       const hold = decodeHold(sample.hold, session.meta.pieceOrder);
-      const active = decodeActive(sample.active, session.meta.pieceOrder);
+      const active = decodeActive(
+        sample.active,
+        board,
+        session.meta.pieceOrder,
+      );
       const queuePieces = decodeQueuePieces(sample, session.meta.pieceOrder);
+      const queueOdds = decodeQueueOdds(sample, session.meta.pieceOrder);
       const fileName = `remote:${session.meta.id ?? 'unknown'}`;
       const sessionId =
         remote.sessionId ??
@@ -991,6 +1009,7 @@ export function createLabelingTool(
         hold,
         active,
         queuePieces,
+        queueOdds,
         snapshotId: remote.snapshotId ?? undefined,
         timeMs: sample.timeMs,
         trigger: sample.trigger,
@@ -1006,6 +1025,8 @@ export function createLabelingTool(
       clearLabelSelection();
       if (toolActive) {
         canvas.render(board, hold, undefined, active, queuePieces);
+        toolUi.setQueueOddsMode(queueOdds.length > 0);
+        toolUi.setQueueProbabilities(queueOdds);
       }
       if (remoteSampleQueue.length < REMOTE_PREFETCH_MIN_QUEUE) {
         void ensureRemotePrefetch(REMOTE_PREFETCH_MIN_QUEUE);
@@ -1017,6 +1038,8 @@ export function createLabelingTool(
       updateToolSampleStatus('Sample: -');
       if (toolActive) {
         canvas.clear();
+        toolUi.setQueueOddsMode(false);
+        toolUi.setQueueProbabilities([]);
       }
       return;
     }
@@ -1049,7 +1072,13 @@ export function createLabelingTool(
       target = toolSampleIndex[pick];
     }
     if (!target) {
+      currentSample = null;
       updateToolSampleStatus('Sample: -');
+      if (toolActive) {
+        canvas.clear();
+        toolUi.setQueueOddsMode(false);
+        toolUi.setQueueProbabilities([]);
+      }
       return;
     }
     const file = target.file;
@@ -1058,8 +1087,13 @@ export function createLabelingTool(
     const rawBoard = sample.board;
     const board = decodeBoard(rawBoard, file.session.meta.pieceOrder);
     const hold = decodeHold(sample.hold, file.session.meta.pieceOrder);
-    const active = decodeActive(sample.active, file.session.meta.pieceOrder);
+    const active = decodeActive(
+      sample.active,
+      board,
+      file.session.meta.pieceOrder,
+    );
     const queuePieces = decodeQueuePieces(sample, file.session.meta.pieceOrder);
+    const queueOdds = decodeQueueOdds(sample, file.session.meta.pieceOrder);
     const sessionId = file.session.meta.id ?? file.name;
     const batchId = sampleBatchId(indexInFile);
     pushRecentUnique(
@@ -1087,6 +1121,7 @@ export function createLabelingTool(
       hold,
       active,
       queuePieces,
+      queueOdds,
       timeMs: sample.timeMs,
       trigger: sample.trigger,
       linesLeft: sample.linesLeft,
@@ -1102,6 +1137,8 @@ export function createLabelingTool(
     clearLabelSelection();
     if (toolActive) {
       canvas.render(board, hold, undefined, active, queuePieces);
+      toolUi.setQueueOddsMode(queueOdds.length > 0);
+      toolUi.setQueueProbabilities(queueOdds);
     }
   };
 
@@ -1291,6 +1328,8 @@ export function createLabelingTool(
         await showNextToolSample();
       } else {
         canvas.clear();
+        toolUi.setQueueOddsMode(false);
+        toolUi.setQueueProbabilities([]);
       }
       return;
     }
@@ -1301,6 +1340,8 @@ export function createLabelingTool(
       currentSample.active ?? null,
       currentSample.queuePieces,
     );
+    toolUi.setQueueOddsMode(currentSample.queueOdds.length > 0);
+    toolUi.setQueueProbabilities(currentSample.queueOdds);
   };
 
   return {
