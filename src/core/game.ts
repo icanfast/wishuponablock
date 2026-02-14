@@ -6,6 +6,8 @@ import {
   DEFAULT_SOFT_DROP_MS,
   NEXT_COUNT,
   ROWS,
+  SPAWN_DANGER_HARD_LOCK_DELAY_BONUS_MS,
+  SPAWN_DANGER_LOCK_DELAY_BONUS_MS,
   SPAWN_X,
   SPAWN_Y,
 } from './constants';
@@ -82,6 +84,8 @@ export class Game {
   private softDropMs: number;
   private lockDelayMs: number;
   private hardLockDelayMs: number;
+  private activeLockDelayMs: number;
+  private activeHardLockDelayMs: number;
   private onPieceLock?: (board: Board, hold: PieceKind | null) => void;
   private onHold?: (board: Board, hold: PieceKind | null) => void;
   private onLineClear?: (combo: number, clearedLines: number) => void;
@@ -93,6 +97,8 @@ export class Game {
     this.softDropMs = cfg.softDropMs ?? DEFAULT_SOFT_DROP_MS;
     this.lockDelayMs = cfg.lockDelayMs ?? DEFAULT_LOCK_DELAY_MS;
     this.hardLockDelayMs = cfg.hardLockDelayMs ?? DEFAULT_HARD_LOCK_DELAY_MS;
+    this.activeLockDelayMs = this.lockDelayMs;
+    this.activeHardLockDelayMs = this.hardLockDelayMs;
     this.lockNudgeRate = clamp01(cfg.lockNudgeRate ?? 0);
     this.gravityDropRate = clamp01(cfg.gravityDropRate ?? 0);
     this.lockRotateRate = clamp01(cfg.lockRotateRate ?? 0);
@@ -277,8 +283,8 @@ export class Game {
       this.lockAcc += dtMs;
       this.hardLockAcc += dtMs;
       if (
-        this.lockAcc >= this.lockDelayMs ||
-        this.hardLockAcc >= this.hardLockDelayMs
+        this.lockAcc >= this.activeLockDelayMs ||
+        this.hardLockAcc >= this.activeHardLockDelayMs
       ) {
         if (this.tryButterfingerNudge()) {
           this.recomputeGhost();
@@ -683,6 +689,9 @@ export class Game {
 
     if (held == null) {
       this.state.hold = current;
+      this.gravityAcc = 0;
+      this.lockAcc = 0;
+      this.hardLockAcc = 0;
       this.generator.onLock?.(this.state.board, this.state.hold);
       this.spawnNext();
       this.onHold?.(this.state.board, this.state.hold);
@@ -721,10 +730,13 @@ export class Game {
 
   private spawnActive(k: PieceKind): void {
     this.state.active = { k, r: 0, x: SPAWN_X, y: SPAWN_Y };
+    this.activeLockDelayMs = this.lockDelayMs;
+    this.activeHardLockDelayMs = this.hardLockDelayMs;
     this.softDropHeld = false;
     this.softDropSegmentCells = 0;
     this.softDropLastSegmentCells = 0;
     this.liftSpawnIfBlocked();
+    this.applySpawnDangerDelayBonus();
     this.recomputeGhost();
     if (collides(this.state.board, this.state.active)) {
       this.state.gameOver = true;
@@ -736,6 +748,22 @@ export class Game {
       if (!collides(this.state.board, this.state.active)) return;
       this.state.active.y -= 1;
     }
+  }
+
+  private applySpawnDangerDelayBonus(): void {
+    const spawnedAboveField = cellsOf(this.state.active).some(([, y]) => y < 0);
+    const touchingStack = collides(
+      this.state.board,
+      this.state.active,
+      this.state.active.r,
+      0,
+      1,
+    );
+    if (!spawnedAboveField && !touchingStack) {
+      return;
+    }
+    this.activeLockDelayMs += SPAWN_DANGER_LOCK_DELAY_BONUS_MS;
+    this.activeHardLockDelayMs += SPAWN_DANGER_HARD_LOCK_DELAY_BONUS_MS;
   }
 
   private recomputeGhost(): void {
