@@ -1845,7 +1845,9 @@ input[type=number] {
   footer.appendChild(githubLink);
 
   const versionLabel = document.createElement('div');
-  versionLabel.textContent = `v${version}`;
+  const footerVersion =
+    import.meta.env.MODE === 'dev030' ? `${version}-dev` : version;
+  versionLabel.textContent = `v${footerVersion}`;
   Object.assign(versionLabel.style, {
     color: '#8fa0b8',
     fontSize: '12px',
