@@ -42,4 +42,12 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euxo pipefail
-          npx --yes wrangler@4 deploy --env dev --log-level debug
+          if ! npx --yes wrangler@4 deploy --env dev; then
+            echo "Wrangler deploy failed, dumping latest wrangler log:"
+            latest_log="$(ls -1t ~/.config/.wrangler/logs/wrangler-*.log | head -n1 || true)"
+            if [ -n "${latest_log}" ] && [ -f "${latest_log}" ]; then
+              echo "=== ${latest_log} ==="
+              cat "${latest_log}"
+            fi
+            exit 1
+          fi
