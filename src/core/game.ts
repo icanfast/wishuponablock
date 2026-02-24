@@ -24,6 +24,7 @@ import {
   tryRotate180PreferDirect,
 } from './piece';
 import { getSrsKickTests } from './srs';
+import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 import type {
   Board,
@@ -217,11 +218,43 @@ export class Game {
   step(dtMs: number, input: InputFrame): void {
     if (this.state.gameOver || this.state.gameWon) return;
 
+    const perfEnabled = hasPerfMetricsSink();
+    const stepStartMs = perfEnabled ? performance.now() : 0;
     this.state.timeMs += Math.max(0, dtMs);
     this.updateSoftDropState(input.softDrop);
-    if (this.applyInput(input)) return;
+    const applyInputStartMs = perfEnabled ? performance.now() : 0;
+    const consumed = this.applyInput(input);
+    if (perfEnabled) {
+      const nowMs = performance.now();
+      recordPerfDuration(
+        'game.apply_input_ms',
+        nowMs - applyInputStartMs,
+        nowMs,
+      );
+    }
+    if (consumed) {
+      if (perfEnabled) {
+        recordPerfDuration('game.step_ms', performance.now() - stepStartMs);
+      }
+      return;
+    }
+    const gravityStartMs = perfEnabled ? performance.now() : 0;
     this.applyGravity(dtMs, input);
+    if (perfEnabled) {
+      const nowMs = performance.now();
+      recordPerfDuration(
+        'game.apply_gravity_ms',
+        nowMs - gravityStartMs,
+        nowMs,
+      );
+    }
+    const lockStartMs = perfEnabled ? performance.now() : 0;
     this.applyLock(dtMs);
+    if (perfEnabled) {
+      const nowMs = performance.now();
+      recordPerfDuration('game.apply_lock_ms', nowMs - lockStartMs, nowMs);
+      recordPerfDuration('game.step_ms', nowMs - stepStartMs, nowMs);
+    }
   }
 
   private applyInput(input: InputFrame): boolean {

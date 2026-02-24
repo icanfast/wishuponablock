@@ -39,6 +39,8 @@ import { createLabelingTool } from './ui/tools/labelingTool';
 import { createConstructorTool } from './ui/tools/constructorTool';
 import { createToolCanvas } from './ui/tools/toolCanvas';
 import { getPiecePalette } from './core/palette';
+import { createPerfOverlay } from './app/perfOverlay';
+import { setPerfMetricsSink } from './core/perfMetrics';
 import pkg from '../package.json';
 
 function hasWebGL(): boolean {
@@ -125,6 +127,17 @@ async function boot() {
   const settings = settingsStore.get();
   const SHOW_DEV_TOOLS =
     import.meta.env.VITE_SHOW_DEV_TOOLS === 'true' || import.meta.env.DEV;
+  const SHOW_PERF_OVERLAY =
+    import.meta.env.VITE_SHOW_PERF_OVERLAY === 'true' || SHOW_DEV_TOOLS;
+  const perfOverlay = SHOW_PERF_OVERLAY
+    ? createPerfOverlay({
+        root: playWindow,
+        windowMs: 10_000,
+        targetFps: 120,
+        initialVisible: true,
+      })
+    : null;
+  setPerfMetricsSink(perfOverlay);
   const uploadService = createUploadService({
     envMode: import.meta.env.VITE_UPLOAD_MODE as string | undefined,
     envBaseUrl: import.meta.env.VITE_UPLOAD_URL as string | undefined,

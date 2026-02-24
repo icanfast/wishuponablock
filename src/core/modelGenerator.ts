@@ -4,6 +4,7 @@ import { XorShift32 } from './rng';
 import type { PieceGenerator } from './generator';
 import type { LoadedModel } from './wubModel';
 import { predictLogits, softmax } from './wubModel';
+import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 type InferenceStrategy = 'clean_uniform' | 'threshold';
 
@@ -79,7 +80,15 @@ export class ModelGenerator implements PieceGenerator {
       this.pendingDistribution = null;
       return;
     }
+    const perfEnabled = hasPerfMetricsSink();
+    const lockStartMs = perfEnabled ? performance.now() : 0;
+    const logitsStartMs = perfEnabled ? performance.now() : 0;
     const logits = predictLogits(this.model, board, hold);
+    if (perfEnabled) {
+      const nowMs = performance.now();
+      recordPerfDuration('ml.predict_logits_ms', nowMs - logitsStartMs, nowMs);
+    }
+    const sampleStartMs = perfEnabled ? performance.now() : 0;
     const probs =
       this.strategy === 'threshold'
         ? thresholdedSoftmax(
@@ -104,6 +113,15 @@ export class ModelGenerator implements PieceGenerator {
       probability: Number.isFinite(probs[index]) ? probs[index] : 0,
     }));
     this.pending = pieces[this.sampleIndex(probs)] ?? PIECES[0];
+    if (perfEnabled) {
+      const nowMs = performance.now();
+      recordPerfDuration(
+        'ml.sample_distribution_ms',
+        nowMs - sampleStartMs,
+        nowMs,
+      );
+      recordPerfDuration('ml.on_lock_ms', nowMs - lockStartMs, nowMs);
+    }
   }
 
   private sampleFallback(): PieceKind {

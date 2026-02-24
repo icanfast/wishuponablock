@@ -1,5 +1,6 @@
 import type { Board, PieceKind } from './types';
 import { PIECES } from './types';
+import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 export type ModelTensor = {
   shape: number[];
@@ -74,9 +75,12 @@ export function predictLogits(
   board: Board,
   hold: PieceKind | null,
 ): Float32Array {
+  const perfEnabled = hasPerfMetricsSink();
+  const predictStartMs = perfEnabled ? performance.now() : 0;
   const { config } = model;
   const rows = board.length;
   const cols = board[0]?.length ?? 0;
+  const encodeStartMs = perfEnabled ? performance.now() : 0;
   let input = buildInputChannels(board, model.boardChannels);
   const expectedLength = config.input_channels * rows * cols;
   if (input.length !== expectedLength) {
@@ -84,12 +88,21 @@ export function predictLogits(
     padded.set(input.subarray(0, expectedLength), 0);
     input = padded;
   }
+  if (perfEnabled) {
+    const nowMs = performance.now();
+    recordPerfDuration(
+      'ml.model.input_encode_ms',
+      nowMs - encodeStartMs,
+      nowMs,
+    );
+  }
 
   let current = input;
   let inChannels = config.input_channels;
   const height = rows;
   const width = cols;
   const poolShape = getPoolShape(config.pool_shape);
+  const convStartMs = perfEnabled ? performance.now() : 0;
 
   for (let i = 0; i < config.conv_channels.length; i++) {
     const layerIndex = i * 2;
@@ -106,7 +119,12 @@ export function predictLogits(
     );
     inChannels = config.conv_channels[i];
   }
+  if (perfEnabled) {
+    const nowMs = performance.now();
+    recordPerfDuration('ml.model.conv_stack_ms', nowMs - convStartMs, nowMs);
+  }
 
+  const poolStartMs = perfEnabled ? performance.now() : 0;
   const pooled = adaptiveAveragePool(
     current,
     inChannels,
@@ -115,7 +133,12 @@ export function predictLogits(
     poolShape[0],
     poolShape[1],
   );
+  if (perfEnabled) {
+    const nowMs = performance.now();
+    recordPerfDuration('ml.model.pool_ms', nowMs - poolStartMs, nowMs);
+  }
 
+  const headStartMs = perfEnabled ? performance.now() : 0;
   const extra = buildExtraFeatures(config.extra_features, hold, model.pieces);
 
   let mlpInput = concatFeatures(pooled, extra);
@@ -133,6 +156,11 @@ export function predictLogits(
     getParam(model, 'mlp.2.weight').data,
     getParam(model, 'mlp.2.bias').data,
   );
+  if (perfEnabled) {
+    const nowMs = performance.now();
+    recordPerfDuration('ml.model.head_ms', nowMs - headStartMs, nowMs);
+    recordPerfDuration('ml.model.total_ms', nowMs - predictStartMs, nowMs);
+  }
   return logits;
 }
 
