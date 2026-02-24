@@ -11,6 +11,9 @@ type D1Database = {
 type Env = {
   DB: D1Database;
   ASSETS: { fetch: (request: Request) => Promise<Response> };
+  RELEASE_CHANNEL?: string;
+  FEATURE_FLAGS?: string;
+  TRAJECTORIES_BUCKET?: unknown;
 };
 
 const BUILD_COUNTS_CACHE_TTL_MS = 30_000;
@@ -87,6 +90,33 @@ const asCount = (value: unknown): number => {
     }
   }
   return 0;
+};
+
+const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!key.trim()) continue;
+      if (
+        value == null ||
+        typeof value === 'boolean' ||
+        typeof value === 'number' ||
+        typeof value === 'string'
+      ) {
+        out[key] = value;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
 };
 
 type SnapshotFilterSql = {
@@ -1040,6 +1070,17 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return okResponse();
+    }
+
+    if (url.pathname.startsWith('/api/runtime/flags')) {
+      if (request.method !== 'GET') {
+        return jsonResponse({ error: 'Method not allowed.' }, 405);
+      }
+      const channel = asString(env.RELEASE_CHANNEL) ?? 'unknown';
+      return jsonResponse({
+        channel,
+        flags: parseFeatureFlags(env.FEATURE_FLAGS),
+      });
     }
 
     if (url.pathname.startsWith('/api/snapshots')) {

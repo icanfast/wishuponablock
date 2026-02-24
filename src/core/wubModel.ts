@@ -14,6 +14,10 @@ export type ExportedModel = {
     mlp_hidden: number;
     extra_features: number;
     num_outputs: number;
+    pool_shape?: number[];
+    feature_norm?: string | null;
+    feature_norm_eps?: number;
+    dropout_p?: number;
   };
   params: Record<string, { shape: number[]; data: number[] }>;
   pieces?: string[];
@@ -85,6 +89,7 @@ export function predictLogits(
   let inChannels = config.input_channels;
   const height = rows;
   const width = cols;
+  const poolShape = getPoolShape(config.pool_shape);
 
   for (let i = 0; i < config.conv_channels.length; i++) {
     const layerIndex = i * 2;
@@ -102,11 +107,21 @@ export function predictLogits(
     inChannels = config.conv_channels[i];
   }
 
-  const pooled = globalAveragePool(current, inChannels, height, width);
+  const pooled = adaptiveAveragePool(
+    current,
+    inChannels,
+    height,
+    width,
+    poolShape[0],
+    poolShape[1],
+  );
 
   const extra = buildExtraFeatures(config.extra_features, hold, model.pieces);
 
-  const mlpInput = concatFeatures(pooled, extra);
+  let mlpInput = concatFeatures(pooled, extra);
+  if (config.feature_norm === 'layernorm') {
+    mlpInput = layerNorm1d(mlpInput, config.feature_norm_eps ?? 1e-5);
+  }
   const hidden = linear(
     mlpInput,
     getParam(model, 'mlp.0.weight').data,
@@ -147,14 +162,27 @@ export function softmax(logits: Float32Array): Float32Array {
 function buildInputChannels(board: Board, channels: string[]): Float32Array {
   const rows = board.length;
   const cols = board[0]?.length ?? 0;
+  const size = rows * cols;
   const occupancy = new Float32Array(rows * cols);
-  const rowFill = new Float32Array(rows * cols);
+  const rowFill = new Float32Array(size);
+  const coordX = new Float32Array(size);
+  const coordY = new Float32Array(size);
+  const colHeight = new Float32Array(size);
+  const wellDepth = new Float32Array(size);
+  const reachableEmpty = new Float32Array(size);
+  const coarseOccV2 = new Float32Array(size);
+
+  const denomX = Math.max(1, cols - 1);
+  const denomY = Math.max(1, rows - 1);
 
   for (let y = 0; y < rows; y++) {
     let rowCount = 0;
     for (let x = 0; x < cols; x++) {
+      const idx = y * cols + x;
       const filled = board[y][x] != null ? 1 : 0;
-      occupancy[y * cols + x] = filled;
+      occupancy[idx] = filled;
+      coordX[idx] = x / denomX;
+      coordY[idx] = y / denomY;
       rowCount += filled;
     }
     const ratio = cols > 0 ? rowCount / cols : 0;
@@ -176,6 +204,90 @@ function buildInputChannels(board: Board, channels: string[]): Float32Array {
     }
   }
 
+  for (let x = 0; x < cols; x++) {
+    let firstFilled = -1;
+    for (let y = 0; y < rows; y++) {
+      if (occupancy[y * cols + x] > 0) {
+        firstFilled = y;
+        break;
+      }
+    }
+    const value =
+      firstFilled < 0 ? 0 : (rows - firstFilled) / Math.max(1, rows);
+    for (let y = 0; y < rows; y++) {
+      colHeight[y * cols + x] = value;
+    }
+  }
+
+  for (let x = 0; x < cols; x++) {
+    let depth = 0;
+    for (let y = 0; y < rows; y++) {
+      const idx = y * cols + x;
+      if (occupancy[idx] > 0) {
+        depth = 0;
+        continue;
+      }
+      const leftBlocked = x === 0 || occupancy[idx - 1] > 0;
+      const rightBlocked = x === cols - 1 || occupancy[idx + 1] > 0;
+      if (leftBlocked && rightBlocked) {
+        depth += 1;
+        wellDepth[idx] = depth / Math.max(1, rows);
+      } else {
+        depth = 0;
+      }
+    }
+  }
+
+  const queueY = new Int16Array(size);
+  const queueX = new Int16Array(size);
+  let head = 0;
+  let tail = 0;
+  const visited = new Uint8Array(size);
+  for (let x = 0; x < cols; x++) {
+    const idx = x;
+    if (occupancy[idx] > 0) continue;
+    visited[idx] = 1;
+    queueY[tail] = 0;
+    queueX[tail] = x;
+    tail += 1;
+  }
+  while (head < tail) {
+    const y = queueY[head];
+    const x = queueX[head];
+    head += 1;
+    const idx = y * cols + x;
+    reachableEmpty[idx] = 1;
+    const neighbors: [number, number][] = [
+      [y - 1, x],
+      [y + 1, x],
+      [y, x - 1],
+      [y, x + 1],
+    ];
+    for (const [ny, nx] of neighbors) {
+      if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) continue;
+      const nIdx = ny * cols + nx;
+      if (visited[nIdx] > 0) continue;
+      if (occupancy[nIdx] > 0) continue;
+      visited[nIdx] = 1;
+      queueY[tail] = ny;
+      queueX[tail] = nx;
+      tail += 1;
+    }
+  }
+
+  for (let y0 = 0; y0 < rows; y0 += 2) {
+    const y1 = Math.min(rows, y0 + 2);
+    for (let x = 0; x < cols; x++) {
+      let value = 0;
+      for (let y = y0; y < y1; y++) {
+        value = Math.max(value, occupancy[y * cols + x]);
+      }
+      for (let y = y0; y < y1; y++) {
+        coarseOccV2[y * cols + x] = value;
+      }
+    }
+  }
+
   const input = new Float32Array(channels.length * rows * cols);
   channels.forEach((name, channelIndex) => {
     const offset = channelIndex * rows * cols;
@@ -189,6 +301,24 @@ function buildInputChannels(board: Board, channels: string[]): Float32Array {
         break;
       case 'row_fill':
         source = rowFill;
+        break;
+      case 'coord_x':
+        source = coordX;
+        break;
+      case 'coord_y':
+        source = coordY;
+        break;
+      case 'col_height':
+        source = colHeight;
+        break;
+      case 'well_depth':
+        source = wellDepth;
+        break;
+      case 'reachable_empty':
+        source = reachableEmpty;
+        break;
+      case 'coarse_occ_v2':
+        source = coarseOccV2;
         break;
       default:
         source = null;
@@ -235,6 +365,15 @@ function getParam(model: LoadedModel, name: string): ModelTensor {
   return tensor;
 }
 
+function getPoolShape(value: number[] | undefined): [number, number] {
+  if (!Array.isArray(value) || value.length !== 2) {
+    return [1, 1];
+  }
+  const h = Math.max(1, Math.trunc(Number(value[0]) || 1));
+  const w = Math.max(1, Math.trunc(Number(value[1]) || 1));
+  return [h, w];
+}
+
 function conv2d(
   input: Float32Array,
   inChannels: number,
@@ -274,21 +413,35 @@ function conv2d(
   return output;
 }
 
-function globalAveragePool(
+function adaptiveAveragePool(
   input: Float32Array,
   channels: number,
   height: number,
   width: number,
+  outHeight: number,
+  outWidth: number,
 ): Float32Array {
-  const spatial = height * width;
-  const out = new Float32Array(channels);
+  const out = new Float32Array(channels * outHeight * outWidth);
   for (let c = 0; c < channels; c++) {
-    let sum = 0;
-    const offset = c * spatial;
-    for (let i = 0; i < spatial; i++) {
-      sum += input[offset + i];
+    const channelOffset = c * height * width;
+    for (let oy = 0; oy < outHeight; oy++) {
+      const yStart = Math.floor((oy * height) / outHeight);
+      const yEnd = Math.ceil(((oy + 1) * height) / outHeight);
+      for (let ox = 0; ox < outWidth; ox++) {
+        const xStart = Math.floor((ox * width) / outWidth);
+        const xEnd = Math.ceil(((ox + 1) * width) / outWidth);
+        let sum = 0;
+        let count = 0;
+        for (let iy = yStart; iy < yEnd; iy++) {
+          for (let ix = xStart; ix < xEnd; ix++) {
+            sum += input[channelOffset + iy * width + ix];
+            count += 1;
+          }
+        }
+        const outIdx = (c * outHeight + oy) * outWidth + ox;
+        out[outIdx] = count > 0 ? sum / count : 0;
+      }
     }
-    out[c] = sum / spatial;
   }
   return out;
 }
@@ -316,4 +469,25 @@ function reluInPlace(values: Float32Array): void {
   for (let i = 0; i < values.length; i++) {
     if (values[i] < 0) values[i] = 0;
   }
+}
+
+function layerNorm1d(values: Float32Array, eps = 1e-5): Float32Array {
+  const out = new Float32Array(values.length);
+  if (values.length === 0) return out;
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+  }
+  const mean = sum / values.length;
+  let varSum = 0;
+  for (let i = 0; i < values.length; i++) {
+    const diff = values[i] - mean;
+    varSum += diff * diff;
+  }
+  const variance = varSum / values.length;
+  const denom = Math.sqrt(variance + Math.max(1e-12, eps));
+  for (let i = 0; i < values.length; i++) {
+    out[i] = (values[i] - mean) / denom;
+  }
+  return out;
 }

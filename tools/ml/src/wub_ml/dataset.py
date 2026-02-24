@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,17 @@ import torch
 from torch.utils.data import Dataset
 
 DEFAULT_PIECES = ["I", "O", "T", "S", "Z", "J", "L"]
+BOARD_CHANNELS = [
+    "occupancy",
+    "holes",
+    "row_fill",
+    "coord_x",
+    "coord_y",
+    "col_height",
+    "well_depth",
+    "reachable_empty",
+    "coarse_occ_v2",
+]
 
 
 @dataclass
@@ -71,6 +83,33 @@ def board_to_tensor(rows: list[str]) -> torch.Tensor:
 
     height = len(occupancy)
     width = len(occupancy[0])
+    holes = build_holes_channel(occupancy)
+    coord_x, coord_y = build_coord_channels(height, width)
+    col_height = build_column_height_channel(occupancy)
+    well_depth = build_well_depth_channel(occupancy)
+    reachable_empty = build_reachable_empty_channel(occupancy)
+    coarse_occ_v2 = build_coarse_occupancy_channel(occupancy, pool_rows=2)
+
+    tensor = torch.tensor(
+        [
+            occupancy,
+            holes,
+            row_fill,
+            coord_x,
+            coord_y,
+            col_height,
+            well_depth,
+            reachable_empty,
+            coarse_occ_v2,
+        ],
+        dtype=torch.float32,
+    )
+    return tensor
+
+
+def build_holes_channel(occupancy: list[list[float]]) -> list[list[float]]:
+    height = len(occupancy)
+    width = len(occupancy[0])
     holes: list[list[float]] = [[0.0 for _ in range(width)] for _ in range(height)]
     for x in range(width):
         filled_seen = False
@@ -79,9 +118,110 @@ def board_to_tensor(rows: list[str]) -> torch.Tensor:
                 filled_seen = True
             elif filled_seen:
                 holes[y][x] = 1.0
+    return holes
 
-    tensor = torch.tensor([occupancy, holes, row_fill], dtype=torch.float32)
-    return tensor
+
+def build_coord_channels(
+    height: int,
+    width: int,
+) -> tuple[list[list[float]], list[list[float]]]:
+    denom_x = max(1, width - 1)
+    denom_y = max(1, height - 1)
+    coord_x: list[list[float]] = []
+    coord_y: list[list[float]] = []
+    for y in range(height):
+        row_x = [float(x) / float(denom_x) for x in range(width)]
+        row_y = [float(y) / float(denom_y) for _ in range(width)]
+        coord_x.append(row_x)
+        coord_y.append(row_y)
+    return coord_x, coord_y
+
+
+def build_column_height_channel(occupancy: list[list[float]]) -> list[list[float]]:
+    height = len(occupancy)
+    width = len(occupancy[0])
+    out: list[list[float]] = [[0.0 for _ in range(width)] for _ in range(height)]
+    for x in range(width):
+        first_filled: int | None = None
+        for y in range(height):
+            if occupancy[y][x] > 0:
+                first_filled = y
+                break
+        col_height = (
+            0.0 if first_filled is None else float(height - first_filled) / float(height)
+        )
+        for y in range(height):
+            out[y][x] = col_height
+    return out
+
+
+def build_well_depth_channel(occupancy: list[list[float]]) -> list[list[float]]:
+    height = len(occupancy)
+    width = len(occupancy[0])
+    out: list[list[float]] = [[0.0 for _ in range(width)] for _ in range(height)]
+    for x in range(width):
+        depth = 0
+        for y in range(height):
+            if occupancy[y][x] > 0:
+                depth = 0
+                continue
+            left_blocked = x == 0 or occupancy[y][x - 1] > 0
+            right_blocked = x == width - 1 or occupancy[y][x + 1] > 0
+            if left_blocked and right_blocked:
+                depth += 1
+                out[y][x] = float(depth) / float(height)
+            else:
+                depth = 0
+    return out
+
+
+def build_reachable_empty_channel(occupancy: list[list[float]]) -> list[list[float]]:
+    height = len(occupancy)
+    width = len(occupancy[0])
+    out: list[list[float]] = [[0.0 for _ in range(width)] for _ in range(height)]
+    visited: list[list[bool]] = [[False for _ in range(width)] for _ in range(height)]
+    frontier: deque[tuple[int, int]] = deque()
+
+    for x in range(width):
+        if occupancy[0][x] <= 0:
+            visited[0][x] = True
+            frontier.append((0, x))
+
+    while frontier:
+        y, x = frontier.popleft()
+        out[y][x] = 1.0
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny = y + dy
+            nx = x + dx
+            if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                continue
+            if visited[ny][nx]:
+                continue
+            if occupancy[ny][nx] > 0:
+                continue
+            visited[ny][nx] = True
+            frontier.append((ny, nx))
+
+    return out
+
+
+def build_coarse_occupancy_channel(
+    occupancy: list[list[float]],
+    pool_rows: int,
+) -> list[list[float]]:
+    height = len(occupancy)
+    width = len(occupancy[0])
+    step = max(1, int(pool_rows))
+    out: list[list[float]] = [[0.0 for _ in range(width)] for _ in range(height)]
+    for y0 in range(0, height, step):
+        y1 = min(height, y0 + step)
+        for x in range(width):
+            value = 0.0
+            for y in range(y0, y1):
+                value = max(value, occupancy[y][x])
+            for y in range(y0, y1):
+                out[y][x] = value
+    return out
 
 
 class LabelsDataset(Dataset[Sample]):
@@ -100,7 +240,7 @@ class LabelsDataset(Dataset[Sample]):
         self.skipped = 0
         self.mirror_prob = max(0.0, min(1.0, float(mirror_prob)))
         self.virtual_session_size = max(0, int(virtual_session_size))
-        self.input_channels = 3
+        self.input_channels = len(BOARD_CHANNELS)
         self.session_ids: list[str] = []
 
         for source_path in self.paths:

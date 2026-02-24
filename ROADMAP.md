@@ -1,12 +1,14 @@
-Here is the list of features in the backlog, with corresponding "impact score" (1-5) — the importance of the feature in my judgment. Generally the more the score, the sooner I'll get to it
+Here is the list of features in the backlog, with corresponding "impact score" (1-5) — the importance of the feature in my judgment. Generally the more the score, the sooner I'll get to it.
 
 ## Gameplay
 
 - Replays — 2 // lowered priority, blocked by personalization
-- Wish Upon a Bag — a less intrusive ML piece generator that shuffles the next 7 bag to try and help — 4
+- Wish Upon a Bag — a less intrusive ML piece generator that shuffles the next 7 bag to try and help — 3
 - For Wish Upon a Block generator maybe it is possible to display the most likely next piece. Will require completely new ML pipeline — 1
-- Bots — 2
-- RL bots and piece generators — 1
+- Bots — 5
+- RL bots and piece generators — 5
+- DCD (DAS cut delay) — 5
+- Temperature selection in-game (or just temp 0 toggle) — 5
 
 ## UI/UX
 
@@ -20,11 +22,12 @@ Here is the list of features in the backlog, with corresponding "impact score" (
 ## Labeling and ML
 
 - Snapshot Explorer — 5
-  - Heuristics for clustering snapshots based on the board itsel (?)
+  - Heuristics for clustering snapshots based on the board itself (?)
 - Unsupervised learning (press "Hold" = don't want that = negative signal?) — 2
-- Different generators for pro and noob — 2 // lowered priority, too much data required
-- Replace softmax with threshold + flatter normalization - 3
+- Separate generators for pro and noob — 2 // lowered priority, too much data required
+- Rethink Curse Upon a Block inference. Currently too flat. — 4
 - Labeling gameification — 5
+- Separate generators for stacking and digging — 5
 
 ## Personalization
 

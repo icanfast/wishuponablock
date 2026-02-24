@@ -3,6 +3,10 @@
   "name": "wishuponablock",
   "compatibility_date": "2026-02-05",
   "main": "./src/entry/worker.ts",
+  "vars": {
+    "RELEASE_CHANNEL": "local",
+    "FEATURE_FLAGS": "{}",
+  },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -16,4 +20,22 @@
       "migrations_dir": "./tools/db/migrations",
     },
   ],
+  "env": {
+    "dev": {
+      "name": "wishuponablock-030-dev",
+      "vars": {
+        "RELEASE_CHANNEL": "dev",
+        "FEATURE_FLAGS": "{\"computeProfiler\":false,\"rlPipeline\":false,\"authV1\":false,\"dbV3\":false}",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "wishuponablock-dev",
+          // Temporary binding only; clean-slate D1 will be added later.
+          "database_id": "032328e1-972f-4fc5-8976-2a504b2b71a5",
+          "migrations_dir": "./tools/db/migrations",
+        },
+      ],
+    },
+  },
 }

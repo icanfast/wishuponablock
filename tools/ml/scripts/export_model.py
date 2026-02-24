@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,17 @@ from typing import Any
 import torch
 
 ML_ROOT = Path(__file__).resolve().parents[1]
+FULL_BOARD_CHANNELS = [
+    "occupancy",
+    "holes",
+    "row_fill",
+    "coord_x",
+    "coord_y",
+    "col_height",
+    "well_depth",
+    "reachable_empty",
+    "coarse_occ_v2",
+]
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
@@ -26,7 +38,52 @@ def tensor_to_payload(tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def infer_model_config(state: dict[str, torch.Tensor]) -> dict[str, Any]:
+def normalize_pool_shape(value: Any) -> list[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        h = int(value[0])
+        w = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if h <= 0 or w <= 0:
+        return None
+    return [h, w]
+
+
+def infer_pool_shape_from_area(area: int) -> list[int]:
+    if area <= 1:
+        return [1, 1]
+    root = int(math.sqrt(area))
+    for h in range(root, 0, -1):
+        if area % h == 0:
+            w = area // h
+            return [int(h), int(w)]
+    return [1, int(area)]
+
+
+def infer_model_config(
+    checkpoint: dict[str, Any],
+    state: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    model_cfg = checkpoint.get("model_config")
+    if isinstance(model_cfg, dict):
+        pool_shape = normalize_pool_shape(model_cfg.get("pool_shape")) or [1, 1]
+        try:
+            return {
+                "input_channels": int(model_cfg["input_channels"]),
+                "conv_channels": [int(c) for c in model_cfg["conv_channels"]],
+                "mlp_hidden": int(model_cfg["mlp_hidden"]),
+                "extra_features": int(model_cfg["extra_features"]),
+                "num_outputs": int(model_cfg["num_outputs"]),
+                "pool_shape": pool_shape,
+                "feature_norm": model_cfg.get("feature_norm"),
+                "feature_norm_eps": float(model_cfg.get("feature_norm_eps", 1e-5)),
+                "dropout_p": float(model_cfg.get("dropout_p", 0.0)),
+            }
+        except (KeyError, TypeError, ValueError):
+            pass
+
     conv_weights = []
     for name, tensor in state.items():
         if name.startswith("conv.") and name.endswith(".weight"):
@@ -49,7 +106,21 @@ def infer_model_config(state: dict[str, torch.Tensor]) -> dict[str, Any]:
 
     mlp_hidden = mlp0.shape[0]
     mlp_in = mlp0.shape[1]
-    extra_features = mlp_in - conv_channels[-1]
+    args = checkpoint.get("args")
+    include_hold = True
+    if isinstance(args, dict):
+        include_hold = not bool(args.get("no_hold"))
+    extra_features = 8 if include_hold else 0
+    pooled_features = mlp_in - extra_features
+    if pooled_features <= 0:
+        extra_features = max(0, mlp_in - conv_channels[-1])
+        pooled_features = mlp_in - extra_features
+    conv_out = max(1, conv_channels[-1])
+    if pooled_features % conv_out == 0:
+        pool_area = max(1, pooled_features // conv_out)
+    else:
+        pool_area = 1
+    pool_shape = infer_pool_shape_from_area(pool_area)
     num_outputs = mlp2.shape[0]
 
     return {
@@ -58,7 +129,18 @@ def infer_model_config(state: dict[str, torch.Tensor]) -> dict[str, Any]:
         "mlp_hidden": int(mlp_hidden),
         "extra_features": int(extra_features),
         "num_outputs": int(num_outputs),
+        "pool_shape": pool_shape,
+        "feature_norm": None,
+        "feature_norm_eps": 1e-5,
+        "dropout_p": 0.0,
     }
+
+
+def board_channels_for_input_count(input_channels: int) -> list[str]:
+    count = max(0, int(input_channels))
+    if count <= len(FULL_BOARD_CHANNELS):
+        return FULL_BOARD_CHANNELS[:count]
+    return [*FULL_BOARD_CHANNELS, *["occupancy"] * (count - len(FULL_BOARD_CHANNELS))]
 
 
 def main() -> int:
@@ -77,7 +159,7 @@ def main() -> int:
 
     ckpt = load_checkpoint(ckpt_path)
     state = ckpt["model_state"]
-    config = infer_model_config(state)
+    config = infer_model_config(ckpt, state)
 
     payload = {
         "schema": "wishuponablock.model.v1",
@@ -87,7 +169,7 @@ def main() -> int:
             "epoch": ckpt.get("epoch"),
         },
         "pieces": ["I", "O", "T", "S", "Z", "J", "L"],
-        "board_channels": ["occupancy", "holes", "row_fill"],
+        "board_channels": board_channels_for_input_count(config["input_channels"]),
         "model": config,
         "params": {name: tensor_to_payload(tensor) for name, tensor in state.items()},
     }

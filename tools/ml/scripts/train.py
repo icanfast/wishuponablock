@@ -21,6 +21,23 @@ from wub_ml.training.multilabel import MultiLabelTraining
 from wub_ml.training.soft_targets import SoftTargetsTraining
 
 
+def parse_pool_shape(value: str) -> tuple[int, int]:
+    text = value.strip().lower().replace("x", ",")
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 2 or any(part == "" for part in parts):
+        raise argparse.ArgumentTypeError("Expected pool shape as H,W or HxW, e.g. 2,1")
+    try:
+        pool_h = int(parts[0])
+        pool_w = int(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Expected pool shape as H,W or HxW, e.g. 2,1",
+        ) from exc
+    if pool_h <= 0 or pool_w <= 0:
+        raise argparse.ArgumentTypeError("Pool dimensions must be >= 1.")
+    return (pool_h, pool_w)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -36,7 +53,8 @@ def split_by_session(
     for idx, group_id in enumerate(group_ids):
         sessions.setdefault(group_id, []).append(idx)
 
-    session_list = list(sessions.keys())
+    # Sort before seeded shuffle so split is stable even if input record order changes.
+    session_list = sorted(sessions.keys())
     rng = random.Random(seed)
     rng.shuffle(session_list)
 
@@ -152,6 +170,12 @@ def main() -> int:
             "Set 0 to split by session_id only."
         ),
     )
+    parser.add_argument(
+        "--pool-shape",
+        type=parse_pool_shape,
+        default=parse_pool_shape("2,1"),
+        help="Adaptive pooling shape as H,W or HxW. Default is 2,1.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -213,7 +237,9 @@ def main() -> int:
     model = BoardNet(
         input_channels=base_dataset.input_channels,
         extra_features=features.feature_dim,
+        pool_shape=args.pool_shape,
     )
+    model_config = model.export_config()
     model.to(device)
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -305,6 +331,7 @@ def main() -> int:
                     "val_loss": val_loss / max(1, val_batches),
                     "val_acc": val_acc / max(1, val_batches),
                     "args": vars(args),
+                    "model_config": model_config,
                 },
                 ckpt_path,
             )
@@ -323,6 +350,7 @@ def main() -> int:
                     "val_loss": current_val,
                     "val_acc": val_acc / max(1, val_batches),
                     "args": vars(args),
+                    "model_config": model_config,
                 },
                 best_path,
             )
