@@ -1,0 +1,33 @@
+name: deploy-dev-worker
+
+on:
+  push:
+    branches:
+      - codex/0.3.0-dev
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VITE_UPLOAD_MODE: local
+      VITE_SHOW_DEV_TOOLS: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build:dev030
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --env dev
