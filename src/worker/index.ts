@@ -13,6 +13,8 @@ type Env = {
   ASSETS: { fetch: (request: Request) => Promise<Response> };
   RELEASE_CHANNEL?: string;
   FEATURE_FLAGS?: string;
+  MODELS_BUCKET?: unknown;
+  RECORDINGS_BUCKET?: unknown;
   TRAJECTORIES_BUCKET?: unknown;
 };
 
