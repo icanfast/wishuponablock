@@ -102,6 +102,7 @@ export function predictLogits(
   const height = rows;
   const width = cols;
   const poolShape = getModelPoolShape(config.pool_shape);
+  const computeStartMs = perfEnabled ? performance.now() : 0;
   const convStartMs = perfEnabled ? performance.now() : 0;
 
   for (let i = 0; i < config.conv_channels.length; i++) {
@@ -163,6 +164,7 @@ export function predictLogits(
   if (perfEnabled) {
     const nowMs = performance.now();
     recordPerfDuration('ml.model.head_ms', nowMs - headStartMs, nowMs);
+    recordPerfDuration('ml.model.compute_ms', nowMs - computeStartMs, nowMs);
     recordPerfDuration('ml.model.total_ms', nowMs - predictStartMs, nowMs);
   }
   return logits;

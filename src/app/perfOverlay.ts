@@ -36,9 +36,7 @@ const STAGES: StageSpec[] = [
 
 const ML_SUBSTAGES: StageSpec[] = [
   { key: 'runtime.stage.ml_input_encode_ms', label: 'input encode' },
-  { key: 'runtime.stage.ml_conv_stack_ms', label: 'conv stack' },
-  { key: 'runtime.stage.ml_pool_ms', label: 'pooling' },
-  { key: 'runtime.stage.ml_head_ms', label: 'mlp head' },
+  { key: 'runtime.stage.ml_model_compute_ms', label: 'model compute' },
   { key: 'runtime.stage.ml_post_ms', label: 'post/sample' },
   { key: 'runtime.stage.ml_other_ms', label: 'other' },
 ];

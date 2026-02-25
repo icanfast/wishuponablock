@@ -64,9 +64,7 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
     const inputMs = runnerProfile?.inputMs ?? 0;
     const mlMs = runnerProfile?.mlMs ?? 0;
     const mlInputEncodeMs = runnerProfile?.mlInputEncodeMs ?? 0;
-    const mlConvStackMs = runnerProfile?.mlConvStackMs ?? 0;
-    const mlPoolMs = runnerProfile?.mlPoolMs ?? 0;
-    const mlHeadMs = runnerProfile?.mlHeadMs ?? 0;
+    const mlModelComputeMs = runnerProfile?.mlModelComputeMs ?? 0;
     const mlPostMs = runnerProfile?.mlPostMs ?? 0;
     const mlOtherMs = runnerProfile?.mlOtherMs ?? 0;
     const simulationMs = runnerProfile
@@ -85,9 +83,11 @@ export function createGameRuntime(options: GameRuntimeOptions): GameRuntime {
       mlInputEncodeMs,
       nowMs,
     );
-    recordPerfDuration('runtime.stage.ml_conv_stack_ms', mlConvStackMs, nowMs);
-    recordPerfDuration('runtime.stage.ml_pool_ms', mlPoolMs, nowMs);
-    recordPerfDuration('runtime.stage.ml_head_ms', mlHeadMs, nowMs);
+    recordPerfDuration(
+      'runtime.stage.ml_model_compute_ms',
+      mlModelComputeMs,
+      nowMs,
+    );
     recordPerfDuration('runtime.stage.ml_post_ms', mlPostMs, nowMs);
     recordPerfDuration('runtime.stage.ml_other_ms', mlOtherMs, nowMs);
     recordPerfDuration('runtime.stage.simulation_ms', simulationMs, nowMs);

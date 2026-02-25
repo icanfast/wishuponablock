@@ -206,18 +206,6 @@ const transposeLinearWeightOutInToInOut = (
   return out;
 };
 
-const flushTensorStage = (
-  tfModule: TfjsModule,
-  tensor: TfTensor,
-  axis: number | number[],
-): void => {
-  // WebGL execution can be deferred; materialize a tiny reduction result to
-  // keep stage timings (conv/pool/head) attributable in the profiler overlay.
-  const marker = tfModule.mean(tensor, axis);
-  marker.dataSync();
-  tfModule.dispose(marker);
-};
-
 export const reorderInputChwToNhwc = (
   input: Float32Array,
   channels: number,
@@ -441,6 +429,7 @@ export function createTfjsModelRunner(
       );
     }
 
+    const computeStartMs = perfEnabled ? performance.now() : 0;
     const convStartMs = perfEnabled ? performance.now() : 0;
     const convOutput = tfModule.tidy(() => {
       let x = tfModule.tensor4d(nhwcInput, [
@@ -462,9 +451,6 @@ export function createTfjsModelRunner(
       return x;
     });
     if (perfEnabled) {
-      flushTensorStage(tfModule, convOutput, [0, 1, 2, 3]);
-    }
-    if (perfEnabled) {
       const nowMs = performance.now();
       recordPerfDuration('ml.model.conv_stack_ms', nowMs - convStartMs, nowMs);
     }
@@ -484,9 +470,6 @@ export function createTfjsModelRunner(
       const pooledNchw = tfModule.transpose(pooled, [0, 3, 1, 2]);
       return pooledNchw.reshape([1, preparedState.pooledFeatureCount]);
     });
-    if (perfEnabled) {
-      flushTensorStage(tfModule, pooledFlat, [0, 1]);
-    }
     tfModule.dispose(convOutput);
     if (perfEnabled) {
       const nowMs = performance.now();
@@ -527,6 +510,7 @@ export function createTfjsModelRunner(
     if (perfEnabled) {
       const nowMs = performance.now();
       recordPerfDuration('ml.model.head_ms', nowMs - headStartMs, nowMs);
+      recordPerfDuration('ml.model.compute_ms', nowMs - computeStartMs, nowMs);
       recordPerfDuration('ml.model.total_ms', nowMs - predictStartMs, nowMs);
     }
     return logits;

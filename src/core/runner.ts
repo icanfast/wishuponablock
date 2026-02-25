@@ -31,9 +31,7 @@ type RunnerStepProfile = {
   gameMs: number;
   mlMs: number;
   mlInputEncodeMs: number;
-  mlConvStackMs: number;
-  mlPoolMs: number;
-  mlHeadMs: number;
+  mlModelComputeMs: number;
   mlPostMs: number;
   mlOtherMs: number;
   overheadMs: number;
@@ -45,9 +43,7 @@ export interface RunnerTickProfile {
   inputMs: number;
   mlMs: number;
   mlInputEncodeMs: number;
-  mlConvStackMs: number;
-  mlPoolMs: number;
-  mlHeadMs: number;
+  mlModelComputeMs: number;
   mlPostMs: number;
   mlOtherMs: number;
   simulationMs: number;
@@ -100,9 +96,7 @@ export class GameRunner {
     let stepGameMs = 0;
     let stepMlMs = 0;
     let stepMlInputEncodeMs = 0;
-    let stepMlConvStackMs = 0;
-    let stepMlPoolMs = 0;
-    let stepMlHeadMs = 0;
+    let stepMlModelComputeMs = 0;
     let stepMlPostMs = 0;
     let stepMlOtherMs = 0;
     let stepOverheadMs = 0;
@@ -115,9 +109,7 @@ export class GameRunner {
         stepGameMs += stepProfile.gameMs;
         stepMlMs += stepProfile.mlMs;
         stepMlInputEncodeMs += stepProfile.mlInputEncodeMs;
-        stepMlConvStackMs += stepProfile.mlConvStackMs;
-        stepMlPoolMs += stepProfile.mlPoolMs;
-        stepMlHeadMs += stepProfile.mlHeadMs;
+        stepMlModelComputeMs += stepProfile.mlModelComputeMs;
         stepMlPostMs += stepProfile.mlPostMs;
         stepMlOtherMs += stepProfile.mlOtherMs;
         stepOverheadMs += stepProfile.overheadMs;
@@ -157,12 +149,10 @@ export class GameRunner {
         nowMs,
       );
       recordPerfDuration(
-        'runner.tick.ml_conv_stack_ms',
-        stepMlConvStackMs,
+        'runner.tick.ml_model_compute_ms',
+        stepMlModelComputeMs,
         nowMs,
       );
-      recordPerfDuration('runner.tick.ml_pool_ms', stepMlPoolMs, nowMs);
-      recordPerfDuration('runner.tick.ml_head_ms', stepMlHeadMs, nowMs);
       recordPerfDuration('runner.tick.ml_post_ms', stepMlPostMs, nowMs);
       recordPerfDuration('runner.tick.ml_other_ms', stepMlOtherMs, nowMs);
       recordPerfDuration('runner.tick.simulation_ms', simulationMs, nowMs);
@@ -175,9 +165,7 @@ export class GameRunner {
         inputMs: stepInputMs,
         mlMs: stepMlMs,
         mlInputEncodeMs: stepMlInputEncodeMs,
-        mlConvStackMs: stepMlConvStackMs,
-        mlPoolMs: stepMlPoolMs,
-        mlHeadMs: stepMlHeadMs,
+        mlModelComputeMs: stepMlModelComputeMs,
         mlPostMs: stepMlPostMs,
         mlOtherMs: stepMlOtherMs,
         simulationMs,
@@ -215,18 +203,14 @@ export class GameRunner {
         gameMs: 0,
         mlMs: 0,
         mlInputEncodeMs: 0,
-        mlConvStackMs: 0,
-        mlPoolMs: 0,
-        mlHeadMs: 0,
+        mlModelComputeMs: 0,
         mlPostMs: 0,
         mlOtherMs: 0,
         overheadMs: Math.max(0, totalMs - inputMs),
       };
     }
     const modelInputBefore = readPerfDurationTotal('ml.model.input_encode_ms');
-    const modelConvBefore = readPerfDurationTotal('ml.model.conv_stack_ms');
-    const modelPoolBefore = readPerfDurationTotal('ml.model.pool_ms');
-    const modelHeadBefore = readPerfDurationTotal('ml.model.head_ms');
+    const modelComputeBefore = readPerfDurationTotal('ml.model.compute_ms');
     const modelPostBefore =
       readPerfDurationTotal('ml.sample_distribution_ms') +
       readPerfDurationTotal('curse.infer_distribution_ms');
@@ -245,17 +229,9 @@ export class GameRunner {
       0,
       readPerfDurationTotal('ml.model.input_encode_ms') - modelInputBefore,
     );
-    const mlConvStackMs = Math.max(
+    const mlModelComputeMs = Math.max(
       0,
-      readPerfDurationTotal('ml.model.conv_stack_ms') - modelConvBefore,
-    );
-    const mlPoolMs = Math.max(
-      0,
-      readPerfDurationTotal('ml.model.pool_ms') - modelPoolBefore,
-    );
-    const mlHeadMs = Math.max(
-      0,
-      readPerfDurationTotal('ml.model.head_ms') - modelHeadBefore,
+      readPerfDurationTotal('ml.model.compute_ms') - modelComputeBefore,
     );
     const mlPostMs = Math.max(
       0,
@@ -263,8 +239,7 @@ export class GameRunner {
         readPerfDurationTotal('curse.infer_distribution_ms') -
         modelPostBefore,
     );
-    const mlKnownMs =
-      mlInputEncodeMs + mlConvStackMs + mlPoolMs + mlHeadMs + mlPostMs;
+    const mlKnownMs = mlInputEncodeMs + mlModelComputeMs + mlPostMs;
     const mlOtherMs = Math.max(0, mlMs - mlKnownMs);
     const totalMs = gameStepEndMs - stepStartMs;
     const overheadMs = Math.max(0, totalMs - inputMs - gameMs);
@@ -276,12 +251,10 @@ export class GameRunner {
       gameStepEndMs,
     );
     recordPerfDuration(
-      'runner.step.ml_conv_stack_ms',
-      mlConvStackMs,
+      'runner.step.ml_model_compute_ms',
+      mlModelComputeMs,
       gameStepEndMs,
     );
-    recordPerfDuration('runner.step.ml_pool_ms', mlPoolMs, gameStepEndMs);
-    recordPerfDuration('runner.step.ml_head_ms', mlHeadMs, gameStepEndMs);
     recordPerfDuration('runner.step.ml_post_ms', mlPostMs, gameStepEndMs);
     recordPerfDuration('runner.step.ml_other_ms', mlOtherMs, gameStepEndMs);
     recordPerfDuration('runner.step.total_ms', totalMs, gameStepEndMs);
@@ -291,9 +264,7 @@ export class GameRunner {
       gameMs,
       mlMs,
       mlInputEncodeMs,
-      mlConvStackMs,
-      mlPoolMs,
-      mlHeadMs,
+      mlModelComputeMs,
       mlPostMs,
       mlOtherMs,
       overheadMs,
