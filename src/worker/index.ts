@@ -1685,6 +1685,20 @@ const handleOAuthStart = async (
   console.log(
     `[auth] oauth ${provider} start: redirect_uri=${redirectUri} state_len=${state.length}`,
   );
+  if (url.searchParams.get('response') === 'json') {
+    return jsonResponse(
+      {
+        ok: true,
+        provider,
+        authorizeUrl,
+      },
+      200,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': oauthStateCookieHeader(provider, state, secure),
+      },
+    );
+  }
 
   return redirectResponse(authorizeUrl, 302, {
     'cache-control': 'no-store',
