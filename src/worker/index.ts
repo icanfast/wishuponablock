@@ -19,6 +19,10 @@ type Env = {
   RESEND_API_KEY?: string;
   AUTH_EMAIL_FROM?: string;
   AUTH_APP_BASE_URL?: string;
+  GOOGLE_OAUTH_CLIENT_ID?: string;
+  GOOGLE_OAUTH_CLIENT_SECRET?: string;
+  DISCORD_OAUTH_CLIENT_ID?: string;
+  DISCORD_OAUTH_CLIENT_SECRET?: string;
   MODELS_BUCKET?: unknown;
   RECORDINGS_BUCKET?: unknown;
 };
@@ -48,6 +52,19 @@ const MAX_EMAIL_LENGTH = 320;
 const MIN_USERNAME_LENGTH = 2;
 const MAX_USERNAME_LENGTH = 32;
 const RESEND_SEND_EMAIL_URL = 'https://api.resend.com/emails';
+const OAUTH_STATE_COOKIE_NAME = 'wub_oauth_state';
+const OAUTH_STATE_MAX_AGE_MS = 10 * 60 * 1000;
+const OAUTH_STATE_MAX_AGE_SECONDS = Math.trunc(OAUTH_STATE_MAX_AGE_MS / 1000);
+const OAUTH_GOOGLE_AUTHORIZE_URL =
+  'https://accounts.google.com/o/oauth2/v2/auth';
+const OAUTH_GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const OAUTH_GOOGLE_USERINFO_URL =
+  'https://openidconnect.googleapis.com/v1/userinfo';
+const OAUTH_DISCORD_AUTHORIZE_URL = 'https://discord.com/oauth2/authorize';
+const OAUTH_DISCORD_TOKEN_URL = 'https://discord.com/api/oauth2/token';
+const OAUTH_DISCORD_USERINFO_URL = 'https://discord.com/api/v10/users/@me';
+const OAUTH_GOOGLE_SCOPES = 'openid email profile';
+const OAUTH_DISCORD_SCOPES = 'identify email';
 const CORS_BASE_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'content-type',
@@ -87,6 +104,19 @@ const emptyResponse = (status = 204, headers?: HeadersInit): Response =>
     headers: withBaseHeaders(headers),
   });
 
+const redirectResponse = (
+  location: string,
+  status = 302,
+  headers?: HeadersInit,
+): Response => {
+  const responseHeaders = withBaseHeaders(headers);
+  responseHeaders.set('location', location);
+  return new Response(null, {
+    status,
+    headers: responseHeaders,
+  });
+};
+
 const asString = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
 
@@ -99,6 +129,16 @@ const asInt = (value: unknown): number | null => {
     if (Number.isFinite(parsed)) {
       return Math.trunc(parsed);
     }
+  }
+  return null;
+};
+
+const asBoolean = (value: unknown): boolean | null => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
   }
   return null;
 };
@@ -293,6 +333,35 @@ const sessionCookieHeader = (token: string, secure: boolean): string => {
   return parts.join('; ');
 };
 
+const oauthStateCookieHeader = (
+  provider: OAuthProvider,
+  state: string,
+  secure: boolean,
+): string => {
+  const parts = [
+    `${OAUTH_STATE_COOKIE_NAME}=${encodeURIComponent(`${provider}:${state}`)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${OAUTH_STATE_MAX_AGE_SECONDS}`,
+  ];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
+};
+
+const clearOAuthStateCookieHeader = (secure: boolean): string => {
+  const parts = [
+    `${OAUTH_STATE_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0',
+    'Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+  ];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
+};
+
 const normalizeEmail = (value: unknown): string | null => {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
@@ -356,8 +425,28 @@ type AuthUser = {
   emailVerifiedAtMs: number | null;
 };
 
+type OAuthProvider = 'google' | 'discord';
+
+type OAuthResolvedProfile = {
+  providerSub: string;
+  emailNorm: string | null;
+  emailVerified: boolean;
+  usernameHint: string;
+};
+
+type OAuthProviderConfig = {
+  clientId: string;
+  clientSecret: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  userInfoUrl: string;
+  scope: string;
+};
+
 type UserLookupRecord = AuthUser & {
   passwordHash: string | null;
+  googleSub: string | null;
+  discordSub: string | null;
 };
 
 type AuthTokenType = 'email_verify' | 'password_reset';
@@ -367,6 +456,41 @@ type AuthTokenRecord = {
   userId: string;
   emailNorm: string | null;
   expiresAtMs: number;
+};
+
+const getOAuthProviderColumn = (
+  provider: OAuthProvider,
+): 'google_sub' | 'discord_sub' =>
+  provider === 'google' ? 'google_sub' : 'discord_sub';
+
+const getOAuthProviderConfig = (
+  env: Env,
+  provider: OAuthProvider,
+): OAuthProviderConfig | null => {
+  if (provider === 'google') {
+    const clientId = asString(env.GOOGLE_OAUTH_CLIENT_ID);
+    const clientSecret = asString(env.GOOGLE_OAUTH_CLIENT_SECRET);
+    if (!clientId || !clientSecret) return null;
+    return {
+      clientId,
+      clientSecret,
+      authorizeUrl: OAUTH_GOOGLE_AUTHORIZE_URL,
+      tokenUrl: OAUTH_GOOGLE_TOKEN_URL,
+      userInfoUrl: OAUTH_GOOGLE_USERINFO_URL,
+      scope: OAUTH_GOOGLE_SCOPES,
+    };
+  }
+  const clientId = asString(env.DISCORD_OAUTH_CLIENT_ID);
+  const clientSecret = asString(env.DISCORD_OAUTH_CLIENT_SECRET);
+  if (!clientId || !clientSecret) return null;
+  return {
+    clientId,
+    clientSecret,
+    authorizeUrl: OAUTH_DISCORD_AUTHORIZE_URL,
+    tokenUrl: OAUTH_DISCORD_TOKEN_URL,
+    userInfoUrl: OAUTH_DISCORD_USERINFO_URL,
+    scope: OAUTH_DISCORD_SCOPES,
+  };
 };
 
 const readUserByEmail = async (
@@ -379,7 +503,9 @@ const readUserByEmail = async (
        username,
        email_norm,
        email_verified_at_ms,
-       password_hash
+       password_hash,
+       google_sub,
+       discord_sub
      FROM users
      WHERE email_norm = ?
      LIMIT 1`,
@@ -397,7 +523,68 @@ const readUserByEmail = async (
     emailNorm: asString(row.email_norm),
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
     passwordHash: asString(row.password_hash),
+    googleSub: asString(row.google_sub),
+    discordSub: asString(row.discord_sub),
   };
+};
+
+const readUserByOAuthSub = async (
+  env: Env,
+  provider: OAuthProvider,
+  providerSub: string,
+): Promise<UserLookupRecord | null> => {
+  const providerColumn = getOAuthProviderColumn(provider);
+  const row = await env.DB.prepare(
+    `SELECT
+       id,
+       username,
+       email_norm,
+       email_verified_at_ms,
+       password_hash,
+       google_sub,
+       discord_sub
+     FROM users
+     WHERE ${providerColumn} = ?
+     LIMIT 1`,
+  )
+    .bind(providerSub)
+    .first<Record<string, unknown>>();
+
+  if (!row) return null;
+  const id = asString(row.id);
+  const username = asString(row.username);
+  if (!id || !username) return null;
+  return {
+    id,
+    username,
+    emailNorm: asString(row.email_norm),
+    emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+    passwordHash: asString(row.password_hash),
+    googleSub: asString(row.google_sub),
+    discordSub: asString(row.discord_sub),
+  };
+};
+
+const normalizeOAuthUsername = (
+  usernameHint: string,
+  emailNorm: string | null,
+): string => {
+  if (emailNorm) {
+    return normalizeUsername(usernameHint, emailNorm);
+  }
+  const collapsed = usernameHint.trim().replace(/\s+/g, ' ');
+  const safe = collapsed.replace(/[^A-Za-z0-9._ -]/g, '').trim();
+  if (
+    safe.length >= MIN_USERNAME_LENGTH &&
+    safe.length <= MAX_USERNAME_LENGTH
+  ) {
+    return safe;
+  }
+  const trimmed = safe.slice(0, MAX_USERNAME_LENGTH).trim();
+  if (trimmed.length >= MIN_USERNAME_LENGTH) {
+    return trimmed;
+  }
+  return 'player';
 };
 
 const readUserById = async (
@@ -423,6 +610,298 @@ const readUserById = async (
     emailNorm: asString(row.email_norm),
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
   };
+};
+
+const resolveOAuthCallbackUrl = (
+  request: Request,
+  provider: OAuthProvider,
+): string => {
+  const origin = new URL(request.url).origin;
+  return `${origin}/api/auth/oauth/${provider}/callback`;
+};
+
+const resolveOAuthLandingUrl = (request: Request, env: Env): string =>
+  new URL('/', `${resolveAuthAppBaseUrl(request, env)}/`).toString();
+
+const resolveOAuthErrorUrl = (
+  request: Request,
+  env: Env,
+  errorCode: string,
+): string => {
+  const url = new URL(resolveOAuthLandingUrl(request, env));
+  url.searchParams.set('auth_error', errorCode);
+  return url.toString();
+};
+
+const readOAuthStateFromRequest = (
+  request: Request,
+  provider: OAuthProvider,
+): string | null => {
+  const cookies = parseCookies(request.headers.get('cookie'));
+  const cookieValue = cookies[OAUTH_STATE_COOKIE_NAME];
+  if (!cookieValue) return null;
+  const separatorIdx = cookieValue.indexOf(':');
+  if (separatorIdx <= 0) return null;
+  const cookieProvider = cookieValue.slice(0, separatorIdx);
+  const state = cookieValue.slice(separatorIdx + 1);
+  if (cookieProvider !== provider) return null;
+  if (!isLikelyOpaqueToken(state)) return null;
+  return state;
+};
+
+const buildOAuthAuthorizeUrl = (
+  provider: OAuthProvider,
+  config: OAuthProviderConfig,
+  redirectUri: string,
+  state: string,
+): string => {
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: config.scope,
+    state,
+  });
+  if (provider === 'google') {
+    params.set('include_granted_scopes', 'true');
+    params.set('access_type', 'online');
+  }
+  return `${config.authorizeUrl}?${params.toString()}`;
+};
+
+const exchangeOAuthCodeForAccessToken = async (
+  config: OAuthProviderConfig,
+  code: string,
+  redirectUri: string,
+): Promise<string> => {
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    client_id: config.clientId,
+    client_secret: config.clientSecret,
+  });
+  const response = await fetch(config.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: body.toString(),
+  });
+  const payload = (await response.json().catch(() => null)) as Record<
+    string,
+    unknown
+  > | null;
+  if (!response.ok || !payload || typeof payload !== 'object') {
+    throw new Error('OAuth token exchange failed.');
+  }
+  const accessToken = asString(payload.access_token);
+  if (!accessToken) {
+    throw new Error('OAuth token exchange returned no access token.');
+  }
+  return accessToken;
+};
+
+const fetchOAuthProfile = async (
+  provider: OAuthProvider,
+  config: OAuthProviderConfig,
+  accessToken: string,
+): Promise<OAuthResolvedProfile> => {
+  const response = await fetch(config.userInfoUrl, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+  });
+  const payload = (await response.json().catch(() => null)) as Record<
+    string,
+    unknown
+  > | null;
+  if (!response.ok || !payload || typeof payload !== 'object') {
+    throw new Error('OAuth profile request failed.');
+  }
+
+  if (provider === 'google') {
+    const providerSub = asString(payload.sub);
+    if (!providerSub) {
+      throw new Error('Google OAuth profile is missing subject identifier.');
+    }
+    const emailNorm = normalizeEmail(payload.email);
+    const emailVerified = asBoolean(payload.email_verified) === true;
+    const usernameHint =
+      asString(payload.name) ??
+      asString(payload.given_name) ??
+      emailNorm ??
+      'player';
+    return {
+      providerSub,
+      emailNorm,
+      emailVerified,
+      usernameHint,
+    };
+  }
+
+  const providerSub = asString(payload.id);
+  if (!providerSub) {
+    throw new Error('Discord OAuth profile is missing subject identifier.');
+  }
+  const emailNorm = normalizeEmail(payload.email);
+  const emailVerified = asBoolean(payload.verified) === true;
+  const usernameHint =
+    asString(payload.global_name) ?? asString(payload.username) ?? 'player';
+  return {
+    providerSub,
+    emailNorm,
+    emailVerified,
+    usernameHint,
+  };
+};
+
+const maybeUpdateOAuthLinkedUser = async (
+  env: Env,
+  user: UserLookupRecord,
+  provider: OAuthProvider,
+  profile: OAuthResolvedProfile,
+  nowMs: number,
+): Promise<void> => {
+  const providerColumn = getOAuthProviderColumn(provider);
+  const existingProviderSub =
+    provider === 'google' ? user.googleSub : user.discordSub;
+  if (existingProviderSub && existingProviderSub !== profile.providerSub) {
+    throw new Error(`OAuth ${provider} account is linked to a different user.`);
+  }
+
+  const updates: string[] = [];
+  const values: unknown[] = [];
+  if (!existingProviderSub) {
+    updates.push(`${providerColumn} = ?`);
+    values.push(profile.providerSub);
+  }
+  if (!user.emailNorm && profile.emailNorm) {
+    updates.push('email_norm = ?');
+    values.push(profile.emailNorm);
+  }
+  const canVerifyEmail =
+    profile.emailNorm != null &&
+    profile.emailVerified &&
+    user.emailVerifiedAtMs == null &&
+    (user.emailNorm == null || user.emailNorm === profile.emailNorm);
+  if (canVerifyEmail) {
+    updates.push('email_verified_at_ms = ?');
+    values.push(nowMs);
+  }
+  if (updates.length === 0) return;
+
+  updates.push('updated_at_ms = ?');
+  values.push(nowMs);
+  await env.DB.prepare(
+    `UPDATE users
+     SET ${updates.join(', ')}
+     WHERE id = ?`,
+  )
+    .bind(...values, user.id)
+    .run();
+};
+
+const resolveOAuthUser = async (
+  env: Env,
+  provider: OAuthProvider,
+  profile: OAuthResolvedProfile,
+  nowMs: number,
+): Promise<AuthUser> => {
+  const byProvider = await readUserByOAuthSub(
+    env,
+    provider,
+    profile.providerSub,
+  );
+  if (byProvider) {
+    await maybeUpdateOAuthLinkedUser(env, byProvider, provider, profile, nowMs);
+    const user = await readUserById(env, byProvider.id);
+    if (user) return user;
+    throw new Error('Linked OAuth user could not be loaded.');
+  }
+
+  if (profile.emailNorm) {
+    const byEmail = await readUserByEmail(env, profile.emailNorm);
+    if (byEmail) {
+      await maybeUpdateOAuthLinkedUser(env, byEmail, provider, profile, nowMs);
+      const user = await readUserById(env, byEmail.id);
+      if (user) return user;
+      throw new Error('Email-linked OAuth user could not be loaded.');
+    }
+  }
+
+  const userId = crypto.randomUUID();
+  const providerColumn = getOAuthProviderColumn(provider);
+  const emailVerifiedAtMs =
+    profile.emailNorm && profile.emailVerified ? nowMs : null;
+  const username = normalizeOAuthUsername(
+    profile.usernameHint,
+    profile.emailNorm,
+  );
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO users (
+         id,
+         username,
+         email_norm,
+         email_verified_at_ms,
+         ${providerColumn},
+         created_at_ms,
+         updated_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        userId,
+        username,
+        profile.emailNorm,
+        emailVerifiedAtMs,
+        profile.providerSub,
+        nowMs,
+        nowMs,
+      )
+      .run();
+  } catch (error) {
+    const retriedByProvider = await readUserByOAuthSub(
+      env,
+      provider,
+      profile.providerSub,
+    );
+    if (retriedByProvider) {
+      await maybeUpdateOAuthLinkedUser(
+        env,
+        retriedByProvider,
+        provider,
+        profile,
+        nowMs,
+      );
+      const user = await readUserById(env, retriedByProvider.id);
+      if (user) return user;
+    }
+    if (profile.emailNorm) {
+      const retriedByEmail = await readUserByEmail(env, profile.emailNorm);
+      if (retriedByEmail) {
+        await maybeUpdateOAuthLinkedUser(
+          env,
+          retriedByEmail,
+          provider,
+          profile,
+          nowMs,
+        );
+        const user = await readUserById(env, retriedByEmail.id);
+        if (user) return user;
+      }
+    }
+    throw error;
+  }
+
+  const createdUser = await readUserById(env, userId);
+  if (!createdUser) {
+    throw new Error('Created OAuth user could not be loaded.');
+  }
+  return createdUser;
 };
 
 const createSessionForUser = async (
@@ -1143,6 +1622,126 @@ const handlePasswordReset = async (
   }
 };
 
+const handleOAuthStart = async (
+  request: Request,
+  env: Env,
+  provider: OAuthProvider,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+
+  const config = getOAuthProviderConfig(env, provider);
+  if (!config) {
+    return jsonResponse({ error: 'OAuth provider is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const state = generateOpaqueToken(24);
+  const secure = isSecureRequest(request);
+  const redirectUri = resolveOAuthCallbackUrl(request, provider);
+  const authorizeUrl = buildOAuthAuthorizeUrl(
+    provider,
+    config,
+    redirectUri,
+    state,
+  );
+
+  return redirectResponse(authorizeUrl, 302, {
+    'cache-control': 'no-store',
+    'set-cookie': oauthStateCookieHeader(provider, state, secure),
+  });
+};
+
+const handleOAuthCallback = async (
+  request: Request,
+  env: Env,
+  provider: OAuthProvider,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+
+  const secure = isSecureRequest(request);
+  const clearStateCookie = clearOAuthStateCookieHeader(secure);
+  const config = getOAuthProviderConfig(env, provider);
+  if (!config) {
+    return redirectResponse(
+      resolveOAuthErrorUrl(request, env, 'oauth_not_configured'),
+      302,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': clearStateCookie,
+      },
+    );
+  }
+
+  const url = new URL(request.url);
+  if (url.searchParams.get('error')) {
+    return redirectResponse(
+      resolveOAuthErrorUrl(request, env, 'oauth_denied'),
+      302,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': clearStateCookie,
+      },
+    );
+  }
+
+  const stateParam = asString(url.searchParams.get('state'));
+  const code = asString(url.searchParams.get('code'));
+  const stateCookie = readOAuthStateFromRequest(request, provider);
+  if (!stateParam || !code || !stateCookie || stateParam !== stateCookie) {
+    return redirectResponse(
+      resolveOAuthErrorUrl(request, env, 'oauth_state_mismatch'),
+      302,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': clearStateCookie,
+      },
+    );
+  }
+
+  try {
+    const redirectUri = resolveOAuthCallbackUrl(request, provider);
+    const accessToken = await exchangeOAuthCodeForAccessToken(
+      config,
+      code,
+      redirectUri,
+    );
+    const profile = await fetchOAuthProfile(provider, config, accessToken);
+    if (provider === 'google') {
+      profile.emailVerified = true;
+    }
+
+    const nowMs = Date.now();
+    const user = await resolveOAuthUser(env, provider, profile, nowMs);
+    const session = await createSessionForUser(env, user.id, nowMs);
+
+    const headers = withBaseHeaders({
+      'cache-control': 'no-store',
+      location: resolveOAuthLandingUrl(request, env),
+    });
+    headers.append('set-cookie', clearStateCookie);
+    headers.append('set-cookie', sessionCookieHeader(session.token, secure));
+    return new Response(null, {
+      status: 302,
+      headers,
+    });
+  } catch (error) {
+    console.error(`[auth] oauth ${provider} callback failed`, error);
+    return redirectResponse(
+      resolveOAuthErrorUrl(request, env, 'oauth_failed'),
+      302,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': clearStateCookie,
+      },
+    );
+  }
+};
+
 const handleAuthMe = async (request: Request, env: Env): Promise<Response> => {
   if (request.method !== 'GET') {
     return jsonResponse({ error: 'Method not allowed.' }, 405);
@@ -1382,6 +1981,18 @@ export default {
 
     if (isLegacyApiPath(url.pathname)) {
       return jsonResponse({ error: LEGACY_API_ERROR }, 410);
+    }
+
+    const oauthRoute = url.pathname.match(
+      /^\/api\/auth\/oauth\/(google|discord)\/(start|callback)$/,
+    );
+    if (oauthRoute) {
+      const provider = oauthRoute[1] as OAuthProvider;
+      const action = oauthRoute[2];
+      if (action === 'start') {
+        return handleOAuthStart(request, env, provider);
+      }
+      return handleOAuthCallback(request, env, provider);
     }
 
     if (url.pathname === '/api/auth/email/signup') {
