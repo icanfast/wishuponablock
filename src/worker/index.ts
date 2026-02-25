@@ -1633,6 +1633,9 @@ const handleOAuthStart = async (
 
   const config = getOAuthProviderConfig(env, provider);
   if (!config) {
+    console.warn(
+      `[auth] oauth ${provider} start failed: provider not configured`,
+    );
     return jsonResponse({ error: 'OAuth provider is not configured.' }, 503, {
       'cache-control': 'no-store',
     });
@@ -1646,6 +1649,9 @@ const handleOAuthStart = async (
     config,
     redirectUri,
     state,
+  );
+  console.log(
+    `[auth] oauth ${provider} start: redirect_uri=${redirectUri} state_len=${state.length}`,
   );
 
   return redirectResponse(authorizeUrl, 302, {
@@ -1667,6 +1673,9 @@ const handleOAuthCallback = async (
   const clearStateCookie = clearOAuthStateCookieHeader(secure);
   const config = getOAuthProviderConfig(env, provider);
   if (!config) {
+    console.warn(
+      `[auth] oauth ${provider} callback failed: provider not configured`,
+    );
     return redirectResponse(
       resolveOAuthErrorUrl(request, env, 'oauth_not_configured'),
       302,
@@ -1679,6 +1688,9 @@ const handleOAuthCallback = async (
 
   const url = new URL(request.url);
   if (url.searchParams.get('error')) {
+    console.warn(
+      `[auth] oauth ${provider} callback denied: provider_error=${url.searchParams.get('error')}`,
+    );
     return redirectResponse(
       resolveOAuthErrorUrl(request, env, 'oauth_denied'),
       302,
@@ -1693,6 +1705,9 @@ const handleOAuthCallback = async (
   const code = asString(url.searchParams.get('code'));
   const stateCookie = readOAuthStateFromRequest(request, provider);
   if (!stateParam || !code || !stateCookie || stateParam !== stateCookie) {
+    console.warn(
+      `[auth] oauth ${provider} callback state mismatch: has_state_param=${stateParam != null} has_code=${code != null} has_state_cookie=${stateCookie != null}`,
+    );
     return redirectResponse(
       resolveOAuthErrorUrl(request, env, 'oauth_state_mismatch'),
       302,
@@ -1718,6 +1733,9 @@ const handleOAuthCallback = async (
     const nowMs = Date.now();
     const user = await resolveOAuthUser(env, provider, profile, nowMs);
     const session = await createSessionForUser(env, user.id, nowMs);
+    console.log(
+      `[auth] oauth ${provider} callback success: user_id=${user.id}`,
+    );
 
     const headers = withBaseHeaders({
       'cache-control': 'no-store',
