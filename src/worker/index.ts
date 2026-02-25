@@ -1632,15 +1632,23 @@ const handleOAuthStart = async (
   }
   const url = new URL(request.url);
   if (url.searchParams.get('probe') === '1') {
-    return jsonResponse(
+    const payload = {
+      ok: true,
+      route: 'oauth_start',
+      provider,
+      ts: Date.now(),
+      href: url.toString(),
+    };
+    const payloadJson = JSON.stringify(payload).replace(/</g, '\\u003c');
+    return new Response(
+      `<!doctype html><meta charset="utf-8"><title>OAuth Probe</title><pre id="out"></pre><script>const payload=${payloadJson};console.log('[oauth probe]', payload);document.getElementById('out').textContent=JSON.stringify(payload,null,2);</script>`,
       {
-        ok: true,
-        route: 'oauth_start',
-        provider,
-        ts: Date.now(),
+        status: 200,
+        headers: withBaseHeaders({
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        }),
       },
-      200,
-      { 'cache-control': 'no-store' },
     );
   }
 
