@@ -1630,6 +1630,19 @@ const handleOAuthStart = async (
   if (request.method !== 'GET') {
     return jsonResponse({ error: 'Method not allowed.' }, 405);
   }
+  const url = new URL(request.url);
+  if (url.searchParams.get('probe') === '1') {
+    return jsonResponse(
+      {
+        ok: true,
+        route: 'oauth_start',
+        provider,
+        ts: Date.now(),
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  }
 
   const config = getOAuthProviderConfig(env, provider);
   if (!config) {
