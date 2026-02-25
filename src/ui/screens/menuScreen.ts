@@ -1897,15 +1897,35 @@ input[type=number] {
     return label;
   };
 
+  const makeTextAction = (text: string) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    Object.assign(button.style, {
+      background: 'transparent',
+      border: 'none',
+      color: '#8fa0b8',
+      fontSize: '12px',
+      padding: '0',
+      textDecoration: 'underline',
+      textAlign: 'left',
+      cursor: 'pointer',
+    });
+    return button;
+  };
+
   const accountRefreshButton = makeMenuButton('REFRESH SESSION');
   const accountGoogleButton = makeMenuButton('SIGN IN WITH GOOGLE');
   const accountDiscordButton = makeMenuButton('SIGN IN WITH DISCORD');
   const accountVerifyButton = makeMenuButton('SEND VERIFICATION EMAIL');
   const accountLogoutButton = makeMenuButton('LOG OUT');
-  const accountEmailSignupButton = makeMenuButton('SIGN UP');
-  const accountEmailLoginButton = makeMenuButton('LOG IN');
-  const accountForgotButton = makeMenuButton('SEND RESET EMAIL');
-  const accountResetButton = makeMenuButton('RESET PASSWORD');
+  const accountEmailContinueButton = makeMenuButton('CONTINUE WITH EMAIL');
+  const accountEmailSubmitButton = makeMenuButton('LOG IN');
+  const accountResetSubmitButton = makeMenuButton('SET NEW PASSWORD');
+  const accountForgotLink = makeTextAction('Forgot password?');
+  const accountSwitchModeLink = makeTextAction('Need an account? Sign up');
+  const accountBackToEmailLink = makeTextAction('Use different email');
+  const accountResetBackLink = makeTextAction('Back to sign in');
   const accountBackButton = makeMenuButton('BACK');
   Object.assign(accountBackButton.style, { marginTop: 'auto' });
 
@@ -1915,15 +1935,12 @@ input[type=number] {
   accountUsernameInput.autocomplete = 'username';
   const accountPasswordInput = makeAccountInput('Password', 'password');
   accountPasswordInput.autocomplete = 'current-password';
-  const accountResetTokenInput = makeAccountInput('Reset token');
   const accountResetPasswordInput = makeAccountInput(
     'New password',
     'password',
   );
   accountResetPasswordInput.autocomplete = 'new-password';
-  if (authInitialResetToken) {
-    accountResetTokenInput.value = authInitialResetToken;
-  }
+  let hiddenResetToken: string | null = authInitialResetToken;
 
   const accountSignedOutActions = document.createElement('div');
   Object.assign(accountSignedOutActions.style, {
@@ -1938,34 +1955,82 @@ input[type=number] {
     gap: '8px',
   });
 
-  const accountEmailButtons = document.createElement('div');
-  Object.assign(accountEmailButtons.style, {
+  const accountEmailEntrySection = document.createElement('div');
+  Object.assign(accountEmailEntrySection.style, {
     display: 'flex',
+    flexDirection: 'column',
     gap: '8px',
   });
-  Object.assign(accountEmailSignupButton.style, { flex: '1' });
-  Object.assign(accountEmailLoginButton.style, { flex: '1' });
-  accountEmailButtons.appendChild(accountEmailSignupButton);
-  accountEmailButtons.appendChild(accountEmailLoginButton);
+  const accountEmailAuthSection = document.createElement('div');
+  Object.assign(accountEmailAuthSection.style, {
+    display: 'none',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  const accountResetSection = document.createElement('div');
+  Object.assign(accountResetSection.style, {
+    display: 'none',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+
+  const accountEmailModeLabel = makeSectionLabel('SIGN IN WITH EMAIL');
+  Object.assign(accountEmailModeLabel.style, { marginTop: '0' });
+  const accountEmailSelectedValue = document.createElement('div');
+  Object.assign(accountEmailSelectedValue.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+  });
+
+  const accountResetHelp = document.createElement('div');
+  accountResetHelp.textContent =
+    'Use the password reset link from your email to set a new password.';
+  Object.assign(accountResetHelp.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.4',
+  });
+  const accountDivider = document.createElement('div');
+  accountDivider.textContent = 'or';
+  Object.assign(accountDivider.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    textAlign: 'center',
+    margin: '2px 0',
+  });
 
   accountSignedOutActions.appendChild(makeSectionLabel('OAUTH'));
   accountSignedOutActions.appendChild(accountGoogleButton);
   accountSignedOutActions.appendChild(accountDiscordButton);
+  accountSignedOutActions.appendChild(accountDivider);
   accountSignedOutActions.appendChild(makeSectionLabel('EMAIL'));
-  accountSignedOutActions.appendChild(accountEmailInput);
-  accountSignedOutActions.appendChild(accountUsernameInput);
-  accountSignedOutActions.appendChild(accountPasswordInput);
-  accountSignedOutActions.appendChild(accountEmailButtons);
-  accountSignedOutActions.appendChild(accountForgotButton);
-  accountSignedOutActions.appendChild(makeSectionLabel('RESET WITH TOKEN'));
-  accountSignedOutActions.appendChild(accountResetTokenInput);
-  accountSignedOutActions.appendChild(accountResetPasswordInput);
-  accountSignedOutActions.appendChild(accountResetButton);
+  accountEmailEntrySection.appendChild(accountEmailInput);
+  accountEmailEntrySection.appendChild(accountEmailContinueButton);
+  accountSignedOutActions.appendChild(accountEmailEntrySection);
+
+  accountEmailAuthSection.appendChild(accountEmailModeLabel);
+  accountEmailAuthSection.appendChild(accountEmailSelectedValue);
+  accountEmailAuthSection.appendChild(accountUsernameInput);
+  accountEmailAuthSection.appendChild(accountPasswordInput);
+  accountEmailAuthSection.appendChild(accountEmailSubmitButton);
+  accountEmailAuthSection.appendChild(accountForgotLink);
+  accountEmailAuthSection.appendChild(accountSwitchModeLink);
+  accountEmailAuthSection.appendChild(accountBackToEmailLink);
+  accountSignedOutActions.appendChild(accountEmailAuthSection);
+
+  accountResetSection.appendChild(makeSectionLabel('RESET PASSWORD'));
+  accountResetSection.appendChild(accountResetHelp);
+  accountResetSection.appendChild(accountResetPasswordInput);
+  accountResetSection.appendChild(accountResetSubmitButton);
+  accountResetSection.appendChild(accountResetBackLink);
+  accountSignedOutActions.appendChild(accountResetSection);
 
   accountSignedInActions.appendChild(accountRefreshButton);
   accountSignedInActions.appendChild(accountVerifyButton);
   accountSignedInActions.appendChild(accountLogoutButton);
 
+  type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
+  let signedOutStage: SignedOutStage = hiddenResetToken ? 'reset' : 'email';
   let currentAuthState: MenuAuthState = authState;
   let authActionPending = false;
   const statusColor = (tone: MenuAuthStatusTone): string => {
@@ -1984,6 +2049,36 @@ input[type=number] {
   const toErrorMessage = (error: unknown, fallback: string): string => {
     if (error instanceof Error && error.message.trim()) return error.message;
     return fallback;
+  };
+  const setSignedOutStage = (next: SignedOutStage) => {
+    signedOutStage = next;
+  };
+  const syncSignedOutStageUi = () => {
+    const isLogin = signedOutStage === 'login';
+    const isSignup = signedOutStage === 'signup';
+    const isEmailAuth = isLogin || isSignup;
+    const isReset = signedOutStage === 'reset';
+    accountEmailEntrySection.style.display =
+      signedOutStage === 'email' ? 'flex' : 'none';
+    accountEmailAuthSection.style.display = isEmailAuth ? 'flex' : 'none';
+    accountResetSection.style.display = isReset ? 'flex' : 'none';
+    accountDivider.style.display =
+      signedOutStage === 'email' ? 'block' : 'none';
+    accountUsernameInput.style.display = isSignup ? 'block' : 'none';
+    accountForgotLink.style.display = isLogin ? 'inline-flex' : 'none';
+    accountSwitchModeLink.textContent = isSignup
+      ? 'Already have an account? Log in'
+      : 'Need an account? Sign up';
+    accountEmailSubmitButton.textContent = isSignup
+      ? 'CREATE ACCOUNT'
+      : 'LOG IN';
+    accountEmailModeLabel.textContent = isSignup
+      ? 'SIGN UP WITH EMAIL'
+      : 'SIGN IN WITH EMAIL';
+    const email = readField(accountEmailInput);
+    accountEmailSelectedValue.textContent = email
+      ? `Email: ${email}`
+      : 'Email: (not set)';
   };
 
   const formatAccountSummary = (state: MenuAuthState): string => {
@@ -2007,12 +2102,15 @@ input[type=number] {
     accountSummary.textContent = formatAccountSummary(currentAuthState);
     const authenticated =
       currentAuthState.authenticated && currentAuthState.user != null;
+    if (!authenticated && signedOutStage === 'reset' && !hiddenResetToken) {
+      setSignedOutStage('email');
+    }
+    syncSignedOutStageUi();
     const busy = authActionPending || currentAuthState.loading;
     for (const input of [
       accountEmailInput,
       accountUsernameInput,
       accountPasswordInput,
-      accountResetTokenInput,
       accountResetPasswordInput,
     ]) {
       input.disabled = busy;
@@ -2023,10 +2121,13 @@ input[type=number] {
       accountDiscordButton,
       accountLogoutButton,
       accountVerifyButton,
-      accountEmailSignupButton,
-      accountEmailLoginButton,
-      accountForgotButton,
-      accountResetButton,
+      accountEmailContinueButton,
+      accountEmailSubmitButton,
+      accountResetSubmitButton,
+      accountForgotLink,
+      accountSwitchModeLink,
+      accountBackToEmailLink,
+      accountResetBackLink,
     ]) {
       button.disabled = busy;
     }
@@ -2060,6 +2161,47 @@ input[type=number] {
       authActionPending = false;
       updateAccountControls();
     }
+  });
+
+  accountEmailContinueButton.addEventListener('click', () => {
+    if (authActionPending) return;
+    const email = readField(accountEmailInput);
+    if (!email) {
+      setAccountActionStatus('Enter your email first.', 'error');
+      return;
+    }
+    setSignedOutStage('login');
+    setAccountActionStatus('');
+    updateAccountControls();
+  });
+
+  accountEmailInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    accountEmailContinueButton.click();
+  });
+
+  accountSwitchModeLink.addEventListener('click', () => {
+    if (authActionPending) return;
+    setSignedOutStage(signedOutStage === 'signup' ? 'login' : 'signup');
+    setAccountActionStatus('');
+    updateAccountControls();
+  });
+
+  accountBackToEmailLink.addEventListener('click', () => {
+    if (authActionPending) return;
+    setSignedOutStage('email');
+    accountPasswordInput.value = '';
+    accountUsernameInput.value = '';
+    setAccountActionStatus('');
+    updateAccountControls();
+  });
+
+  accountResetBackLink.addEventListener('click', () => {
+    if (authActionPending) return;
+    setSignedOutStage('email');
+    setAccountActionStatus('');
+    updateAccountControls();
   });
 
   accountGoogleButton.addEventListener('click', () => {
@@ -2110,7 +2252,7 @@ input[type=number] {
     }
   });
 
-  accountEmailSignupButton.addEventListener('click', async () => {
+  accountEmailSubmitButton.addEventListener('click', async () => {
     if (authActionPending) return;
     const email = readField(accountEmailInput);
     const password = accountPasswordInput.value;
@@ -2120,21 +2262,29 @@ input[type=number] {
       return;
     }
 
+    const isSignup = signedOutStage === 'signup';
     authActionPending = true;
-    setAccountActionStatus('Creating account...');
+    setAccountActionStatus(isSignup ? 'Creating account...' : 'Signing in...');
     updateAccountControls();
     try {
-      await onAuthEmailSignup({
-        email,
-        password,
-        ...(username ? { username } : {}),
-      });
+      if (isSignup) {
+        await onAuthEmailSignup({
+          email,
+          password,
+          ...(username ? { username } : {}),
+        });
+      } else {
+        await onAuthEmailLogin({ email, password });
+      }
       setAccountActionStatus('Signed in.', 'success');
       accountPasswordInput.value = '';
-      accountResetPasswordInput.value = '';
+      accountUsernameInput.value = '';
     } catch (error) {
       setAccountActionStatus(
-        toErrorMessage(error, 'Could not create account.'),
+        toErrorMessage(
+          error,
+          isSignup ? 'Could not create account.' : 'Could not sign in.',
+        ),
         'error',
       );
     } finally {
@@ -2143,35 +2293,13 @@ input[type=number] {
     }
   });
 
-  accountEmailLoginButton.addEventListener('click', async () => {
-    if (authActionPending) return;
-    const email = readField(accountEmailInput);
-    const password = accountPasswordInput.value;
-    if (!email || !password) {
-      setAccountActionStatus('Email and password are required.', 'error');
-      return;
-    }
-
-    authActionPending = true;
-    setAccountActionStatus('Signing in...');
-    updateAccountControls();
-    try {
-      await onAuthEmailLogin({ email, password });
-      setAccountActionStatus('Signed in.', 'success');
-      accountPasswordInput.value = '';
-      accountResetPasswordInput.value = '';
-    } catch (error) {
-      setAccountActionStatus(
-        toErrorMessage(error, 'Could not sign in.'),
-        'error',
-      );
-    } finally {
-      authActionPending = false;
-      updateAccountControls();
-    }
+  accountPasswordInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    accountEmailSubmitButton.click();
   });
 
-  accountForgotButton.addEventListener('click', async () => {
+  accountForgotLink.addEventListener('click', async () => {
     if (authActionPending) return;
     const email = readField(accountEmailInput);
     if (!email) {
@@ -2198,13 +2326,13 @@ input[type=number] {
     }
   });
 
-  accountResetButton.addEventListener('click', async () => {
+  accountResetSubmitButton.addEventListener('click', async () => {
     if (authActionPending) return;
-    const token = readField(accountResetTokenInput);
+    const token = hiddenResetToken;
     const password = accountResetPasswordInput.value;
     if (!token || !password) {
       setAccountActionStatus(
-        'Reset token and new password are required.',
+        'Reset link is missing or password is empty.',
         'error',
       );
       return;
@@ -2216,9 +2344,10 @@ input[type=number] {
     try {
       await onAuthPasswordReset({ token, password });
       setAccountActionStatus('Password reset complete. Signed in.', 'success');
-      accountResetTokenInput.value = '';
+      hiddenResetToken = null;
       accountResetPasswordInput.value = '';
       accountPasswordInput.value = '';
+      setSignedOutStage('login');
     } catch (error) {
       setAccountActionStatus(
         toErrorMessage(error, 'Could not reset password.'),
@@ -2228,6 +2357,12 @@ input[type=number] {
       authActionPending = false;
       updateAccountControls();
     }
+  });
+
+  accountResetPasswordInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    accountResetSubmitButton.click();
   });
 
   accountPanel.appendChild(accountTitle);
