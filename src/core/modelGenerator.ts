@@ -2,8 +2,9 @@ import type { Board, PieceKind, PieceProbability } from './types';
 import { PIECES } from './types';
 import { XorShift32 } from './rng';
 import type { PieceGenerator } from './generator';
+import { createModelRunner, type ModelRunner } from './modelRunner';
 import type { LoadedModel } from './wubModel';
-import { predictLogits, softmax } from './wubModel';
+import { softmax } from './wubModel';
 import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 type InferenceStrategy = 'clean_uniform' | 'threshold';
@@ -18,6 +19,7 @@ type InferenceOptions = {
 export class ModelGenerator implements PieceGenerator {
   private rng: XorShift32;
   private model: LoadedModel | null;
+  private runner: ModelRunner;
   private pending: PieceKind | null = null;
   private pendingDistribution: PieceProbability[] | null = null;
   private lastSampleDistribution: PieceProbability[] | null = null;
@@ -30,10 +32,12 @@ export class ModelGenerator implements PieceGenerator {
     seed: number,
     model: LoadedModel | null,
     modelPromise?: Promise<LoadedModel | null>,
+    runner?: ModelRunner,
     options: InferenceOptions = {},
   ) {
     this.rng = new XorShift32(seed);
     this.model = model ?? null;
+    this.runner = runner ?? createModelRunner().runner;
     this.strategy = options.strategy ?? 'clean_uniform';
     this.temperature = options.temperature ?? 1;
     this.threshold = options.threshold ?? 0;
@@ -83,7 +87,7 @@ export class ModelGenerator implements PieceGenerator {
     const perfEnabled = hasPerfMetricsSink();
     const lockStartMs = perfEnabled ? performance.now() : 0;
     const logitsStartMs = perfEnabled ? performance.now() : 0;
-    const logits = predictLogits(this.model, board, hold);
+    const logits = this.runner.predictLogits(this.model, board, hold);
     if (perfEnabled) {
       const nowMs = performance.now();
       recordPerfDuration('ml.predict_logits_ms', nowMs - logitsStartMs, nowMs);

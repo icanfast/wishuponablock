@@ -16,6 +16,7 @@ The deploy uses `vite --mode dev030` with:
 - `VITE_SHOW_PERF_OVERLAY=true`
 - `VITE_SHOW_EXPERIMENTAL_GAMEPLAY_CONTROLS=false`
 - `VITE_ENABLE_LEGACY_DATA_TOOLS=false`
+- `VITE_ML_BACKEND=tfjs`
 
 So the online dev build does not depend on new D1/R2 yet.
 

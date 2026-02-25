@@ -79,6 +79,7 @@ export function createGameSessionFactory(
       generatorFactory: createGeneratorFactory(merged.generator, {
         mlModel: modelService.getModel(),
         mlModelPromise: modelService.getModelPromise() ?? undefined,
+        mlRunner: modelService.getRunner(),
       }),
       onPieceLock,
       onHold,

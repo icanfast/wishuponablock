@@ -7,6 +7,7 @@ import {
   ROWS,
 } from './core/constants';
 import { GENERATOR_TYPES, usesModelGenerator } from './core/generators';
+import type { MlBackend } from './core/modelRunner';
 import type { GameSession } from './core/gameSession';
 import { createSettingsStore } from './core/settingsStore';
 import { createGameRuntime, type GameRuntime } from './app/runtime';
@@ -238,12 +239,17 @@ async function boot() {
   const toolUsesRemote =
     ENABLE_LEGACY_DATA_TOOLS && uploadService.toolUsesRemote;
   const LABELING_PROGRESS_TARGET = 1000;
+  const preferredMlBackend: MlBackend =
+    import.meta.env.VITE_ML_BACKEND === 'native' ? 'native' : 'tfjs';
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
   let requestStartGame: () => void = () => {};
   let runtime: GameRuntime | null = null;
-  const modelService = createModelService({ modelUrl: ML_MODEL_URL });
+  const modelService = createModelService({
+    modelUrl: ML_MODEL_URL,
+    preferredBackend: preferredMlBackend,
+  });
   modelService.setStatusListener((status) => {
     updateModelStatusUI(status);
   });
@@ -264,20 +270,25 @@ async function boot() {
       return;
     }
     const generatorLabel = getModelGeneratorLabel();
+    const runnerInfo = modelService.getRunnerInfo();
+    const backendSuffix =
+      runnerInfo.requestedBackend === runnerInfo.activeBackend
+        ? ` (${runnerInfo.activeBackend})`
+        : ` (${runnerInfo.activeBackend} fallback)`;
     modelStatusLabel.style.display = 'block';
-    let text = `${generatorLabel}: idle (RNG fallback)`;
+    let text = `${generatorLabel}: idle (RNG fallback)${backendSuffix}`;
     let color = '#f4b266';
     let shouldPause = false;
     if (status === 'ready') {
-      text = `${generatorLabel}: loaded`;
+      text = `${generatorLabel}: loaded${backendSuffix}`;
       color = '#8fd19e';
       shouldPause = false;
     } else if (status === 'loading') {
-      text = `${generatorLabel}: loading (RNG fallback)`;
+      text = `${generatorLabel}: loading (RNG fallback)${backendSuffix}`;
       color = '#f4b266';
       shouldPause = false;
     } else if (status === 'failed') {
-      text = `${generatorLabel}: failed to load model`;
+      text = `${generatorLabel}: failed to load model${backendSuffix}`;
       color = '#f28b82';
       shouldPause = true;
     }

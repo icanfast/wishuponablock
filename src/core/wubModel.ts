@@ -81,7 +81,7 @@ export function predictLogits(
   const rows = board.length;
   const cols = board[0]?.length ?? 0;
   const encodeStartMs = perfEnabled ? performance.now() : 0;
-  let input = buildInputChannels(board, model.boardChannels);
+  let input = buildModelInputChannels(board, model.boardChannels);
   const expectedLength = config.input_channels * rows * cols;
   if (input.length !== expectedLength) {
     const padded = new Float32Array(expectedLength);
@@ -101,7 +101,7 @@ export function predictLogits(
   let inChannels = config.input_channels;
   const height = rows;
   const width = cols;
-  const poolShape = getPoolShape(config.pool_shape);
+  const poolShape = getModelPoolShape(config.pool_shape);
   const convStartMs = perfEnabled ? performance.now() : 0;
 
   for (let i = 0; i < config.conv_channels.length; i++) {
@@ -139,7 +139,11 @@ export function predictLogits(
   }
 
   const headStartMs = perfEnabled ? performance.now() : 0;
-  const extra = buildExtraFeatures(config.extra_features, hold, model.pieces);
+  const extra = buildModelExtraFeatures(
+    config.extra_features,
+    hold,
+    model.pieces,
+  );
 
   let mlpInput = concatFeatures(pooled, extra);
   if (config.feature_norm === 'layernorm') {
@@ -187,7 +191,10 @@ export function softmax(logits: Float32Array): Float32Array {
   return out;
 }
 
-function buildInputChannels(board: Board, channels: string[]): Float32Array {
+export function buildModelInputChannels(
+  board: Board,
+  channels: string[],
+): Float32Array {
   const rows = board.length;
   const cols = board[0]?.length ?? 0;
   const size = rows * cols;
@@ -359,7 +366,7 @@ function buildInputChannels(board: Board, channels: string[]): Float32Array {
   return input;
 }
 
-function buildExtraFeatures(
+export function buildModelExtraFeatures(
   extraFeatures: number,
   hold: PieceKind | null,
   pieces: PieceKind[],
@@ -393,7 +400,9 @@ function getParam(model: LoadedModel, name: string): ModelTensor {
   return tensor;
 }
 
-function getPoolShape(value: number[] | undefined): [number, number] {
+export function getModelPoolShape(
+  value: number[] | undefined,
+): [number, number] {
   if (!Array.isArray(value) || value.length !== 2) {
     return [1, 1];
   }

@@ -7,6 +7,7 @@ import { NesGenerator } from './nesGenerator';
 import { ModelGenerator } from './modelGenerator';
 import { CurseModelGenerator } from './curseModelGenerator';
 import { DEFAULT_ML_INFERENCE } from './constants';
+import type { ModelRunner } from './modelRunner';
 import type { LoadedModel } from './wubModel';
 
 export const GENERATOR_TYPES = [
@@ -36,6 +37,7 @@ export interface GeneratorSettings {
 export interface GeneratorFactoryOptions {
   mlModel?: LoadedModel | null;
   mlModelPromise?: Promise<LoadedModel | null>;
+  mlRunner?: ModelRunner;
 }
 
 export function isGeneratorType(value: unknown): value is GeneratorType {
@@ -74,6 +76,7 @@ export function createGeneratorFactory(
           seed,
           options.mlModel ?? null,
           options.mlModelPromise,
+          options.mlRunner,
           settings.ml ?? DEFAULT_ML_INFERENCE,
         );
     case 'curse':
@@ -82,6 +85,7 @@ export function createGeneratorFactory(
           seed,
           options.mlModel ?? null,
           options.mlModelPromise,
+          options.mlRunner,
         );
     case 'bag7':
     default:
