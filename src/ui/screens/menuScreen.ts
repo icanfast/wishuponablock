@@ -26,7 +26,8 @@ export type LabelingProgressState = {
 
 export type MenuScreenOptions = {
   settingsStore: SettingsStore;
-  showDevTools: boolean;
+  showExperimentalGameplayControls: boolean;
+  showLegacyDataTools: boolean;
   version: string;
   charcuterieDefaultSimCount?: number;
   tools: Array<{ id: string; label: string }>;
@@ -56,7 +57,8 @@ export type MenuScreen = {
 export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
   const {
     settingsStore,
-    showDevTools,
+    showExperimentalGameplayControls,
+    showLegacyDataTools,
     version,
     charcuterieDefaultSimCount = 10000,
     tools,
@@ -230,7 +232,7 @@ input[type=number] {
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
-    display: showDevTools ? 'flex' : 'none',
+    display: showExperimentalGameplayControls ? 'flex' : 'none',
   });
   Object.assign(playMenuRow.style, {
     display: 'none',
@@ -241,6 +243,9 @@ input[type=number] {
   const playButton = makeMenuButton('PLAY');
   const optionsButton = makeMenuButton('OPTIONS');
   const toolsButton = makeMenuButton('TOOLS');
+  if (!showLegacyDataTools) {
+    toolsButton.style.display = 'none';
+  }
   const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
@@ -994,8 +999,10 @@ input[type=number] {
   optionsMiddleColumn.appendChild(arrControl.wrapper);
   optionsMiddleColumn.appendChild(softDropControl.wrapper);
   optionsMiddleColumn.appendChild(gameplayResetButton);
-  optionsMiddleColumn.appendChild(dataTitle);
-  optionsMiddleColumn.appendChild(shareRow);
+  if (showLegacyDataTools) {
+    optionsMiddleColumn.appendChild(dataTitle);
+    optionsMiddleColumn.appendChild(shareRow);
+  }
 
   optionsRightColumn.appendChild(audioTitle);
   optionsRightColumn.appendChild(volumeWrapper);
@@ -1238,8 +1245,9 @@ input[type=number] {
   });
 
   const dataNotice = document.createElement('div');
-  dataNotice.textContent =
-    'This game collects anonymized board snapshots to train the piece generator.';
+  dataNotice.textContent = showLegacyDataTools
+    ? 'This game collects anonymized board snapshots to train the piece generator.'
+    : '0.3.0 dev build: legacy snapshot/label collection is disabled.';
   Object.assign(dataNotice.style, {
     maxWidth: '320px',
     color: '#8fa0b8',
@@ -1303,7 +1311,7 @@ input[type=number] {
   playPanel.appendChild(playBackButton);
 
   let updateButterfingerUI: (cfg: Settings['butterfinger']) => void = () => {};
-  if (showDevTools) {
+  if (showExperimentalGameplayControls) {
     const butterfingerTitle = document.createElement('div');
     butterfingerTitle.textContent = 'BUTTERFINGER';
     Object.assign(butterfingerTitle.style, {
@@ -1566,7 +1574,7 @@ input[type=number] {
   charcuteriePanel.appendChild(charcuterie8Button);
   charcuteriePanel.appendChild(charcuterie14Button);
   charcuteriePanel.appendChild(charcuterie20Button);
-  if (showDevTools) {
+  if (showExperimentalGameplayControls) {
     charcuteriePanel.appendChild(charcuterieSimField);
     charcuteriePanel.appendChild(charcuterieSeedField);
   }
@@ -1780,7 +1788,7 @@ input[type=number] {
   menuLayer.appendChild(menuMainWrapper);
   menuLayer.appendChild(menuTitle);
   playMenuRow.appendChild(playPanel);
-  if (showDevTools) {
+  if (showExperimentalGameplayControls) {
     playMenuRow.appendChild(butterfingerPanel);
   }
   menuLayer.appendChild(playMenuRow);
@@ -1891,7 +1899,9 @@ input[type=number] {
 
   playButton.addEventListener('click', () => show('play'));
   optionsButton.addEventListener('click', () => show('options'));
-  toolsButton.addEventListener('click', () => show('tools'));
+  if (showLegacyDataTools) {
+    toolsButton.addEventListener('click', () => show('tools'));
+  }
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 

@@ -13,7 +13,9 @@ This deploys `env.dev` (`wishuponablock-030-dev`) instead of the default worker.
 The deploy uses `vite --mode dev030` with:
 
 - `VITE_UPLOAD_MODE=local`
-- `VITE_SHOW_DEV_TOOLS=true`
+- `VITE_SHOW_PERF_OVERLAY=true`
+- `VITE_SHOW_EXPERIMENTAL_GAMEPLAY_CONTROLS=false`
+- `VITE_ENABLE_LEGACY_DATA_TOOLS=false`
 
 So the online dev build does not depend on new D1/R2 yet.
 

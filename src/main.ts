@@ -34,11 +34,15 @@ import { PixiRenderer } from './render/pixiRenderer';
 import { type Board, type PieceKind, type GameState } from './core/types';
 import { createMenuScreen, type MenuScreen } from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
-import { createToolHost, type ToolHost } from './ui/tools/toolHost';
+import {
+  createToolHost,
+  type ToolController,
+  type ToolHost,
+} from './ui/tools/toolHost';
 import { createLabelingTool } from './ui/tools/labelingTool';
 import { createConstructorTool } from './ui/tools/constructorTool';
 import { createToolCanvas } from './ui/tools/toolCanvas';
-import { getPiecePalette } from './core/palette';
+import { getPiecePalette, type PiecePalette } from './core/palette';
 import { createPerfOverlay } from './app/perfOverlay';
 import { setPerfMetricsSink } from './core/perfMetrics';
 import pkg from '../package.json';
@@ -125,10 +129,12 @@ async function boot() {
 
   const settingsStore = createSettingsStore();
   const settings = settingsStore.get();
-  const SHOW_DEV_TOOLS =
-    import.meta.env.VITE_SHOW_DEV_TOOLS === 'true' || import.meta.env.DEV;
+  const SHOW_EXPERIMENTAL_GAMEPLAY_CONTROLS =
+    import.meta.env.VITE_SHOW_EXPERIMENTAL_GAMEPLAY_CONTROLS === 'true';
+  const ENABLE_LEGACY_DATA_TOOLS =
+    import.meta.env.VITE_ENABLE_LEGACY_DATA_TOOLS === 'true';
   const SHOW_PERF_OVERLAY =
-    import.meta.env.VITE_SHOW_PERF_OVERLAY === 'true' || SHOW_DEV_TOOLS;
+    import.meta.env.VITE_SHOW_PERF_OVERLAY === 'true' || import.meta.env.DEV;
   const perfOverlay = SHOW_PERF_OVERLAY
     ? createPerfOverlay({
         root: playWindow,
@@ -144,8 +150,9 @@ async function boot() {
   });
   const uploadClient = uploadService.uploadClient;
   const uploadBaseUrl = uploadService.baseUrl;
-  const useRemoteUpload = uploadService.useRemote;
-  const toolUsesRemote = uploadService.toolUsesRemote;
+  const useRemoteUpload = ENABLE_LEGACY_DATA_TOOLS && uploadService.useRemote;
+  const toolUsesRemote =
+    ENABLE_LEGACY_DATA_TOOLS && uploadService.toolUsesRemote;
   const LABELING_PROGRESS_TARGET = 1000;
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
@@ -325,6 +332,13 @@ async function boot() {
   });
   gameScreen.appendChild(gameUi.root);
   gameUi.setQueueOddsMode(usesModelGenerator(settings.generator.type));
+  if (!ENABLE_LEGACY_DATA_TOOLS) {
+    gameUi.folderButton.style.display = 'none';
+    gameUi.folderStatus.style.display = 'none';
+    gameUi.recordRow.style.display = 'none';
+    gameUi.recordStatus.style.display = 'none';
+    gameUi.manualButton.style.display = 'none';
+  }
 
   const formatSprintTime = (ms: number): string => {
     const totalMs = Math.max(0, Math.floor(ms));
@@ -399,7 +413,7 @@ async function boot() {
   runtime.setInputSource(inputService.getInputSource());
   updateModelStatusUI(modelService.getStatus());
 
-  let activeToolId = 'labeling';
+  let activeToolId = '';
   const uiController = createUiController({
     game: gameUi,
     settingsStore,
@@ -427,6 +441,7 @@ async function boot() {
     onMenuClick: () => setScreen('menu'),
     onStartGame: () => requestStartGame(),
     onOpenTool: (id) => {
+      if (!ENABLE_LEGACY_DATA_TOOLS) return;
       activeToolId = id;
       setScreen('tool');
     },
@@ -436,6 +451,10 @@ async function boot() {
   uiController.bindGameUi();
 
   const refreshMenuLabelingProgress = async (): Promise<void> => {
+    if (!ENABLE_LEGACY_DATA_TOOLS) {
+      uiController.setMenuLabelingProgress(null);
+      return;
+    }
     if (!useRemoteUpload) {
       uiController.setMenuLabelingProgress({
         buildVersion: APP_VERSION,
@@ -454,21 +473,23 @@ async function boot() {
     });
   };
 
-  snapshotService = createSnapshotService({
-    settingsStore,
-    rows: ROWS,
-    cols: COLS,
-    uploadClient,
-    useRemoteUpload,
-    identityService,
-    buildVersion: APP_VERSION,
-    onStateChange: uiController.syncSnapshotUi,
-  });
-  snapshotService.setModeInfo({
-    id: initialModeState.mode.id,
-    options: { ...initialModeState.options },
-  });
-  uiController.attachSnapshotService(snapshotService);
+  if (ENABLE_LEGACY_DATA_TOOLS) {
+    snapshotService = createSnapshotService({
+      settingsStore,
+      rows: ROWS,
+      cols: COLS,
+      uploadClient,
+      useRemoteUpload,
+      identityService,
+      buildVersion: APP_VERSION,
+      onStateChange: uiController.syncSnapshotUi,
+    });
+    snapshotService.setModeInfo({
+      id: initialModeState.mode.id,
+      options: { ...initialModeState.options },
+    });
+    uiController.attachSnapshotService(snapshotService);
+  }
 
   modeController.setOnModeChange((mode, options) => {
     snapshotService?.setModeInfo({
@@ -479,50 +500,58 @@ async function boot() {
   });
 
   const toolHost: ToolHost = createToolHost(toolScreen);
-  const labelingTool = createLabelingTool({
-    toolUsesRemote,
-    uploadClient,
-    uploadBaseUrl,
-    buildVersion: APP_VERSION,
-    canvas: toolCanvas,
-    onBack: () => setScreen('menu'),
-  });
-  toolHost.register(labelingTool);
-  const constructorTool = createConstructorTool({
-    canvas: toolCanvas,
-    canvasElement: app.canvas,
-    uploadClient,
-    settingsStore,
-    identityService,
-    buildVersion: APP_VERSION,
-    onBack: () => setScreen('menu'),
-  });
-  toolHost.register(constructorTool);
-  activeToolId = labelingTool.id;
+  const paletteAwareTools: ToolController[] = [];
+  if (ENABLE_LEGACY_DATA_TOOLS) {
+    const labelingTool = createLabelingTool({
+      toolUsesRemote,
+      uploadClient,
+      uploadBaseUrl,
+      buildVersion: APP_VERSION,
+      canvas: toolCanvas,
+      onBack: () => setScreen('menu'),
+    });
+    toolHost.register(labelingTool);
+    const constructorTool = createConstructorTool({
+      canvas: toolCanvas,
+      canvasElement: app.canvas,
+      uploadClient,
+      settingsStore,
+      identityService,
+      buildVersion: APP_VERSION,
+      onBack: () => setScreen('menu'),
+    });
+    toolHost.register(constructorTool);
+    activeToolId = labelingTool.id;
+    paletteAwareTools.push(labelingTool, constructorTool);
+  }
 
   const applyToolPalette = () => {
-    const palette = getPiecePalette(settingsStore.get().graphics);
-    labelingTool.setPiecePalette?.(palette);
-    constructorTool.setPiecePalette?.(palette);
+    const palette: PiecePalette = getPiecePalette(settingsStore.get().graphics);
+    for (const tool of paletteAwareTools) {
+      tool.setPiecePalette?.(palette);
+    }
   };
   applyToolPalette();
 
   menuUi = createMenuScreen({
     settingsStore,
-    showDevTools: SHOW_DEV_TOOLS,
+    showExperimentalGameplayControls: SHOW_EXPERIMENTAL_GAMEPLAY_CONTROLS,
+    showLegacyDataTools: ENABLE_LEGACY_DATA_TOOLS,
     version: APP_VERSION,
     charcuterieDefaultSimCount,
-    tools: toolHost.list(),
-    labelingProgress: {
-      buildVersion: APP_VERSION,
-      labeledBoards: null,
-      target: LABELING_PROGRESS_TARGET,
-    },
+    tools: ENABLE_LEGACY_DATA_TOOLS ? toolHost.list() : [],
+    labelingProgress: ENABLE_LEGACY_DATA_TOOLS
+      ? {
+          buildVersion: APP_VERSION,
+          labeledBoards: null,
+          target: LABELING_PROGRESS_TARGET,
+        }
+      : null,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
   uiController.attachMenu(menuUi);
-  uiController.setMenuTools(toolHost.list());
+  uiController.setMenuTools(ENABLE_LEGACY_DATA_TOOLS ? toolHost.list() : []);
   void refreshMenuLabelingProgress();
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
@@ -543,9 +572,10 @@ async function boot() {
       toolRenderer.setHighContrast(next.graphics.highContrast);
       gameRenderer.setColorblindMode(next.graphics.colorblindMode);
       toolRenderer.setColorblindMode(next.graphics.colorblindMode);
-      const palette = getPiecePalette(next.graphics);
-      labelingTool.setPiecePalette?.(palette);
-      constructorTool.setPiecePalette?.(palette);
+      const palette: PiecePalette = getPiecePalette(next.graphics);
+      for (const tool of paletteAwareTools) {
+        tool.setPiecePalette?.(palette);
+      }
     },
   });
   settingsController.start();
@@ -561,9 +591,11 @@ async function boot() {
     gameGfx,
     toolGfx,
     stopRecording: () => {
+      if (!ENABLE_LEGACY_DATA_TOOLS) return;
       void stopRecordingSession();
     },
     startRecording: () => {
+      if (!ENABLE_LEGACY_DATA_TOOLS) return;
       startRecordingSession();
     },
   });

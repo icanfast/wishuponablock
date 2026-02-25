@@ -27,6 +27,11 @@
 				"RELEASE_CHANNEL": "dev",
 				"FEATURE_FLAGS": "{\"computeProfiler\":false,\"rlPipeline\":false,\"authV1\":false,\"dbV3\":false}",
 			},
+			"triggers": {
+				"crons": [
+					"13 3 * * *"
+				]
+			},
 			"d1_databases": [
 				{
 					"binding": "DB",

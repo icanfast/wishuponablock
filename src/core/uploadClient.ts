@@ -107,6 +107,12 @@ export class UploadClient {
       body: JSON.stringify(item.payload),
     });
     const elapsed = performance.now() - startedAt;
+    if (res.status === 410) {
+      console.warn(
+        `[Upload] Retired API ${url} responded 410 in ${elapsed.toFixed(1)}ms; dropping ${item.type} item.`,
+      );
+      return;
+    }
     if (!res.ok) {
       console.warn(
         `[Upload] Failed ${url} (${res.status}) in ${elapsed.toFixed(1)}ms`,
