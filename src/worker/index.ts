@@ -10,6 +10,26 @@ type D1Database = {
   prepare: (query: string) => D1PreparedStatement;
 };
 
+type R2ObjectBody = {
+  arrayBuffer: () => Promise<ArrayBuffer>;
+};
+
+type R2PutOptions = {
+  httpMetadata?: {
+    contentType?: string;
+  };
+};
+
+type R2Bucket = {
+  get: (key: string) => Promise<R2ObjectBody | null>;
+  put: (
+    key: string,
+    value: ArrayBuffer | ArrayBufferView | string,
+    options?: R2PutOptions,
+  ) => Promise<void>;
+  delete: (key: string) => Promise<void>;
+};
+
 type Env = {
   DB: D1Database;
   ASSETS: { fetch: (request: Request) => Promise<Response> };
@@ -23,8 +43,8 @@ type Env = {
   GOOGLE_OAUTH_CLIENT_SECRET?: string;
   DISCORD_OAUTH_CLIENT_ID?: string;
   DISCORD_OAUTH_CLIENT_SECRET?: string;
-  MODELS_BUCKET?: unknown;
-  RECORDINGS_BUCKET?: unknown;
+  MODELS_BUCKET?: R2Bucket;
+  RECORDINGS_BUCKET?: R2Bucket;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -35,6 +55,7 @@ const SESSION_MAX_AGE_SECONDS = Math.trunc(SESSION_MAX_AGE_MS / 1000);
 const SESSION_SLIDING_WINDOW_DAYS = 90;
 const SESSION_REVOKED_RETENTION_MS = 30 * DAY_MS;
 const TOKEN_CONSUMED_RETENTION_MS = 7 * DAY_MS;
+const MAX_PERSONALIZED_MODEL_BYTES = 2 * 1024 * 1024;
 const LEGACY_API_ERROR =
   'Legacy snapshot/label APIs were removed on the 0.3.0 dev branch.';
 const EMAIL_VERIFY_TOKEN_TTL_MS = DAY_MS;
@@ -68,7 +89,7 @@ const OAUTH_DISCORD_SCOPES = 'identify email';
 const CORS_BASE_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'content-type',
-  'access-control-allow-methods': 'GET,POST,OPTIONS',
+  'access-control-allow-methods': 'GET,POST,PUT,OPTIONS',
 };
 
 const withBaseHeaders = (extra?: HeadersInit): Headers => {
@@ -141,6 +162,30 @@ const asBoolean = (value: unknown): boolean | null => {
     if (normalized === 'false') return false;
   }
   return null;
+};
+
+const binaryResponse = (
+  body: BodyInit,
+  status = 200,
+  headers?: HeadersInit,
+): Response =>
+  new Response(body, {
+    status,
+    headers: withBaseHeaders(headers),
+  });
+
+const normalizeGameMode = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const mode = value.trim().toLowerCase();
+  if (!mode) return null;
+  if (mode.length > 64) return null;
+  if (!/^[a-z0-9_-]+$/.test(mode)) return null;
+  return mode;
+};
+
+const readGameModeFromRequest = (request: Request): string | null => {
+  const mode = new URL(request.url).searchParams.get('mode');
+  return normalizeGameMode(mode);
 };
 
 const isSecureRequest = (request: Request): boolean =>
@@ -456,6 +501,73 @@ type AuthTokenRecord = {
   userId: string;
   emailNorm: string | null;
   expiresAtMs: number;
+};
+
+type PersonalModelRecord = {
+  userId: string;
+  gameMode: string;
+  r2Key: string;
+  version: number;
+  modelSizeBytes: number | null;
+  modelSha256: string | null;
+  updatedAtMs: number;
+};
+
+const readPersonalModelRecord = (
+  row: Record<string, unknown>,
+): PersonalModelRecord | null => {
+  const userId = asString(row.user_id);
+  const gameMode = asString(row.game_mode);
+  const r2Key = asString(row.r2_key);
+  const version = asInt(row.version);
+  const updatedAtMs = asInt(row.updated_at_ms);
+  if (
+    !userId ||
+    !gameMode ||
+    !r2Key ||
+    version == null ||
+    updatedAtMs == null
+  ) {
+    return null;
+  }
+  return {
+    userId,
+    gameMode,
+    r2Key,
+    version,
+    modelSizeBytes: asInt(row.model_size_bytes),
+    modelSha256: asString(row.model_sha256),
+    updatedAtMs,
+  };
+};
+
+const readCurrentPersonalModel = async (
+  env: Env,
+  userId: string,
+  gameMode: string,
+): Promise<PersonalModelRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       user_id,
+       game_mode,
+       r2_key,
+       version,
+       model_size_bytes,
+       model_sha256,
+       updated_at_ms
+     FROM user_models
+     WHERE user_id = ? AND game_mode = ?
+     LIMIT 1`,
+  )
+    .bind(userId, gameMode)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return readPersonalModelRecord(row);
+};
+
+const sha256HexFromBuffer = async (buffer: ArrayBuffer): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return toHex(new Uint8Array(digest));
 };
 
 const getOAuthProviderColumn = (
@@ -1860,6 +1972,204 @@ const handleAuthLogout = async (
   });
 };
 
+const handleGetCurrentPersonalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const gameMode = readGameModeFromRequest(request);
+  if (!gameMode) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[models] touch session failed', error);
+  }
+
+  try {
+    const record = await readCurrentPersonalModel(
+      env,
+      session.userId,
+      gameMode,
+    );
+    if (!record) {
+      return jsonResponse({ error: 'Model not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const object = await env.MODELS_BUCKET.get(record.r2Key);
+    if (!object) {
+      return jsonResponse({ error: 'Model blob is missing.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const bytes = await object.arrayBuffer();
+    const responseHeaders = withBaseHeaders({
+      'cache-control': 'no-store',
+      'content-type': 'application/octet-stream',
+      'x-wub-model-mode': record.gameMode,
+      'x-wub-model-version': String(record.version),
+      'x-wub-model-size': String(bytes.byteLength),
+      'x-wub-model-updated-at-ms': String(record.updatedAtMs),
+    });
+    if (record.modelSha256) {
+      responseHeaders.set('x-wub-model-sha256', record.modelSha256);
+    }
+    return binaryResponse(bytes, 200, responseHeaders);
+  } catch (error) {
+    console.error('[models] current model get failed', error);
+    return jsonResponse(
+      { error: 'Model storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handlePutCurrentPersonalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'PUT') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const gameMode = readGameModeFromRequest(request);
+  if (!gameMode) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[models] touch session failed', error);
+  }
+
+  let modelBuffer: ArrayBuffer;
+  try {
+    modelBuffer = await request.arrayBuffer();
+  } catch {
+    return jsonResponse({ error: 'Invalid model payload.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (modelBuffer.byteLength <= 0) {
+    return jsonResponse({ error: 'Model payload is empty.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (modelBuffer.byteLength > MAX_PERSONALIZED_MODEL_BYTES) {
+    return jsonResponse(
+      {
+        error: `Model payload is too large. Max bytes: ${MAX_PERSONALIZED_MODEL_BYTES}.`,
+      },
+      413,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  try {
+    const existing = await readCurrentPersonalModel(
+      env,
+      session.userId,
+      gameMode,
+    );
+    const nextVersion = (existing?.version ?? 0) + 1;
+    const nextR2Key = `models/${session.userId}/${gameMode}/v${nextVersion}-${nowMs}.bin`;
+    const modelSha256 = await sha256HexFromBuffer(modelBuffer);
+    const contentType =
+      asString(request.headers.get('content-type')) ??
+      'application/octet-stream';
+
+    await env.MODELS_BUCKET.put(nextR2Key, modelBuffer, {
+      httpMetadata: { contentType },
+    });
+    await env.DB.prepare(
+      `INSERT INTO user_models (
+         user_id,
+         game_mode,
+         r2_key,
+         version,
+         model_size_bytes,
+         model_sha256,
+         updated_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, game_mode) DO UPDATE SET
+         r2_key = excluded.r2_key,
+         version = excluded.version,
+         model_size_bytes = excluded.model_size_bytes,
+         model_sha256 = excluded.model_sha256,
+         updated_at_ms = excluded.updated_at_ms`,
+    )
+      .bind(
+        session.userId,
+        gameMode,
+        nextR2Key,
+        nextVersion,
+        modelBuffer.byteLength,
+        modelSha256,
+        nowMs,
+      )
+      .run();
+
+    if (existing && existing.r2Key !== nextR2Key) {
+      env.MODELS_BUCKET.delete(existing.r2Key).catch((error) => {
+        console.warn(
+          `[models] failed to delete previous model blob (${existing.r2Key})`,
+          error,
+        );
+      });
+    }
+
+    return jsonResponse(
+      {
+        ok: true,
+        model: {
+          mode: gameMode,
+          version: nextVersion,
+          sizeBytes: modelBuffer.byteLength,
+          sha256: modelSha256,
+          updatedAtMs: nowMs,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[models] current model put failed', error);
+    return jsonResponse(
+      { error: 'Model storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -2025,6 +2335,16 @@ export default {
 
     if (url.pathname === '/api/auth/logout') {
       return handleAuthLogout(request, env);
+    }
+
+    if (url.pathname === '/api/models/me/current') {
+      if (request.method === 'GET') {
+        return handleGetCurrentPersonalModel(request, env);
+      }
+      if (request.method === 'PUT') {
+        return handlePutCurrentPersonalModel(request, env);
+      }
+      return jsonResponse({ error: 'Method not allowed.' }, 405);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {

@@ -28,6 +28,7 @@ import { createUiController } from './app/uiController';
 import { createScreenFlowController } from './app/screenFlowController';
 import { createSettingsController } from './app/settingsController';
 import { createAuthService } from './app/authService';
+import { createPersonalModelService } from './app/personalModelService';
 import type {
   CharcuterieHoleWeights,
   CharcuterieScoreWeights,
@@ -207,6 +208,9 @@ async function boot() {
   const uploadClient = uploadService.uploadClient;
   const uploadBaseUrl = uploadService.baseUrl;
   const authService = createAuthService({ baseUrl: uploadBaseUrl });
+  const personalModelService = createPersonalModelService({
+    baseUrl: uploadBaseUrl,
+  });
   const authErrorMessages: Record<string, string> = {
     oauth_not_configured: 'OAuth provider is not configured.',
     oauth_denied: 'OAuth sign-in was cancelled.',
@@ -421,6 +425,9 @@ async function boot() {
 
   const logoutAuthState = async () => {
     await authService.logout();
+    await modelService.reloadDefaultModel();
+    sessionController.rebuildSession();
+    updateModelStatusUI(modelService.getStatus());
     await refreshAuthState();
   };
 
@@ -453,6 +460,41 @@ async function boot() {
   }) => {
     await authService.passwordReset(payload);
     await refreshAuthState();
+  };
+  const loadCurrentModePersonalModel = async (): Promise<string> => {
+    const mode = modeController.getState().mode.id;
+    try {
+      const result = await personalModelService.downloadCurrent(mode);
+      await modelService.replaceModelFromBytes(
+        result.bytes,
+        `personal model (${mode})`,
+      );
+      sessionController.rebuildSession();
+      updateModelStatusUI(modelService.getStatus());
+      const versionLabel =
+        result.version != null ? `v${result.version}` : 'latest';
+      return `Loaded ${versionLabel} model for mode "${result.mode}".`;
+    } catch (error) {
+      const status =
+        typeof (error as { status?: unknown })?.status === 'number'
+          ? Math.trunc((error as { status?: number }).status ?? 0)
+          : null;
+      if (status === 404) {
+        throw new Error(`No cloud model saved for mode "${mode}" yet.`);
+      }
+      throw error;
+    }
+  };
+  const saveCurrentModePersonalModel = async (): Promise<string> => {
+    const mode = modeController.getState().mode.id;
+    const bytes = await modelService.ensureModelBytes();
+    if (!bytes) {
+      throw new Error('No model is loaded to upload.');
+    }
+    const result = await personalModelService.uploadCurrent(mode, bytes);
+    const versionLabel =
+      result.version != null ? `v${result.version}` : 'saved';
+    return `Saved ${versionLabel} model for mode "${result.mode}".`;
   };
   applyAuthState(authState);
 
@@ -863,6 +905,8 @@ async function boot() {
     onAuthEmailLogin: loginWithEmail,
     onAuthPasswordForgot: sendPasswordReset,
     onAuthPasswordReset: resetPasswordWithToken,
+    onAuthLoadCurrentModel: loadCurrentModePersonalModel,
+    onAuthSaveCurrentModel: saveCurrentModePersonalModel,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);

@@ -39,7 +39,28 @@ export async function loadWubModel(url: string): Promise<LoadedModel> {
   if (!res.ok) {
     throw new Error(`Failed to load model (${res.status})`);
   }
-  const json = (await res.json()) as ExportedModel;
+  const bytes = await res.arrayBuffer();
+  return parseWubModelFromBytes(bytes);
+}
+
+export function parseWubModelFromBytes(
+  payload: ArrayBuffer | ArrayBufferView,
+): LoadedModel {
+  const view =
+    payload instanceof ArrayBuffer
+      ? new Uint8Array(payload)
+      : new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  const text = new TextDecoder().decode(view);
+  return parseWubModelFromJsonText(text);
+}
+
+export function parseWubModelFromJsonText(payload: string): LoadedModel {
+  let json: ExportedModel;
+  try {
+    json = JSON.parse(payload) as ExportedModel;
+  } catch {
+    throw new Error('Invalid model payload: expected JSON.');
+  }
   return parseWubModel(json);
 }
 

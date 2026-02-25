@@ -94,6 +94,8 @@ export type MenuScreenOptions = {
     token: string;
     password: string;
   }) => Promise<void>;
+  onAuthLoadCurrentModel: () => Promise<string>;
+  onAuthSaveCurrentModel: () => Promise<string>;
 };
 
 export type MenuScreen = {
@@ -138,6 +140,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthEmailLogin,
     onAuthPasswordForgot,
     onAuthPasswordReset,
+    onAuthLoadCurrentModel,
+    onAuthSaveCurrentModel,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -2090,6 +2094,8 @@ input[type=number] {
   const accountGoogleButton = makeMenuButton('SIGN IN WITH GOOGLE');
   const accountDiscordButton = makeMenuButton('SIGN IN WITH DISCORD');
   const accountVerifyButton = makeMenuButton('SEND VERIFICATION EMAIL');
+  const accountLoadModelButton = makeMenuButton('LOAD CLOUD MODEL');
+  const accountSaveModelButton = makeMenuButton('SAVE CURRENT MODEL');
   const accountLogoutButton = makeMenuButton('LOG OUT');
   const accountEmailContinueButton = makeMenuButton('CONTINUE WITH EMAIL');
   const accountEmailSubmitButton = makeMenuButton('LOG IN');
@@ -2199,6 +2205,8 @@ input[type=number] {
 
   accountSignedInActions.appendChild(accountRefreshButton);
   accountSignedInActions.appendChild(accountVerifyButton);
+  accountSignedInActions.appendChild(accountLoadModelButton);
+  accountSignedInActions.appendChild(accountSaveModelButton);
   accountSignedInActions.appendChild(accountLogoutButton);
 
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
@@ -2293,6 +2301,8 @@ input[type=number] {
       accountDiscordButton,
       accountLogoutButton,
       accountVerifyButton,
+      accountLoadModelButton,
+      accountSaveModelButton,
       accountEmailContinueButton,
       accountEmailSubmitButton,
       accountResetSubmitButton,
@@ -2402,6 +2412,44 @@ input[type=number] {
       await onAuthRefresh().catch(() => {});
     } catch {
       setAccountActionStatus('Could not send verification email.', 'error');
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountLoadModelButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    authActionPending = true;
+    setAccountActionStatus('Loading cloud model...');
+    updateAccountControls();
+    try {
+      const message = await onAuthLoadCurrentModel();
+      setAccountActionStatus(message || 'Cloud model loaded.', 'success');
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not load cloud model.'),
+        'error',
+      );
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountSaveModelButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    authActionPending = true;
+    setAccountActionStatus('Saving current model...');
+    updateAccountControls();
+    try {
+      const message = await onAuthSaveCurrentModel();
+      setAccountActionStatus(message || 'Current model saved.', 'success');
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not save current model.'),
+        'error',
+      );
     } finally {
       authActionPending = false;
       updateAccountControls();
