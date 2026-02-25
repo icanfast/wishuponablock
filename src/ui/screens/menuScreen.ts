@@ -1224,6 +1224,11 @@ input[type=number] {
   optionsMiddleColumn.appendChild(arrControl.wrapper);
   optionsMiddleColumn.appendChild(softDropControl.wrapper);
   optionsMiddleColumn.appendChild(gameplayResetButton);
+  optionsMiddleColumn.appendChild(mlTitle);
+  optionsMiddleColumn.appendChild(mlRuntimeSummary);
+  optionsMiddleColumn.appendChild(mlBackendRow);
+  optionsMiddleColumn.appendChild(mlActions);
+  optionsMiddleColumn.appendChild(mlStatus);
   if (showLegacyDataTools) {
     optionsMiddleColumn.appendChild(dataTitle);
     optionsMiddleColumn.appendChild(shareRow);
@@ -1238,11 +1243,6 @@ input[type=number] {
   optionsRightColumn.appendChild(ghostOpacityRow);
   optionsRightColumn.appendChild(highContrastRow);
   optionsRightColumn.appendChild(colorblindRow);
-  optionsRightColumn.appendChild(mlTitle);
-  optionsRightColumn.appendChild(mlRuntimeSummary);
-  optionsRightColumn.appendChild(mlBackendRow);
-  optionsRightColumn.appendChild(mlActions);
-  optionsRightColumn.appendChild(mlStatus);
 
   optionsPanel.appendChild(optionsBackButton);
 
