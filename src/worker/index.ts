@@ -16,6 +16,9 @@ type Env = {
   RELEASE_CHANNEL?: string;
   FEATURE_FLAGS?: string;
   AUTH_TOKEN_PEPPER?: string;
+  RESEND_API_KEY?: string;
+  AUTH_EMAIL_FROM?: string;
+  AUTH_APP_BASE_URL?: string;
   MODELS_BUCKET?: unknown;
   RECORDINGS_BUCKET?: unknown;
 };
@@ -30,6 +33,8 @@ const SESSION_REVOKED_RETENTION_MS = 30 * DAY_MS;
 const TOKEN_CONSUMED_RETENTION_MS = 7 * DAY_MS;
 const LEGACY_API_ERROR =
   'Legacy snapshot/label APIs were removed on the 0.3.0 dev branch.';
+const EMAIL_VERIFY_TOKEN_TTL_MS = DAY_MS;
+const PASSWORD_RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
 const PASSWORD_SCHEME = 'pbkdf2_sha256';
 // Cloudflare Workers currently rejects PBKDF2 iteration counts above 100000.
 const PASSWORD_PBKDF2_ITERATIONS = 100_000;
@@ -42,6 +47,7 @@ const MAX_PASSWORD_LENGTH = 128;
 const MAX_EMAIL_LENGTH = 320;
 const MIN_USERNAME_LENGTH = 2;
 const MAX_USERNAME_LENGTH = 32;
+const RESEND_SEND_EMAIL_URL = 'https://api.resend.com/emails';
 const CORS_BASE_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'content-type',
@@ -354,6 +360,15 @@ type UserLookupRecord = AuthUser & {
   passwordHash: string | null;
 };
 
+type AuthTokenType = 'email_verify' | 'password_reset';
+
+type AuthTokenRecord = {
+  id: string;
+  userId: string;
+  emailNorm: string | null;
+  expiresAtMs: number;
+};
+
 const readUserByEmail = async (
   env: Env,
   emailNorm: string,
@@ -385,6 +400,31 @@ const readUserByEmail = async (
   };
 };
 
+const readUserById = async (
+  env: Env,
+  userId: string,
+): Promise<AuthUser | null> => {
+  const row = await env.DB.prepare(
+    `SELECT id, username, email_norm, email_verified_at_ms
+     FROM users
+     WHERE id = ?
+     LIMIT 1`,
+  )
+    .bind(userId)
+    .first<Record<string, unknown>>();
+
+  if (!row) return null;
+  const id = asString(row.id);
+  const username = asString(row.username);
+  if (!id || !username) return null;
+  return {
+    id,
+    username,
+    emailNorm: asString(row.email_norm),
+    emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+  };
+};
+
 const createSessionForUser = async (
   env: Env,
   userId: string,
@@ -407,6 +447,139 @@ const createSessionForUser = async (
     .bind(sessionId, userId, tokenHash, expiresAtMs, nowMs, nowMs)
     .run();
   return { token, expiresAtMs };
+};
+
+const createAuthToken = async (
+  env: Env,
+  type: AuthTokenType,
+  userId: string,
+  emailNorm: string | null,
+  ttlMs: number,
+  nowMs: number,
+): Promise<{ token: string; expiresAtMs: number }> => {
+  const tokenId = crypto.randomUUID();
+  const token = generateOpaqueToken(32);
+  const tokenHash = await hashOpaqueToken(token, getTokenPepper(env));
+  const expiresAtMs = nowMs + ttlMs;
+  await env.DB.prepare(
+    `INSERT INTO auth_tokens (
+       id,
+       user_id,
+       type,
+       token_hash,
+       email_norm,
+       expires_at_ms,
+       consumed_at_ms,
+       created_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+  )
+    .bind(tokenId, userId, type, tokenHash, emailNorm, expiresAtMs, nowMs)
+    .run();
+  return { token, expiresAtMs };
+};
+
+const readActiveAuthTokenByHash = async (
+  env: Env,
+  type: AuthTokenType,
+  tokenHash: string,
+  nowMs: number,
+): Promise<AuthTokenRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       id,
+       user_id,
+       email_norm,
+       expires_at_ms
+     FROM auth_tokens
+     WHERE type = ?
+       AND token_hash = ?
+       AND consumed_at_ms IS NULL
+       AND expires_at_ms > ?
+     LIMIT 1`,
+  )
+    .bind(type, tokenHash, nowMs)
+    .first<Record<string, unknown>>();
+
+  if (!row) return null;
+  const id = asString(row.id);
+  const userId = asString(row.user_id);
+  const expiresAtMs = asInt(row.expires_at_ms);
+  if (!id || !userId || expiresAtMs == null) {
+    return null;
+  }
+  return {
+    id,
+    userId,
+    emailNorm: asString(row.email_norm),
+    expiresAtMs,
+  };
+};
+
+const consumeAuthToken = async (
+  env: Env,
+  tokenId: string,
+  nowMs: number,
+): Promise<void> => {
+  await env.DB.prepare(
+    `UPDATE auth_tokens
+     SET consumed_at_ms = ?
+     WHERE id = ?
+       AND consumed_at_ms IS NULL
+       AND expires_at_ms > ?`,
+  )
+    .bind(nowMs, tokenId, nowMs)
+    .run();
+};
+
+const isLikelyOpaqueToken = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length >= 24 &&
+  value.length <= 512 &&
+  /^[A-Za-z0-9_-]+$/.test(value);
+
+const normalizeAppBaseUrl = (value: string): string =>
+  value.replace(/\/+$/g, '');
+
+const resolveAuthAppBaseUrl = (request: Request, env: Env): string => {
+  const configured = asString(env.AUTH_APP_BASE_URL);
+  if (configured) return normalizeAppBaseUrl(configured);
+  return normalizeAppBaseUrl(new URL(request.url).origin);
+};
+
+const sendEmailViaResend = async (
+  env: Env,
+  to: string,
+  subject: string,
+  html: string,
+): Promise<boolean> => {
+  const apiKey = asString(env.RESEND_API_KEY);
+  const from = asString(env.AUTH_EMAIL_FROM);
+  if (!apiKey || !from) {
+    console.warn('[auth] email delivery skipped: resend not configured');
+    return false;
+  }
+
+  const response = await fetch(RESEND_SEND_EMAIL_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      html,
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    console.warn(
+      `[auth] resend delivery failed: ${response.status} ${body.slice(0, 200)}`,
+    );
+    return false;
+  }
+  return true;
 };
 
 const buildAuthenticatedPayload = (
@@ -468,6 +641,48 @@ const readSessionContext = async (
     expiresAtMs,
     lastSeenAtMs: asInt(row.last_seen_at_ms),
   };
+};
+
+const requireAuthenticatedSession = async (
+  request: Request,
+  env: Env,
+  nowMs: number,
+): Promise<{ session: SessionContext | null; response?: Response }> => {
+  const token = getSessionTokenFromRequest(request);
+  if (!token) {
+    return {
+      session: null,
+      response: jsonResponse({ error: 'Unauthorized.' }, 401, {
+        'cache-control': 'no-store',
+      }),
+    };
+  }
+
+  const secure = isSecureRequest(request);
+  try {
+    const tokenHash = await hashOpaqueToken(token, getTokenPepper(env));
+    const session = await readSessionContext(env, tokenHash, nowMs);
+    if (!session) {
+      return {
+        session: null,
+        response: jsonResponse({ error: 'Unauthorized.' }, 401, {
+          'cache-control': 'no-store',
+          'set-cookie': clearSessionCookieHeader(secure),
+        }),
+      };
+    }
+    return { session };
+  } catch (error) {
+    console.error('[auth] session lookup failed', error);
+    return {
+      session: null,
+      response: jsonResponse(
+        { error: 'Auth storage is currently unavailable.' },
+        503,
+        { 'cache-control': 'no-store' },
+      ),
+    };
+  }
 };
 
 const touchSessionIfStale = async (
@@ -637,6 +852,289 @@ const handleEmailLogin = async (
     );
   } catch (error) {
     console.error('[auth] email login failed', error);
+    return jsonResponse(
+      { error: 'Auth storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleEmailVerifySend = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  if (!session.emailNorm) {
+    return jsonResponse(
+      { error: 'Email is not available for this account.' },
+      400,
+      { 'cache-control': 'no-store' },
+    );
+  }
+  if (session.emailVerifiedAtMs != null) {
+    return jsonResponse({ ok: true, alreadyVerified: true }, 200, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  try {
+    const token = await createAuthToken(
+      env,
+      'email_verify',
+      session.userId,
+      session.emailNorm,
+      EMAIL_VERIFY_TOKEN_TTL_MS,
+      nowMs,
+    );
+    const appBaseUrl = resolveAuthAppBaseUrl(request, env);
+    const verifyUrl = `${appBaseUrl}/auth/email/verify?token=${encodeURIComponent(token.token)}`;
+    const html =
+      `<p>Verify your Wish Upon a Block account email.</p>` +
+      `<p><a href="${verifyUrl}">Verify email</a></p>` +
+      `<p>If the button does not work, paste this URL into your browser:</p>` +
+      `<p>${verifyUrl}</p>`;
+    await sendEmailViaResend(
+      env,
+      session.emailNorm,
+      'Verify your Wish Upon a Block email',
+      html,
+    );
+  } catch (error) {
+    console.error('[auth] email verify send failed', error);
+    return jsonResponse(
+      { error: 'Auth storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  return jsonResponse({ ok: true }, 202, { 'cache-control': 'no-store' });
+};
+
+const handleEmailVerifyConsume = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body !== 'object') {
+    return jsonResponse({ error: 'Invalid payload.' }, 400);
+  }
+  const payload = body as { token?: unknown };
+  if (!isLikelyOpaqueToken(payload.token)) {
+    return jsonResponse({ error: 'Invalid or expired token.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const secure = isSecureRequest(request);
+  try {
+    const tokenHash = await hashOpaqueToken(payload.token, getTokenPepper(env));
+    const token = await readActiveAuthTokenByHash(
+      env,
+      'email_verify',
+      tokenHash,
+      nowMs,
+    );
+    if (!token) {
+      return jsonResponse({ error: 'Invalid or expired token.' }, 400, {
+        'cache-control': 'no-store',
+      });
+    }
+
+    if (token.emailNorm) {
+      await env.DB.prepare(
+        `UPDATE users
+         SET email_verified_at_ms = COALESCE(email_verified_at_ms, ?),
+             updated_at_ms = ?
+         WHERE id = ? AND email_norm = ?`,
+      )
+        .bind(nowMs, nowMs, token.userId, token.emailNorm)
+        .run();
+    } else {
+      await env.DB.prepare(
+        `UPDATE users
+         SET email_verified_at_ms = COALESCE(email_verified_at_ms, ?),
+             updated_at_ms = ?
+         WHERE id = ?`,
+      )
+        .bind(nowMs, nowMs, token.userId)
+        .run();
+    }
+
+    await consumeAuthToken(env, token.id, nowMs);
+    const user = await readUserById(env, token.userId);
+    if (!user) {
+      return jsonResponse(
+        { error: 'Auth storage is currently unavailable.' },
+        503,
+        { 'cache-control': 'no-store' },
+      );
+    }
+    const session = await createSessionForUser(env, user.id, nowMs);
+    return jsonResponse(
+      buildAuthenticatedPayload(
+        {
+          id: user.id,
+          username: user.username,
+          emailNorm: user.emailNorm,
+          emailVerifiedAtMs: user.emailVerifiedAtMs ?? nowMs,
+        },
+        session.expiresAtMs,
+      ),
+      200,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': sessionCookieHeader(session.token, secure),
+      },
+    );
+  } catch (error) {
+    console.error('[auth] email verify consume failed', error);
+    return jsonResponse(
+      { error: 'Auth storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handlePasswordForgot = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const body = await request.json().catch(() => null);
+  const payload = body as { email?: unknown } | null;
+  const emailNorm = normalizeEmail(payload?.email);
+  const nowMs = Date.now();
+  try {
+    if (emailNorm) {
+      const user = await readUserByEmail(env, emailNorm);
+      if (user && user.passwordHash) {
+        const token = await createAuthToken(
+          env,
+          'password_reset',
+          user.id,
+          user.emailNorm,
+          PASSWORD_RESET_TOKEN_TTL_MS,
+          nowMs,
+        );
+        const appBaseUrl = resolveAuthAppBaseUrl(request, env);
+        const resetUrl = `${appBaseUrl}/auth/password/reset?token=${encodeURIComponent(token.token)}`;
+        const html =
+          `<p>Reset your Wish Upon a Block password.</p>` +
+          `<p><a href="${resetUrl}">Reset password</a></p>` +
+          `<p>If you did not request this, you can ignore this email.</p>`;
+        await sendEmailViaResend(
+          env,
+          user.emailNorm ?? emailNorm,
+          'Reset your Wish Upon a Block password',
+          html,
+        );
+      }
+    }
+  } catch (error) {
+    console.error('[auth] password forgot failed', error);
+  }
+
+  return jsonResponse({ ok: true }, 202, { 'cache-control': 'no-store' });
+};
+
+const handlePasswordReset = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body !== 'object') {
+    return jsonResponse({ error: 'Invalid payload.' }, 400);
+  }
+
+  const payload = body as {
+    token?: unknown;
+    password?: unknown;
+  };
+  if (!isLikelyOpaqueToken(payload.token)) {
+    return jsonResponse({ error: 'Invalid or expired token.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!isValidPasswordCandidate(payload.password)) {
+    return jsonResponse(
+      {
+        error: `Password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.`,
+      },
+      400,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  const nowMs = Date.now();
+  const secure = isSecureRequest(request);
+  try {
+    const tokenHash = await hashOpaqueToken(payload.token, getTokenPepper(env));
+    const token = await readActiveAuthTokenByHash(
+      env,
+      'password_reset',
+      tokenHash,
+      nowMs,
+    );
+    if (!token) {
+      return jsonResponse({ error: 'Invalid or expired token.' }, 400, {
+        'cache-control': 'no-store',
+      });
+    }
+
+    const passwordHash = await hashPassword(payload.password);
+    await env.DB.prepare(
+      `UPDATE users
+       SET password_hash = ?, updated_at_ms = ?
+       WHERE id = ?`,
+    )
+      .bind(passwordHash, nowMs, token.userId)
+      .run();
+    await consumeAuthToken(env, token.id, nowMs);
+    await env.DB.prepare(
+      `UPDATE auth_sessions
+       SET revoked_at_ms = ?
+       WHERE user_id = ? AND revoked_at_ms IS NULL`,
+    )
+      .bind(nowMs, token.userId)
+      .run();
+
+    const user = await readUserById(env, token.userId);
+    if (!user) {
+      return jsonResponse(
+        { error: 'Auth storage is currently unavailable.' },
+        503,
+        { 'cache-control': 'no-store' },
+      );
+    }
+    const session = await createSessionForUser(env, user.id, nowMs);
+    return jsonResponse(
+      buildAuthenticatedPayload(user, session.expiresAtMs),
+      200,
+      {
+        'cache-control': 'no-store',
+        'set-cookie': sessionCookieHeader(session.token, secure),
+      },
+    );
+  } catch (error) {
+    console.error('[auth] password reset failed', error);
     return jsonResponse(
       { error: 'Auth storage is currently unavailable.' },
       503,
@@ -892,6 +1390,22 @@ export default {
 
     if (url.pathname === '/api/auth/email/login') {
       return handleEmailLogin(request, env);
+    }
+
+    if (url.pathname === '/api/auth/email/verify/send') {
+      return handleEmailVerifySend(request, env);
+    }
+
+    if (url.pathname === '/api/auth/email/verify/consume') {
+      return handleEmailVerifyConsume(request, env);
+    }
+
+    if (url.pathname === '/api/auth/password/forgot') {
+      return handlePasswordForgot(request, env);
+    }
+
+    if (url.pathname === '/api/auth/password/reset') {
+      return handlePasswordReset(request, env);
     }
 
     if (url.pathname === '/api/auth/me') {
