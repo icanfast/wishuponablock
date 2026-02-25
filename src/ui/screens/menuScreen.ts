@@ -1245,9 +1245,8 @@ input[type=number] {
   });
 
   const dataNotice = document.createElement('div');
-  dataNotice.textContent = showLegacyDataTools
-    ? 'This game collects anonymized board snapshots to train the piece generator.'
-    : '0.3.0 dev build: legacy snapshot/label collection is disabled.';
+  dataNotice.textContent =
+    'This game collects anonymized board snapshots to train the piece generator.';
   Object.assign(dataNotice.style, {
     maxWidth: '320px',
     color: '#8fa0b8',
