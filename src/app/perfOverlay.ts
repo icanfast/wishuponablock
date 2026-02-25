@@ -107,7 +107,7 @@ export function createPerfOverlay(options: PerfOverlayOptions): PerfOverlay {
     windowMs = 10_000,
     targetFps = 120,
     refreshMs = 250,
-    initialVisible = true,
+    initialVisible = false,
   } = options;
 
   const durationSamples = new Map<string, Sample[]>();

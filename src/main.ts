@@ -145,7 +145,7 @@ async function boot() {
         root: playWindow,
         windowMs: 10_000,
         targetFps: 120,
-        initialVisible: true,
+        initialVisible: false,
       })
     : null;
   setPerfMetricsSink(perfOverlay);
