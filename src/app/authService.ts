@@ -15,6 +15,21 @@ export type AuthService = {
   getSession: () => Promise<AuthState>;
   logout: () => Promise<void>;
   sendVerificationEmail: () => Promise<{ alreadyVerified: boolean }>;
+  consumeEmailVerification: (token: string) => Promise<AuthState>;
+  emailSignup: (payload: {
+    email: string;
+    password: string;
+    username?: string;
+  }) => Promise<AuthState>;
+  emailLogin: (payload: {
+    email: string;
+    password: string;
+  }) => Promise<AuthState>;
+  passwordForgot: (email: string) => Promise<void>;
+  passwordReset: (payload: {
+    token: string;
+    password: string;
+  }) => Promise<AuthState>;
   startOAuth: (provider: 'google' | 'discord') => void;
 };
 
@@ -62,6 +77,12 @@ const parseErrorMessage = async (response: Response): Promise<string> => {
 
 const normalizeBaseUrl = (baseUrl: string): string =>
   baseUrl.trim().replace(/\/+$/, '');
+
+const normalizeToken = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const token = value.trim();
+  return token ? token : null;
+};
 
 const toAuthState = (payload: AuthMePayload | null | undefined): AuthState => {
   if (!payload || payload.authenticated !== true || !payload.user) {
@@ -131,6 +152,75 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
         alreadyVerified?: unknown;
       } | null;
       return { alreadyVerified: payload?.alreadyVerified === true };
+    },
+    consumeEmailVerification: async (token) => {
+      const normalizedToken = normalizeToken(token);
+      if (!normalizedToken) {
+        throw new Error('Verification token is required.');
+      }
+      const response = await request('/auth/email/verify/consume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: normalizedToken }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response));
+      }
+      const payload = (await response.json()) as AuthMePayload;
+      return toAuthState(payload);
+    },
+    emailSignup: async (payload) => {
+      const response = await request('/auth/email/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response));
+      }
+      const body = (await response.json()) as AuthMePayload;
+      return toAuthState(body);
+    },
+    emailLogin: async (payload) => {
+      const response = await request('/auth/email/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response));
+      }
+      const body = (await response.json()) as AuthMePayload;
+      return toAuthState(body);
+    },
+    passwordForgot: async (email) => {
+      const response = await request('/auth/password/forgot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response));
+      }
+    },
+    passwordReset: async (payload) => {
+      const normalizedToken = normalizeToken(payload.token);
+      if (!normalizedToken) {
+        throw new Error('Reset token is required.');
+      }
+      const response = await request('/auth/password/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: normalizedToken,
+          password: payload.password,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await parseErrorMessage(response));
+      }
+      const body = (await response.json()) as AuthMePayload;
+      return toAuthState(body);
     },
     startOAuth: (provider) => {
       window.location.assign(`${baseUrl}/auth/oauth/${provider}/start`);

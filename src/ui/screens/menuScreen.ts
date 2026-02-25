@@ -32,6 +32,8 @@ export type MenuAuthState = {
   user: MenuAuthUser | null;
 };
 
+export type MenuAuthStatusTone = 'neutral' | 'success' | 'error';
+
 export type LabelingProgressState = {
   buildVersion: string;
   labeledBoards: number | null;
@@ -47,6 +49,8 @@ export type MenuScreenOptions = {
   tools: Array<{ id: string; label: string }>;
   labelingProgress?: LabelingProgressState | null;
   authState: MenuAuthState;
+  authInitialResetToken?: string | null;
+  authInitialStatus?: { message: string; tone?: MenuAuthStatusTone } | null;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -61,6 +65,20 @@ export type MenuScreenOptions = {
   onAuthStartOAuth: (provider: 'google' | 'discord') => void;
   onAuthLogout: () => Promise<void>;
   onAuthSendVerifyEmail: () => Promise<{ alreadyVerified: boolean }>;
+  onAuthEmailSignup: (payload: {
+    email: string;
+    password: string;
+    username?: string;
+  }) => Promise<void>;
+  onAuthEmailLogin: (payload: {
+    email: string;
+    password: string;
+  }) => Promise<void>;
+  onAuthPasswordForgot: (email: string) => Promise<void>;
+  onAuthPasswordReset: (payload: {
+    token: string;
+    password: string;
+  }) => Promise<void>;
 };
 
 export type MenuScreen = {
@@ -84,6 +102,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     tools,
     labelingProgress = null,
     authState,
+    authInitialResetToken = null,
+    authInitialStatus = null,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -95,6 +115,10 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthStartOAuth,
     onAuthLogout,
     onAuthSendVerifyEmail,
+    onAuthEmailSignup,
+    onAuthEmailLogin,
+    onAuthPasswordForgot,
+    onAuthPasswordReset,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -1841,19 +1865,125 @@ input[type=number] {
     textAlign: 'center',
   });
 
+  const makeAccountInput = (
+    placeholder: string,
+    type = 'text',
+  ): HTMLInputElement => {
+    const input = document.createElement('input');
+    input.type = type;
+    input.placeholder = placeholder;
+    Object.assign(input.style, {
+      width: '100%',
+      boxSizing: 'border-box',
+      background: '#0b0f14',
+      color: '#e2e8f0',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      padding: '8px',
+      fontSize: '12px',
+    });
+    return input;
+  };
+
+  const makeSectionLabel = (text: string) => {
+    const label = document.createElement('div');
+    label.textContent = text;
+    Object.assign(label.style, {
+      color: '#8fa0b8',
+      fontSize: '11px',
+      letterSpacing: '0.3px',
+      marginTop: '4px',
+    });
+    return label;
+  };
+
   const accountRefreshButton = makeMenuButton('REFRESH SESSION');
   const accountGoogleButton = makeMenuButton('SIGN IN WITH GOOGLE');
   const accountDiscordButton = makeMenuButton('SIGN IN WITH DISCORD');
   const accountVerifyButton = makeMenuButton('SEND VERIFICATION EMAIL');
   const accountLogoutButton = makeMenuButton('LOG OUT');
+  const accountEmailSignupButton = makeMenuButton('SIGN UP');
+  const accountEmailLoginButton = makeMenuButton('LOG IN');
+  const accountForgotButton = makeMenuButton('SEND RESET EMAIL');
+  const accountResetButton = makeMenuButton('RESET PASSWORD');
   const accountBackButton = makeMenuButton('BACK');
   Object.assign(accountBackButton.style, { marginTop: 'auto' });
 
+  const accountEmailInput = makeAccountInput('Email', 'email');
+  accountEmailInput.autocomplete = 'email';
+  const accountUsernameInput = makeAccountInput('Username (optional)');
+  accountUsernameInput.autocomplete = 'username';
+  const accountPasswordInput = makeAccountInput('Password', 'password');
+  accountPasswordInput.autocomplete = 'current-password';
+  const accountResetTokenInput = makeAccountInput('Reset token');
+  const accountResetPasswordInput = makeAccountInput(
+    'New password',
+    'password',
+  );
+  accountResetPasswordInput.autocomplete = 'new-password';
+  if (authInitialResetToken) {
+    accountResetTokenInput.value = authInitialResetToken;
+  }
+
+  const accountSignedOutActions = document.createElement('div');
+  Object.assign(accountSignedOutActions.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  const accountSignedInActions = document.createElement('div');
+  Object.assign(accountSignedInActions.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+
+  const accountEmailButtons = document.createElement('div');
+  Object.assign(accountEmailButtons.style, {
+    display: 'flex',
+    gap: '8px',
+  });
+  Object.assign(accountEmailSignupButton.style, { flex: '1' });
+  Object.assign(accountEmailLoginButton.style, { flex: '1' });
+  accountEmailButtons.appendChild(accountEmailSignupButton);
+  accountEmailButtons.appendChild(accountEmailLoginButton);
+
+  accountSignedOutActions.appendChild(makeSectionLabel('OAUTH'));
+  accountSignedOutActions.appendChild(accountGoogleButton);
+  accountSignedOutActions.appendChild(accountDiscordButton);
+  accountSignedOutActions.appendChild(makeSectionLabel('EMAIL'));
+  accountSignedOutActions.appendChild(accountEmailInput);
+  accountSignedOutActions.appendChild(accountUsernameInput);
+  accountSignedOutActions.appendChild(accountPasswordInput);
+  accountSignedOutActions.appendChild(accountEmailButtons);
+  accountSignedOutActions.appendChild(accountForgotButton);
+  accountSignedOutActions.appendChild(makeSectionLabel('RESET WITH TOKEN'));
+  accountSignedOutActions.appendChild(accountResetTokenInput);
+  accountSignedOutActions.appendChild(accountResetPasswordInput);
+  accountSignedOutActions.appendChild(accountResetButton);
+
+  accountSignedInActions.appendChild(accountRefreshButton);
+  accountSignedInActions.appendChild(accountVerifyButton);
+  accountSignedInActions.appendChild(accountLogoutButton);
+
   let currentAuthState: MenuAuthState = authState;
   let authActionPending = false;
-  const setAccountActionStatus = (message: string, color = '#8fa0b8') => {
+  const statusColor = (tone: MenuAuthStatusTone): string => {
+    if (tone === 'success') return '#8fd19e';
+    if (tone === 'error') return '#f28b82';
+    return '#8fa0b8';
+  };
+  const setAccountActionStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
     accountActionStatus.textContent = message;
-    accountActionStatus.style.color = color;
+    accountActionStatus.style.color = statusColor(tone);
+  };
+  const readField = (input: HTMLInputElement): string => input.value.trim();
+  const toErrorMessage = (error: unknown, fallback: string): string => {
+    if (error instanceof Error && error.message.trim()) return error.message;
+    return fallback;
   };
 
   const formatAccountSummary = (state: MenuAuthState): string => {
@@ -1875,26 +2005,36 @@ input[type=number] {
 
   const updateAccountControls = () => {
     accountSummary.textContent = formatAccountSummary(currentAuthState);
+    const authenticated =
+      currentAuthState.authenticated && currentAuthState.user != null;
     const busy = authActionPending || currentAuthState.loading;
-    accountRefreshButton.disabled = busy;
-    accountGoogleButton.disabled = busy;
-    accountDiscordButton.disabled = busy;
-    accountLogoutButton.disabled = busy;
-    accountVerifyButton.disabled = busy;
-    accountGoogleButton.style.display =
-      currentAuthState.authenticated && currentAuthState.user
-        ? 'none'
-        : 'block';
-    accountDiscordButton.style.display =
-      currentAuthState.authenticated && currentAuthState.user
-        ? 'none'
-        : 'block';
-    accountLogoutButton.style.display =
-      currentAuthState.authenticated && currentAuthState.user
-        ? 'block'
-        : 'none';
+    for (const input of [
+      accountEmailInput,
+      accountUsernameInput,
+      accountPasswordInput,
+      accountResetTokenInput,
+      accountResetPasswordInput,
+    ]) {
+      input.disabled = busy;
+    }
+    for (const button of [
+      accountRefreshButton,
+      accountGoogleButton,
+      accountDiscordButton,
+      accountLogoutButton,
+      accountVerifyButton,
+      accountEmailSignupButton,
+      accountEmailLoginButton,
+      accountForgotButton,
+      accountResetButton,
+    ]) {
+      button.disabled = busy;
+    }
+
+    accountSignedOutActions.style.display = authenticated ? 'none' : 'flex';
+    accountSignedInActions.style.display = authenticated ? 'flex' : 'none';
     accountVerifyButton.style.display =
-      currentAuthState.authenticated &&
+      authenticated &&
       currentAuthState.user?.email &&
       currentAuthState.user.emailVerifiedAtMs == null
         ? 'block'
@@ -1915,7 +2055,7 @@ input[type=number] {
       await onAuthRefresh();
       setAccountActionStatus('');
     } catch {
-      setAccountActionStatus('Could not refresh session.', '#f28b82');
+      setAccountActionStatus('Could not refresh session.', 'error');
     } finally {
       authActionPending = false;
       updateAccountControls();
@@ -1943,11 +2083,11 @@ input[type=number] {
         result.alreadyVerified
           ? 'Email is already verified.'
           : 'Verification email sent.',
-        '#8fd19e',
+        'success',
       );
       await onAuthRefresh().catch(() => {});
     } catch {
-      setAccountActionStatus('Could not send verification email.', '#f28b82');
+      setAccountActionStatus('Could not send verification email.', 'error');
     } finally {
       authActionPending = false;
       updateAccountControls();
@@ -1961,9 +2101,129 @@ input[type=number] {
     updateAccountControls();
     try {
       await onAuthLogout();
-      setAccountActionStatus('Signed out.', '#8fd19e');
+      setAccountActionStatus('Signed out.', 'success');
     } catch {
-      setAccountActionStatus('Could not sign out.', '#f28b82');
+      setAccountActionStatus('Could not sign out.', 'error');
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountEmailSignupButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    const email = readField(accountEmailInput);
+    const password = accountPasswordInput.value;
+    const username = readField(accountUsernameInput);
+    if (!email || !password) {
+      setAccountActionStatus('Email and password are required.', 'error');
+      return;
+    }
+
+    authActionPending = true;
+    setAccountActionStatus('Creating account...');
+    updateAccountControls();
+    try {
+      await onAuthEmailSignup({
+        email,
+        password,
+        ...(username ? { username } : {}),
+      });
+      setAccountActionStatus('Signed in.', 'success');
+      accountPasswordInput.value = '';
+      accountResetPasswordInput.value = '';
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not create account.'),
+        'error',
+      );
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountEmailLoginButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    const email = readField(accountEmailInput);
+    const password = accountPasswordInput.value;
+    if (!email || !password) {
+      setAccountActionStatus('Email and password are required.', 'error');
+      return;
+    }
+
+    authActionPending = true;
+    setAccountActionStatus('Signing in...');
+    updateAccountControls();
+    try {
+      await onAuthEmailLogin({ email, password });
+      setAccountActionStatus('Signed in.', 'success');
+      accountPasswordInput.value = '';
+      accountResetPasswordInput.value = '';
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not sign in.'),
+        'error',
+      );
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountForgotButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    const email = readField(accountEmailInput);
+    if (!email) {
+      setAccountActionStatus('Enter your email first.', 'error');
+      return;
+    }
+    authActionPending = true;
+    setAccountActionStatus('Sending password reset email...');
+    updateAccountControls();
+    try {
+      await onAuthPasswordForgot(email);
+      setAccountActionStatus(
+        'If account exists, reset email was sent.',
+        'success',
+      );
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not send reset email.'),
+        'error',
+      );
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountResetButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    const token = readField(accountResetTokenInput);
+    const password = accountResetPasswordInput.value;
+    if (!token || !password) {
+      setAccountActionStatus(
+        'Reset token and new password are required.',
+        'error',
+      );
+      return;
+    }
+
+    authActionPending = true;
+    setAccountActionStatus('Resetting password...');
+    updateAccountControls();
+    try {
+      await onAuthPasswordReset({ token, password });
+      setAccountActionStatus('Password reset complete. Signed in.', 'success');
+      accountResetTokenInput.value = '';
+      accountResetPasswordInput.value = '';
+      accountPasswordInput.value = '';
+    } catch (error) {
+      setAccountActionStatus(
+        toErrorMessage(error, 'Could not reset password.'),
+        'error',
+      );
     } finally {
       authActionPending = false;
       updateAccountControls();
@@ -1973,12 +2233,17 @@ input[type=number] {
   accountPanel.appendChild(accountTitle);
   accountPanel.appendChild(accountSummary);
   accountPanel.appendChild(accountActionStatus);
-  accountPanel.appendChild(accountRefreshButton);
-  accountPanel.appendChild(accountGoogleButton);
-  accountPanel.appendChild(accountDiscordButton);
-  accountPanel.appendChild(accountVerifyButton);
-  accountPanel.appendChild(accountLogoutButton);
+  accountPanel.appendChild(accountSignedOutActions);
+  accountPanel.appendChild(accountSignedInActions);
   accountPanel.appendChild(accountBackButton);
+  if (authInitialStatus?.message) {
+    setAccountActionStatus(
+      authInitialStatus.message,
+      authInitialStatus.tone ?? 'neutral',
+    );
+  } else {
+    setAccountActionStatus('');
+  }
   setAuthState(currentAuthState);
 
   const menuLayer = document.createElement('div');

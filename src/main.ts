@@ -36,6 +36,7 @@ import { type Board, type PieceKind, type GameState } from './core/types';
 import {
   createMenuScreen,
   type MenuAuthState,
+  type MenuAuthStatusTone,
   type MenuScreen,
 } from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
@@ -156,6 +157,83 @@ async function boot() {
   const uploadClient = uploadService.uploadClient;
   const uploadBaseUrl = uploadService.baseUrl;
   const authService = createAuthService({ baseUrl: uploadBaseUrl });
+  const authErrorMessages: Record<string, string> = {
+    oauth_not_configured: 'OAuth provider is not configured.',
+    oauth_denied: 'OAuth sign-in was cancelled.',
+    oauth_state_mismatch: 'OAuth session expired. Please try again.',
+    oauth_failed: 'OAuth sign-in failed. Please try again.',
+  };
+  const toErrorMessage = (error: unknown, fallback: string): string => {
+    if (error instanceof Error && error.message.trim()) return error.message;
+    return fallback;
+  };
+  const readUrlToken = (value: string | null): string | null => {
+    if (!value) return null;
+    const token = value.trim();
+    return token ? token : null;
+  };
+  const startupUrl = new URL(window.location.href);
+  let authInitialResetToken: string | null = null;
+  let authInitialStatus: {
+    message: string;
+    tone: MenuAuthStatusTone;
+  } | null = null;
+  let openAccountOnBoot = false;
+
+  const authError = startupUrl.searchParams.get('auth_error');
+  if (authError) {
+    const message = authErrorMessages[authError] ?? 'Authentication failed.';
+    authInitialStatus = { message, tone: 'error' };
+    openAccountOnBoot = true;
+    startupUrl.searchParams.delete('auth_error');
+  }
+
+  if (startupUrl.pathname === '/auth/password/reset') {
+    authInitialResetToken = readUrlToken(startupUrl.searchParams.get('token'));
+    authInitialStatus = {
+      message: authInitialResetToken
+        ? 'Paste your new password and submit reset.'
+        : 'Missing password reset token.',
+      tone: authInitialResetToken ? 'neutral' : 'error',
+    };
+    openAccountOnBoot = true;
+    startupUrl.pathname = '/';
+    startupUrl.searchParams.delete('token');
+  }
+
+  if (startupUrl.pathname === '/auth/email/verify') {
+    const verifyToken = readUrlToken(startupUrl.searchParams.get('token'));
+    if (!verifyToken) {
+      authInitialStatus = {
+        message: 'Missing email verification token.',
+        tone: 'error',
+      };
+    } else {
+      try {
+        await authService.consumeEmailVerification(verifyToken);
+        authInitialStatus = {
+          message: 'Email verified. You are signed in.',
+          tone: 'success',
+        };
+      } catch (error) {
+        authInitialStatus = {
+          message: toErrorMessage(error, 'Email verification failed.'),
+          tone: 'error',
+        };
+      }
+    }
+    openAccountOnBoot = true;
+    startupUrl.pathname = '/';
+    startupUrl.searchParams.delete('token');
+  }
+
+  const cleanedHref = `${startupUrl.pathname}${startupUrl.search}${startupUrl.hash}`;
+  if (
+    cleanedHref !==
+    `${window.location.pathname}${window.location.search}${window.location.hash}`
+  ) {
+    window.history.replaceState(null, '', cleanedHref);
+  }
   const useRemoteUpload = ENABLE_LEGACY_DATA_TOOLS && uploadService.useRemote;
   const toolUsesRemote =
     ENABLE_LEGACY_DATA_TOOLS && uploadService.toolUsesRemote;
@@ -273,6 +351,31 @@ async function boot() {
     const result = await authService.sendVerificationEmail();
     await refreshAuthState().catch(() => {});
     return result;
+  };
+  const signupWithEmail = async (payload: {
+    email: string;
+    password: string;
+    username?: string;
+  }) => {
+    await authService.emailSignup(payload);
+    await refreshAuthState();
+  };
+  const loginWithEmail = async (payload: {
+    email: string;
+    password: string;
+  }) => {
+    await authService.emailLogin(payload);
+    await refreshAuthState();
+  };
+  const sendPasswordReset = async (email: string) => {
+    await authService.passwordForgot(email);
+  };
+  const resetPasswordWithToken = async (payload: {
+    token: string;
+    password: string;
+  }) => {
+    await authService.passwordReset(payload);
+    await refreshAuthState();
   };
   applyAuthState(authState);
 
@@ -599,10 +702,16 @@ async function boot() {
         }
       : null,
     authState,
+    authInitialResetToken,
+    authInitialStatus,
     onAuthRefresh: refreshAuthState,
     onAuthStartOAuth: (provider) => authService.startOAuth(provider),
     onAuthLogout: logoutAuthState,
     onAuthSendVerifyEmail: sendAuthVerificationEmail,
+    onAuthEmailSignup: signupWithEmail,
+    onAuthEmailLogin: loginWithEmail,
+    onAuthPasswordForgot: sendPasswordReset,
+    onAuthPasswordReset: resetPasswordWithToken,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
@@ -703,6 +812,9 @@ async function boot() {
   };
 
   setScreen('menu');
+  if (openAccountOnBoot) {
+    menuUi?.show('account');
+  }
 
   const identityConsole = window as Window & {
     wubSetUserId?: (value: string | null) => void;
