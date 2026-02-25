@@ -3,6 +3,7 @@ import { predictLogits, type LoadedModel } from './wubModel';
 import { createTfjsModelRunner } from './modelRunnerTfjs';
 
 export type MlBackend = 'native' | 'tfjs';
+export type TfjsBackendPreference = 'auto' | 'webgl' | 'cpu';
 
 export type ModelRunner = {
   prepare: (model: LoadedModel) => Promise<void>;
@@ -17,11 +18,13 @@ export type ModelRunner = {
 export type ModelRunnerInfo = {
   requestedBackend: MlBackend;
   activeBackend: MlBackend;
+  runtimeBackend: string | null;
   fallbackReason: string | null;
 };
 
 type CreateModelRunnerOptions = {
   preferredBackend?: MlBackend | null;
+  tfjsBackendPreference?: TfjsBackendPreference | null;
 };
 
 const normalizeBackend = (value: unknown): MlBackend =>
@@ -31,6 +34,7 @@ const createNativeModelRunner = (): ModelRunner => {
   const info: ModelRunnerInfo = {
     requestedBackend: 'native',
     activeBackend: 'native',
+    runtimeBackend: null,
     fallbackReason: null,
   };
   return {
@@ -44,10 +48,15 @@ export function createModelRunner(options: CreateModelRunnerOptions = {}): {
   runner: ModelRunner;
 } {
   const requestedBackend = normalizeBackend(options.preferredBackend);
+  const tfjsBackendPreference =
+    options.tfjsBackendPreference === 'webgl' ||
+    options.tfjsBackendPreference === 'cpu'
+      ? options.tfjsBackendPreference
+      : 'auto';
 
   if (requestedBackend === 'tfjs') {
     return {
-      runner: createTfjsModelRunner(requestedBackend),
+      runner: createTfjsModelRunner(requestedBackend, tfjsBackendPreference),
     };
   }
 

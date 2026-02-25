@@ -7,7 +7,12 @@ import {
   type LoadedModel,
   type ModelTensor,
 } from './wubModel';
-import type { MlBackend, ModelRunner, ModelRunnerInfo } from './modelRunner';
+import type {
+  MlBackend,
+  ModelRunner,
+  ModelRunnerInfo,
+  TfjsBackendPreference,
+} from './modelRunner';
 import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 type TensorData = Float32Array | Int32Array | Uint8Array;
@@ -97,8 +102,16 @@ const loadTfjsModule = async (): Promise<TfjsModule> => {
   return tfjsModulePromise;
 };
 
-const selectTfjsBackend = async (tf: TfjsModule): Promise<string> => {
-  const candidates = ['webgl', 'cpu'];
+const selectTfjsBackend = async (
+  tf: TfjsModule,
+  preferredBackend: TfjsBackendPreference,
+): Promise<string> => {
+  const candidates =
+    preferredBackend === 'webgl'
+      ? ['webgl']
+      : preferredBackend === 'cpu'
+        ? ['cpu']
+        : ['webgl', 'cpu'];
   for (const backend of candidates) {
     try {
       const changed = await tf.setBackend(backend);
@@ -208,11 +221,13 @@ const disposePreparedWeights = (
 const createInfo = (requestedBackend: MlBackend): ModelRunnerInfo => ({
   requestedBackend,
   activeBackend: requestedBackend,
+  runtimeBackend: null,
   fallbackReason: null,
 });
 
 export function createTfjsModelRunner(
   requestedBackend: MlBackend,
+  tfjsBackendPreference: TfjsBackendPreference,
 ): ModelRunner {
   const info = createInfo(requestedBackend);
   let tf: TfjsModule | null = null;
@@ -225,6 +240,7 @@ export function createTfjsModelRunner(
       );
     }
     info.activeBackend = 'native';
+    info.runtimeBackend = null;
     info.fallbackReason = reason;
     disposePreparedWeights(tf, prepared);
     prepared = null;
@@ -242,7 +258,7 @@ export function createTfjsModelRunner(
       if (!tf) {
         tf = await loadTfjsModule();
       }
-      const backend = await selectTfjsBackend(tf);
+      const backend = await selectTfjsBackend(tf, tfjsBackendPreference);
 
       const convKernels: TfTensor[] = [];
       const convBiases: TfTensor[] = [];
@@ -333,8 +349,11 @@ export function createTfjsModelRunner(
       disposePreparedWeights(tf, prepared);
       prepared = nextPrepared;
       info.activeBackend = 'tfjs';
+      info.runtimeBackend = backend;
       info.fallbackReason = null;
-      console.info(`[ML] tfjs backend ready (backend=${backend})`);
+      console.info(
+        `[ML] tfjs backend ready (backend=${backend}, preference=${tfjsBackendPreference})`,
+      );
     } catch (error) {
       setFallback(describeError(error));
     }

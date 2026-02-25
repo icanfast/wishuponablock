@@ -33,6 +33,15 @@ export type MenuAuthState = {
 };
 
 export type MenuAuthStatusTone = 'neutral' | 'success' | 'error';
+export type MenuMlBackendPreference =
+  | 'native'
+  | 'tfjs_auto'
+  | 'tfjs_webgl'
+  | 'tfjs_cpu';
+export type MenuMlParityResult = {
+  ok: boolean;
+  message: string;
+};
 
 export type LabelingProgressState = {
   buildVersion: string;
@@ -51,6 +60,12 @@ export type MenuScreenOptions = {
   authState: MenuAuthState;
   authInitialResetToken?: string | null;
   authInitialStatus?: { message: string; tone?: MenuAuthStatusTone } | null;
+  mlBackendPreference: MenuMlBackendPreference;
+  getMlRuntimeSummary: () => string;
+  onMlBackendPreferenceChange: (next: MenuMlBackendPreference) => void;
+  onMlRunParityCheck: (
+    preference: MenuMlBackendPreference,
+  ) => Promise<MenuMlParityResult>;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -104,6 +119,10 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     authState,
     authInitialResetToken = null,
     authInitialStatus = null,
+    mlBackendPreference,
+    getMlRuntimeSummary,
+    onMlBackendPreferenceChange,
+    onMlRunParityCheck,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -986,6 +1005,154 @@ input[type=number] {
   colorblindRow.appendChild(colorblindLabel);
   colorblindRow.appendChild(colorblindToggle);
 
+  const mlTitle = document.createElement('div');
+  mlTitle.textContent = 'ML';
+  Object.assign(mlTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginTop: '10px',
+    marginBottom: '4px',
+  });
+
+  const mlRuntimeSummary = document.createElement('div');
+  Object.assign(mlRuntimeSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    marginBottom: '6px',
+    textAlign: 'left',
+    whiteSpace: 'pre-wrap',
+  });
+
+  const mlBackendRow = document.createElement('div');
+  Object.assign(mlBackendRow.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    marginBottom: '6px',
+  });
+
+  const mlBackendLabel = document.createElement('div');
+  mlBackendLabel.textContent = 'Backend';
+  Object.assign(mlBackendLabel.style, {
+    color: '#b6c2d4',
+    fontSize: '11px',
+  });
+
+  const mlBackendSelect = document.createElement('select');
+  Object.assign(mlBackendSelect.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  const mlBackendOptions: Array<{
+    value: MenuMlBackendPreference;
+    label: string;
+  }> = [
+    { value: 'tfjs_auto', label: 'TFJS (auto: WebGL->CPU)' },
+    { value: 'tfjs_webgl', label: 'TFJS (WebGL)' },
+    { value: 'tfjs_cpu', label: 'TFJS (CPU)' },
+    { value: 'native', label: 'Native (legacy)' },
+  ];
+  for (const option of mlBackendOptions) {
+    const el = document.createElement('option');
+    el.value = option.value;
+    el.textContent = option.label;
+    mlBackendSelect.appendChild(el);
+  }
+  mlBackendSelect.value = mlBackendPreference;
+
+  mlBackendRow.appendChild(mlBackendLabel);
+  mlBackendRow.appendChild(mlBackendSelect);
+
+  const mlActions = document.createElement('div');
+  Object.assign(mlActions.style, {
+    display: 'flex',
+    gap: '8px',
+  });
+
+  const mlApplyButton = makeMenuButton('APPLY + RELOAD');
+  const mlParityButton = makeMenuButton('RUN PARITY CHECK');
+  Object.assign(mlApplyButton.style, { flex: '1', padding: '8px 10px' });
+  Object.assign(mlParityButton.style, { flex: '1', padding: '8px 10px' });
+  mlActions.appendChild(mlApplyButton);
+  mlActions.appendChild(mlParityButton);
+
+  const mlStatus = document.createElement('div');
+  Object.assign(mlStatus.style, {
+    marginTop: '4px',
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    textAlign: 'left',
+    minHeight: '28px',
+    whiteSpace: 'pre-wrap',
+  });
+  const setMlStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
+    mlStatus.textContent = message;
+    mlStatus.style.color =
+      tone === 'success' ? '#8fd19e' : tone === 'error' ? '#f28b82' : '#8fa0b8';
+  };
+  const syncMlRuntimeSummary = () => {
+    mlRuntimeSummary.textContent = getMlRuntimeSummary();
+  };
+  syncMlRuntimeSummary();
+  let mlActionPending = false;
+  const syncMlControls = () => {
+    const disabled = mlActionPending;
+    mlBackendSelect.disabled = disabled;
+    mlApplyButton.disabled = disabled;
+    mlParityButton.disabled = disabled;
+    mlApplyButton.style.opacity = disabled ? '0.65' : '1';
+    mlParityButton.style.opacity = disabled ? '0.65' : '1';
+    mlApplyButton.style.cursor = disabled ? 'default' : 'pointer';
+    mlParityButton.style.cursor = disabled ? 'default' : 'pointer';
+  };
+  syncMlControls();
+
+  mlApplyButton.addEventListener('click', () => {
+    if (mlActionPending) return;
+    const next = mlBackendSelect.value as MenuMlBackendPreference;
+    if (
+      next !== 'native' &&
+      next !== 'tfjs_auto' &&
+      next !== 'tfjs_webgl' &&
+      next !== 'tfjs_cpu'
+    ) {
+      setMlStatus('Invalid backend preference selected.', 'error');
+      return;
+    }
+    setMlStatus('Saving preference and reloading...');
+    onMlBackendPreferenceChange(next);
+  });
+
+  mlParityButton.addEventListener('click', async () => {
+    if (mlActionPending) return;
+    mlActionPending = true;
+    syncMlControls();
+    setMlStatus('Running parity check...');
+    try {
+      const preference = mlBackendSelect.value as MenuMlBackendPreference;
+      const result = await onMlRunParityCheck(preference);
+      setMlStatus(result.message, result.ok ? 'success' : 'error');
+      syncMlRuntimeSummary();
+    } catch {
+      setMlStatus('Parity check failed.', 'error');
+    } finally {
+      mlActionPending = false;
+      syncMlControls();
+    }
+  });
+
   const dataTitle = document.createElement('div');
   dataTitle.textContent = 'DATA';
   Object.assign(dataTitle.style, {
@@ -1071,6 +1238,11 @@ input[type=number] {
   optionsRightColumn.appendChild(ghostOpacityRow);
   optionsRightColumn.appendChild(highContrastRow);
   optionsRightColumn.appendChild(colorblindRow);
+  optionsRightColumn.appendChild(mlTitle);
+  optionsRightColumn.appendChild(mlRuntimeSummary);
+  optionsRightColumn.appendChild(mlBackendRow);
+  optionsRightColumn.appendChild(mlActions);
+  optionsRightColumn.appendChild(mlStatus);
 
   optionsPanel.appendChild(optionsBackButton);
 
@@ -2500,6 +2672,9 @@ input[type=number] {
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display = panel === 'options' ? 'none' : 'block';
+    if (panel === 'options') {
+      syncMlRuntimeSummary();
+    }
   };
 
   const showMain = () => show('main');

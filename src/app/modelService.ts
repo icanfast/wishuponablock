@@ -4,6 +4,7 @@ import {
   type MlBackend,
   type ModelRunner,
   type ModelRunnerInfo,
+  type TfjsBackendPreference,
 } from '../core/modelRunner';
 
 export type ModelStatus = 'idle' | 'loading' | 'ready' | 'failed';
@@ -21,15 +22,23 @@ export type ModelService = {
 type ModelServiceOptions = {
   modelUrl: string;
   preferredBackend?: MlBackend;
+  tfjsBackendPreference?: TfjsBackendPreference;
 };
 
 export function createModelService(options: ModelServiceOptions): ModelService {
-  const { modelUrl, preferredBackend = 'native' } = options;
+  const {
+    modelUrl,
+    preferredBackend = 'native',
+    tfjsBackendPreference = 'auto',
+  } = options;
   let model: LoadedModel | null = null;
   let modelPromise: Promise<LoadedModel | null> | null = null;
   let status: ModelStatus = 'idle';
   let listener: ((status: ModelStatus) => void) | null = null;
-  const modelRunner = createModelRunner({ preferredBackend }).runner;
+  const modelRunner = createModelRunner({
+    preferredBackend,
+    tfjsBackendPreference,
+  }).runner;
   const logRunnerState = (prefix = '[ML] backend') => {
     const runnerInfo = modelRunner.getInfo();
     if (runnerInfo.fallbackReason) {

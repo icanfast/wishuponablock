@@ -1,13 +1,19 @@
 import { Application, Graphics } from 'pixi.js';
 import {
   COLS,
+  ML_BACKEND_PREFERENCE_STORAGE_KEY,
   ML_MODEL_URL,
   PLAY_HEIGHT,
   PLAY_WIDTH,
   ROWS,
 } from './core/constants';
 import { GENERATOR_TYPES, usesModelGenerator } from './core/generators';
-import type { MlBackend } from './core/modelRunner';
+import {
+  createModelRunner,
+  type MlBackend,
+  type ModelRunnerInfo,
+  type TfjsBackendPreference,
+} from './core/modelRunner';
 import type { GameSession } from './core/gameSession';
 import { createSettingsStore } from './core/settingsStore';
 import { createGameRuntime, type GameRuntime } from './app/runtime';
@@ -37,6 +43,8 @@ import { type Board, type PieceKind, type GameState } from './core/types';
 import {
   createMenuScreen,
   type MenuAuthState,
+  type MenuMlBackendPreference,
+  type MenuMlParityResult,
   type MenuAuthStatusTone,
   type MenuScreen,
 } from './ui/screens/menuScreen';
@@ -58,6 +66,47 @@ function hasWebGL(): boolean {
   const c = document.createElement('canvas');
   return !!(c.getContext('webgl2') || c.getContext('webgl'));
 }
+
+const resolveMlBackendPreference = (
+  value: string | null | undefined,
+  fallback: MenuMlBackendPreference,
+): MenuMlBackendPreference => {
+  if (
+    value === 'native' ||
+    value === 'tfjs_auto' ||
+    value === 'tfjs_webgl' ||
+    value === 'tfjs_cpu'
+  ) {
+    return value;
+  }
+  return fallback;
+};
+
+const getMlBackendPreferenceParts = (
+  preference: MenuMlBackendPreference,
+): {
+  preferredBackend: MlBackend;
+  tfjsBackendPreference: TfjsBackendPreference;
+} => {
+  if (preference === 'native') {
+    return { preferredBackend: 'native', tfjsBackendPreference: 'auto' };
+  }
+  if (preference === 'tfjs_webgl') {
+    return { preferredBackend: 'tfjs', tfjsBackendPreference: 'webgl' };
+  }
+  if (preference === 'tfjs_cpu') {
+    return { preferredBackend: 'tfjs', tfjsBackendPreference: 'cpu' };
+  }
+  return { preferredBackend: 'tfjs', tfjsBackendPreference: 'auto' };
+};
+
+const formatMlRuntimeSummary = (info: ModelRunnerInfo): string => {
+  const runtime = info.runtimeBackend ? ` (${info.runtimeBackend})` : '';
+  const fallback = info.fallbackReason
+    ? `\nFallback: ${info.fallbackReason}`
+    : '';
+  return `Requested: ${info.requestedBackend}\nActive: ${info.activeBackend}${runtime}${fallback}`;
+};
 
 async function boot() {
   const APP_VERSION = pkg.version;
@@ -239,8 +288,14 @@ async function boot() {
   const toolUsesRemote =
     ENABLE_LEGACY_DATA_TOOLS && uploadService.toolUsesRemote;
   const LABELING_PROGRESS_TARGET = 1000;
-  const preferredMlBackend: MlBackend =
-    import.meta.env.VITE_ML_BACKEND === 'native' ? 'native' : 'tfjs';
+  const defaultMlBackendPreference: MenuMlBackendPreference =
+    import.meta.env.VITE_ML_BACKEND === 'native' ? 'native' : 'tfjs_auto';
+  const storedMlBackendPreference = resolveMlBackendPreference(
+    localStorage.getItem(ML_BACKEND_PREFERENCE_STORAGE_KEY),
+    defaultMlBackendPreference,
+  );
+  const { preferredBackend: preferredMlBackend, tfjsBackendPreference } =
+    getMlBackendPreferenceParts(storedMlBackendPreference);
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
@@ -249,6 +304,7 @@ async function boot() {
   const modelService = createModelService({
     modelUrl: ML_MODEL_URL,
     preferredBackend: preferredMlBackend,
+    tfjsBackendPreference,
   });
   modelService.setStatusListener((status) => {
     updateModelStatusUI(status);
@@ -271,10 +327,14 @@ async function boot() {
     }
     const generatorLabel = getModelGeneratorLabel();
     const runnerInfo = modelService.getRunnerInfo();
+    const runtimeLabel =
+      runnerInfo.activeBackend === 'tfjs' && runnerInfo.runtimeBackend
+        ? `:${runnerInfo.runtimeBackend}`
+        : '';
     const backendSuffix =
       runnerInfo.requestedBackend === runnerInfo.activeBackend
-        ? ` (${runnerInfo.activeBackend})`
-        : ` (${runnerInfo.activeBackend} fallback)`;
+        ? ` (${runnerInfo.activeBackend}${runtimeLabel})`
+        : ` (${runnerInfo.activeBackend}${runtimeLabel} fallback)`;
     modelStatusLabel.style.display = 'block';
     let text = `${generatorLabel}: idle (RNG fallback)${backendSuffix}`;
     let color = '#f4b266';
@@ -298,6 +358,12 @@ async function boot() {
       pausedByModel = shouldPause;
       runtime?.setPausedByModel(shouldPause);
     }
+  };
+  const getMlRuntimeSummary = (): string =>
+    formatMlRuntimeSummary(modelService.getRunnerInfo());
+  const applyMlBackendPreference = (next: MenuMlBackendPreference): void => {
+    localStorage.setItem(ML_BACKEND_PREFERENCE_STORAGE_KEY, next);
+    window.location.reload();
   };
   void modelService.ensureLoaded();
   let menuUi: MenuScreen | null = null;
@@ -474,6 +540,76 @@ async function boot() {
       runtime?.renderNow();
     },
   });
+  const runMlParityCheck = async (
+    preference: MenuMlBackendPreference,
+  ): Promise<MenuMlParityResult> => {
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      return { ok: false, message: 'Model is not loaded.' };
+    }
+    const tfjsPreferenceForParity =
+      preference === 'tfjs_webgl'
+        ? 'webgl'
+        : preference === 'tfjs_cpu'
+          ? 'cpu'
+          : 'auto';
+    const nativeRunner = createModelRunner({
+      preferredBackend: 'native',
+      tfjsBackendPreference: 'auto',
+    }).runner;
+    const tfjsRunner = createModelRunner({
+      preferredBackend: 'tfjs',
+      tfjsBackendPreference: tfjsPreferenceForParity,
+    }).runner;
+
+    await nativeRunner.prepare(model);
+    await tfjsRunner.prepare(model);
+    const tfjsInfo = tfjsRunner.getInfo();
+    if (tfjsInfo.activeBackend !== 'tfjs') {
+      return {
+        ok: false,
+        message: `TFJS unavailable: ${tfjsInfo.fallbackReason ?? 'unknown error.'}`,
+      };
+    }
+
+    const state = session.getGame().state;
+    const nativeLogits = nativeRunner.predictLogits(
+      model,
+      state.board,
+      state.hold,
+    );
+    const tfjsLogits = tfjsRunner.predictLogits(model, state.board, state.hold);
+    const len = Math.min(nativeLogits.length, tfjsLogits.length);
+    if (len === 0) {
+      return { ok: false, message: 'Parity check failed: empty logits.' };
+    }
+
+    let maxAbsDiff = 0;
+    let sumAbsDiff = 0;
+    let nativeBestIndex = 0;
+    let tfjsBestIndex = 0;
+    for (let i = 0; i < len; i++) {
+      const absDiff = Math.abs(nativeLogits[i] - tfjsLogits[i]);
+      sumAbsDiff += absDiff;
+      if (absDiff > maxAbsDiff) maxAbsDiff = absDiff;
+      if (nativeLogits[i] > nativeLogits[nativeBestIndex]) nativeBestIndex = i;
+      if (tfjsLogits[i] > tfjsLogits[tfjsBestIndex]) tfjsBestIndex = i;
+    }
+    const meanAbsDiff = sumAbsDiff / len;
+    const nativeBestPiece = model.pieces[nativeBestIndex] ?? '?';
+    const tfjsBestPiece = model.pieces[tfjsBestIndex] ?? '?';
+    const tfBackend = tfjsInfo.runtimeBackend ?? 'tfjs';
+    const matchesTop1 = nativeBestIndex === tfjsBestIndex;
+    const withinTolerance = maxAbsDiff <= 1e-3;
+
+    return {
+      ok: withinTolerance && matchesTop1,
+      message:
+        `TFJS backend: ${tfBackend}\n` +
+        `max|Δ|=${maxAbsDiff.toExponential(3)} mean|Δ|=${meanAbsDiff.toExponential(3)}\n` +
+        `top1 native=${nativeBestPiece} tfjs=${tfjsBestPiece}`,
+    };
+  };
 
   const gameRenderer = new PixiRenderer(gameGfx);
   const toolRenderer = new PixiRenderer(toolGfx);
@@ -715,6 +851,10 @@ async function boot() {
     authState,
     authInitialResetToken,
     authInitialStatus,
+    mlBackendPreference: storedMlBackendPreference,
+    getMlRuntimeSummary,
+    onMlBackendPreferenceChange: applyMlBackendPreference,
+    onMlRunParityCheck: runMlParityCheck,
     onAuthRefresh: refreshAuthState,
     onAuthStartOAuth: (provider) => authService.startOAuth(provider),
     onAuthLogout: logoutAuthState,

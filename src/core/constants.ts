@@ -96,6 +96,8 @@ export const DEFAULT_KEY_BINDINGS = {
 };
 
 export const SETTINGS_STORAGE_KEY = 'wishuponablock.settings';
+export const ML_BACKEND_PREFERENCE_STORAGE_KEY =
+  'wishuponablock.ml_backend_preference';
 
 export const GAME_PROTOCOL_VERSION = 2;
 
