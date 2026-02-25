@@ -1632,6 +1632,16 @@ const handleOAuthStart = async (
   }
   const url = new URL(request.url);
   if (url.searchParams.get('probe') === '1') {
+    const secure = isSecureRequest(request);
+    const probeCookie = [
+      `wub_oauth_probe=${encodeURIComponent(`${provider}-${Date.now()}`)}`,
+      'Path=/',
+      'SameSite=Lax',
+      `Max-Age=${OAUTH_STATE_MAX_AGE_SECONDS}`,
+      secure ? 'Secure' : '',
+    ]
+      .filter(Boolean)
+      .join('; ');
     const payload = {
       ok: true,
       route: 'oauth_start',
@@ -1641,12 +1651,13 @@ const handleOAuthStart = async (
     };
     const payloadJson = JSON.stringify(payload).replace(/</g, '\\u003c');
     return new Response(
-      `<!doctype html><meta charset="utf-8"><title>OAuth Probe</title><pre id="out"></pre><script>const payload=${payloadJson};console.log('[oauth probe]', payload);document.getElementById('out').textContent=JSON.stringify(payload,null,2);</script>`,
+      `<!doctype html><meta charset="utf-8"><title>OAuth Probe</title><pre id="out"></pre><script>const payload=${payloadJson};const cookieSnapshot=document.cookie;console.log('[oauth probe]', payload);console.log('[oauth probe] document.cookie:', cookieSnapshot);document.getElementById('out').textContent=JSON.stringify({...payload,cookieSnapshot},null,2);</script>`,
       {
         status: 200,
         headers: withBaseHeaders({
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
+          'set-cookie': probeCookie,
         }),
       },
     );
