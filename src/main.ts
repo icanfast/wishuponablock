@@ -54,6 +54,15 @@ function hasWebGL(): boolean {
 
 async function boot() {
   const APP_VERSION = pkg.version;
+  const pageUrl = new URL(window.location.href);
+  const deployProbeEnabled =
+    pageUrl.searchParams.get('probe') === '1' ||
+    pageUrl.searchParams.get('deploy_probe') === '1';
+  if (deployProbeEnabled) {
+    console.log(
+      `[deploy probe] app boot version=${APP_VERSION} mode=${import.meta.env.MODE} dev=${import.meta.env.DEV} path=${pageUrl.pathname}${pageUrl.search}`,
+    );
+  }
   const GAME_SCREEN_Y_OFFSET = 20;
   if (!hasWebGL()) {
     document.body.innerHTML = `<div style="padding:16px;color:#fff;background:#000;height:100vh">
