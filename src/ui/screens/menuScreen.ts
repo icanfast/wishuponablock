@@ -16,7 +16,21 @@ type MenuPanel =
   | 'cheese'
   | 'charcuterie'
   | 'tools'
-  | 'feedback';
+  | 'feedback'
+  | 'account';
+
+export type MenuAuthUser = {
+  id: string;
+  username: string;
+  email: string | null;
+  emailVerifiedAtMs: number | null;
+};
+
+export type MenuAuthState = {
+  loading: boolean;
+  authenticated: boolean;
+  user: MenuAuthUser | null;
+};
 
 export type LabelingProgressState = {
   buildVersion: string;
@@ -32,6 +46,7 @@ export type MenuScreenOptions = {
   charcuterieDefaultSimCount?: number;
   tools: Array<{ id: string; label: string }>;
   labelingProgress?: LabelingProgressState | null;
+  authState: MenuAuthState;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -42,6 +57,10 @@ export type MenuScreenOptions = {
   ) => void;
   onOpenTool: (id: string) => void;
   onSendFeedback: (feedback: string, contact: string | null) => Promise<void>;
+  onAuthRefresh: () => Promise<void>;
+  onAuthStartOAuth: (provider: 'google' | 'discord') => void;
+  onAuthLogout: () => Promise<void>;
+  onAuthSendVerifyEmail: () => Promise<{ alreadyVerified: boolean }>;
 };
 
 export type MenuScreen = {
@@ -50,6 +69,7 @@ export type MenuScreen = {
   showMain: () => void;
   setTools: (tools: Array<{ id: string; label: string }>) => void;
   setLabelingProgress: (progress: LabelingProgressState | null) => void;
+  setAuthState: (state: MenuAuthState) => void;
   setCharcuterieSpinnerVisible: (visible: boolean) => void;
   syncSettings: (settings: Settings) => void;
 };
@@ -63,6 +83,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     charcuterieDefaultSimCount = 10000,
     tools,
     labelingProgress = null,
+    authState,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -70,6 +91,10 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onStartCharcuterie,
     onOpenTool,
     onSendFeedback,
+    onAuthRefresh,
+    onAuthStartOAuth,
+    onAuthLogout,
+    onAuthSendVerifyEmail,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -202,6 +227,7 @@ input[type=number] {
   const charcuteriePanel = makeMenuPanel();
   const toolsPanel = makeMenuPanel();
   const feedbackPanel = makeMenuPanel();
+  const accountPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
 
@@ -229,6 +255,12 @@ input[type=number] {
     display: 'none',
     textAlign: 'left',
   });
+  Object.assign(accountPanel.style, {
+    minHeight: '260px',
+    width: '320px',
+    display: 'none',
+    textAlign: 'left',
+  });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
@@ -246,11 +278,13 @@ input[type=number] {
   if (!showLegacyDataTools) {
     toolsButton.style.display = 'none';
   }
+  const accountButton = makeMenuButton('ACCOUNT');
   const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
   menuMainPanel.appendChild(optionsButton);
   menuMainPanel.appendChild(toolsButton);
+  menuMainPanel.appendChild(accountButton);
   menuMainPanel.appendChild(aboutButton);
 
   const optionsTitle = document.createElement('div');
@@ -1775,6 +1809,178 @@ input[type=number] {
   feedbackPanel.appendChild(feedbackButtons);
   feedbackPanel.appendChild(feedbackStatus);
 
+  const accountTitle = document.createElement('div');
+  accountTitle.textContent = 'ACCOUNT';
+  Object.assign(accountTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '6px',
+    textAlign: 'center',
+  });
+
+  const accountSummary = document.createElement('div');
+  Object.assign(accountSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.45',
+    minHeight: '66px',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+
+  const accountActionStatus = document.createElement('div');
+  Object.assign(accountActionStatus.style, {
+    marginTop: '4px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+    minHeight: '16px',
+    textAlign: 'center',
+  });
+
+  const accountRefreshButton = makeMenuButton('REFRESH SESSION');
+  const accountGoogleButton = makeMenuButton('SIGN IN WITH GOOGLE');
+  const accountDiscordButton = makeMenuButton('SIGN IN WITH DISCORD');
+  const accountVerifyButton = makeMenuButton('SEND VERIFICATION EMAIL');
+  const accountLogoutButton = makeMenuButton('LOG OUT');
+  const accountBackButton = makeMenuButton('BACK');
+  Object.assign(accountBackButton.style, { marginTop: 'auto' });
+
+  let currentAuthState: MenuAuthState = authState;
+  let authActionPending = false;
+  const setAccountActionStatus = (message: string, color = '#8fa0b8') => {
+    accountActionStatus.textContent = message;
+    accountActionStatus.style.color = color;
+  };
+
+  const formatAccountSummary = (state: MenuAuthState): string => {
+    if (state.loading) {
+      return 'Checking session...';
+    }
+    if (!state.authenticated || !state.user) {
+      return 'Not signed in.';
+    }
+    const emailLine = state.user.email ? `Email: ${state.user.email}` : '';
+    const verificationLine =
+      state.user.emailVerifiedAtMs == null
+        ? 'Email verification: pending'
+        : 'Email verification: complete';
+    return [`Signed in as ${state.user.username}`, emailLine, verificationLine]
+      .filter((line) => line.length > 0)
+      .join('\n');
+  };
+
+  const updateAccountControls = () => {
+    accountSummary.textContent = formatAccountSummary(currentAuthState);
+    const busy = authActionPending || currentAuthState.loading;
+    accountRefreshButton.disabled = busy;
+    accountGoogleButton.disabled = busy;
+    accountDiscordButton.disabled = busy;
+    accountLogoutButton.disabled = busy;
+    accountVerifyButton.disabled = busy;
+    accountGoogleButton.style.display =
+      currentAuthState.authenticated && currentAuthState.user
+        ? 'none'
+        : 'block';
+    accountDiscordButton.style.display =
+      currentAuthState.authenticated && currentAuthState.user
+        ? 'none'
+        : 'block';
+    accountLogoutButton.style.display =
+      currentAuthState.authenticated && currentAuthState.user
+        ? 'block'
+        : 'none';
+    accountVerifyButton.style.display =
+      currentAuthState.authenticated &&
+      currentAuthState.user?.email &&
+      currentAuthState.user.emailVerifiedAtMs == null
+        ? 'block'
+        : 'none';
+  };
+
+  const setAuthState = (state: MenuAuthState) => {
+    currentAuthState = state;
+    updateAccountControls();
+  };
+
+  accountRefreshButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    authActionPending = true;
+    setAccountActionStatus('Refreshing session...');
+    updateAccountControls();
+    try {
+      await onAuthRefresh();
+      setAccountActionStatus('');
+    } catch {
+      setAccountActionStatus('Could not refresh session.', '#f28b82');
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountGoogleButton.addEventListener('click', () => {
+    setAccountActionStatus('Redirecting to Google...');
+    onAuthStartOAuth('google');
+  });
+
+  accountDiscordButton.addEventListener('click', () => {
+    setAccountActionStatus('Redirecting to Discord...');
+    onAuthStartOAuth('discord');
+  });
+
+  accountVerifyButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    authActionPending = true;
+    setAccountActionStatus('Sending verification email...');
+    updateAccountControls();
+    try {
+      const result = await onAuthSendVerifyEmail();
+      setAccountActionStatus(
+        result.alreadyVerified
+          ? 'Email is already verified.'
+          : 'Verification email sent.',
+        '#8fd19e',
+      );
+      await onAuthRefresh().catch(() => {});
+    } catch {
+      setAccountActionStatus('Could not send verification email.', '#f28b82');
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountLogoutButton.addEventListener('click', async () => {
+    if (authActionPending) return;
+    authActionPending = true;
+    setAccountActionStatus('Signing out...');
+    updateAccountControls();
+    try {
+      await onAuthLogout();
+      setAccountActionStatus('Signed out.', '#8fd19e');
+    } catch {
+      setAccountActionStatus('Could not sign out.', '#f28b82');
+    } finally {
+      authActionPending = false;
+      updateAccountControls();
+    }
+  });
+
+  accountPanel.appendChild(accountTitle);
+  accountPanel.appendChild(accountSummary);
+  accountPanel.appendChild(accountActionStatus);
+  accountPanel.appendChild(accountRefreshButton);
+  accountPanel.appendChild(accountGoogleButton);
+  accountPanel.appendChild(accountDiscordButton);
+  accountPanel.appendChild(accountVerifyButton);
+  accountPanel.appendChild(accountLogoutButton);
+  accountPanel.appendChild(accountBackButton);
+  setAuthState(currentAuthState);
+
   const menuLayer = document.createElement('div');
   Object.assign(menuLayer.style, {
     position: 'absolute',
@@ -1797,6 +2003,7 @@ input[type=number] {
   menuLayer.appendChild(charcuteriePanel);
   menuLayer.appendChild(toolsPanel);
   menuLayer.appendChild(feedbackPanel);
+  menuLayer.appendChild(accountPanel);
   root.appendChild(menuLayer);
 
   const feedbackMenuButton = makeMenuButton('LEAVE FEEDBACK');
@@ -1890,6 +2097,7 @@ input[type=number] {
     charcuteriePanel.style.display = panel === 'charcuterie' ? 'flex' : 'none';
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
     feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
+    accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display = panel === 'options' ? 'none' : 'block';
   };
@@ -1901,6 +2109,7 @@ input[type=number] {
   if (showLegacyDataTools) {
     toolsButton.addEventListener('click', () => show('tools'));
   }
+  accountButton.addEventListener('click', () => show('account'));
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 
@@ -1946,6 +2155,7 @@ input[type=number] {
   charcuterieBackButton.addEventListener('click', () => show('play'));
   toolsBackButton.addEventListener('click', showMain);
   feedbackBackButton.addEventListener('click', showMain);
+  accountBackButton.addEventListener('click', showMain);
 
   window.addEventListener('keydown', (event) => {
     if (event.code !== 'Escape') return;
@@ -2019,6 +2229,7 @@ input[type=number] {
     showMain,
     setTools,
     setLabelingProgress,
+    setAuthState,
     setCharcuterieSpinnerVisible: (visible) => {
       charcuterieSpinner.style.display = visible ? 'flex' : 'none';
     },

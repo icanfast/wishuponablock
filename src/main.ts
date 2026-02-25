@@ -20,6 +20,7 @@ import { createScreenManager } from './app/screenManager';
 import { createUiController } from './app/uiController';
 import { createScreenFlowController } from './app/screenFlowController';
 import { createSettingsController } from './app/settingsController';
+import { createAuthService } from './app/authService';
 import type {
   CharcuterieHoleWeights,
   CharcuterieScoreWeights,
@@ -32,7 +33,11 @@ import {
 import { createGameSessionFactory } from './app/gameFactory';
 import { PixiRenderer } from './render/pixiRenderer';
 import { type Board, type PieceKind, type GameState } from './core/types';
-import { createMenuScreen, type MenuScreen } from './ui/screens/menuScreen';
+import {
+  createMenuScreen,
+  type MenuAuthState,
+  type MenuScreen,
+} from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
 import {
   createToolHost,
@@ -150,6 +155,7 @@ async function boot() {
   });
   const uploadClient = uploadService.uploadClient;
   const uploadBaseUrl = uploadService.baseUrl;
+  const authService = createAuthService({ baseUrl: uploadBaseUrl });
   const useRemoteUpload = ENABLE_LEGACY_DATA_TOOLS && uploadService.useRemote;
   const toolUsesRemote =
     ENABLE_LEGACY_DATA_TOOLS && uploadService.toolUsesRemote;
@@ -224,6 +230,51 @@ async function boot() {
   const inputService = createInputService({ settings });
   const identityService = createIdentityService();
   const inputSource = inputService.getInputSource();
+  let authState: MenuAuthState = {
+    loading: true,
+    authenticated: false,
+    user: null,
+  };
+
+  const applyAuthState = (next: MenuAuthState) => {
+    authState = next;
+    menuUi?.setAuthState(next);
+    identityService.setUserId(
+      next.authenticated ? (next.user?.id ?? null) : null,
+    );
+  };
+
+  const refreshAuthState = async () => {
+    applyAuthState({ ...authState, loading: true });
+    try {
+      const session = await authService.getSession();
+      applyAuthState({
+        loading: false,
+        authenticated: session.authenticated,
+        user: session.user,
+      });
+    } catch (error) {
+      console.error('[auth] /me failed', error);
+      applyAuthState({
+        loading: false,
+        authenticated: false,
+        user: null,
+      });
+      throw error;
+    }
+  };
+
+  const logoutAuthState = async () => {
+    await authService.logout();
+    await refreshAuthState();
+  };
+
+  const sendAuthVerificationEmail = async () => {
+    const result = await authService.sendVerificationEmail();
+    await refreshAuthState().catch(() => {});
+    return result;
+  };
+  applyAuthState(authState);
 
   const soundService = createSoundService({ settings });
   let suppressLockEffects = false;
@@ -547,12 +598,18 @@ async function boot() {
           target: LABELING_PROGRESS_TARGET,
         }
       : null,
+    authState,
+    onAuthRefresh: refreshAuthState,
+    onAuthStartOAuth: (provider) => authService.startOAuth(provider),
+    onAuthLogout: logoutAuthState,
+    onAuthSendVerifyEmail: sendAuthVerificationEmail,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
   uiController.attachMenu(menuUi);
   uiController.setMenuTools(ENABLE_LEGACY_DATA_TOOLS ? toolHost.list() : []);
   void refreshMenuLabelingProgress();
+  void refreshAuthState();
 
   app.renderer.resize(PLAY_WIDTH, PLAY_HEIGHT);
   const settingsController = createSettingsController({
