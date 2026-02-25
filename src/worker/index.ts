@@ -557,6 +557,7 @@ const readCurrentPersonalModel = async (
        updated_at_ms
      FROM user_models
      WHERE user_id = ? AND game_mode = ?
+     ORDER BY updated_at_ms DESC
      LIMIT 1`,
   )
     .bind(userId, gameMode)
@@ -568,6 +569,76 @@ const readCurrentPersonalModel = async (
 const sha256HexFromBuffer = async (buffer: ArrayBuffer): Promise<string> => {
   const digest = await crypto.subtle.digest('SHA-256', buffer);
   return toHex(new Uint8Array(digest));
+};
+
+const writeCurrentPersonalModelPointer = async (
+  env: Env,
+  options: {
+    existing: PersonalModelRecord | null;
+    userId: string;
+    gameMode: string;
+    r2Key: string;
+    version: number;
+    modelSizeBytes: number;
+    modelSha256: string;
+    updatedAtMs: number;
+  },
+): Promise<void> => {
+  const {
+    existing,
+    userId,
+    gameMode,
+    r2Key,
+    version,
+    modelSizeBytes,
+    modelSha256,
+    updatedAtMs,
+  } = options;
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE user_models
+       SET
+         r2_key = ?,
+         version = ?,
+         model_size_bytes = ?,
+         model_sha256 = ?,
+         updated_at_ms = ?
+       WHERE user_id = ? AND game_mode = ? AND r2_key = ?`,
+    )
+      .bind(
+        r2Key,
+        version,
+        modelSizeBytes,
+        modelSha256,
+        updatedAtMs,
+        userId,
+        gameMode,
+        existing.r2Key,
+      )
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO user_models (
+       user_id,
+       game_mode,
+       r2_key,
+       version,
+       model_size_bytes,
+       model_sha256,
+       updated_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      userId,
+      gameMode,
+      r2Key,
+      version,
+      modelSizeBytes,
+      modelSha256,
+      updatedAtMs,
+    )
+    .run();
 };
 
 const getOAuthProviderColumn = (
@@ -2109,33 +2180,16 @@ const handlePutCurrentPersonalModel = async (
     await env.MODELS_BUCKET.put(nextR2Key, modelBuffer, {
       httpMetadata: { contentType },
     });
-    await env.DB.prepare(
-      `INSERT INTO user_models (
-         user_id,
-         game_mode,
-         r2_key,
-         version,
-         model_size_bytes,
-         model_sha256,
-         updated_at_ms
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id, game_mode) DO UPDATE SET
-         r2_key = excluded.r2_key,
-         version = excluded.version,
-         model_size_bytes = excluded.model_size_bytes,
-         model_sha256 = excluded.model_sha256,
-         updated_at_ms = excluded.updated_at_ms`,
-    )
-      .bind(
-        session.userId,
-        gameMode,
-        nextR2Key,
-        nextVersion,
-        modelBuffer.byteLength,
-        modelSha256,
-        nowMs,
-      )
-      .run();
+    await writeCurrentPersonalModelPointer(env, {
+      existing,
+      userId: session.userId,
+      gameMode,
+      r2Key: nextR2Key,
+      version: nextVersion,
+      modelSizeBytes: modelBuffer.byteLength,
+      modelSha256,
+      updatedAtMs: nowMs,
+    });
 
     if (existing && existing.r2Key !== nextR2Key) {
       env.MODELS_BUCKET.delete(existing.r2Key).catch((error) => {
