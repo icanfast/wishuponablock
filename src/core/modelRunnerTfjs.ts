@@ -48,6 +48,7 @@ type TfjsModule = {
     strides: number | [number, number],
     pad: 'same' | 'valid',
   ) => TfTensor;
+  transpose: (x: TfTensor, perm?: number[]) => TfTensor;
   concat: (tensors: TfTensor[], axis: number) => TfTensor;
   matMul: (a: TfTensor, b: TfTensor) => TfTensor;
   mean: (x: TfTensor, axis: number | number[], keepDims?: boolean) => TfTensor;
@@ -200,6 +201,25 @@ const transposeLinearWeightOutInToInOut = (
   for (let o = 0; o < outFeatures; o++) {
     for (let i = 0; i < inFeatures; i++) {
       out[i * outFeatures + o] = tensor.data[o * inFeatures + i];
+    }
+  }
+  return out;
+};
+
+export const reorderInputChwToNhwc = (
+  input: Float32Array,
+  channels: number,
+  rows: number,
+  cols: number,
+): Float32Array => {
+  const out = new Float32Array(channels * rows * cols);
+  let dst = 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      for (let c = 0; c < channels; c++) {
+        const src = (c * rows + y) * cols + x;
+        out[dst++] = input[src];
+      }
     }
   }
   return out;
@@ -389,6 +409,12 @@ export function createTfjsModelRunner(
       padded.set(input.subarray(0, expectedLength), 0);
       input = padded;
     }
+    const nhwcInput = reorderInputChwToNhwc(
+      input,
+      model.config.input_channels,
+      rows,
+      cols,
+    );
     const extra = buildModelExtraFeatures(
       model.config.extra_features,
       hold,
@@ -405,7 +431,7 @@ export function createTfjsModelRunner(
 
     const convStartMs = perfEnabled ? performance.now() : 0;
     const convOutput = tfModule.tidy(() => {
-      let x = tfModule.tensor4d(input, [
+      let x = tfModule.tensor4d(nhwcInput, [
         1,
         rows,
         cols,
@@ -440,7 +466,8 @@ export function createTfjsModelRunner(
         poolKernel,
         'valid',
       );
-      return pooled.reshape([1, preparedState.pooledFeatureCount]);
+      const pooledNchw = tfModule.transpose(pooled, [0, 3, 1, 2]);
+      return pooledNchw.reshape([1, preparedState.pooledFeatureCount]);
     });
     tfModule.dispose(convOutput);
     if (perfEnabled) {
