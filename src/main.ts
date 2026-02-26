@@ -450,6 +450,7 @@ async function boot() {
   };
   void modelService.ensureLoaded();
   const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
+  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = 8;
   const trajectoryRewardPolicyId: TrajectoryRewardPolicyId =
     resolveTrajectoryRewardPolicyId(
       import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined,
@@ -822,6 +823,7 @@ async function boot() {
     startedAtMs: number;
   };
   let activeTrajectoryRun: TrajectoryRunState | null = null;
+  let pendingTrajectoryRunModeId: string | null = null;
   let pendingTrajectorySession: TrajectorySessionV1 | null = null;
   let lastTrajectoryUploadMessage = 'No uploads yet.';
   let lastTrajectoryUploadAtMs: number | null = null;
@@ -886,15 +888,24 @@ async function boot() {
     };
   };
 
+  const scheduleTrajectoryRunStart = (modeId: string): void => {
+    pendingTrajectoryRunModeId = modeId;
+  };
+
+  const listRunSamples = (
+    run: TrajectoryRunState,
+  ): TrajectoryDecisionSample[] =>
+    trajectoryBuffer
+      .listSamples({ modeId: run.modeId })
+      .filter((sample) => sample.createdAtMs >= run.startedAtMs);
+
   const buildTrajectorySession = (
     run: TrajectoryRunState,
     outcome: string,
     terminal: TrajectoryRewardTerminalStats | null = null,
   ): TrajectorySessionV1 | null => {
-    const runSamples = trajectoryBuffer
-      .listSamples({ modeId: run.modeId })
-      .filter((sample) => sample.createdAtMs >= run.startedAtMs);
-    if (runSamples.length === 0) return null;
+    const runSamples = listRunSamples(run);
+    if (runSamples.length < MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD) return null;
     const rewards = computeTrajectoryRewards(
       runSamples,
       {
@@ -927,6 +938,7 @@ async function boot() {
   ): TrajectorySessionV1 | null => {
     const run = activeTrajectoryRun;
     activeTrajectoryRun = null;
+    pendingTrajectoryRunModeId = null;
     if (!run) return null;
     const session = buildTrajectorySession(run, outcome, terminal);
     if (session) {
@@ -975,6 +987,12 @@ async function boot() {
       candidate = buildTrajectorySession(activeTrajectoryRun, 'manual');
     }
     if (!candidate) {
+      if (activeTrajectoryRun) {
+        const count = listRunSamples(activeTrajectoryRun).length;
+        throw new Error(
+          `Need at least ${MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD} samples before upload (currently ${count}).`,
+        );
+      }
       throw new Error('No trajectory recording available to upload.');
     }
     try {
@@ -999,9 +1017,7 @@ async function boot() {
     const lines: string[] = [];
     const run = activeTrajectoryRun;
     if (run) {
-      const activeSamples = trajectoryBuffer
-        .listSamples({ modeId: run.modeId })
-        .filter((sample) => sample.createdAtMs >= run.startedAtMs).length;
+      const activeSamples = listRunSamples(run).length;
       lines.push(`Active run: ${run.modeId} (${activeSamples} samples)`);
     } else {
       lines.push('Active run: none');
@@ -1165,7 +1181,8 @@ async function boot() {
     onBeforeRestart: () => {
       restartRecordingSession();
       previousRunEnded = false;
-      beginTrajectoryRun(modeController.getState().mode.id);
+      activeTrajectoryRun = null;
+      scheduleTrajectoryRunStart(modeController.getState().mode.id);
     },
     onModelDecision: (decision) => {
       const modeId = modeController.getState().mode.id;
@@ -1344,6 +1361,10 @@ async function boot() {
       gameUi.gameOverLabel.style.display = visible ? 'block' : 'none';
     },
     onFrame: (state) => {
+      if (pendingTrajectoryRunModeId && !activeTrajectoryRun) {
+        beginTrajectoryRun(pendingTrajectoryRunModeId);
+        pendingTrajectoryRunModeId = null;
+      }
       updateSprintHud(state);
       updateClassicHud(state);
       gameUi.setQueueOddsMode(
@@ -1366,6 +1387,9 @@ async function boot() {
           if (finalized) {
             lastTrajectoryUploadMessage =
               'Run captured locally. Sign in and use "UPLOAD TRAJECTORY".';
+            lastTrajectoryUploadError = null;
+          } else if (activeTrajectoryRun == null) {
+            lastTrajectoryUploadMessage = `Run ignored (need >= ${MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD} samples).`;
             lastTrajectoryUploadError = null;
           }
         }
@@ -1639,8 +1663,9 @@ async function boot() {
           reason: 'start_game',
         });
       }
-      beginTrajectoryRun(modeController.getState().mode.id);
+      activeTrajectoryRun = null;
       previousRunEnded = false;
+      scheduleTrajectoryRunStart(modeController.getState().mode.id);
       await screenManager.setActive('game');
     } finally {
       startingGame = false;
