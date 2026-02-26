@@ -1,4 +1,5 @@
 import {
+  MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   MAX_TRAJECTORY_SAMPLES_PER_SESSION,
   parseTrajectorySessionV1,
 } from '../core/trajectoryProtocol';
@@ -2415,6 +2416,7 @@ const handlePostTrajectoryRecording = async (
   }
 
   const parsed = parseTrajectorySessionV1(payload, {
+    minSamples: MIN_TRAJECTORY_SAMPLES_PER_SESSION,
     maxSamples: MAX_TRAJECTORY_SAMPLES_PER_SESSION,
   });
   if (!parsed.ok) {
@@ -2436,8 +2438,12 @@ const handlePostTrajectoryRecording = async (
     model_version: recording.meta?.modelVersion ?? null,
     channel: recording.meta?.channel ?? null,
     reward_policy: recording.meta?.rewardPolicy ?? null,
+    reward_policy_id: recording.meta?.rewardPolicyId ?? null,
     reward_kind: recording.meta?.rewardKind ?? null,
     reward_gamma: recording.meta?.rewardGamma ?? null,
+    pipeline_id: recording.meta?.pipelineId ?? null,
+    pipeline_mode: recording.meta?.pipelineMode ?? null,
+    model_arch: recording.meta?.modelArch ?? null,
   });
 
   try {

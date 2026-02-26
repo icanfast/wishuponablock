@@ -47,6 +47,7 @@ import {
 } from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import {
+  MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
   type TrajectorySessionMetaV1,
   type TrajectorySessionV1,
@@ -450,7 +451,8 @@ async function boot() {
   };
   void modelService.ensureLoaded();
   const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
-  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = 8;
+  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = MIN_TRAJECTORY_SAMPLES_PER_SESSION;
+  const TRAJECTORY_PIPELINE_ID = 'personal_rl_v1';
   const trajectoryRewardPolicyId: TrajectoryRewardPolicyId =
     resolveTrajectoryRewardPolicyId(
       import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined,
@@ -811,8 +813,12 @@ async function boot() {
       avgReward,
       meanDeliberationMs,
       rewardPolicy: session.meta?.rewardPolicy ?? null,
+      rewardPolicyId: session.meta?.rewardPolicyId ?? null,
       rewardKind: session.meta?.rewardKind ?? null,
       rewardGamma: session.meta?.rewardGamma ?? null,
+      pipelineId: session.meta?.pipelineId ?? null,
+      pipelineMode: session.meta?.pipelineMode ?? null,
+      modelArch: session.meta?.modelArch ?? null,
       outcome: session.meta?.outcome ?? null,
     };
   };
@@ -830,7 +836,20 @@ async function boot() {
   let lastTrajectoryUploadSamples = 0;
   let lastTrajectoryUploadError: string | null = null;
 
+  const getTrajectoryModelArch = (): string => {
+    const model = modelService.getModel();
+    if (!model) return 'unknown';
+    const cfg = model.config;
+    const conv = cfg.conv_channels.map((value) => Math.trunc(value)).join('x');
+    const poolShape =
+      cfg.pool_shape && cfg.pool_shape.length >= 2
+        ? `${Math.trunc(cfg.pool_shape[0])}x${Math.trunc(cfg.pool_shape[1])}`
+        : '1x1';
+    return `ic${Math.trunc(cfg.input_channels)}_conv${conv}_pool${poolShape}_mlp${Math.trunc(cfg.mlp_hidden)}_extra${Math.trunc(cfg.extra_features)}_out${Math.trunc(cfg.num_outputs)}`;
+  };
+
   const toTrajectoryMeta = (
+    modeId: string,
     outcome: string,
     rewards: TrajectoryRewardComputation | null,
   ): TrajectorySessionMetaV1 => {
@@ -838,6 +857,9 @@ async function boot() {
       outcome,
       channel: import.meta.env.MODE,
       modelSource: activeModelSource.kind,
+      pipelineId: TRAJECTORY_PIPELINE_ID,
+      pipelineMode: modeId,
+      modelArch: getTrajectoryModelArch(),
     };
     if (activeModelSource.kind === 'personal') {
       meta.modelMode = activeModelSource.mode;
@@ -847,6 +869,7 @@ async function boot() {
     }
     if (rewards) {
       meta.rewardPolicy = rewards.policyId;
+      meta.rewardPolicyId = rewards.policyId;
       meta.rewardKind = rewards.kind;
       meta.rewardGamma = rewards.gamma;
     }
@@ -928,7 +951,7 @@ async function boot() {
       endedAtMs,
       durationMs: Math.max(0, endedAtMs - run.startedAtMs),
       samples: toTrajectorySamples(runSamples, rewards.rewards),
-      meta: toTrajectoryMeta(outcome, rewards),
+      meta: toTrajectoryMeta(run.modeId, outcome, rewards),
     };
   };
 

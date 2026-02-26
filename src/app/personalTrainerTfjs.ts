@@ -1,5 +1,6 @@
 import type { LoadedModel } from '../core/wubModel';
 import { serializeWubModelToBytes } from '../core/wubModel';
+import { MIN_TRAJECTORY_SAMPLES_PER_SESSION } from '../core/trajectoryProtocol';
 import type { TrajectoryDecisionSample } from './trajectoryBuffer';
 
 const TFJS_CDN_URL = 'https://esm.sh/@tensorflow/tfjs@4.22.0';
@@ -222,10 +223,10 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
             sample.actionIndex < numOutputs,
         )
         .slice(-sampleLimit);
-      if (eligible.length < 8) {
+      if (eligible.length < MIN_TRAJECTORY_SAMPLES_PER_SESSION) {
         return {
           ok: false,
-          message: 'Not enough trajectory samples for training (need >= 8).',
+          message: `Not enough trajectory samples for training (need >= ${MIN_TRAJECTORY_SAMPLES_PER_SESSION}).`,
           backend: null,
           samplesUsed: eligible.length,
           epochs: 0,

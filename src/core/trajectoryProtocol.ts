@@ -2,6 +2,7 @@ import { PIECES, type PieceKind } from './types';
 
 export const TRAJECTORY_SESSION_SCHEMA_V1 =
   'wishuponablock.trajectory_session.v1' as const;
+export const MIN_TRAJECTORY_SAMPLES_PER_SESSION = 8;
 export const MAX_TRAJECTORY_SAMPLES_PER_SESSION = 5000;
 export const MAX_TRAJECTORY_ROWS = 40;
 export const MAX_TRAJECTORY_COLS = 20;
@@ -13,8 +14,12 @@ export type TrajectorySessionMetaV1 = {
   modelVersion?: number | null;
   channel?: string;
   rewardPolicy?: string;
+  rewardPolicyId?: string;
   rewardKind?: string;
   rewardGamma?: number;
+  pipelineId?: string;
+  pipelineMode?: string;
+  modelArch?: string;
 };
 
 export type TrajectorySessionSampleV1 = {
@@ -57,6 +62,7 @@ export type ParseTrajectorySessionResult =
     };
 
 type ParseOptions = {
+  minSamples?: number;
   maxSamples?: number;
   maxRows?: number;
   maxCols?: number;
@@ -178,7 +184,11 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   const modelMode = asString(obj.modelMode, 1, 64);
   const channel = asString(obj.channel, 1, 64);
   const rewardPolicy = asString(obj.rewardPolicy, 1, 64);
+  const rewardPolicyId = asString(obj.rewardPolicyId, 1, 64);
   const rewardKind = asString(obj.rewardKind, 1, 64);
+  const pipelineId = asString(obj.pipelineId, 1, 64);
+  const pipelineMode = asString(obj.pipelineMode, 1, 64);
+  const modelArch = asString(obj.modelArch, 1, 128);
   const rewardGamma =
     obj.rewardGamma == null
       ? null
@@ -193,7 +203,11 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   if (modelMode) meta.modelMode = modelMode;
   if (channel) meta.channel = channel;
   if (rewardPolicy) meta.rewardPolicy = rewardPolicy;
+  if (rewardPolicyId) meta.rewardPolicyId = rewardPolicyId;
   if (rewardKind) meta.rewardKind = rewardKind;
+  if (pipelineId) meta.pipelineId = pipelineId;
+  if (pipelineMode) meta.pipelineMode = pipelineMode;
+  if (modelArch) meta.modelArch = modelArch;
   if (rewardGamma != null) meta.rewardGamma = rewardGamma;
   if (modelVersion != null) meta.modelVersion = modelVersion;
   if (obj.rewardGamma != null && rewardGamma == null) return null;
@@ -276,6 +290,8 @@ export const parseTrajectorySessionV1 = (
   payload: unknown,
   options: ParseOptions = {},
 ): ParseTrajectorySessionResult => {
+  const minSamplesRaw = options.minSamples ?? 1;
+  const minSamples = Math.max(1, Math.trunc(minSamplesRaw));
   const maxSamples = options.maxSamples ?? MAX_TRAJECTORY_SAMPLES_PER_SESSION;
   const maxRows = options.maxRows ?? MAX_TRAJECTORY_ROWS;
   const maxCols = options.maxCols ?? MAX_TRAJECTORY_COLS;
@@ -321,8 +337,11 @@ export const parseTrajectorySessionV1 = (
   if (!Array.isArray(obj.samples)) {
     return { ok: false, error: 'Missing trajectory samples.' };
   }
-  if (obj.samples.length === 0) {
-    return { ok: false, error: 'Trajectory is empty.' };
+  if (obj.samples.length < minSamples) {
+    return {
+      ok: false,
+      error: `Trajectory has too few samples (need >= ${minSamples}).`,
+    };
   }
   if (obj.samples.length > maxSamples) {
     return { ok: false, error: 'Trajectory has too many samples.' };

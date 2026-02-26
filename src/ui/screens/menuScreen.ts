@@ -5,6 +5,7 @@ import {
   DEFAULT_SOFT_DROP_MS,
   OUTER_MARGIN,
 } from '../../core/constants';
+import { MIN_TRAJECTORY_SAMPLES_PER_SESSION } from '../../core/trajectoryProtocol';
 import type { Settings } from '../../core/settings';
 import type { SettingsStore } from '../../core/settingsStore';
 
@@ -96,8 +97,12 @@ export type MenuAdminRecordingPreview = {
   avgReward: number | null;
   meanDeliberationMs: number | null;
   rewardPolicy: string | null;
+  rewardPolicyId: string | null;
   rewardKind: string | null;
   rewardGamma: number | null;
+  pipelineId: string | null;
+  pipelineMode: string | null;
+  modelArch: string | null;
   outcome: string | null;
 };
 
@@ -2741,12 +2746,24 @@ input[type=number] {
       preview.rewardPolicy
         ? `Reward policy: ${preview.rewardPolicy}`
         : 'Reward policy: (none)',
+      preview.rewardPolicyId
+        ? `Reward policy id: ${preview.rewardPolicyId}`
+        : 'Reward policy id: (none)',
       preview.rewardKind
         ? `Reward kind: ${preview.rewardKind}`
         : 'Reward kind: (none)',
       preview.rewardGamma != null
         ? `Reward gamma: ${preview.rewardGamma.toFixed(3)}`
         : 'Reward gamma: (none)',
+      preview.pipelineId
+        ? `Pipeline id: ${preview.pipelineId}`
+        : 'Pipeline id: (none)',
+      preview.pipelineMode
+        ? `Pipeline mode: ${preview.pipelineMode}`
+        : 'Pipeline mode: (none)',
+      preview.modelArch
+        ? `Model arch: ${preview.modelArch}`
+        : 'Model arch: (none)',
       preview.avgReward != null
         ? `Avg reward: ${preview.avgReward.toFixed(4)}`
         : 'Avg reward: (n/a)',
@@ -2762,9 +2779,9 @@ input[type=number] {
     stats: MenuLocalTrainingStats,
   ): string => {
     const eligibilityLine =
-      stats.currentModeSamples >= 8
+      stats.currentModeSamples >= MIN_TRAJECTORY_SAMPLES_PER_SESSION
         ? 'Ready to train'
-        : `Need ${8 - stats.currentModeSamples} more mode samples`;
+        : `Need ${MIN_TRAJECTORY_SAMPLES_PER_SESSION - stats.currentModeSamples} more mode samples`;
     const lastSampleLine =
       stats.lastSampleAtMs == null
         ? 'Last sample: none yet'
@@ -2782,7 +2799,8 @@ input[type=number] {
     const authenticated =
       currentAuthState.authenticated && currentAuthState.user != null;
     const trainingStats = getLocalTrainingStats();
-    const hasTrainSamples = trainingStats.currentModeSamples >= 8;
+    const hasTrainSamples =
+      trainingStats.currentModeSamples >= MIN_TRAJECTORY_SAMPLES_PER_SESSION;
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
     myModelsTrainingSummary.textContent =
       formatMyModelsTrainingSummary(trainingStats);
