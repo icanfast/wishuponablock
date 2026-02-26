@@ -5,7 +5,6 @@ import {
   DEFAULT_SOFT_DROP_MS,
   OUTER_MARGIN,
 } from '../../core/constants';
-import { MIN_TRAJECTORY_SAMPLES_PER_SESSION } from '../../core/trajectoryProtocol';
 import type { Settings } from '../../core/settings';
 import type { SettingsStore } from '../../core/settingsStore';
 
@@ -57,6 +56,32 @@ export type MenuLocalTrainingResult = {
   message: string;
   samplesUsed: number;
   finalLoss: number | null;
+};
+export type MenuLocalTrainingBackendPreference = 'auto' | 'webgl' | 'cpu';
+export type MenuLocalTrainingRequest = {
+  sampleLimit?: number;
+  epochs?: number;
+  learningRate?: number;
+  l2?: number;
+  backendPreference?: MenuLocalTrainingBackendPreference;
+};
+export type MenuLocalTrainingPreset = {
+  pipelineId: string;
+  modeId: string;
+  minSamples: number;
+  trainDefaults: {
+    epochs: number;
+    learningRate: number;
+    l2: number;
+    sampleLimit: number;
+    backendPreference: MenuLocalTrainingBackendPreference;
+  };
+  evalGate: {
+    holdoutRatio: number;
+    minHoldoutSamples: number;
+    minTrainSamples: number;
+    minObjectiveGain: number;
+  };
 };
 
 export type MenuAdminRecordingSummary = {
@@ -130,7 +155,10 @@ export type MenuScreenOptions = {
     preference: MenuMlBackendPreference,
   ) => Promise<MenuMlParityResult>;
   getLocalTrainingStats: () => MenuLocalTrainingStats;
-  onRunLocalBiasTraining: () => Promise<MenuLocalTrainingResult>;
+  getLocalTrainingPreset: () => MenuLocalTrainingPreset;
+  onRunLocalBiasTraining: (
+    request?: MenuLocalTrainingRequest,
+  ) => Promise<MenuLocalTrainingResult>;
   getTrajectoryUploadSummary: () => string;
   onUploadLatestTrajectory: () => Promise<string>;
   onStartPractice: () => void;
@@ -197,6 +225,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onMlBackendPreferenceChange,
     onMlRunParityCheck,
     getLocalTrainingStats,
+    getLocalTrainingPreset,
     onRunLocalBiasTraining,
     getTrajectoryUploadSummary,
     onUploadLatestTrajectory,
@@ -2366,6 +2395,73 @@ input[type=number] {
     padding: '8px',
     whiteSpace: 'pre-wrap',
   });
+  const myModelsAdvancedLabel = makeSectionLabel('TRAINING SETTINGS');
+  const myModelsTrainingControls = document.createElement('div');
+  Object.assign(myModelsTrainingControls.style, {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: '6px',
+  });
+  const makeMyModelsTrainingInput = (
+    placeholder: string,
+    type: 'number' | 'text' = 'number',
+  ): HTMLInputElement => {
+    const input = document.createElement('input');
+    input.type = type;
+    input.placeholder = placeholder;
+    Object.assign(input.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '12px',
+      padding: '6px 8px',
+      width: '100%',
+      boxSizing: 'border-box',
+    });
+    return input;
+  };
+  const myModelsEpochsInput = makeMyModelsTrainingInput('epochs');
+  myModelsEpochsInput.min = '1';
+  myModelsEpochsInput.step = '1';
+  const myModelsLearningRateInput = makeMyModelsTrainingInput('learning rate');
+  myModelsLearningRateInput.min = '0.000001';
+  myModelsLearningRateInput.step = '0.0001';
+  const myModelsSampleLimitInput = makeMyModelsTrainingInput('sample limit');
+  myModelsSampleLimitInput.min = '1';
+  myModelsSampleLimitInput.step = '1';
+  const myModelsBackendSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['auto', 'backend: auto'],
+    ['webgl', 'backend: webgl'],
+    ['cpu', 'backend: cpu'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    myModelsBackendSelect.appendChild(option);
+  }
+  Object.assign(myModelsBackendSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const myModelsTrainingPresetSummary = document.createElement('div');
+  Object.assign(myModelsTrainingPresetSummary.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    whiteSpace: 'pre-wrap',
+  });
+  myModelsTrainingControls.appendChild(myModelsEpochsInput);
+  myModelsTrainingControls.appendChild(myModelsLearningRateInput);
+  myModelsTrainingControls.appendChild(myModelsSampleLimitInput);
+  myModelsTrainingControls.appendChild(myModelsBackendSelect);
   const myModelsTrainButton = makeMenuButton('TRAIN ON CLIENT SAMPLES');
   const myModelsRecordingLabel = makeSectionLabel('TRAJECTORY RECORDINGS');
   Object.assign(myModelsRecordingLabel.style, { marginTop: '4px' });
@@ -2393,6 +2489,9 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsActions);
   myModelsPanel.appendChild(myModelsTrainingLabel);
   myModelsPanel.appendChild(myModelsTrainingSummary);
+  myModelsPanel.appendChild(myModelsAdvancedLabel);
+  myModelsPanel.appendChild(myModelsTrainingControls);
+  myModelsPanel.appendChild(myModelsTrainingPresetSummary);
   myModelsPanel.appendChild(myModelsTrainButton);
   myModelsPanel.appendChild(myModelsRecordingLabel);
   myModelsPanel.appendChild(myModelsRecordingSummary);
@@ -2573,6 +2672,7 @@ input[type=number] {
   let adminCurrentRecordings: MenuAdminRecordingSummary[] = [];
   let adminSelectedRecordingId: string | null = null;
   let adminLastPage: MenuAdminRecordingsPage | null = null;
+  let lastTrainingPresetKey = '';
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
     if (tone === 'error') return '#f28b82';
@@ -2604,6 +2704,25 @@ input[type=number] {
     if (error instanceof Error && error.message.trim()) return error.message;
     return fallback;
   };
+  const parsePositiveIntInput = (
+    input: HTMLInputElement,
+  ): number | undefined => {
+    const value = Number(input.value.trim());
+    if (!Number.isFinite(value)) return undefined;
+    const normalized = Math.trunc(value);
+    if (normalized <= 0) return undefined;
+    return normalized;
+  };
+  const parsePositiveFloatInput = (
+    input: HTMLInputElement,
+  ): number | undefined => {
+    const value = Number(input.value.trim());
+    if (!Number.isFinite(value)) return undefined;
+    if (value <= 0) return undefined;
+    return value;
+  };
+  const formatLearningRate = (value: number): string =>
+    value >= 0.001 ? value.toFixed(4) : value.toExponential(2);
   const setSignedOutStage = (next: SignedOutStage) => {
     signedOutStage = next;
   };
@@ -2779,11 +2898,13 @@ input[type=number] {
 
   const formatMyModelsTrainingSummary = (
     stats: MenuLocalTrainingStats,
+    preset: MenuLocalTrainingPreset,
   ): string => {
+    const requiredSamples = Math.max(1, Math.trunc(preset.minSamples));
     const eligibilityLine =
-      stats.currentModeSamples >= MIN_TRAJECTORY_SAMPLES_PER_SESSION
+      stats.currentModeSamples >= requiredSamples
         ? 'Ready to train'
-        : `Need ${MIN_TRAJECTORY_SAMPLES_PER_SESSION - stats.currentModeSamples} more mode samples`;
+        : `Need ${requiredSamples - stats.currentModeSamples} more mode samples`;
     const lastSampleLine =
       stats.lastSampleAtMs == null
         ? 'Last sample: none yet'
@@ -2792,26 +2913,62 @@ input[type=number] {
       `Mode: ${stats.currentModeId}`,
       `Client samples (mode): ${stats.currentModeSamples}`,
       `Client samples (total): ${stats.totalSamples}`,
+      `Pipeline: ${preset.pipelineId}`,
       eligibilityLine,
       lastSampleLine,
+    ].join('\n');
+  };
+
+  const formatMyModelsTrainingPresetSummary = (
+    preset: MenuLocalTrainingPreset,
+  ): string => {
+    const holdoutPercent = Math.round(
+      Math.max(0, Math.min(1, preset.evalGate.holdoutRatio)) * 100,
+    );
+    return [
+      `Defaults (${preset.modeId}): epochs ${preset.trainDefaults.epochs}, lr ${formatLearningRate(preset.trainDefaults.learningRate)}, samples ${preset.trainDefaults.sampleLimit}, backend ${preset.trainDefaults.backendPreference}`,
+      `Eval gate: holdout ${holdoutPercent}%, train>=${preset.evalGate.minTrainSamples}, holdout>=${preset.evalGate.minHoldoutSamples}, Δ>=${preset.evalGate.minObjectiveGain.toFixed(4)}`,
     ].join('\n');
   };
 
   const updateMyModelsControls = () => {
     const authenticated =
       currentAuthState.authenticated && currentAuthState.user != null;
+    const trainingPreset = getLocalTrainingPreset();
+    const presetKey = `${trainingPreset.pipelineId}:${trainingPreset.modeId}`;
+    if (presetKey !== lastTrainingPresetKey) {
+      myModelsEpochsInput.value = String(trainingPreset.trainDefaults.epochs);
+      myModelsLearningRateInput.value = String(
+        trainingPreset.trainDefaults.learningRate,
+      );
+      myModelsSampleLimitInput.value = String(
+        trainingPreset.trainDefaults.sampleLimit,
+      );
+      myModelsBackendSelect.value =
+        trainingPreset.trainDefaults.backendPreference;
+      lastTrainingPresetKey = presetKey;
+    }
     const trainingStats = getLocalTrainingStats();
     const hasTrainSamples =
-      trainingStats.currentModeSamples >= MIN_TRAJECTORY_SAMPLES_PER_SESSION;
+      trainingStats.currentModeSamples >=
+      Math.max(1, Math.trunc(trainingPreset.minSamples));
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
-    myModelsTrainingSummary.textContent =
-      formatMyModelsTrainingSummary(trainingStats);
+    myModelsTrainingSummary.textContent = formatMyModelsTrainingSummary(
+      trainingStats,
+      trainingPreset,
+    );
+    myModelsTrainingPresetSummary.textContent =
+      formatMyModelsTrainingPresetSummary(trainingPreset);
     myModelsRecordingSummary.textContent = getTrajectoryUploadSummary();
     myModelsSignedOutHint.style.display = authenticated ? 'none' : 'block';
     myModelsActions.style.display = authenticated ? 'flex' : 'none';
     const busy = modelActionPending || currentAuthState.loading;
     myModelsLoadButton.disabled = !authenticated || busy;
     myModelsSaveButton.disabled = !authenticated || busy;
+    myModelsEpochsInput.disabled = !authenticated || busy;
+    myModelsLearningRateInput.disabled = !authenticated || busy;
+    myModelsSampleLimitInput.disabled = !authenticated || busy;
+    myModelsBackendSelect.disabled = !authenticated || busy;
     myModelsTrainButton.disabled = busy || !hasTrainSamples;
     myModelsTrainButton.style.opacity = busy || !hasTrainSamples ? '0.65' : '1';
     myModelsTrainButton.style.cursor =
@@ -3056,7 +3213,18 @@ input[type=number] {
     setMyModelsActionStatus('Training on local client samples...');
     updateMyModelsControls();
     try {
-      const result = await onRunLocalBiasTraining();
+      const backendPreference = myModelsBackendSelect.value
+        .trim()
+        .toLowerCase();
+      const result = await onRunLocalBiasTraining({
+        epochs: parsePositiveIntInput(myModelsEpochsInput),
+        learningRate: parsePositiveFloatInput(myModelsLearningRateInput),
+        sampleLimit: parsePositiveIntInput(myModelsSampleLimitInput),
+        backendPreference:
+          backendPreference === 'webgl' || backendPreference === 'cpu'
+            ? backendPreference
+            : 'auto',
+      });
       const lossSuffix =
         result.finalLoss != null
           ? `\nFinal loss: ${result.finalLoss.toExponential(3)}`

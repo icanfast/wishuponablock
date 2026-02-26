@@ -1,5 +1,9 @@
 export type PersonalModelDownload = {
   mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  versionId: string | null;
   version: number | null;
   sizeBytes: number;
   updatedAtMs: number | null;
@@ -9,10 +13,15 @@ export type PersonalModelDownload = {
 
 export type PersonalModelUpload = {
   mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  versionId: string | null;
   version: number | null;
   sizeBytes: number | null;
   updatedAtMs: number | null;
   sha256: string | null;
+  baseGlobalModelId: string | null;
 };
 
 export type PersonalModelHttpError = Error & {
@@ -34,10 +43,15 @@ type PersonalModelServiceOptions = {
 type UploadPayload = {
   model?: {
     mode?: unknown;
+    arch?: unknown;
+    rewardProfileId?: unknown;
+    queuePolicyId?: unknown;
+    versionId?: unknown;
     version?: unknown;
     sizeBytes?: unknown;
     updatedAtMs?: unknown;
     sha256?: unknown;
+    baseGlobalModelId?: unknown;
   } | null;
 };
 
@@ -125,6 +139,16 @@ export function createPersonalModelService(
       }
       const bytes = await response.arrayBuffer();
       const modeHeader = asString(response.headers.get('x-wub-model-mode'));
+      const arch = asString(response.headers.get('x-wub-model-arch'));
+      const rewardProfileId = asString(
+        response.headers.get('x-wub-model-reward-profile'),
+      );
+      const queuePolicyId = asString(
+        response.headers.get('x-wub-model-queue-policy'),
+      );
+      const versionId = asString(
+        response.headers.get('x-wub-model-version-id'),
+      );
       const version = asInt(response.headers.get('x-wub-model-version'));
       const headerSize = asInt(response.headers.get('x-wub-model-size'));
       const updatedAtMs = asInt(
@@ -133,6 +157,10 @@ export function createPersonalModelService(
       const sha256 = asString(response.headers.get('x-wub-model-sha256'));
       return {
         mode: modeHeader ?? normalizeMode(mode),
+        arch,
+        rewardProfileId,
+        queuePolicyId,
+        versionId,
         version,
         sizeBytes: headerSize ?? bytes.byteLength,
         updatedAtMs,
@@ -163,10 +191,15 @@ export function createPersonalModelService(
       const model = body?.model ?? null;
       return {
         mode: asString(model?.mode) ?? normalizeMode(mode),
+        arch: asString(model?.arch),
+        rewardProfileId: asString(model?.rewardProfileId),
+        queuePolicyId: asString(model?.queuePolicyId),
+        versionId: asString(model?.versionId),
         version: asInt(model?.version),
         sizeBytes: asInt(model?.sizeBytes),
         updatedAtMs: asInt(model?.updatedAtMs),
         sha256: asString(model?.sha256),
+        baseGlobalModelId: asString(model?.baseGlobalModelId),
       };
     },
   };

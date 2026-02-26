@@ -4,7 +4,7 @@ import {
   serializeWubModelToBytes,
   type LoadedModel,
 } from '../core/wubModel';
-import type { PersonalTrainingPipeline } from './trainingPipelines';
+import type { ResolvedPersonalTrainingPipeline } from './trainingPipelines';
 import type { TrajectoryDecisionSample } from './trajectoryBuffer';
 
 const TFJS_CDN_URL = 'https://esm.sh/@tensorflow/tfjs@4.22.0';
@@ -35,7 +35,7 @@ export type PersonalTrainer = {
   trainHeadOnly: (options: {
     model: LoadedModel;
     samples: TrajectoryDecisionSample[];
-    pipeline: PersonalTrainingPipeline;
+    pipeline: ResolvedPersonalTrainingPipeline;
     train?: TrainOptions;
   }) => Promise<PersonalTrainerResult>;
 };
@@ -273,11 +273,19 @@ const overwriteLinearHeadParams = (options: {
 export function createPersonalTrainerTfjs(): PersonalTrainer {
   return {
     trainHeadOnly: async ({ model, samples, pipeline, train }) => {
-      const sampleLimit = clampInt(train?.sampleLimit, 512);
-      const epochs = clampInt(train?.epochs, 8);
-      const learningRate = clampFloat(train?.learningRate, 0.003, 1e-6);
-      const l2 = clampFloat(train?.l2, 5e-5, 0);
-      const backendPreference = train?.backendPreference ?? 'auto';
+      const sampleLimit = clampInt(
+        train?.sampleLimit,
+        pipeline.trainDefaults.sampleLimit,
+      );
+      const epochs = clampInt(train?.epochs, pipeline.trainDefaults.epochs);
+      const learningRate = clampFloat(
+        train?.learningRate,
+        pipeline.trainDefaults.learningRate,
+        1e-6,
+      );
+      const l2 = clampFloat(train?.l2, pipeline.trainDefaults.l2, 0);
+      const backendPreference =
+        train?.backendPreference ?? pipeline.trainDefaults.backendPreference;
       const minSamples = Math.max(1, Math.trunc(pipeline.minSamples));
       const holdoutRatio = Math.min(
         0.5,

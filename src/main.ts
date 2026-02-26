@@ -46,7 +46,7 @@ import {
   type TrajectoryRewardTerminalStats,
 } from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
-import { getPersonalTrainingPipeline } from './app/trainingPipelines';
+import { resolvePersonalTrainingPipelineForMode } from './app/trainingPipelines';
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
@@ -452,24 +452,33 @@ async function boot() {
   };
   void modelService.ensureLoaded();
   const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
-  const trainingPipeline = getPersonalTrainingPipeline(
-    import.meta.env.VITE_TRAINING_PIPELINE as string | undefined,
-  );
-  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = Math.max(
-    MIN_TRAJECTORY_SAMPLES_PER_SESSION,
-    trainingPipeline.minSamples,
-  );
-  const TRAJECTORY_PIPELINE_ID = trainingPipeline.id;
-  const trajectoryRewardPolicyId: TrajectoryRewardPolicyId =
-    resolveTrajectoryRewardPolicyId(
-      (import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined) ??
-        trainingPipeline.rewardPolicyId,
-    );
-  const personalTrainer = createPersonalTrainerTfjs();
-  let menuUi: MenuScreen | null = null;
   const modeController = createModeController({
     initialModeId: 'practice',
   });
+  const trainingPipelineValue = import.meta.env.VITE_TRAINING_PIPELINE as
+    | string
+    | undefined;
+  const getTrainingPipelineForMode = (modeId: string) =>
+    resolvePersonalTrainingPipelineForMode(trainingPipelineValue, modeId);
+  const defaultTrainingPipeline = getTrainingPipelineForMode(
+    modeController.getState().mode.id,
+  );
+  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = Math.max(
+    MIN_TRAJECTORY_SAMPLES_PER_SESSION,
+    defaultTrainingPipeline.minSamples,
+  );
+  const TRAJECTORY_PIPELINE_ID = defaultTrainingPipeline.id;
+  const configuredTrajectoryRewardPolicy = import.meta.env
+    .VITE_TRAJECTORY_REWARD_POLICY as string | undefined;
+  const getTrajectoryRewardPolicyId = (
+    modeId: string,
+  ): TrajectoryRewardPolicyId =>
+    resolveTrajectoryRewardPolicyId(
+      configuredTrajectoryRewardPolicy ??
+        getTrainingPipelineForMode(modeId).rewardPolicyId,
+    );
+  const personalTrainer = createPersonalTrainerTfjs();
+  let menuUi: MenuScreen | null = null;
   const charcuterieDefaultSimCount = 10000;
   const charcuterieScoreWeights: CharcuterieScoreWeights = {
     height: 10,
@@ -944,7 +953,7 @@ async function boot() {
         outcome,
         terminal,
       },
-      trajectoryRewardPolicyId,
+      getTrajectoryRewardPolicyId(run.modeId),
     );
     const endedAtMs = Math.max(
       Date.now(),
@@ -1095,6 +1104,7 @@ async function boot() {
       };
     }
     const modeId = options?.modeId ?? modeController.getState().mode.id;
+    const trainingPipeline = getTrainingPipelineForMode(modeId);
     const samples = trajectoryBuffer.listSamples({
       modeId,
       limit: options?.sampleLimit,
@@ -1130,6 +1140,17 @@ async function boot() {
       message: result.message,
       samplesUsed: result.samplesUsed,
       finalLoss: result.finalLoss,
+    };
+  };
+  const getLocalTrainingPreset = () => {
+    const modeId = modeController.getState().mode.id;
+    const pipeline = getTrainingPipelineForMode(modeId);
+    return {
+      pipelineId: pipeline.id,
+      modeId,
+      minSamples: pipeline.minSamples,
+      trainDefaults: { ...pipeline.trainDefaults },
+      evalGate: { ...pipeline.evalGate },
     };
   };
   const getLocalTrainingStats = () => {
@@ -1586,7 +1607,8 @@ async function boot() {
     onMlBackendPreferenceChange: applyMlBackendPreference,
     onMlRunParityCheck: runMlParityCheck,
     getLocalTrainingStats,
-    onRunLocalBiasTraining: () => runLocalHeadTraining(),
+    getLocalTrainingPreset,
+    onRunLocalBiasTraining: (options) => runLocalHeadTraining(options),
     getTrajectoryUploadSummary,
     onUploadLatestTrajectory: uploadLatestTrajectory,
     onAuthRefresh: refreshAuthState,

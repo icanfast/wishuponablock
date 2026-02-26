@@ -84,7 +84,12 @@ const MAX_PASSWORD_LENGTH = 128;
 const MAX_EMAIL_LENGTH = 320;
 const MIN_USERNAME_LENGTH = 2;
 const MAX_USERNAME_LENGTH = 32;
+const MAX_MODEL_AXIS_LENGTH = 64;
 const RESEND_SEND_EMAIL_URL = 'https://api.resend.com/emails';
+const DEFAULT_MODEL_ARCH = 'full';
+const DEFAULT_REWARD_PROFILE_ID = 'default';
+const DEFAULT_QUEUE_POLICY_ID = 'next_piece_v1';
+const DEFAULT_PERSONAL_MODEL_SOURCE = 'upload';
 const OAUTH_STATE_COOKIE_NAME = 'wub_oauth_state';
 const OAUTH_STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const OAUTH_STATE_MAX_AGE_SECONDS = Math.trunc(OAUTH_STATE_MAX_AGE_MS / 1000);
@@ -245,9 +250,46 @@ const parseJsonObjectString = (
   }
 };
 
-const readGameModeFromRequest = (request: Request): string | null => {
-  const mode = new URL(request.url).searchParams.get('mode');
-  return normalizeGameMode(mode);
+const normalizeModelAxis = (
+  value: string | null | undefined,
+  fallback: string,
+): string => {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (normalized.length > MAX_MODEL_AXIS_LENGTH) return fallback;
+  if (!/^[a-z0-9_-]+$/.test(normalized)) return fallback;
+  return normalized;
+};
+
+type PersonalModelSelector = {
+  gameMode: string;
+  modelArch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+};
+
+const readPersonalModelSelectorFromRequest = (
+  request: Request,
+): PersonalModelSelector | null => {
+  const url = new URL(request.url);
+  const gameMode = normalizeGameMode(url.searchParams.get('mode'));
+  if (!gameMode) return null;
+  return {
+    gameMode,
+    modelArch: normalizeModelAxis(
+      url.searchParams.get('arch'),
+      DEFAULT_MODEL_ARCH,
+    ),
+    rewardProfileId: normalizeModelAxis(
+      url.searchParams.get('reward_profile'),
+      DEFAULT_REWARD_PROFILE_ID,
+    ),
+    queuePolicyId: normalizeModelAxis(
+      url.searchParams.get('queue_policy'),
+      DEFAULT_QUEUE_POLICY_ID,
+    ),
+  };
 };
 
 const isSecureRequest = (request: Request): boolean =>
@@ -592,11 +634,18 @@ type AuthTokenRecord = {
 type PersonalModelRecord = {
   userId: string;
   gameMode: string;
+  modelArch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+  versionId: string;
   r2Key: string;
   version: number;
   modelSizeBytes: number | null;
   modelSha256: string | null;
   updatedAtMs: number;
+  source: string | null;
+  pipelineId: string | null;
+  baseGlobalModelId: string | null;
 };
 
 const readPersonalModelRecord = (
@@ -604,12 +653,20 @@ const readPersonalModelRecord = (
 ): PersonalModelRecord | null => {
   const userId = asString(row.user_id);
   const gameMode = asString(row.game_mode);
+  const modelArch = asString(row.model_arch);
+  const rewardProfileId = asString(row.reward_profile_id);
+  const queuePolicyId = asString(row.queue_policy_id);
+  const versionId = asString(row.version_id);
   const r2Key = asString(row.r2_key);
   const version = asInt(row.version);
   const updatedAtMs = asInt(row.updated_at_ms);
   if (
     !userId ||
     !gameMode ||
+    !modelArch ||
+    !rewardProfileId ||
+    !queuePolicyId ||
+    !versionId ||
     !r2Key ||
     version == null ||
     updatedAtMs == null
@@ -619,34 +676,59 @@ const readPersonalModelRecord = (
   return {
     userId,
     gameMode,
+    modelArch,
+    rewardProfileId,
+    queuePolicyId,
+    versionId,
     r2Key,
     version,
     modelSizeBytes: asInt(row.model_size_bytes),
     modelSha256: asString(row.model_sha256),
     updatedAtMs,
+    source: asString(row.source),
+    pipelineId: asString(row.pipeline_id),
+    baseGlobalModelId: asString(row.base_global_model_id),
   };
 };
 
 const readCurrentPersonalModel = async (
   env: Env,
   userId: string,
-  gameMode: string,
+  selector: PersonalModelSelector,
 ): Promise<PersonalModelRecord | null> => {
   const row = await env.DB.prepare(
     `SELECT
-       user_id,
-       game_mode,
-       r2_key,
-       version,
-       model_size_bytes,
-       model_sha256,
-       updated_at_ms
-     FROM user_models
-     WHERE user_id = ? AND game_mode = ?
-     ORDER BY updated_at_ms DESC
+       s.user_id,
+       s.game_mode,
+       s.model_arch,
+       s.reward_profile_id,
+       s.queue_policy_id,
+       v.id AS version_id,
+       v.version_seq AS version,
+       v.r2_key,
+       v.size_bytes AS model_size_bytes,
+       v.sha256 AS model_sha256,
+       s.updated_at_ms,
+       v.source,
+       v.pipeline_id,
+       v.base_global_model_id
+     FROM personal_model_slots s
+     JOIN personal_model_versions v ON v.id = s.active_version_id
+     WHERE
+       s.user_id = ?
+       AND s.game_mode = ?
+       AND s.model_arch = ?
+       AND s.reward_profile_id = ?
+       AND s.queue_policy_id = ?
      LIMIT 1`,
   )
-    .bind(userId, gameMode)
+    .bind(
+      userId,
+      selector.gameMode,
+      selector.modelArch,
+      selector.rewardProfileId,
+      selector.queuePolicyId,
+    )
     .first<Record<string, unknown>>();
   if (!row) return null;
   return readPersonalModelRecord(row);
@@ -657,74 +739,151 @@ const sha256HexFromBuffer = async (buffer: ArrayBuffer): Promise<string> => {
   return toHex(new Uint8Array(digest));
 };
 
-const writeCurrentPersonalModelPointer = async (
+const readDefaultGlobalModelId = async (
+  env: Env,
+  selector: PersonalModelSelector,
+): Promise<string | null> => {
+  const row = await env.DB.prepare(
+    `SELECT id
+     FROM global_models
+     WHERE
+       mode_id = ?
+       AND model_arch = ?
+       AND reward_profile_id = ?
+       AND queue_policy_id = ?
+       AND retired_at_ms IS NULL
+     ORDER BY is_default DESC, created_at_ms DESC
+     LIMIT 1`,
+  )
+    .bind(
+      selector.gameMode,
+      selector.modelArch,
+      selector.rewardProfileId,
+      selector.queuePolicyId,
+    )
+    .first<Record<string, unknown>>();
+  return asString(row?.id);
+};
+
+const writeCurrentPersonalModelVersion = async (
   env: Env,
   options: {
     existing: PersonalModelRecord | null;
     userId: string;
-    gameMode: string;
+    selector: PersonalModelSelector;
     r2Key: string;
     version: number;
     modelSizeBytes: number;
     modelSha256: string;
     updatedAtMs: number;
+    source?: string;
+    pipelineId?: string | null;
   },
-): Promise<void> => {
+): Promise<PersonalModelRecord> => {
   const {
     existing,
     userId,
-    gameMode,
+    selector,
     r2Key,
     version,
     modelSizeBytes,
     modelSha256,
     updatedAtMs,
+    source,
+    pipelineId,
   } = options;
-  if (existing) {
-    await env.DB.prepare(
-      `UPDATE user_models
-       SET
-         r2_key = ?,
-         version = ?,
-         model_size_bytes = ?,
-         model_sha256 = ?,
-         updated_at_ms = ?
-       WHERE user_id = ? AND game_mode = ? AND r2_key = ?`,
-    )
-      .bind(
-        r2Key,
-        version,
-        modelSizeBytes,
-        modelSha256,
-        updatedAtMs,
-        userId,
-        gameMode,
-        existing.r2Key,
-      )
-      .run();
-    return;
-  }
+  const versionId = crypto.randomUUID();
+  const parentVersionId = existing?.versionId ?? null;
+  const baseGlobalModelId =
+    existing?.baseGlobalModelId ??
+    (await readDefaultGlobalModelId(env, selector));
+  const sourceTag = normalizeModelAxis(source, DEFAULT_PERSONAL_MODEL_SOURCE);
+  const normalizedPipelineId = asString(pipelineId);
+
   await env.DB.prepare(
-    `INSERT INTO user_models (
+    `INSERT INTO personal_model_versions (
+       id,
        user_id,
        game_mode,
+       model_arch,
+       reward_profile_id,
+       queue_policy_id,
+       version_seq,
+       parent_version_id,
+       base_global_model_id,
+       source,
+       pipeline_id,
        r2_key,
-       version,
-       model_size_bytes,
-       model_sha256,
-       updated_at_ms
-     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       sha256,
+       size_bytes,
+       metrics_json,
+       created_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
+      versionId,
       userId,
-      gameMode,
-      r2Key,
+      selector.gameMode,
+      selector.modelArch,
+      selector.rewardProfileId,
+      selector.queuePolicyId,
       version,
-      modelSizeBytes,
+      parentVersionId,
+      baseGlobalModelId,
+      sourceTag,
+      normalizedPipelineId,
+      r2Key,
       modelSha256,
+      modelSizeBytes,
+      null,
       updatedAtMs,
     )
     .run();
+
+  await env.DB.prepare(
+    `INSERT INTO personal_model_slots (
+       user_id,
+       game_mode,
+       model_arch,
+       reward_profile_id,
+       queue_policy_id,
+       active_version_id,
+       updated_at_ms,
+       created_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, game_mode, model_arch, reward_profile_id, queue_policy_id)
+     DO UPDATE SET
+       active_version_id = excluded.active_version_id,
+       updated_at_ms = excluded.updated_at_ms`,
+  )
+    .bind(
+      userId,
+      selector.gameMode,
+      selector.modelArch,
+      selector.rewardProfileId,
+      selector.queuePolicyId,
+      versionId,
+      updatedAtMs,
+      updatedAtMs,
+    )
+    .run();
+
+  return {
+    userId,
+    gameMode: selector.gameMode,
+    modelArch: selector.modelArch,
+    rewardProfileId: selector.rewardProfileId,
+    queuePolicyId: selector.queuePolicyId,
+    versionId,
+    r2Key,
+    version,
+    modelSizeBytes,
+    modelSha256,
+    updatedAtMs,
+    source: sourceTag,
+    pipelineId: normalizedPipelineId,
+    baseGlobalModelId,
+  };
 };
 
 const getOAuthProviderColumn = (
@@ -2167,8 +2326,8 @@ const handleGetCurrentPersonalModel = async (
   if (request.method !== 'GET') {
     return jsonResponse({ error: 'Method not allowed.' }, 405);
   }
-  const gameMode = readGameModeFromRequest(request);
-  if (!gameMode) {
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
     return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
       'cache-control': 'no-store',
     });
@@ -2193,7 +2352,7 @@ const handleGetCurrentPersonalModel = async (
     const record = await readCurrentPersonalModel(
       env,
       session.userId,
-      gameMode,
+      selector,
     );
     if (!record) {
       return jsonResponse({ error: 'Model not found.' }, 404, {
@@ -2211,7 +2370,11 @@ const handleGetCurrentPersonalModel = async (
       'cache-control': 'no-store',
       'content-type': 'application/octet-stream',
       'x-wub-model-mode': record.gameMode,
+      'x-wub-model-arch': record.modelArch,
+      'x-wub-model-reward-profile': record.rewardProfileId,
+      'x-wub-model-queue-policy': record.queuePolicyId,
       'x-wub-model-version': String(record.version),
+      'x-wub-model-version-id': record.versionId,
       'x-wub-model-size': String(bytes.byteLength),
       'x-wub-model-updated-at-ms': String(record.updatedAtMs),
     });
@@ -2236,8 +2399,8 @@ const handlePutCurrentPersonalModel = async (
   if (request.method !== 'PUT') {
     return jsonResponse({ error: 'Method not allowed.' }, 405);
   }
-  const gameMode = readGameModeFromRequest(request);
-  if (!gameMode) {
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
     return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
       'cache-control': 'no-store',
     });
@@ -2285,10 +2448,16 @@ const handlePutCurrentPersonalModel = async (
     const existing = await readCurrentPersonalModel(
       env,
       session.userId,
-      gameMode,
+      selector,
     );
     const nextVersion = (existing?.version ?? 0) + 1;
-    const nextR2Key = `models/${session.userId}/${gameMode}/v${nextVersion}-${nowMs}.bin`;
+    const nextR2Key =
+      `models/${session.userId}` +
+      `/${selector.gameMode}` +
+      `/${selector.modelArch}` +
+      `/${selector.rewardProfileId}` +
+      `/${selector.queuePolicyId}` +
+      `/v${nextVersion}-${nowMs}.bin`;
     const modelSha256 = await sha256HexFromBuffer(modelBuffer);
     const contentType =
       asString(request.headers.get('content-type')) ??
@@ -2297,37 +2466,33 @@ const handlePutCurrentPersonalModel = async (
     await env.MODELS_BUCKET.put(nextR2Key, modelBuffer, {
       httpMetadata: { contentType },
     });
-    await writeCurrentPersonalModelPointer(env, {
+    const nextRecord = await writeCurrentPersonalModelVersion(env, {
       existing,
       userId: session.userId,
-      gameMode,
+      selector,
       r2Key: nextR2Key,
       version: nextVersion,
       modelSizeBytes: modelBuffer.byteLength,
       modelSha256,
       updatedAtMs: nowMs,
+      source: DEFAULT_PERSONAL_MODEL_SOURCE,
+      pipelineId: null,
     });
-
-    if (existing && existing.r2Key !== nextR2Key) {
-      try {
-        await env.MODELS_BUCKET.delete(existing.r2Key);
-      } catch (error) {
-        console.warn(
-          `[models] failed to delete previous model blob (${existing.r2Key})`,
-          error,
-        );
-      }
-    }
 
     return jsonResponse(
       {
         ok: true,
         model: {
-          mode: gameMode,
-          version: nextVersion,
+          mode: nextRecord.gameMode,
+          arch: nextRecord.modelArch,
+          rewardProfileId: nextRecord.rewardProfileId,
+          queuePolicyId: nextRecord.queuePolicyId,
+          versionId: nextRecord.versionId,
+          version: nextRecord.version,
           sizeBytes: modelBuffer.byteLength,
           sha256: modelSha256,
-          updatedAtMs: nowMs,
+          updatedAtMs: nextRecord.updatedAtMs,
+          baseGlobalModelId: nextRecord.baseGlobalModelId,
         },
       },
       200,
