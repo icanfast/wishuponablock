@@ -1417,8 +1417,10 @@ async function boot() {
     }
     const modeId = options?.modeId ?? modeController.getState().mode.id;
     const trainingPipeline = getTrainingPipelineForMode(modeId);
+    const axes = getActiveModelAxes();
     const samples = trajectoryBuffer.listSamples({
       modeId,
+      modelAxes: axes,
       limit: options?.sampleLimit,
     });
     const result = await personalTrainer.trainHeadOnly({
@@ -1468,8 +1470,11 @@ async function boot() {
   const getLocalTrainingStats = () => {
     const stats = trajectoryBuffer.getStats();
     const currentModeId = modeController.getState().mode.id;
+    const axes = getActiveModelAxes();
+    const modeAxesKey = `${currentModeId}:${modelAxesKey(axes)}`;
     return {
       currentModeId,
+      currentModeAxesSamples: stats.byModeAndAxes[modeAxesKey] ?? 0,
       currentModeSamples: stats.byMode[currentModeId] ?? 0,
       totalSamples: stats.totalSamples,
       lastSampleAtMs: stats.lastSampleAtMs,
@@ -1551,7 +1556,11 @@ async function boot() {
     },
     onModelDecision: (decision) => {
       const modeId = modeController.getState().mode.id;
-      trajectoryBuffer.recordDecision({ modeId, decision });
+      trajectoryBuffer.recordDecision({
+        modeId,
+        modelAxes: getActiveModelAxes(),
+        decision,
+      });
     },
     setLockEffectsSuppressed: (value) => {
       suppressLockEffects = value;

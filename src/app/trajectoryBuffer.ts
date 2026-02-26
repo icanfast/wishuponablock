@@ -3,10 +3,19 @@ import type { ModelGeneratorDecisionEvent } from '../core/modelGenerator';
 
 export const TRAJECTORY_SCHEMA_V1 = 'wishuponablock.trajectory.v1';
 
+export type TrajectorySampleAxes = {
+  arch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+};
+
 export type TrajectoryDecisionSample = {
   schema: typeof TRAJECTORY_SCHEMA_V1;
   id: string;
   modeId: string;
+  arch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
   createdAtMs: number;
   deliberationMs: number | null;
   boardOccupancy: number[][];
@@ -25,16 +34,19 @@ export type TrajectoryDecisionSample = {
 export type TrajectoryBufferStats = {
   totalSamples: number;
   byMode: Record<string, number>;
+  byModeAndAxes: Record<string, number>;
   lastSampleAtMs: number | null;
 };
 
 export type TrajectoryBuffer = {
   recordDecision: (options: {
     modeId: string;
+    modelAxes: TrajectorySampleAxes;
     decision: ModelGeneratorDecisionEvent;
   }) => TrajectoryDecisionSample;
   listSamples: (options?: {
     modeId?: string;
+    modelAxes?: Partial<TrajectorySampleAxes>;
     limit?: number;
   }) => TrajectoryDecisionSample[];
   clear: () => number;
@@ -55,6 +67,21 @@ const clampLimit = (value: number | undefined, fallback: number): number => {
 
 const cloneBoardOccupancy = (board: Board): number[][] =>
   board.map((row) => row.map((cell) => (cell != null ? 1 : 0)));
+
+const normalizeAxis = (value: unknown, fallback: string): string => {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-z0-9_-]{1,64}$/.test(normalized)) return fallback;
+  return normalized;
+};
+
+const buildModeAxesKey = (sample: {
+  modeId: string;
+  arch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+}): string =>
+  `${sample.modeId}:${sample.arch}:${sample.rewardProfileId}:${sample.queuePolicyId}`;
 
 const cloneDecision = (
   sample: TrajectoryDecisionSample,
@@ -80,18 +107,30 @@ export function createTrajectoryBuffer(
   };
 
   return {
-    recordDecision: ({ modeId, decision }) => {
+    recordDecision: ({ modeId, modelAxes, decision }) => {
       const actionIndex = decision.pieces.indexOf(decision.action);
       const deliberationMs =
         lastDecisionAtMs == null
           ? null
           : Math.max(0, decision.wallTimeMs - lastDecisionAtMs);
       lastDecisionAtMs = decision.wallTimeMs;
+      const arch = normalizeAxis(modelAxes.arch, 'full');
+      const rewardProfileId = normalizeAxis(
+        modelAxes.rewardProfileId,
+        'default',
+      );
+      const queuePolicyId = normalizeAxis(
+        modelAxes.queuePolicyId,
+        'next_piece_v1',
+      );
 
       const sample: TrajectoryDecisionSample = {
         schema: TRAJECTORY_SCHEMA_V1,
         id: `traj_${nextId++}`,
         modeId,
+        arch,
+        rewardProfileId,
+        queuePolicyId,
         createdAtMs: Date.now(),
         deliberationMs,
         boardOccupancy: cloneBoardOccupancy(decision.board),
@@ -112,11 +151,37 @@ export function createTrajectoryBuffer(
     },
     listSamples: (query) => {
       const modeId = query?.modeId?.trim();
+      const archFilter = normalizeAxis(query?.modelAxes?.arch, '');
+      const rewardProfileIdFilter = normalizeAxis(
+        query?.modelAxes?.rewardProfileId,
+        '',
+      );
+      const queuePolicyIdFilter = normalizeAxis(
+        query?.modelAxes?.queuePolicyId,
+        '',
+      );
       const limit = query?.limit;
-      const filtered =
-        modeId && modeId.length > 0
-          ? samples.filter((sample) => sample.modeId === modeId)
-          : samples;
+      const filtered = samples.filter((sample) => {
+        if (modeId && modeId.length > 0 && sample.modeId !== modeId) {
+          return false;
+        }
+        if (archFilter && sample.arch !== archFilter) {
+          return false;
+        }
+        if (
+          rewardProfileIdFilter &&
+          sample.rewardProfileId !== rewardProfileIdFilter
+        ) {
+          return false;
+        }
+        if (
+          queuePolicyIdFilter &&
+          sample.queuePolicyId !== queuePolicyIdFilter
+        ) {
+          return false;
+        }
+        return true;
+      });
       const sliced =
         limit != null && Number.isFinite(limit) && limit > 0
           ? filtered.slice(-Math.trunc(limit))
@@ -132,12 +197,16 @@ export function createTrajectoryBuffer(
     size: () => samples.length,
     getStats: () => {
       const byMode: Record<string, number> = {};
+      const byModeAndAxes: Record<string, number> = {};
       for (const sample of samples) {
         byMode[sample.modeId] = (byMode[sample.modeId] ?? 0) + 1;
+        const axesKey = buildModeAxesKey(sample);
+        byModeAndAxes[axesKey] = (byModeAndAxes[axesKey] ?? 0) + 1;
       }
       return {
         totalSamples: samples.length,
         byMode,
+        byModeAndAxes,
         lastSampleAtMs:
           samples.length > 0 ? samples[samples.length - 1].createdAtMs : null,
       };

@@ -47,6 +47,7 @@ export type MenuMlParityResult = {
 };
 export type MenuLocalTrainingStats = {
   currentModeId: string;
+  currentModeAxesSamples: number;
   currentModeSamples: number;
   totalSamples: number;
   lastSampleAtMs: number | null;
@@ -3462,15 +3463,16 @@ input[type=number] {
   ): string => {
     const requiredSamples = Math.max(1, Math.trunc(preset.minSamples));
     const eligibilityLine =
-      stats.currentModeSamples >= requiredSamples
+      stats.currentModeAxesSamples >= requiredSamples
         ? 'Ready to train'
-        : `Need ${requiredSamples - stats.currentModeSamples} more mode samples`;
+        : `Need ${requiredSamples - stats.currentModeAxesSamples} more mode+axes samples`;
     const lastSampleLine =
       stats.lastSampleAtMs == null
         ? 'Last sample: none yet'
         : `Last sample: ${new Date(stats.lastSampleAtMs).toLocaleTimeString()}`;
     return [
       `Mode: ${stats.currentModeId}`,
+      `Client samples (mode+axes): ${stats.currentModeAxesSamples}`,
       `Client samples (mode): ${stats.currentModeSamples}`,
       `Client samples (total): ${stats.totalSamples}`,
       `Pipeline: ${preset.pipelineId}`,
@@ -3525,7 +3527,7 @@ input[type=number] {
       void refreshMyModelsBaselines({ silent: true });
     }
     const hasTrainSamples =
-      trainingStats.currentModeSamples >=
+      trainingStats.currentModeAxesSamples >=
       Math.max(1, Math.trunc(trainingPreset.minSamples));
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
     myModelsBaselinesSummary.textContent = formatMyModelsBaselinesSummary(
