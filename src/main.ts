@@ -7,7 +7,11 @@ import {
   PLAY_WIDTH,
   ROWS,
 } from './core/constants';
-import { GENERATOR_TYPES, usesModelGenerator } from './core/generators';
+import {
+  GENERATOR_TYPES,
+  usesModelGenerator,
+  type GeneratorType,
+} from './core/generators';
 import {
   createModelRunner,
   type MlBackend,
@@ -40,6 +44,10 @@ import {
   type AdminRecordingsPage,
 } from './app/adminRecordingsService';
 import {
+  createAdminBotPolicyService,
+  type BotPolicyRecord as AdminBotPolicyRecord,
+} from './app/adminBotPolicyService';
+import {
   computeTrajectoryRewards,
   resolveTrajectoryRewardPolicyId,
   type TrajectoryRewardComputation,
@@ -50,9 +58,12 @@ import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import { runGlobalTrainingOneShot } from './app/globalTrainerTfjs';
 import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
 import {
+  createGuiInspectBotInputSource,
   generateBotTrajectoryBatch,
+  runHeadlessBotValidation,
   runCapabilityBenchmark,
   trainBotPolicyOneShot,
+  type BotPieceSourceProfile,
   type BotPolicyArtifact,
 } from './app/headlessBotService';
 import {
@@ -85,6 +96,7 @@ import {
   type MenuAdminRecordingsQuery,
   type MenuAdminManifestQuery,
   type MenuAdminGlobalBaselineSummary,
+  type MenuBotPoliciesPage,
   type MenuScreen,
 } from './ui/screens/menuScreen';
 import {
@@ -100,6 +112,7 @@ import {
   type ToolController,
   type ToolHost,
 } from './ui/tools/toolHost';
+import type { InputSource } from './core/runner';
 import { createLabelingTool } from './ui/tools/labelingTool';
 import { createConstructorTool } from './ui/tools/constructorTool';
 import { createToolCanvas } from './ui/tools/toolCanvas';
@@ -268,6 +281,9 @@ async function boot() {
     baseUrl: uploadBaseUrl,
   });
   const adminRecordingsService = createAdminRecordingsService({
+    baseUrl: uploadBaseUrl,
+  });
+  const adminBotPolicyService = createAdminBotPolicyService({
     baseUrl: uploadBaseUrl,
   });
   const authErrorMessages: Record<string, string> = {
@@ -541,7 +557,21 @@ async function boot() {
 
   const inputService = createInputService({ settings });
   const identityService = createIdentityService();
-  const inputSource = inputService.getInputSource();
+  let manualInputSource = inputService.getInputSource();
+  let botGuiInputSource: InputSource | null = null;
+  let botGuiInspectEnabled = false;
+  const activeInputSource: InputSource = {
+    sample: (state, dtMs) => {
+      if (botGuiInspectEnabled && botGuiInputSource) {
+        return botGuiInputSource.sample(state, dtMs);
+      }
+      return manualInputSource.sample(state, dtMs);
+    },
+    reset: (seed) => {
+      manualInputSource.reset?.(seed);
+      botGuiInputSource?.reset?.(seed);
+    },
+  };
   let authState: MenuAuthState = {
     loading: true,
     authenticated: false,
@@ -1181,7 +1211,9 @@ async function boot() {
     finalLoss: number | null;
   } | null = null;
   let adminBotPolicy: BotPolicyArtifact | null = null;
+  let adminBotPolicyRecord: AdminBotPolicyRecord | null = null;
   let adminBenchmarkSuggestedArch: 'full' | 'lean' | null = null;
+  let botGuiInspectGeneratorBackup: GeneratorType | null = null;
 
   const prepareAdminManifest = async (
     query: MenuAdminManifestQuery,
@@ -1310,9 +1342,191 @@ async function boot() {
     });
   };
 
+  const getBotPolicySelector = () => {
+    const modeId = modeController.getState().mode.id;
+    const axes = getActiveModelAxes();
+    return {
+      modeId,
+      archId: axes.arch,
+      queuePolicyId: axes.queuePolicyId,
+    };
+  };
+
+  const ensureBotPolicyLoaded = (): {
+    policy: BotPolicyArtifact;
+    policyId: string;
+  } => {
+    if (!adminBotPolicy) {
+      throw new Error('No bot policy loaded. Train or load one first.');
+    }
+    return {
+      policy: adminBotPolicy,
+      policyId: adminBotPolicyRecord?.id ?? adminBotPolicy.id,
+    };
+  };
+
+  const fetchCurrentAdminBotPolicy = async (): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const selector = getBotPolicySelector();
+    const current = await adminBotPolicyService.getCurrent(selector);
+    if (!current.current) {
+      adminBotPolicyRecord = null;
+      return `No published current bot policy for ${selector.modeId}/${selector.archId}/${selector.queuePolicyId}.`;
+    }
+    const loaded = await adminBotPolicyService.loadObject(current.current.id);
+    adminBotPolicyRecord = current.current;
+    adminBotPolicy = loaded.artifact;
+    adminBotPolicy.id = current.current.id;
+    adminBotPolicy.modeId = current.current.modeId;
+    return `Loaded current bot policy: ${current.current.id} (v${current.current.version}).`;
+  };
+
+  const listAdminBotPolicies = async (options?: {
+    limit?: number;
+    cursor?: string | null;
+  }): Promise<MenuBotPoliciesPage> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const page = await adminBotPolicyService.list(getBotPolicySelector(), {
+      limit: options?.limit,
+      cursor: options?.cursor ?? null,
+    });
+    return {
+      policies: page.policies.map((policy) => ({
+        id: policy.id,
+        modeId: policy.modeId,
+        archId: policy.archId,
+        queuePolicyId: policy.queuePolicyId,
+        pipelineId: policy.pipelineId,
+        pieceSourceProfile: policy.pieceSourceProfile,
+        version: policy.version,
+        isPinned: policy.isPinned,
+        createdAtMs: policy.createdAtMs,
+      })),
+      page: {
+        returned: page.page.returned,
+        nextCursor: page.page.nextCursor,
+      },
+    };
+  };
+
+  const loadAdminBotPolicyById = async (id: string): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const loaded = await adminBotPolicyService.loadObject(id);
+    adminBotPolicyRecord = loaded.policy;
+    adminBotPolicy = loaded.artifact;
+    adminBotPolicy.id = loaded.policy.id;
+    adminBotPolicy.modeId = loaded.policy.modeId;
+    return `Loaded bot policy ${loaded.policy.id} (v${loaded.policy.version}).`;
+  };
+
+  const publishAdminBotPolicy = async (options?: {
+    pin?: boolean;
+    setCurrent?: boolean;
+    pipelineId?: string;
+    pieceSourceProfile?: BotPieceSourceProfile;
+    metrics?: Record<string, unknown> | null;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    if (!adminBotPolicy) {
+      throw new Error('No bot policy loaded to publish.');
+    }
+    const selector = getBotPolicySelector();
+    const published = await adminBotPolicyService.publish({
+      selector,
+      policyArtifact: {
+        ...adminBotPolicy,
+        id: adminBotPolicyRecord?.id ?? adminBotPolicy.id,
+        modeId: selector.modeId,
+        archId: selector.archId,
+        queuePolicyId: selector.queuePolicyId,
+        pipelineId: options?.pipelineId ?? 'bot_reinforce_v1',
+        pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
+      },
+      pipelineId: options?.pipelineId ?? 'bot_reinforce_v1',
+      pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
+      metrics: options?.metrics ?? null,
+      pin: options?.pin === true,
+      setCurrent: options?.setCurrent !== false,
+    });
+    adminBotPolicyRecord = published;
+    adminBotPolicy.id = published.id;
+    adminBotPolicy.modeId = published.modeId;
+    adminBotPolicy.archId = published.archId;
+    adminBotPolicy.queuePolicyId = published.queuePolicyId;
+    adminBotPolicy.pipelineId = published.pipelineId;
+    adminBotPolicy.pieceSourceProfile =
+      (published.pieceSourceProfile as BotPieceSourceProfile) ?? 'bag7';
+    return `Published bot policy ${published.id} (v${published.version}).`;
+  };
+
+  const selectAdminBotPolicyAsCurrent = async (id: string): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const selected = await adminBotPolicyService.selectCurrent(id);
+    adminBotPolicyRecord = selected;
+    if (!adminBotPolicy || adminBotPolicy.id !== selected.id) {
+      const loaded = await adminBotPolicyService.loadObject(selected.id);
+      adminBotPolicy = loaded.artifact;
+      adminBotPolicy.id = selected.id;
+      adminBotPolicy.modeId = selected.modeId;
+    }
+    return `Selected current policy ${selected.id}.`;
+  };
+
+  const setAdminBotPolicyPinState = async (
+    id: string,
+    pin: boolean,
+  ): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const record = pin
+      ? await adminBotPolicyService.pin(id)
+      : await adminBotPolicyService.unpin(id);
+    if (adminBotPolicyRecord?.id === id) {
+      adminBotPolicyRecord = record;
+    }
+    return pin ? `Pinned ${id}.` : `Unpinned ${id}.`;
+  };
+
   const runAdminTrainBotPolicyOneShot = async (options: {
     episodes?: number;
     maxPiecesPerEpisode?: number;
+    seed?: number;
+    pieceSourceProfile?: BotPieceSourceProfile;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1334,11 +1548,14 @@ async function boot() {
       modelAxes: getActiveModelAxes(),
       episodes: options.episodes,
       maxPiecesPerEpisode: options.maxPiecesPerEpisode,
+      seed: options.seed,
+      pieceSourceProfile: options.pieceSourceProfile ?? 'bag7',
     });
     if (!result.ok || !result.policyArtifact) {
       throw new Error(result.message);
     }
     adminBotPolicy = result.policyArtifact;
+    adminBotPolicyRecord = null;
     const lossSuffix =
       result.finalLoss != null
         ? ` finalLoss=${result.finalLoss.toExponential(3)}`
@@ -1352,6 +1569,7 @@ async function boot() {
   const runAdminGenerateBotRecordings = async (options: {
     sessions?: number;
     maxPiecesPerEpisode?: number;
+    pieceSourceProfile?: BotPieceSourceProfile;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1360,9 +1578,7 @@ async function boot() {
     ) {
       throw new Error('Admin account required.');
     }
-    if (!adminBotPolicy) {
-      throw new Error('Train bot policy first.');
-    }
+    const { policy, policyId } = ensureBotPolicyLoaded();
     const model = await modelService.ensureLoaded();
     if (!model) {
       throw new Error('Model is not loaded.');
@@ -1374,10 +1590,11 @@ async function boot() {
       model,
       modelRunner: modelService.getRunner(),
       modelAxes: getActiveModelAxes(),
-      policy: adminBotPolicy,
+      policy,
       sessions: Math.max(1, options.sessions ?? 1),
       maxPiecesPerEpisode: options.maxPiecesPerEpisode,
       trainingIntent: 'bot_generation_v1',
+      pieceSourceProfile: options.pieceSourceProfile ?? 'active_generator',
     });
 
     let uploadedSessions = 0;
@@ -1423,6 +1640,10 @@ async function boot() {
         rewardPolicyId,
       );
       const sessionId = crypto.randomUUID();
+      const pieceSourceProfile =
+        options.pieceSourceProfile ??
+        policy.pieceSourceProfile ??
+        'active_generator';
       const session: TrajectorySessionV1 = {
         schema: TRAJECTORY_SESSION_SCHEMA_V1,
         sessionId,
@@ -1462,8 +1683,9 @@ async function boot() {
           pipelineMode: draft.modeId,
           modelArch,
           actorType: 'bot',
-          actorPolicyId: adminBotPolicy.id,
+          actorPolicyId: policyId,
           trainingIntent: generated.trainingIntent ?? undefined,
+          pieceSourceProfile,
         },
       };
       await trajectoryRecordingService.uploadSession(session);
@@ -1472,13 +1694,14 @@ async function boot() {
     }
     return (
       `Bot generation complete. sessions=${uploadedSessions}, samples=${uploadedSamples}, ` +
-      `policy=${adminBotPolicy.id}.`
+      `policy=${policyId}.`
     );
   };
 
   const runAdminCapabilityBenchmark = async (options?: {
     episodes?: number;
     maxPiecesPerEpisode?: number;
+    pieceSourceProfile?: BotPieceSourceProfile;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1487,9 +1710,7 @@ async function boot() {
     ) {
       throw new Error('Admin account required.');
     }
-    if (!adminBotPolicy) {
-      throw new Error('Train bot policy first.');
-    }
+    const { policy } = ensureBotPolicyLoaded();
     const model = await modelService.ensureLoaded();
     if (!model) {
       throw new Error('Model is not loaded.');
@@ -1501,9 +1722,10 @@ async function boot() {
       model,
       modelRunner: modelService.getRunner(),
       modelAxes: getActiveModelAxes(),
-      policy: adminBotPolicy,
+      policy,
       episodes: options?.episodes,
       maxPiecesPerEpisode: options?.maxPiecesPerEpisode,
+      pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
     });
     adminBenchmarkSuggestedArch = result.recommendedArch;
     return (
@@ -1512,6 +1734,120 @@ async function boot() {
       `tick p95=${result.metrics.p95TickMs.toFixed(2)}ms, ` +
       `sim=${(result.metrics.simThroughput * 100).toFixed(1)}% of ${result.metrics.targetSimFps}fps.`
     );
+  };
+
+  const runAdminHeadlessBotValidation = async (options?: {
+    maxPieces?: number;
+    seed?: number;
+    pieceSourceProfile?: BotPieceSourceProfile;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const { policy } = ensureBotPolicyLoaded();
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      throw new Error('Model is not loaded.');
+    }
+    const modeId = modeController.getState().mode.id;
+    const validation = await runHeadlessBotValidation({
+      modeId,
+      settings: settingsStore.get(),
+      model,
+      modelRunner: modelService.getRunner(),
+      modelAxes: getActiveModelAxes(),
+      policy,
+      maxPieces: options?.maxPieces ?? 10_000,
+      seed: options?.seed,
+      pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
+    });
+    return (
+      `Headless validate: pieces=${validation.piecesSurvived}, outcome=${validation.outcome}, ` +
+      `decision p95=${validation.p95DecisionMs.toFixed(2)}ms, ` +
+      `tick p95=${validation.p95TickMs.toFixed(2)}ms, ` +
+      `meanΔscore=${validation.meanBoardScoreDelta.toFixed(4)}, ` +
+      `totalReward=${validation.totalReward.toFixed(3)}.`
+    );
+  };
+
+  const applyBotGuiPieceSourceProfile = (
+    profile: BotPieceSourceProfile,
+  ): void => {
+    const current = settingsStore.get();
+    if (profile === 'bag7') {
+      if (botGuiInspectGeneratorBackup == null) {
+        botGuiInspectGeneratorBackup = current.generator.type;
+      }
+      if (current.generator.type !== 'bag7') {
+        settingsStore.apply({
+          generator: {
+            ...current.generator,
+            type: 'bag7',
+          },
+        });
+      }
+      return;
+    }
+    if (botGuiInspectGeneratorBackup) {
+      settingsStore.apply({
+        generator: {
+          ...current.generator,
+          type: botGuiInspectGeneratorBackup,
+        },
+      });
+      botGuiInspectGeneratorBackup = null;
+    }
+  };
+
+  const startAdminBotGuiInspect = async (options?: {
+    apmInput?: number;
+    seed?: number;
+    pieceSourceProfile?: BotPieceSourceProfile;
+    pieces?: number;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const { policy, policyId } = ensureBotPolicyLoaded();
+    const apmInput = Math.max(
+      20,
+      Math.min(1200, Math.trunc(options?.apmInput ?? 240)),
+    );
+    const seed = options?.seed ?? 42_030;
+    const pieceSourceProfile =
+      options?.pieceSourceProfile ?? policy.pieceSourceProfile ?? 'bag7';
+    botGuiInputSource = createGuiInspectBotInputSource({
+      policy,
+      apmInput,
+      seed,
+      greedy: true,
+    });
+    botGuiInspectEnabled = true;
+    applyBotGuiPieceSourceProfile(pieceSourceProfile);
+    modeController.startCharcuterie(Math.max(1, options?.pieces ?? 20), {
+      simCount: charcuterieDefaultSimCount,
+      ...(Number.isFinite(seed) ? { seed: Math.trunc(seed) } : {}),
+    });
+    requestStartGame();
+    return (
+      `GUI inspect started for ${policyId}. ` +
+      `APM=${apmInput}, piece_source=${pieceSourceProfile}.`
+    );
+  };
+
+  const stopAdminBotGuiInspect = (): string => {
+    botGuiInspectEnabled = false;
+    botGuiInputSource = null;
+    applyBotGuiPieceSourceProfile('active_generator');
+    return 'GUI inspect stopped.';
   };
 
   const applyAdminBenchmarkSuggestedArch = async (): Promise<string> => {
@@ -1613,6 +1949,10 @@ async function boot() {
       rewardProfileId: run.axes.rewardProfileId,
       queuePolicyId: run.axes.queuePolicyId,
       modelArch: getTrajectoryModelArch(),
+      pieceSourceProfile:
+        settingsStore.get().generator.type === 'bag7'
+          ? 'bag7'
+          : 'active_generator',
     };
     if (activeModelSource.kind === 'personal') {
       meta.modelMode = activeModelSource.mode;
@@ -2170,7 +2510,7 @@ async function boot() {
     app,
     session,
     renderer: gameRenderer,
-    inputSource,
+    inputSource: activeInputSource,
     onGameOver: (visible) => {
       gameUi.gameOverLabel.style.display = visible ? 'block' : 'none';
     },
@@ -2212,9 +2552,10 @@ async function boot() {
     },
   });
   inputService.setOnInputSourceChange((source) => {
-    runtime?.setInputSource(source);
+    manualInputSource = source;
+    runtime?.setInputSource(activeInputSource);
   });
-  runtime.setInputSource(inputService.getInputSource());
+  runtime.setInputSource(activeInputSource);
   updateModelStatusUI(modelService.getStatus());
 
   let activeToolId = '';
@@ -2404,6 +2745,24 @@ async function boot() {
     onAdminGenerateBotRecordings: runAdminGenerateBotRecordings,
     onAdminRunCapabilityBenchmark: runAdminCapabilityBenchmark,
     onAdminApplyBenchmarkSuggestedArch: applyAdminBenchmarkSuggestedArch,
+    onBotLabFetchCurrentPolicy: fetchCurrentAdminBotPolicy,
+    onBotLabListPolicies: listAdminBotPolicies,
+    onBotLabLoadPolicyById: loadAdminBotPolicyById,
+    onBotLabPublishPolicy: (options) =>
+      publishAdminBotPolicy({
+        pin: options?.pin,
+        setCurrent: options?.setCurrent,
+        pieceSourceProfile: options?.pieceSourceProfile,
+      }),
+    onBotLabSelectCurrentPolicy: selectAdminBotPolicyAsCurrent,
+    onBotLabPinPolicy: (id) => setAdminBotPolicyPinState(id, true),
+    onBotLabUnpinPolicy: (id) => setAdminBotPolicyPinState(id, false),
+    onBotLabTrainPolicyOneShot: runAdminTrainBotPolicyOneShot,
+    onBotLabRunHeadlessValidate: runAdminHeadlessBotValidation,
+    onBotLabStartGuiInspect: startAdminBotGuiInspect,
+    onBotLabStopGuiInspect: stopAdminBotGuiInspect,
+    onBotLabGenerateRecordings: runAdminGenerateBotRecordings,
+    onBotLabRunBenchmark: runAdminCapabilityBenchmark,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);

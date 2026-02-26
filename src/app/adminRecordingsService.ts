@@ -36,6 +36,7 @@ export type AdminRecordingsManifestQuery = {
   queuePolicyId?: string;
   pipelineId?: string;
   actorType?: 'human' | 'bot';
+  pieceSourceProfile?: string;
   minSamples?: number;
   limit?: number;
   cursor?: string | null;
@@ -53,6 +54,7 @@ export type AdminRecordingsManifestPage = {
     queuePolicyId?: string;
     pipelineId?: string;
     actorType?: 'human' | 'bot';
+    pieceSourceProfile?: string;
     minSamples?: number;
     startedFromMs?: number;
     startedToMs?: number;
@@ -264,6 +266,9 @@ export function createAdminRecordingsService(
       if (query?.actorType) {
         url.searchParams.set('actor_type', query.actorType);
       }
+      if (query?.pieceSourceProfile) {
+        url.searchParams.set('piece_source_profile', query.pieceSourceProfile);
+      }
       if (query?.minSamples != null && Number.isFinite(query.minSamples)) {
         url.searchParams.set(
           'min_samples',
@@ -328,6 +333,8 @@ export function createAdminRecordingsService(
             actorTypeRaw === 'human' || actorTypeRaw === 'bot'
               ? actorTypeRaw
               : undefined,
+          pieceSourceProfile:
+            asString(selector?.pieceSourceProfile) ?? undefined,
           minSamples: asInt(selector?.minSamples) ?? undefined,
           startedFromMs: asInt(selector?.startedFromMs) ?? undefined,
           startedToMs: asInt(selector?.startedToMs) ?? undefined,

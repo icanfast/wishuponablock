@@ -90,6 +90,10 @@ const DEFAULT_MODEL_ARCH = 'full';
 const DEFAULT_REWARD_PROFILE_ID = 'default';
 const DEFAULT_QUEUE_POLICY_ID = 'next_piece_v1';
 const DEFAULT_PERSONAL_MODEL_SOURCE = 'upload';
+const DEFAULT_BOT_ARCH_ID = 'full';
+const DEFAULT_BOT_QUEUE_POLICY_ID = 'default';
+const DEFAULT_BOT_PIPELINE_ID = 'bot_reinforce_v1';
+const DEFAULT_BOT_PIECE_SOURCE_PROFILE = 'bag7';
 const OAUTH_STATE_COOKIE_NAME = 'wub_oauth_state';
 const OAUTH_STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const OAUTH_STATE_MAX_AGE_SECONDS = Math.trunc(OAUTH_STATE_MAX_AGE_MS / 1000);
@@ -214,8 +218,16 @@ const isValidRecordingId = (value: string): boolean =>
 const isValidGlobalModelId = (value: string): boolean =>
   value.length >= 8 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
 
+const isValidBotPolicyId = (value: string): boolean =>
+  value.length >= 8 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
+
 type RecordingCursor = {
   startedAtMs: number;
+  id: string;
+};
+
+type BotPolicyCursor = {
+  createdAtMs: number;
   id: string;
 };
 
@@ -237,6 +249,23 @@ const parseRecordingsCursor = (
 
 const formatRecordingsCursor = (cursor: RecordingCursor): string =>
   `${cursor.startedAtMs}:${cursor.id}`;
+
+const parseBotPolicyCursor = (value: string | null): BotPolicyCursor | null => {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const separator = trimmed.indexOf(':');
+  if (separator <= 0 || separator >= trimmed.length - 1) return null;
+  const createdAtMs = asInt(trimmed.slice(0, separator));
+  const id = trimmed.slice(separator + 1);
+  if (createdAtMs == null || createdAtMs < 0 || !isValidBotPolicyId(id)) {
+    return null;
+  }
+  return { createdAtMs, id };
+};
+
+const formatBotPolicyCursor = (cursor: BotPolicyCursor): string =>
+  `${cursor.createdAtMs}:${cursor.id}`;
 
 const parseJsonObjectString = (
   value: string | null,
@@ -294,6 +323,12 @@ type PersonalModelSelector = {
   queuePolicyId: string;
 };
 
+type BotPolicySelector = {
+  modeId: string;
+  archId: string;
+  queuePolicyId: string;
+};
+
 const readPersonalModelSelectorFromRequest = (
   request: Request,
 ): PersonalModelSelector | null => {
@@ -313,6 +348,25 @@ const readPersonalModelSelectorFromRequest = (
     queuePolicyId: normalizeModelAxis(
       url.searchParams.get('queue_policy'),
       DEFAULT_QUEUE_POLICY_ID,
+    ),
+  };
+};
+
+const readBotPolicySelectorFromRequest = (
+  request: Request,
+): BotPolicySelector | null => {
+  const url = new URL(request.url);
+  const modeId = normalizeGameMode(url.searchParams.get('mode'));
+  if (!modeId) return null;
+  return {
+    modeId,
+    archId: normalizeModelAxis(
+      url.searchParams.get('arch'),
+      DEFAULT_BOT_ARCH_ID,
+    ),
+    queuePolicyId: normalizeModelAxis(
+      url.searchParams.get('queue_policy'),
+      DEFAULT_BOT_QUEUE_POLICY_ID,
     ),
   };
 };
@@ -690,6 +744,20 @@ type GlobalModelRecord = {
   retiredAtMs: number | null;
 };
 
+type BotPolicyRecord = {
+  id: string;
+  modeId: string;
+  archId: string;
+  queuePolicyId: string;
+  pipelineId: string;
+  pieceSourceProfile: string;
+  r2Key: string;
+  version: number;
+  isPinned: boolean;
+  metrics: Record<string, unknown> | null;
+  createdAtMs: number;
+};
+
 const readPersonalModelRecord = (
   row: Record<string, unknown>,
 ): PersonalModelRecord | null => {
@@ -773,6 +841,46 @@ const readGlobalModelRecord = (
     createdAtMs,
     updatedAtMs,
     retiredAtMs: asInt(row.retired_at_ms),
+  };
+};
+
+const readBotPolicyRecord = (
+  row: Record<string, unknown>,
+): BotPolicyRecord | null => {
+  const id = asString(row.id);
+  const modeId = normalizeGameMode(row.mode_id);
+  const archId = asString(row.arch_id);
+  const queuePolicyId = asString(row.queue_policy_id);
+  const pipelineId = asString(row.pipeline_id);
+  const pieceSourceProfile = asString(row.piece_source_profile);
+  const r2Key = asString(row.r2_key);
+  const version = asInt(row.version);
+  const createdAtMs = asInt(row.created_at_ms);
+  if (
+    !id ||
+    !modeId ||
+    !archId ||
+    !queuePolicyId ||
+    !pipelineId ||
+    !pieceSourceProfile ||
+    !r2Key ||
+    version == null ||
+    createdAtMs == null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    modeId,
+    archId,
+    queuePolicyId,
+    pipelineId,
+    pieceSourceProfile,
+    r2Key,
+    version,
+    isPinned: asInt(row.is_pinned) === 1,
+    metrics: parseJsonObjectString(asString(row.metrics_json)),
+    createdAtMs,
   };
 };
 
@@ -949,6 +1057,166 @@ const readDefaultGlobalModelId = async (
 ): Promise<string | null> => {
   const rows = await listGlobalModelsForSelector(env, selector);
   return rows[0]?.id ?? null;
+};
+
+const readBotPolicyById = async (
+  env: Env,
+  id: string,
+): Promise<BotPolicyRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       id,
+       mode_id,
+       arch_id,
+       queue_policy_id,
+       pipeline_id,
+       piece_source_profile,
+       r2_key,
+       version,
+       is_pinned,
+       metrics_json,
+       created_at_ms
+     FROM bot_policies
+     WHERE id = ?
+     LIMIT 1`,
+  )
+    .bind(id)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return readBotPolicyRecord(row);
+};
+
+const readCurrentBotPolicyForSelector = async (
+  env: Env,
+  selector: BotPolicySelector,
+): Promise<BotPolicyRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       p.id,
+       p.mode_id,
+       p.arch_id,
+       p.queue_policy_id,
+       p.pipeline_id,
+       p.piece_source_profile,
+       p.r2_key,
+       p.version,
+       p.is_pinned,
+       p.metrics_json,
+       p.created_at_ms
+     FROM bot_policy_current c
+     JOIN bot_policies p ON p.id = c.bot_policy_id
+     WHERE
+       c.mode_id = ?
+       AND c.arch_id = ?
+       AND c.queue_policy_id = ?
+     LIMIT 1`,
+  )
+    .bind(selector.modeId, selector.archId, selector.queuePolicyId)
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return readBotPolicyRecord(row);
+};
+
+const listBotPoliciesForSelector = async (
+  env: Env,
+  selector: BotPolicySelector,
+  options: {
+    limit: number;
+    cursor: BotPolicyCursor | null;
+  },
+): Promise<BotPolicyRecord[]> => {
+  const whereParts: string[] = [
+    'mode_id = ?',
+    'arch_id = ?',
+    'queue_policy_id = ?',
+  ];
+  const values: unknown[] = [
+    selector.modeId,
+    selector.archId,
+    selector.queuePolicyId,
+  ];
+  if (options.cursor) {
+    whereParts.push('(created_at_ms < ? OR (created_at_ms = ? AND id < ?))');
+    values.push(
+      options.cursor.createdAtMs,
+      options.cursor.createdAtMs,
+      options.cursor.id,
+    );
+  }
+  const whereClause = `WHERE ${whereParts.join(' AND ')}`;
+  const result = await env.DB.prepare(
+    `SELECT
+       id,
+       mode_id,
+       arch_id,
+       queue_policy_id,
+       pipeline_id,
+       piece_source_profile,
+       r2_key,
+       version,
+       is_pinned,
+       metrics_json,
+       created_at_ms
+     FROM bot_policies
+     ${whereClause}
+     ORDER BY created_at_ms DESC, id DESC
+     LIMIT ?`,
+  )
+    .bind(...values, options.limit)
+    .all<Record<string, unknown>>();
+  const rows = Array.isArray(result.results) ? result.results : [];
+  const records: BotPolicyRecord[] = [];
+  for (const row of rows) {
+    const parsed = readBotPolicyRecord(row);
+    if (parsed) records.push(parsed);
+  }
+  return records;
+};
+
+const readNextBotPolicyVersion = async (
+  env: Env,
+  selector: BotPolicySelector,
+): Promise<number> => {
+  const row = await env.DB.prepare(
+    `SELECT MAX(version) AS max_version
+     FROM bot_policies
+     WHERE
+       mode_id = ?
+       AND arch_id = ?
+       AND queue_policy_id = ?`,
+  )
+    .bind(selector.modeId, selector.archId, selector.queuePolicyId)
+    .first<Record<string, unknown>>();
+  const maxVersion = asInt(row?.max_version);
+  return Math.max(0, maxVersion ?? 0) + 1;
+};
+
+const setCurrentBotPolicy = async (
+  env: Env,
+  policy: BotPolicyRecord,
+  updatedAtMs: number,
+): Promise<void> => {
+  await env.DB.prepare(
+    `INSERT INTO bot_policy_current (
+       mode_id,
+       arch_id,
+       queue_policy_id,
+       bot_policy_id,
+       updated_at_ms
+     ) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(mode_id, arch_id, queue_policy_id)
+     DO UPDATE SET
+       bot_policy_id = excluded.bot_policy_id,
+       updated_at_ms = excluded.updated_at_ms`,
+  )
+    .bind(
+      policy.modeId,
+      policy.archId,
+      policy.queuePolicyId,
+      policy.id,
+      updatedAtMs,
+    )
+    .run();
 };
 
 const writeCurrentPersonalModelVersion = async (
@@ -3022,6 +3290,7 @@ const handlePostTrajectoryRecording = async (
     actor_type: recording.meta?.actorType ?? null,
     actor_policy_id: recording.meta?.actorPolicyId ?? null,
     training_intent: recording.meta?.trainingIntent ?? null,
+    piece_source_profile: recording.meta?.pieceSourceProfile ?? null,
   });
 
   try {
@@ -3446,6 +3715,9 @@ const handleAdminRecordingsExportManifest = async (
       'cache-control': 'no-store',
     });
   }
+  const pieceSourceProfile = normalizeOptionalModelAxis(
+    url.searchParams.get('piece_source_profile'),
+  );
 
   const minSamplesRaw = asInt(url.searchParams.get('min_samples'));
   const minSamples =
@@ -3522,6 +3794,10 @@ const handleAdminRecordingsExportManifest = async (
     whereParts.push(`json_extract(meta_json, '$.actor_type') = ?`);
     values.push(actorType);
   }
+  if (pieceSourceProfile) {
+    whereParts.push(`json_extract(meta_json, '$.piece_source_profile') = ?`);
+    values.push(pieceSourceProfile);
+  }
   if (cursor) {
     whereParts.push('(started_at_ms < ? OR (started_at_ms = ? AND id < ?))');
     values.push(cursor.startedAtMs, cursor.startedAtMs, cursor.id);
@@ -3575,6 +3851,7 @@ const handleAdminRecordingsExportManifest = async (
           queuePolicyId,
           pipelineId,
           actorType,
+          pieceSourceProfile,
           minSamples,
           startedFromMs,
           startedToMs,
@@ -4187,6 +4464,494 @@ const handleAdminRetireGlobalModel = async (
   }
 };
 
+const toBotPolicyResponse = (
+  policy: BotPolicyRecord,
+): Record<string, unknown> => ({
+  id: policy.id,
+  modeId: policy.modeId,
+  archId: policy.archId,
+  queuePolicyId: policy.queuePolicyId,
+  pipelineId: policy.pipelineId,
+  pieceSourceProfile: policy.pieceSourceProfile,
+  r2Key: policy.r2Key,
+  version: policy.version,
+  isPinned: policy.isPinned,
+  metrics: policy.metrics,
+  createdAtMs: policy.createdAtMs,
+});
+
+const handleAdminBotPoliciesCurrent = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  const selector = readBotPolicySelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  try {
+    const current = await readCurrentBotPolicyForSelector(env, selector);
+    return jsonResponse(
+      {
+        ok: true,
+        selector,
+        current: current ? toBotPolicyResponse(current) : null,
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] bot policy current failed', error);
+    return jsonResponse(
+      { error: 'Bot policy registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminBotPoliciesList = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  const selector = readBotPolicySelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const url = new URL(request.url);
+  const limit = clampInt(asInt(url.searchParams.get('limit')), {
+    min: 1,
+    max: 200,
+    fallback: 40,
+  });
+  const requestedCursor = url.searchParams.get('cursor');
+  const cursor = parseBotPolicyCursor(requestedCursor);
+  if (requestedCursor != null && !cursor) {
+    return jsonResponse({ error: 'Invalid cursor.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  try {
+    const records = await listBotPoliciesForSelector(env, selector, {
+      limit,
+      cursor,
+    });
+    const nextCursor =
+      records.length >= limit
+        ? formatBotPolicyCursor({
+            createdAtMs: records[records.length - 1].createdAtMs,
+            id: records[records.length - 1].id,
+          })
+        : null;
+    return jsonResponse(
+      {
+        ok: true,
+        selector,
+        policies: records.map(toBotPolicyResponse),
+        page: {
+          limit,
+          returned: records.length,
+          nextCursor,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] bot policy list failed', error);
+    return jsonResponse(
+      { error: 'Bot policy registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminBotPolicyObject = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const url = new URL(request.url);
+  const policyId = asString(url.searchParams.get('id'));
+  if (!policyId || !isValidBotPolicyId(policyId)) {
+    return jsonResponse({ error: 'Missing or invalid policy id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  try {
+    const policy = await readBotPolicyById(env, policyId);
+    if (!policy) {
+      return jsonResponse({ error: 'Bot policy not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const object = await env.MODELS_BUCKET.get(policy.r2Key);
+    if (!object) {
+      return jsonResponse({ error: 'Bot policy object not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const bytes = await object.arrayBuffer();
+    return binaryResponse(bytes, 200, {
+      'cache-control': 'no-store',
+      'content-type': 'application/json; charset=utf-8',
+      'x-wub-bot-policy-id': policy.id,
+      'x-wub-bot-mode': policy.modeId,
+      'x-wub-bot-arch': policy.archId,
+      'x-wub-bot-queue-policy': policy.queuePolicyId,
+      'x-wub-bot-version': String(policy.version),
+      'x-wub-bot-r2-key': policy.r2Key,
+      'x-wub-bot-created-at-ms': String(policy.createdAtMs),
+    });
+  } catch (error) {
+    console.error('[admin] bot policy object failed', error);
+    return jsonResponse(
+      { error: 'Bot policy storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminBotPolicyPublish = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const payload = (await request.json().catch(() => null)) as {
+    modeId?: unknown;
+    archId?: unknown;
+    queuePolicyId?: unknown;
+    pipelineId?: unknown;
+    pieceSourceProfile?: unknown;
+    metrics?: unknown;
+    policyArtifact?: unknown;
+    setCurrent?: unknown;
+    pin?: unknown;
+  } | null;
+  const modeId = normalizeGameMode(payload?.modeId);
+  if (!modeId) {
+    return jsonResponse({ error: 'Missing or invalid mode id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  const selector: BotPolicySelector = {
+    modeId,
+    archId: normalizeModelAxis(asString(payload?.archId), DEFAULT_BOT_ARCH_ID),
+    queuePolicyId: normalizeModelAxis(
+      asString(payload?.queuePolicyId),
+      DEFAULT_BOT_QUEUE_POLICY_ID,
+    ),
+  };
+  const pipelineId = normalizeModelAxis(
+    asString(payload?.pipelineId),
+    DEFAULT_BOT_PIPELINE_ID,
+  );
+  const pieceSourceProfile = normalizeModelAxis(
+    asString(payload?.pieceSourceProfile),
+    DEFAULT_BOT_PIECE_SOURCE_PROFILE,
+  );
+  const metricsObject =
+    payload?.metrics != null &&
+    typeof payload.metrics === 'object' &&
+    !Array.isArray(payload.metrics)
+      ? (payload.metrics as Record<string, unknown>)
+      : null;
+  const artifactObject =
+    payload?.policyArtifact != null &&
+    typeof payload.policyArtifact === 'object' &&
+    !Array.isArray(payload.policyArtifact)
+      ? (payload.policyArtifact as Record<string, unknown>)
+      : null;
+  if (!artifactObject) {
+    return jsonResponse({ error: 'Missing policyArtifact object.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  const artifactJson = JSON.stringify(artifactObject);
+  const artifactBytes = new TextEncoder().encode(artifactJson);
+  if (artifactBytes.byteLength > MAX_PERSONALIZED_MODEL_BYTES) {
+    return jsonResponse(
+      {
+        error: `Policy artifact is too large. Max bytes: ${MAX_PERSONALIZED_MODEL_BYTES}.`,
+      },
+      413,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  const setCurrent = asBoolean(payload?.setCurrent) === true;
+  const pin = asBoolean(payload?.pin) === true;
+
+  const nextVersion = await readNextBotPolicyVersion(env, selector);
+  const policyId = `bot_policy_${crypto.randomUUID()}`;
+  const r2Key =
+    `bot-policies/${selector.modeId}` +
+    `/${selector.archId}` +
+    `/${selector.queuePolicyId}` +
+    `/v${nextVersion}-${nowMs}-${policyId}.json`;
+
+  let stored = false;
+  try {
+    await env.MODELS_BUCKET.put(r2Key, artifactBytes, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+    stored = true;
+    await env.DB.prepare(
+      `INSERT INTO bot_policies (
+         id,
+         mode_id,
+         arch_id,
+         queue_policy_id,
+         pipeline_id,
+         piece_source_profile,
+         r2_key,
+         version,
+         is_pinned,
+         metrics_json,
+         created_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        policyId,
+        selector.modeId,
+        selector.archId,
+        selector.queuePolicyId,
+        pipelineId,
+        pieceSourceProfile,
+        r2Key,
+        nextVersion,
+        pin ? 1 : 0,
+        metricsObject ? JSON.stringify(metricsObject) : null,
+        nowMs,
+      )
+      .run();
+    const created = await readBotPolicyById(env, policyId);
+    if (!created) {
+      throw new Error('Published policy could not be loaded.');
+    }
+    if (setCurrent) {
+      await setCurrentBotPolicy(env, created, nowMs);
+    }
+    return jsonResponse(
+      {
+        ok: true,
+        policy: toBotPolicyResponse(created),
+        setCurrent,
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    if (stored) {
+      await env.MODELS_BUCKET.delete(r2Key).catch((cleanupError) => {
+        console.warn('[admin] bot policy publish cleanup failed', cleanupError);
+      });
+    }
+    console.error('[admin] bot policy publish failed', error);
+    return jsonResponse(
+      { error: 'Bot policy publish is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminBotPolicySelectCurrent = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  const payload = (await request.json().catch(() => null)) as {
+    id?: unknown;
+  } | null;
+  const id = asString(payload?.id);
+  if (!id || !isValidBotPolicyId(id)) {
+    return jsonResponse({ error: 'Missing or invalid policy id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  try {
+    const policy = await readBotPolicyById(env, id);
+    if (!policy) {
+      return jsonResponse({ error: 'Bot policy not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    await setCurrentBotPolicy(env, policy, nowMs);
+    return jsonResponse(
+      {
+        ok: true,
+        policy: toBotPolicyResponse(policy),
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] bot policy select current failed', error);
+    return jsonResponse(
+      { error: 'Bot policy registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminBotPolicyPinToggle = async (
+  request: Request,
+  env: Env,
+  options: { pin: boolean },
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  const payload = (await request.json().catch(() => null)) as {
+    id?: unknown;
+  } | null;
+  const id = asString(payload?.id);
+  if (!id || !isValidBotPolicyId(id)) {
+    return jsonResponse({ error: 'Missing or invalid policy id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  try {
+    await env.DB.prepare(
+      `UPDATE bot_policies
+       SET is_pinned = ?
+       WHERE id = ?`,
+    )
+      .bind(options.pin ? 1 : 0, id)
+      .run();
+    const policy = await readBotPolicyById(env, id);
+    if (!policy) {
+      return jsonResponse({ error: 'Bot policy not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    return jsonResponse(
+      {
+        ok: true,
+        policy: toBotPolicyResponse(policy),
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] bot policy pin toggle failed', error);
+    return jsonResponse(
+      { error: 'Bot policy registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -4406,6 +5171,34 @@ export default {
 
     if (url.pathname === '/api/admin/models/global/retire') {
       return handleAdminRetireGlobalModel(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/current') {
+      return handleAdminBotPoliciesCurrent(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/list') {
+      return handleAdminBotPoliciesList(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/object') {
+      return handleAdminBotPolicyObject(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/publish') {
+      return handleAdminBotPolicyPublish(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/select-current') {
+      return handleAdminBotPolicySelectCurrent(request, env);
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/pin') {
+      return handleAdminBotPolicyPinToggle(request, env, { pin: true });
+    }
+
+    if (url.pathname === '/api/admin/bot/policies/unpin') {
+      return handleAdminBotPolicyPinToggle(request, env, { pin: false });
     }
 
     if (url.pathname.startsWith('/api/feedback')) {

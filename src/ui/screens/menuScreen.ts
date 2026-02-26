@@ -19,7 +19,8 @@ type MenuPanel =
   | 'feedback'
   | 'account'
   | 'my_models'
-  | 'admin';
+  | 'admin'
+  | 'bot_lab';
 
 export type MenuAuthUser = {
   id: string;
@@ -177,6 +178,26 @@ export type MenuAdminRecordingPreview = {
   outcome: string | null;
 };
 
+export type MenuBotPolicySummary = {
+  id: string;
+  modeId: string;
+  archId: string;
+  queuePolicyId: string;
+  pipelineId: string;
+  pieceSourceProfile: string;
+  version: number;
+  isPinned: boolean;
+  createdAtMs: number;
+};
+
+export type MenuBotPoliciesPage = {
+  policies: MenuBotPolicySummary[];
+  page: {
+    returned: number;
+    nextCursor: string | null;
+  };
+};
+
 export type LabelingProgressState = {
   buildVersion: string;
   labeledBoards: number | null;
@@ -275,6 +296,48 @@ export type MenuScreenOptions = {
     maxPiecesPerEpisode?: number;
   }) => Promise<string>;
   onAdminApplyBenchmarkSuggestedArch: () => Promise<string>;
+  onBotLabFetchCurrentPolicy: () => Promise<string>;
+  onBotLabListPolicies: (options?: {
+    limit?: number;
+    cursor?: string | null;
+  }) => Promise<MenuBotPoliciesPage>;
+  onBotLabLoadPolicyById: (id: string) => Promise<string>;
+  onBotLabPublishPolicy: (options?: {
+    pin?: boolean;
+    setCurrent?: boolean;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+  }) => Promise<string>;
+  onBotLabSelectCurrentPolicy: (id: string) => Promise<string>;
+  onBotLabPinPolicy: (id: string) => Promise<string>;
+  onBotLabUnpinPolicy: (id: string) => Promise<string>;
+  onBotLabTrainPolicyOneShot: (options: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+    seed?: number;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+  }) => Promise<string>;
+  onBotLabRunHeadlessValidate: (options?: {
+    maxPieces?: number;
+    seed?: number;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+  }) => Promise<string>;
+  onBotLabStartGuiInspect: (options?: {
+    apmInput?: number;
+    seed?: number;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+    pieces?: number;
+  }) => Promise<string>;
+  onBotLabStopGuiInspect: () => Promise<string> | string;
+  onBotLabGenerateRecordings: (options: {
+    sessions?: number;
+    maxPiecesPerEpisode?: number;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+  }) => Promise<string>;
+  onBotLabRunBenchmark: (options?: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+    pieceSourceProfile?: 'bag7' | 'active_generator';
+  }) => Promise<string>;
 };
 
 export type MenuScreen = {
@@ -340,10 +403,20 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminPrepareManifest,
     onAdminTrainGlobalOneShot,
     onAdminPublishGlobalCandidate,
-    onAdminTrainBotPolicyOneShot,
-    onAdminGenerateBotRecordings,
-    onAdminRunCapabilityBenchmark,
     onAdminApplyBenchmarkSuggestedArch,
+    onBotLabFetchCurrentPolicy,
+    onBotLabListPolicies,
+    onBotLabLoadPolicyById,
+    onBotLabPublishPolicy,
+    onBotLabSelectCurrentPolicy,
+    onBotLabPinPolicy,
+    onBotLabUnpinPolicy,
+    onBotLabTrainPolicyOneShot,
+    onBotLabRunHeadlessValidate,
+    onBotLabStartGuiInspect,
+    onBotLabStopGuiInspect,
+    onBotLabGenerateRecordings,
+    onBotLabRunBenchmark,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -479,6 +552,7 @@ input[type=number] {
   const accountPanel = makeMenuPanel();
   const myModelsPanel = makeMenuPanel();
   const adminPanel = makeMenuPanel();
+  const botLabPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
 
@@ -528,6 +602,14 @@ input[type=number] {
     maxHeight: '520px',
     overflowY: 'auto',
   });
+  Object.assign(botLabPanel.style, {
+    minHeight: '260px',
+    width: '360px',
+    display: 'none',
+    textAlign: 'left',
+    maxHeight: '520px',
+    overflowY: 'auto',
+  });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
@@ -548,7 +630,9 @@ input[type=number] {
   const accountButton = makeMenuButton('ACCOUNT');
   const myModelsButton = makeMenuButton('MY MODELS');
   const adminButton = makeMenuButton('ADMIN');
+  const botLabButton = makeMenuButton('BOT LAB');
   adminButton.style.display = 'none';
+  botLabButton.style.display = 'none';
   const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
@@ -557,6 +641,7 @@ input[type=number] {
   menuMainPanel.appendChild(accountButton);
   menuMainPanel.appendChild(myModelsButton);
   menuMainPanel.appendChild(adminButton);
+  menuMainPanel.appendChild(botLabButton);
   menuMainPanel.appendChild(aboutButton);
 
   const optionsTitle = document.createElement('div');
@@ -2805,72 +2890,11 @@ input[type=number] {
   const adminPublishGlobalCandidateButton = makeMenuButton(
     'PUBLISH GLOBAL CANDIDATE',
   );
-  const adminBotEpisodesInput = document.createElement('input');
-  adminBotEpisodesInput.type = 'number';
-  adminBotEpisodesInput.min = '1';
-  adminBotEpisodesInput.step = '1';
-  adminBotEpisodesInput.value = '24';
-  adminBotEpisodesInput.placeholder = 'bot episodes';
-  Object.assign(adminBotEpisodesInput.style, {
-    color: '#e2e8f0',
-    background: '#0b0f14',
-    border: '1px solid #1f2a37',
-    borderRadius: '4px',
-    fontSize: '12px',
-    padding: '6px 8px',
-    width: '100%',
-    boxSizing: 'border-box',
-  });
-  const adminBotPiecesInput = document.createElement('input');
-  adminBotPiecesInput.type = 'number';
-  adminBotPiecesInput.min = '8';
-  adminBotPiecesInput.step = '1';
-  adminBotPiecesInput.value = '120';
-  adminBotPiecesInput.placeholder = 'bot max pieces';
-  Object.assign(adminBotPiecesInput.style, {
-    color: '#e2e8f0',
-    background: '#0b0f14',
-    border: '1px solid #1f2a37',
-    borderRadius: '4px',
-    fontSize: '12px',
-    padding: '6px 8px',
-    width: '100%',
-    boxSizing: 'border-box',
-  });
-  const adminTrainBotPolicyButton = makeMenuButton('TRAIN BOT POLICY');
-  const adminGenerateBotSessionsInput = document.createElement('input');
-  adminGenerateBotSessionsInput.type = 'number';
-  adminGenerateBotSessionsInput.min = '1';
-  adminGenerateBotSessionsInput.step = '1';
-  adminGenerateBotSessionsInput.value = '3';
-  adminGenerateBotSessionsInput.placeholder = 'bot sessions to generate';
-  Object.assign(adminGenerateBotSessionsInput.style, {
-    color: '#e2e8f0',
-    background: '#0b0f14',
-    border: '1px solid #1f2a37',
-    borderRadius: '4px',
-    fontSize: '12px',
-    padding: '6px 8px',
-    width: '100%',
-    boxSizing: 'border-box',
-  });
-  const adminGenerateBotRecordingsButton = makeMenuButton(
-    'GENERATE BOT RECORDINGS',
-  );
-  const adminRunBenchmarkButton = makeMenuButton('RUN BENCHMARK');
-  const adminApplyBenchmarkArchButton = makeMenuButton('APPLY BENCHMARK ARCH');
   adminRlControls.appendChild(adminManifestMinSamplesInput);
   adminRlControls.appendChild(adminManifestActorTypeSelect);
   adminRlControls.appendChild(adminPrepareManifestButton);
   adminRlControls.appendChild(adminTrainGlobalOneShotButton);
   adminRlControls.appendChild(adminPublishGlobalCandidateButton);
-  adminRlControls.appendChild(adminBotEpisodesInput);
-  adminRlControls.appendChild(adminBotPiecesInput);
-  adminRlControls.appendChild(adminTrainBotPolicyButton);
-  adminRlControls.appendChild(adminGenerateBotSessionsInput);
-  adminRlControls.appendChild(adminGenerateBotRecordingsButton);
-  adminRlControls.appendChild(adminRunBenchmarkButton);
-  adminRlControls.appendChild(adminApplyBenchmarkArchButton);
 
   const adminBaselinesLabel = makeSectionLabel('GLOBAL BASELINES');
   Object.assign(adminBaselinesLabel.style, { marginTop: '4px' });
@@ -3050,6 +3074,358 @@ input[type=number] {
   adminPanel.appendChild(adminDatasetControls);
   adminPanel.appendChild(adminBackButton);
 
+  const botLabTitle = document.createElement('div');
+  botLabTitle.textContent = 'BOT LAB';
+  Object.assign(botLabTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+  const botLabSummary = document.createElement('div');
+  Object.assign(botLabSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const botLabStatus = document.createElement('div');
+  Object.assign(botLabStatus.style, {
+    minHeight: '24px',
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    marginTop: '2px',
+    whiteSpace: 'pre-wrap',
+  });
+
+  const botLabPolicyLabel = makeSectionLabel('POLICY REGISTRY');
+  Object.assign(botLabPolicyLabel.style, { marginTop: '4px' });
+  const botLabPolicyButtonsTop = document.createElement('div');
+  Object.assign(botLabPolicyButtonsTop.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const botLabFetchCurrentButton = makeMenuButton('LOAD CURRENT');
+  const botLabRefreshPoliciesButton = makeMenuButton('REFRESH LIST');
+  Object.assign(botLabFetchCurrentButton.style, { flex: '1' });
+  Object.assign(botLabRefreshPoliciesButton.style, { flex: '1' });
+  botLabPolicyButtonsTop.appendChild(botLabFetchCurrentButton);
+  botLabPolicyButtonsTop.appendChild(botLabRefreshPoliciesButton);
+  const botLabPoliciesSelect = document.createElement('select');
+  botLabPoliciesSelect.size = 7;
+  Object.assign(botLabPoliciesSelect.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  const botLabPolicyButtonsRow = document.createElement('div');
+  Object.assign(botLabPolicyButtonsRow.style, {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '6px',
+  });
+  const botLabPolicyNextButton = makeMenuButton('NEXT');
+  const botLabPolicyLoadButton = makeMenuButton('LOAD');
+  const botLabPolicySelectCurrentButton = makeMenuButton('SET CURRENT');
+  const botLabPolicyPinButton = makeMenuButton('PIN');
+  const botLabPolicyUnpinButton = makeMenuButton('UNPIN');
+  Object.assign(botLabPolicyNextButton.style, { flex: '1' });
+  Object.assign(botLabPolicyLoadButton.style, { flex: '1' });
+  Object.assign(botLabPolicySelectCurrentButton.style, { flex: '1' });
+  Object.assign(botLabPolicyPinButton.style, { flex: '1' });
+  Object.assign(botLabPolicyUnpinButton.style, { flex: '1' });
+  botLabPolicyButtonsRow.appendChild(botLabPolicyNextButton);
+  botLabPolicyButtonsRow.appendChild(botLabPolicyLoadButton);
+  botLabPolicyButtonsRow.appendChild(botLabPolicySelectCurrentButton);
+  botLabPolicyButtonsRow.appendChild(botLabPolicyPinButton);
+  botLabPolicyButtonsRow.appendChild(botLabPolicyUnpinButton);
+  const botLabPublishRow = document.createElement('div');
+  Object.assign(botLabPublishRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    flexWrap: 'wrap',
+  });
+  const botLabPublishSourceSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['bag7', 'publish source: bag7'],
+    ['active_generator', 'publish source: active'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabPublishSourceSelect.appendChild(option);
+  }
+  Object.assign(botLabPublishSourceSelect.style, {
+    flex: '1',
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+  });
+  const botLabPublishPinToggle = document.createElement('input');
+  botLabPublishPinToggle.type = 'checkbox';
+  const botLabPublishCurrentToggle = document.createElement('input');
+  botLabPublishCurrentToggle.type = 'checkbox';
+  botLabPublishCurrentToggle.checked = true;
+  const makeInlineToggle = (text: string, input: HTMLInputElement) => {
+    const label = document.createElement('label');
+    Object.assign(label.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '4px',
+      color: '#b6c2d4',
+      fontSize: '11px',
+    });
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(text));
+    return label;
+  };
+  botLabPublishRow.appendChild(botLabPublishSourceSelect);
+  botLabPublishRow.appendChild(makeInlineToggle('pin', botLabPublishPinToggle));
+  botLabPublishRow.appendChild(
+    makeInlineToggle('set current', botLabPublishCurrentToggle),
+  );
+  const botLabPublishPolicyButton = makeMenuButton('PUBLISH LOADED POLICY');
+
+  const botLabTrainLabel = makeSectionLabel('TRAIN / VALIDATE');
+  Object.assign(botLabTrainLabel.style, { marginTop: '4px' });
+  const botLabTrainControls = document.createElement('div');
+  Object.assign(botLabTrainControls.style, {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: '6px',
+  });
+  const botLabEpisodesInput = document.createElement('input');
+  botLabEpisodesInput.type = 'number';
+  botLabEpisodesInput.min = '1';
+  botLabEpisodesInput.step = '1';
+  botLabEpisodesInput.value = '24';
+  botLabEpisodesInput.placeholder = 'episodes';
+  const botLabMaxPiecesInput = document.createElement('input');
+  botLabMaxPiecesInput.type = 'number';
+  botLabMaxPiecesInput.min = '8';
+  botLabMaxPiecesInput.step = '1';
+  botLabMaxPiecesInput.value = '120';
+  botLabMaxPiecesInput.placeholder = 'max pieces';
+  const botLabSeedInput = document.createElement('input');
+  botLabSeedInput.type = 'number';
+  botLabSeedInput.step = '1';
+  botLabSeedInput.placeholder = 'seed';
+  botLabSeedInput.value = '42030';
+  const botLabTrainSourceSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['bag7', 'train source: bag7'],
+    ['active_generator', 'train source: active'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabTrainSourceSelect.appendChild(option);
+  }
+  botLabTrainSourceSelect.value = 'bag7';
+  for (const input of [
+    botLabEpisodesInput,
+    botLabMaxPiecesInput,
+    botLabSeedInput,
+  ]) {
+    Object.assign(input.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '12px',
+      padding: '6px 8px',
+      width: '100%',
+      boxSizing: 'border-box',
+    });
+  }
+  Object.assign(botLabTrainSourceSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  botLabTrainControls.appendChild(botLabEpisodesInput);
+  botLabTrainControls.appendChild(botLabMaxPiecesInput);
+  botLabTrainControls.appendChild(botLabSeedInput);
+  botLabTrainControls.appendChild(botLabTrainSourceSelect);
+  const botLabTrainButton = makeMenuButton('TRAIN POLICY (ONE-SHOT)');
+  const botLabHeadlessValidateButton = makeMenuButton('HEADLESS VALIDATE 10K');
+
+  const botLabGuiLabel = makeSectionLabel('GUI INSPECT');
+  Object.assign(botLabGuiLabel.style, { marginTop: '4px' });
+  const botLabGuiControls = document.createElement('div');
+  Object.assign(botLabGuiControls.style, {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: '6px',
+  });
+  const botLabGuiApmInput = document.createElement('input');
+  botLabGuiApmInput.type = 'number';
+  botLabGuiApmInput.min = '20';
+  botLabGuiApmInput.max = '1200';
+  botLabGuiApmInput.step = '1';
+  botLabGuiApmInput.value = '240';
+  botLabGuiApmInput.placeholder = 'APM';
+  const botLabGuiSeedInput = document.createElement('input');
+  botLabGuiSeedInput.type = 'number';
+  botLabGuiSeedInput.step = '1';
+  botLabGuiSeedInput.value = '42030';
+  botLabGuiSeedInput.placeholder = 'seed';
+  const botLabGuiPiecesInput = document.createElement('input');
+  botLabGuiPiecesInput.type = 'number';
+  botLabGuiPiecesInput.min = '1';
+  botLabGuiPiecesInput.step = '1';
+  botLabGuiPiecesInput.value = '20';
+  botLabGuiPiecesInput.placeholder = 'pieces';
+  const botLabGuiSourceSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['bag7', 'GUI source: bag7'],
+    ['active_generator', 'GUI source: active'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabGuiSourceSelect.appendChild(option);
+  }
+  botLabGuiSourceSelect.value = 'bag7';
+  for (const input of [
+    botLabGuiApmInput,
+    botLabGuiSeedInput,
+    botLabGuiPiecesInput,
+  ]) {
+    Object.assign(input.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '12px',
+      padding: '6px 8px',
+      width: '100%',
+      boxSizing: 'border-box',
+    });
+  }
+  Object.assign(botLabGuiSourceSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  botLabGuiControls.appendChild(botLabGuiApmInput);
+  botLabGuiControls.appendChild(botLabGuiSeedInput);
+  botLabGuiControls.appendChild(botLabGuiPiecesInput);
+  botLabGuiControls.appendChild(botLabGuiSourceSelect);
+  const botLabGuiButtons = document.createElement('div');
+  Object.assign(botLabGuiButtons.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const botLabStartGuiButton = makeMenuButton('START GUI INSPECT');
+  const botLabStopGuiButton = makeMenuButton('STOP GUI INSPECT');
+  Object.assign(botLabStartGuiButton.style, { flex: '1' });
+  Object.assign(botLabStopGuiButton.style, { flex: '1' });
+  botLabGuiButtons.appendChild(botLabStartGuiButton);
+  botLabGuiButtons.appendChild(botLabStopGuiButton);
+
+  const botLabDataLabel = makeSectionLabel('GENERATE / BENCHMARK');
+  Object.assign(botLabDataLabel.style, { marginTop: '4px' });
+  const botLabDataControls = document.createElement('div');
+  Object.assign(botLabDataControls.style, {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: '6px',
+  });
+  const botLabGenerateSessionsInput = document.createElement('input');
+  botLabGenerateSessionsInput.type = 'number';
+  botLabGenerateSessionsInput.min = '1';
+  botLabGenerateSessionsInput.step = '1';
+  botLabGenerateSessionsInput.value = '3';
+  botLabGenerateSessionsInput.placeholder = 'sessions';
+  const botLabGenerateSourceSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['active_generator', 'gen source: active'],
+    ['bag7', 'gen source: bag7'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabGenerateSourceSelect.appendChild(option);
+  }
+  botLabGenerateSourceSelect.value = 'active_generator';
+  for (const input of [botLabGenerateSessionsInput]) {
+    Object.assign(input.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '12px',
+      padding: '6px 8px',
+      width: '100%',
+      boxSizing: 'border-box',
+    });
+  }
+  Object.assign(botLabGenerateSourceSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  botLabDataControls.appendChild(botLabGenerateSessionsInput);
+  botLabDataControls.appendChild(botLabGenerateSourceSelect);
+  const botLabGenerateButton = makeMenuButton('GENERATE RECORDINGS');
+  const botLabBenchmarkButton = makeMenuButton('RUN BENCHMARK');
+  const botLabApplyBenchmarkArchButton = makeMenuButton('APPLY BENCHMARK ARCH');
+  const botLabBackButton = makeMenuButton('BACK');
+  Object.assign(botLabBackButton.style, { marginTop: 'auto' });
+
+  botLabPanel.appendChild(botLabTitle);
+  botLabPanel.appendChild(botLabSummary);
+  botLabPanel.appendChild(botLabStatus);
+  botLabPanel.appendChild(botLabPolicyLabel);
+  botLabPanel.appendChild(botLabPolicyButtonsTop);
+  botLabPanel.appendChild(botLabPoliciesSelect);
+  botLabPanel.appendChild(botLabPolicyButtonsRow);
+  botLabPanel.appendChild(botLabPublishRow);
+  botLabPanel.appendChild(botLabPublishPolicyButton);
+  botLabPanel.appendChild(botLabTrainLabel);
+  botLabPanel.appendChild(botLabTrainControls);
+  botLabPanel.appendChild(botLabTrainButton);
+  botLabPanel.appendChild(botLabHeadlessValidateButton);
+  botLabPanel.appendChild(botLabGuiLabel);
+  botLabPanel.appendChild(botLabGuiControls);
+  botLabPanel.appendChild(botLabGuiButtons);
+  botLabPanel.appendChild(botLabDataLabel);
+  botLabPanel.appendChild(botLabDataControls);
+  botLabPanel.appendChild(botLabGenerateButton);
+  botLabPanel.appendChild(botLabBenchmarkButton);
+  botLabPanel.appendChild(botLabApplyBenchmarkArchButton);
+  botLabPanel.appendChild(botLabBackButton);
+
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
   let signedOutStage: SignedOutStage = hiddenResetToken ? 'reset' : 'email';
   let currentAuthState: MenuAuthState = authState;
@@ -3070,6 +3446,13 @@ input[type=number] {
   let myModelsSelectedBaselineId: string | null = null;
   let myModelsBaselinesLoading = false;
   let myModelsBaselinesSelectorKey: string | null = null;
+  let botLabActionPending = false;
+  let botLabListPending = false;
+  let botLabPolicies: MenuBotPolicySummary[] = [];
+  let botLabSelectedPolicyId: string | null = null;
+  let botLabCurrentPolicyId: string | null = null;
+  let botLabPolicyCursor: string | null = null;
+  let botLabGuiInspectRunning = false;
   let lastTrainingPresetKey = '';
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
@@ -3096,6 +3479,13 @@ input[type=number] {
   ) => {
     adminStatus.textContent = message;
     adminStatus.style.color = statusColor(tone);
+  };
+  const setBotLabActionStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
+    botLabStatus.textContent = message;
+    botLabStatus.style.color = statusColor(tone);
   };
   const readField = (input: HTMLInputElement): string => input.value.trim();
   const toErrorMessage = (error: unknown, fallback: string): string => {
@@ -3610,6 +4000,180 @@ input[type=number] {
     return lines.join('\n');
   };
 
+  const parseBotPieceSourceProfile = (
+    value: string,
+    fallback: 'bag7' | 'active_generator' = 'bag7',
+  ): 'bag7' | 'active_generator' =>
+    value === 'active_generator' ? 'active_generator' : fallback;
+
+  const readOptionalSeedInput = (
+    input: HTMLInputElement,
+  ): number | undefined => {
+    const raw = input.value.trim();
+    if (!raw) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return undefined;
+    return Math.trunc(value);
+  };
+
+  const formatBotPolicyOption = (policy: MenuBotPolicySummary): string => {
+    const pinPrefix = policy.isPinned ? '[pin] ' : '';
+    const currentPrefix =
+      policy.id === botLabCurrentPolicyId ? '[current] ' : '';
+    return `${currentPrefix}${pinPrefix}v${policy.version} · ${policy.pipelineId} · ${new Date(policy.createdAtMs).toLocaleTimeString()}`;
+  };
+
+  const renderBotLabPoliciesSelect = (): void => {
+    botLabPoliciesSelect.innerHTML = '';
+    for (const policy of botLabPolicies) {
+      const option = document.createElement('option');
+      option.value = policy.id;
+      option.textContent = formatBotPolicyOption(policy);
+      botLabPoliciesSelect.appendChild(option);
+    }
+    if (botLabPolicies.length === 0) {
+      botLabSelectedPolicyId = null;
+      return;
+    }
+    const activeId =
+      botLabSelectedPolicyId &&
+      botLabPolicies.some((policy) => policy.id === botLabSelectedPolicyId)
+        ? botLabSelectedPolicyId
+        : botLabPolicies[0].id;
+    botLabPoliciesSelect.value = activeId;
+    botLabSelectedPolicyId = activeId;
+  };
+
+  const getSelectedBotLabPolicy = (): MenuBotPolicySummary | null => {
+    if (!botLabSelectedPolicyId) return null;
+    return (
+      botLabPolicies.find((policy) => policy.id === botLabSelectedPolicyId) ??
+      null
+    );
+  };
+
+  const formatBotLabSummary = (isAdmin: boolean): string => {
+    if (!isAdmin) {
+      return `Bot Lab locked.\nSign in with an admin account.\nAxes: ${formatModelAxesCompact(currentModelAxes)}`;
+    }
+    const modeId = getLocalTrainingStats().currentModeId;
+    const selected = getSelectedBotLabPolicy();
+    const selectedLine = selected
+      ? `Selected: ${selected.id} (v${selected.version}${selected.isPinned ? ', pinned' : ''})`
+      : botLabCurrentPolicyId
+        ? `Current: ${botLabCurrentPolicyId}`
+        : 'Current: (none)';
+    return [
+      `Mode: ${modeId}`,
+      `Axes: ${formatModelAxesCompact(currentModelAxes)}`,
+      `Listed policies: ${botLabPolicies.length}`,
+      selectedLine,
+      `Next page: ${botLabPolicyCursor ? 'available' : 'none'}`,
+      `GUI inspect: ${botLabGuiInspectRunning ? 'running' : 'stopped'}`,
+    ].join('\n');
+  };
+
+  const updateBotLabControls = () => {
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    const busy =
+      currentAuthState.loading || botLabActionPending || botLabListPending;
+    const hasPolicies = botLabPolicies.length > 0;
+    const hasSelected = botLabSelectedPolicyId != null;
+
+    botLabButton.style.display = isAdmin ? 'block' : 'none';
+    botLabSummary.textContent = formatBotLabSummary(isAdmin);
+    botLabPolicyLabel.style.display = isAdmin ? 'block' : 'none';
+    botLabPolicyButtonsTop.style.display = isAdmin ? 'flex' : 'none';
+    botLabPoliciesSelect.style.display = isAdmin ? 'block' : 'none';
+    botLabPolicyButtonsRow.style.display = isAdmin ? 'flex' : 'none';
+    botLabPublishRow.style.display = isAdmin ? 'flex' : 'none';
+    botLabPublishPolicyButton.style.display = isAdmin ? 'block' : 'none';
+    botLabTrainLabel.style.display = isAdmin ? 'block' : 'none';
+    botLabTrainControls.style.display = isAdmin ? 'grid' : 'none';
+    botLabTrainButton.style.display = isAdmin ? 'block' : 'none';
+    botLabHeadlessValidateButton.style.display = isAdmin ? 'block' : 'none';
+    botLabGuiLabel.style.display = isAdmin ? 'block' : 'none';
+    botLabGuiControls.style.display = isAdmin ? 'grid' : 'none';
+    botLabGuiButtons.style.display = isAdmin ? 'flex' : 'none';
+    botLabDataLabel.style.display = isAdmin ? 'block' : 'none';
+    botLabDataControls.style.display = isAdmin ? 'grid' : 'none';
+    botLabGenerateButton.style.display = isAdmin ? 'block' : 'none';
+    botLabBenchmarkButton.style.display = isAdmin ? 'block' : 'none';
+    botLabApplyBenchmarkArchButton.style.display = isAdmin ? 'block' : 'none';
+
+    botLabFetchCurrentButton.disabled = !isAdmin || busy;
+    botLabRefreshPoliciesButton.disabled = !isAdmin || busy;
+    botLabPoliciesSelect.disabled = !isAdmin || busy || !hasPolicies;
+    botLabPolicyNextButton.disabled =
+      !isAdmin || busy || botLabPolicyCursor == null;
+    botLabPolicyLoadButton.disabled = !isAdmin || busy || !hasSelected;
+    botLabPolicySelectCurrentButton.disabled = !isAdmin || busy || !hasSelected;
+    botLabPolicyPinButton.disabled = !isAdmin || busy || !hasSelected;
+    botLabPolicyUnpinButton.disabled = !isAdmin || busy || !hasSelected;
+    botLabPublishSourceSelect.disabled = !isAdmin || busy;
+    botLabPublishPinToggle.disabled = !isAdmin || busy;
+    botLabPublishCurrentToggle.disabled = !isAdmin || busy;
+    botLabPublishPolicyButton.disabled = !isAdmin || busy;
+    botLabEpisodesInput.disabled = !isAdmin || busy;
+    botLabMaxPiecesInput.disabled = !isAdmin || busy;
+    botLabSeedInput.disabled = !isAdmin || busy;
+    botLabTrainSourceSelect.disabled = !isAdmin || busy;
+    botLabTrainButton.disabled = !isAdmin || busy;
+    botLabHeadlessValidateButton.disabled = !isAdmin || busy;
+    botLabGuiApmInput.disabled = !isAdmin || busy;
+    botLabGuiSeedInput.disabled = !isAdmin || busy;
+    botLabGuiPiecesInput.disabled = !isAdmin || busy;
+    botLabGuiSourceSelect.disabled = !isAdmin || busy;
+    botLabStartGuiButton.disabled = !isAdmin || busy;
+    botLabStopGuiButton.disabled = !isAdmin || busy || !botLabGuiInspectRunning;
+    botLabGenerateSessionsInput.disabled = !isAdmin || busy;
+    botLabGenerateSourceSelect.disabled = !isAdmin || busy;
+    botLabGenerateButton.disabled = !isAdmin || busy;
+    botLabBenchmarkButton.disabled = !isAdmin || busy;
+    botLabApplyBenchmarkArchButton.disabled = !isAdmin || busy;
+
+    const setVisualState = (button: HTMLButtonElement, enabled: boolean) => {
+      button.style.opacity = enabled ? '1' : '0.65';
+      button.style.cursor = enabled ? 'pointer' : 'default';
+    };
+    setVisualState(
+      botLabFetchCurrentButton,
+      !botLabFetchCurrentButton.disabled,
+    );
+    setVisualState(
+      botLabRefreshPoliciesButton,
+      !botLabRefreshPoliciesButton.disabled,
+    );
+    setVisualState(botLabPolicyNextButton, !botLabPolicyNextButton.disabled);
+    setVisualState(botLabPolicyLoadButton, !botLabPolicyLoadButton.disabled);
+    setVisualState(
+      botLabPolicySelectCurrentButton,
+      !botLabPolicySelectCurrentButton.disabled,
+    );
+    setVisualState(botLabPolicyPinButton, !botLabPolicyPinButton.disabled);
+    setVisualState(botLabPolicyUnpinButton, !botLabPolicyUnpinButton.disabled);
+    setVisualState(
+      botLabPublishPolicyButton,
+      !botLabPublishPolicyButton.disabled,
+    );
+    setVisualState(botLabTrainButton, !botLabTrainButton.disabled);
+    setVisualState(
+      botLabHeadlessValidateButton,
+      !botLabHeadlessValidateButton.disabled,
+    );
+    setVisualState(botLabStartGuiButton, !botLabStartGuiButton.disabled);
+    setVisualState(botLabStopGuiButton, !botLabStopGuiButton.disabled);
+    setVisualState(botLabGenerateButton, !botLabGenerateButton.disabled);
+    setVisualState(botLabBenchmarkButton, !botLabBenchmarkButton.disabled);
+    setVisualState(
+      botLabApplyBenchmarkArchButton,
+      !botLabApplyBenchmarkArchButton.disabled,
+    );
+  };
+
   const formatMyModelsTrainingSummary = (
     stats: MenuLocalTrainingStats,
     preset: MenuLocalTrainingPreset,
@@ -3786,13 +4350,6 @@ input[type=number] {
     adminPrepareManifestButton.disabled = !isAdmin || busy;
     adminTrainGlobalOneShotButton.disabled = !isAdmin || busy;
     adminPublishGlobalCandidateButton.disabled = !isAdmin || busy;
-    adminBotEpisodesInput.disabled = !isAdmin || busy;
-    adminBotPiecesInput.disabled = !isAdmin || busy;
-    adminTrainBotPolicyButton.disabled = !isAdmin || busy;
-    adminGenerateBotSessionsInput.disabled = !isAdmin || busy;
-    adminGenerateBotRecordingsButton.disabled = !isAdmin || busy;
-    adminRunBenchmarkButton.disabled = !isAdmin || busy;
-    adminApplyBenchmarkArchButton.disabled = !isAdmin || busy;
     adminWhoAmIButton.disabled = !isAdmin || busy;
     adminOpenRouteButton.disabled = busy;
     adminPublishBaselineButton.disabled = !isAdmin || busy;
@@ -3826,12 +4383,6 @@ input[type=number] {
       !isAdmin || busy ? '0.65' : '1';
     adminPublishGlobalCandidateButton.style.opacity =
       !isAdmin || busy ? '0.65' : '1';
-    adminTrainBotPolicyButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
-    adminGenerateBotRecordingsButton.style.opacity =
-      !isAdmin || busy ? '0.65' : '1';
-    adminRunBenchmarkButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
-    adminApplyBenchmarkArchButton.style.opacity =
-      !isAdmin || busy ? '0.65' : '1';
     adminBaselinesRefreshButton.style.opacity =
       !isAdmin || baselinesBusy ? '0.65' : '1';
     adminBaselinesSetDefaultButton.style.opacity =
@@ -3858,14 +4409,6 @@ input[type=number] {
     adminTrainGlobalOneShotButton.style.cursor =
       !isAdmin || busy ? 'default' : 'pointer';
     adminPublishGlobalCandidateButton.style.cursor =
-      !isAdmin || busy ? 'default' : 'pointer';
-    adminTrainBotPolicyButton.style.cursor =
-      !isAdmin || busy ? 'default' : 'pointer';
-    adminGenerateBotRecordingsButton.style.cursor =
-      !isAdmin || busy ? 'default' : 'pointer';
-    adminRunBenchmarkButton.style.cursor =
-      !isAdmin || busy ? 'default' : 'pointer';
-    adminApplyBenchmarkArchButton.style.cursor =
       !isAdmin || busy ? 'default' : 'pointer';
     adminBaselinesRefreshButton.style.cursor =
       !isAdmin || baselinesBusy ? 'default' : 'pointer';
@@ -3931,6 +4474,7 @@ input[type=number] {
         : 'none';
     updateMyModelsControls();
     updateAdminControls();
+    updateBotLabControls();
   };
 
   const setAuthState = (state: MenuAuthState) => {
@@ -4339,94 +4883,6 @@ input[type=number] {
     }
   });
 
-  adminTrainBotPolicyButton.addEventListener('click', async () => {
-    if (adminActionPending) return;
-    adminActionPending = true;
-    setAdminActionStatus('Training bot policy...');
-    updateAdminControls();
-    try {
-      const message = await onAdminTrainBotPolicyOneShot({
-        episodes: parsePositiveIntInput(adminBotEpisodesInput),
-        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
-      });
-      setAdminActionStatus(message, 'success');
-    } catch (error) {
-      setAdminActionStatus(
-        toErrorMessage(error, 'Could not train bot policy.'),
-        'error',
-      );
-    } finally {
-      adminActionPending = false;
-      updateAdminControls();
-    }
-  });
-
-  adminGenerateBotRecordingsButton.addEventListener('click', async () => {
-    if (adminActionPending) return;
-    adminActionPending = true;
-    setAdminActionStatus('Generating bot recordings...');
-    updateAdminControls();
-    try {
-      const message = await onAdminGenerateBotRecordings({
-        sessions: parsePositiveIntInput(adminGenerateBotSessionsInput),
-        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
-      });
-      setAdminActionStatus(message, 'success');
-    } catch (error) {
-      setAdminActionStatus(
-        toErrorMessage(error, 'Could not generate bot recordings.'),
-        'error',
-      );
-    } finally {
-      adminActionPending = false;
-      updateAdminControls();
-    }
-  });
-
-  adminRunBenchmarkButton.addEventListener('click', async () => {
-    if (adminActionPending) return;
-    adminActionPending = true;
-    setAdminActionStatus('Running capability benchmark...');
-    updateAdminControls();
-    try {
-      const message = await onAdminRunCapabilityBenchmark({
-        episodes: Math.max(
-          1,
-          parsePositiveIntInput(adminBotEpisodesInput) ?? 3,
-        ),
-        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
-      });
-      setAdminActionStatus(message, 'success');
-    } catch (error) {
-      setAdminActionStatus(
-        toErrorMessage(error, 'Could not run capability benchmark.'),
-        'error',
-      );
-    } finally {
-      adminActionPending = false;
-      updateAdminControls();
-    }
-  });
-
-  adminApplyBenchmarkArchButton.addEventListener('click', async () => {
-    if (adminActionPending) return;
-    adminActionPending = true;
-    setAdminActionStatus('Applying benchmark recommendation...');
-    updateAdminControls();
-    try {
-      const message = await onAdminApplyBenchmarkSuggestedArch();
-      setAdminActionStatus(message, 'success');
-    } catch (error) {
-      setAdminActionStatus(
-        toErrorMessage(error, 'Could not apply benchmark recommendation.'),
-        'error',
-      );
-    } finally {
-      adminActionPending = false;
-      updateAdminControls();
-    }
-  });
-
   adminBaselinesSelect.addEventListener('change', () => {
     const value = adminBaselinesSelect.value.trim();
     adminSelectedBaselineId = value.length > 0 ? value : null;
@@ -4585,6 +5041,389 @@ input[type=number] {
     }
   });
 
+  botLabPoliciesSelect.addEventListener('change', () => {
+    const value = botLabPoliciesSelect.value.trim();
+    botLabSelectedPolicyId = value.length > 0 ? value : null;
+    updateBotLabControls();
+  });
+
+  const loadBotLabPolicies = async (options?: {
+    useNextCursor?: boolean;
+    silent?: boolean;
+  }): Promise<void> => {
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    if (!isAdmin) {
+      setBotLabActionStatus('Admin account required.', 'error');
+      return;
+    }
+    if (botLabListPending) return;
+    botLabListPending = true;
+    setBotLabActionStatus(
+      options?.useNextCursor
+        ? 'Loading next bot policy page...'
+        : 'Loading bot policies...',
+    );
+    updateBotLabControls();
+    try {
+      const page = await onBotLabListPolicies({
+        limit: 12,
+        cursor: options?.useNextCursor ? botLabPolicyCursor : null,
+      });
+      botLabPolicies = page.policies;
+      botLabPolicyCursor = page.page.nextCursor;
+      renderBotLabPoliciesSelect();
+      if (!options?.silent) {
+        setBotLabActionStatus(
+          `Loaded ${page.page.returned} bot polic${page.page.returned === 1 ? 'y' : 'ies'}.`,
+          'success',
+        );
+      }
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not load bot policies.'),
+        'error',
+      );
+    } finally {
+      botLabListPending = false;
+      updateBotLabControls();
+    }
+  };
+
+  botLabFetchCurrentButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Loading current bot policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabFetchCurrentPolicy();
+      const currentMatch = /Loaded current bot policy:\s*([a-z0-9-]{36})/i.exec(
+        message,
+      );
+      botLabCurrentPolicyId = currentMatch?.[1] ?? null;
+      setBotLabActionStatus(message, 'success');
+      await loadBotLabPolicies({ silent: true });
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not load current bot policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabRefreshPoliciesButton.addEventListener('click', () => {
+    botLabPolicyCursor = null;
+    void loadBotLabPolicies();
+  });
+
+  botLabPolicyNextButton.addEventListener('click', () => {
+    void loadBotLabPolicies({ useNextCursor: true });
+  });
+
+  botLabPolicyLoadButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    if (!botLabSelectedPolicyId) {
+      setBotLabActionStatus('Select a policy first.', 'error');
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Loading selected bot policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabLoadPolicyById(botLabSelectedPolicyId);
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not load selected policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabPolicySelectCurrentButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    if (!botLabSelectedPolicyId) {
+      setBotLabActionStatus('Select a policy first.', 'error');
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Setting current bot policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabSelectCurrentPolicy(botLabSelectedPolicyId);
+      botLabCurrentPolicyId = botLabSelectedPolicyId;
+      setBotLabActionStatus(message, 'success');
+      renderBotLabPoliciesSelect();
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not set current policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabPolicyPinButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    if (!botLabSelectedPolicyId) {
+      setBotLabActionStatus('Select a policy first.', 'error');
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Pinning policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabPinPolicy(botLabSelectedPolicyId);
+      setBotLabActionStatus(message, 'success');
+      await loadBotLabPolicies({ silent: true });
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not pin policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabPolicyUnpinButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    if (!botLabSelectedPolicyId) {
+      setBotLabActionStatus('Select a policy first.', 'error');
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Unpinning policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabUnpinPolicy(botLabSelectedPolicyId);
+      setBotLabActionStatus(message, 'success');
+      await loadBotLabPolicies({ silent: true });
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not unpin policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabPublishPolicyButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Publishing loaded policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabPublishPolicy({
+        pin: botLabPublishPinToggle.checked,
+        setCurrent: botLabPublishCurrentToggle.checked,
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabPublishSourceSelect.value,
+          'bag7',
+        ),
+      });
+      if (botLabPublishCurrentToggle.checked && botLabSelectedPolicyId) {
+        botLabCurrentPolicyId = botLabSelectedPolicyId;
+      }
+      setBotLabActionStatus(message, 'success');
+      await loadBotLabPolicies({ silent: true });
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not publish bot policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabTrainButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Training bot policy...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabTrainPolicyOneShot({
+        episodes: parsePositiveIntInput(botLabEpisodesInput),
+        maxPiecesPerEpisode: parsePositiveIntInput(botLabMaxPiecesInput),
+        seed: readOptionalSeedInput(botLabSeedInput),
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabTrainSourceSelect.value,
+          'bag7',
+        ),
+      });
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not train bot policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabHeadlessValidateButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Running headless 10k validation...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabRunHeadlessValidate({
+        maxPieces: 10_000,
+        seed: readOptionalSeedInput(botLabSeedInput),
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabTrainSourceSelect.value,
+          'bag7',
+        ),
+      });
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not run headless validation.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabStartGuiButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Starting GUI inspect...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabStartGuiInspect({
+        apmInput: parsePositiveIntInput(botLabGuiApmInput),
+        seed: readOptionalSeedInput(botLabGuiSeedInput),
+        pieces: parsePositiveIntInput(botLabGuiPiecesInput),
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabGuiSourceSelect.value,
+          'bag7',
+        ),
+      });
+      botLabGuiInspectRunning = true;
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      botLabGuiInspectRunning = false;
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not start GUI inspect.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabStopGuiButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Stopping GUI inspect...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabStopGuiInspect();
+      botLabGuiInspectRunning = false;
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not stop GUI inspect.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabGenerateButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Generating bot recordings...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabGenerateRecordings({
+        sessions: parsePositiveIntInput(botLabGenerateSessionsInput),
+        maxPiecesPerEpisode: parsePositiveIntInput(botLabMaxPiecesInput),
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabGenerateSourceSelect.value,
+          'active_generator',
+        ),
+      });
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not generate bot recordings.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabBenchmarkButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Running bot benchmark...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabRunBenchmark({
+        episodes: parsePositiveIntInput(botLabEpisodesInput),
+        maxPiecesPerEpisode: parsePositiveIntInput(botLabMaxPiecesInput),
+        pieceSourceProfile: parseBotPieceSourceProfile(
+          botLabGenerateSourceSelect.value,
+          'bag7',
+        ),
+      });
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not run bot benchmark.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabApplyBenchmarkArchButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Applying benchmark architecture recommendation...');
+    updateBotLabControls();
+    try {
+      const message = await onAdminApplyBenchmarkSuggestedArch();
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not apply benchmark recommendation.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
   accountLogoutButton.addEventListener('click', async () => {
     if (authActionPending) return;
     authActionPending = true;
@@ -4736,6 +5575,7 @@ input[type=number] {
   adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
   adminLoadedSummary.textContent = 'No recording loaded.';
   setAuthState(currentAuthState);
+  setBotLabActionStatus('');
 
   const menuLayer = document.createElement('div');
   Object.assign(menuLayer.style, {
@@ -4762,6 +5602,7 @@ input[type=number] {
   menuLayer.appendChild(accountPanel);
   menuLayer.appendChild(myModelsPanel);
   menuLayer.appendChild(adminPanel);
+  menuLayer.appendChild(botLabPanel);
   root.appendChild(menuLayer);
 
   const feedbackMenuButton = makeMenuButton('LEAVE FEEDBACK');
@@ -4858,9 +5699,13 @@ input[type=number] {
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     myModelsPanel.style.display = panel === 'my_models' ? 'flex' : 'none';
     adminPanel.style.display = panel === 'admin' ? 'flex' : 'none';
+    botLabPanel.style.display = panel === 'bot_lab' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display =
-      panel === 'options' || panel === 'my_models' || panel === 'admin'
+      panel === 'options' ||
+      panel === 'my_models' ||
+      panel === 'admin' ||
+      panel === 'bot_lab'
         ? 'none'
         : 'block';
     if (panel === 'options') {
@@ -4871,6 +5716,9 @@ input[type=number] {
     }
     if (panel === 'admin') {
       updateAdminControls();
+    }
+    if (panel === 'bot_lab') {
+      updateBotLabControls();
     }
   };
 
@@ -4884,6 +5732,7 @@ input[type=number] {
   accountButton.addEventListener('click', () => show('account'));
   myModelsButton.addEventListener('click', () => show('my_models'));
   adminButton.addEventListener('click', () => show('admin'));
+  botLabButton.addEventListener('click', () => show('bot_lab'));
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 
@@ -4932,6 +5781,7 @@ input[type=number] {
   accountBackButton.addEventListener('click', showMain);
   myModelsBackButton.addEventListener('click', showMain);
   adminBackButton.addEventListener('click', showMain);
+  botLabBackButton.addEventListener('click', showMain);
 
   window.addEventListener('keydown', (event) => {
     if (event.code !== 'Escape') return;

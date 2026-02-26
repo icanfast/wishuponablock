@@ -26,6 +26,7 @@ export type TrajectorySessionMetaV1 = {
   actorType?: 'human' | 'bot';
   actorPolicyId?: string;
   trainingIntent?: string;
+  pieceSourceProfile?: string;
 };
 
 export type TrajectorySessionSampleV1 = {
@@ -203,6 +204,7 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
     actorTypeRaw === 'human' || actorTypeRaw === 'bot' ? actorTypeRaw : null;
   const actorPolicyId = asString(obj.actorPolicyId, 1, 128);
   const trainingIntent = asString(obj.trainingIntent, 1, 128);
+  const pieceSourceProfile = asString(obj.pieceSourceProfile, 1, 64);
   const rewardGamma =
     obj.rewardGamma == null
       ? null
@@ -228,6 +230,7 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   if (actorType) meta.actorType = actorType;
   if (actorPolicyId) meta.actorPolicyId = actorPolicyId;
   if (trainingIntent) meta.trainingIntent = trainingIntent;
+  if (pieceSourceProfile) meta.pieceSourceProfile = pieceSourceProfile;
   if (rewardGamma != null) meta.rewardGamma = rewardGamma;
   if (modelVersion != null) meta.modelVersion = modelVersion;
   if (obj.rewardGamma != null && rewardGamma == null) return null;

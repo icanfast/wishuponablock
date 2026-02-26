@@ -92,9 +92,15 @@ export type BotMacroAction = {
   moveX: number;
 };
 
+export type BotPieceSourceProfile = 'bag7' | 'active_generator';
+
 export type BotPolicyArtifact = {
   id: string;
   modeId: string;
+  archId?: string;
+  queuePolicyId?: string;
+  pipelineId?: string;
+  pieceSourceProfile?: BotPieceSourceProfile;
   createdAtMs: number;
   inputDim: number;
   hiddenDim: number;
@@ -122,6 +128,7 @@ export type BotTrainOneShotConfig = {
   valueWeight?: number;
   epochs?: number;
   seed?: number;
+  pieceSourceProfile?: BotPieceSourceProfile;
 };
 
 export type BotTrainOneShotResult = {
@@ -175,6 +182,7 @@ export type BotGenerateBatchConfig = {
   maxPiecesPerEpisode?: number;
   seed?: number;
   trainingIntent?: string;
+  pieceSourceProfile?: BotPieceSourceProfile;
 };
 
 export type BotGenerateBatchResult = {
@@ -194,6 +202,7 @@ export type CapabilityBenchmarkConfig = {
   episodes?: number;
   maxPiecesPerEpisode?: number;
   seed?: number;
+  pieceSourceProfile?: BotPieceSourceProfile;
 };
 
 export type CapabilityBenchmarkResult = {
@@ -207,6 +216,32 @@ export type CapabilityBenchmarkResult = {
     simThroughput: number;
     targetSimFps: number;
   };
+};
+
+export type BotHeadlessValidateConfig = {
+  modeId: string;
+  settings: Settings;
+  model: LoadedModel;
+  modelRunner: ModelRunner;
+  modelAxes: ModelAxes;
+  policy: BotPolicyArtifact;
+  maxPieces?: number;
+  seed?: number;
+  pieceSourceProfile?: BotPieceSourceProfile;
+};
+
+export type BotHeadlessValidateResult = {
+  piecesSurvived: number;
+  outcome: 'game_over' | 'game_won' | 'manual';
+  meanDecisionMs: number;
+  p95DecisionMs: number;
+  meanTickMs: number;
+  p95TickMs: number;
+  meanBoardScoreDelta: number;
+  totalReward: number;
+  startedAtMs: number;
+  endedAtMs: number;
+  durationMs: number;
 };
 
 type PolicyParams = {
@@ -231,6 +266,10 @@ type RolloutResult = {
   decisions: ModelGeneratorDecisionEvent[];
   tickDurationsMs: number[];
   steps: number;
+  piecesPlaced: number;
+  boardScoreDeltas: number[];
+  boardScoreStart: number;
+  boardScoreEnd: number;
   startedAtMs: number;
   endedAtMs: number;
   outcome: 'game_over' | 'game_won' | 'manual';
@@ -282,6 +321,69 @@ const countBoardHoles = (board: Board): number => {
   return holes;
 };
 
+const countBoardBlocks = (board: Board): number => {
+  let blocks = 0;
+  for (const row of board) {
+    for (const cell of row) {
+      if (cell != null) blocks += 1;
+    }
+  }
+  return blocks;
+};
+
+const getStackHeight = (board: Board): number => {
+  const rows = board.length;
+  for (let y = 0; y < rows; y += 1) {
+    if (board[y].some((cell) => cell != null)) {
+      return rows - y;
+    }
+  }
+  return 0;
+};
+
+const getCharcuterieHolePenalty = (board: Board): number => {
+  const rows = board.length;
+  let penalty = 0;
+  for (let y = rows - 1; y >= 0; y -= 1) {
+    const row = board[y];
+    let empty = 0;
+    let anyFilled = false;
+    for (const cell of row) {
+      if (cell == null) {
+        empty += 1;
+      } else {
+        anyFilled = true;
+      }
+    }
+    if (!anyFilled) continue;
+    const extraHoles = Math.max(0, empty - 1);
+    if (extraHoles === 0) continue;
+    const depth = rows - 1 - y;
+    if (depth < 4) {
+      penalty += extraHoles * CHARCUTERIE_HOLE_WEIGHTS.bottom;
+    } else if (depth < 8) {
+      penalty += extraHoles * CHARCUTERIE_HOLE_WEIGHTS.mid;
+    }
+  }
+  return penalty;
+};
+
+const scoreCharcuterieBoard = (
+  board: Board,
+  gameOver: boolean,
+  clears: number,
+): number => {
+  const height = getStackHeight(board) + (gameOver ? board.length : 0);
+  const holes = getCharcuterieHolePenalty(board);
+  const blocks = countBoardBlocks(board);
+  return (
+    height * CHARCUTERIE_SCORE_WEIGHTS.height +
+    holes * CHARCUTERIE_SCORE_WEIGHTS.holes +
+    blocks * CHARCUTERIE_SCORE_WEIGHTS.blocks -
+    clears * CHARCUTERIE_SCORE_WEIGHTS.clears
+  );
+};
+
 const softmax = (logits: Float32Array): Float32Array => {
   if (logits.length === 0) return new Float32Array();
   let maxValue = logits[0];
@@ -322,6 +424,23 @@ const sampleIndex = (probabilities: Float32Array, rng: XorShift32): number => {
 const actionSpace: BotMacroAction[] = ACTION_ROTATIONS.flatMap((rotation) =>
   ACTION_MOVE_X.map((moveX) => ({ rotation, moveX })),
 );
+
+const CHARCUTERIE_SCORE_WEIGHTS = {
+  height: 10,
+  holes: 20,
+  blocks: 0.01,
+  clears: 100,
+} as const;
+
+const CHARCUTERIE_HOLE_WEIGHTS = {
+  bottom: 5,
+  mid: 2,
+} as const;
+
+const normalizePieceSourceProfile = (
+  value: BotPieceSourceProfile | undefined,
+): BotPieceSourceProfile =>
+  value === 'active_generator' ? 'active_generator' : 'bag7';
 
 const asInputFrame = (action: BotMacroAction): InputFrame => ({
   ...EMPTY_INPUT,
@@ -493,6 +612,7 @@ const buildHeadlessGame = (config: {
   model: LoadedModel;
   modelRunner: ModelRunner;
   modelAxes: ModelAxes;
+  pieceSourceProfile: BotPieceSourceProfile;
   seed: number;
   onDecision: (event: ModelGeneratorDecisionEvent) => void;
 }): { game: Game; runner: GameRunner } => {
@@ -507,6 +627,13 @@ const buildHeadlessGame = (config: {
     },
     mode,
   );
+  const generatorSettings =
+    config.pieceSourceProfile === 'bag7'
+      ? {
+          ...merged.generator,
+          type: 'bag7' as const,
+        }
+      : merged.generator;
   const game = new Game({
     seed: config.seed,
     ...merged.game,
@@ -516,7 +643,7 @@ const buildHeadlessGame = (config: {
     lineGoal: mode.lineGoal,
     classicStartLevel: mode.classicStartLevel,
     scoringEnabled: mode.scoringEnabled,
-    generatorFactory: createGeneratorFactory(merged.generator, {
+    generatorFactory: createGeneratorFactory(generatorSettings, {
       mlModel: config.model,
       mlRunner: config.modelRunner,
       queuePolicyId: config.modelAxes.queuePolicyId,
@@ -536,8 +663,16 @@ const computePieceReward = (options: {
   scoreDelta: number;
   timeDeltaMs: number;
   holesDelta: number;
+  boardScoreDelta: number;
 }): number => {
-  const { modeId, linesDelta, scoreDelta, timeDeltaMs, holesDelta } = options;
+  const {
+    modeId,
+    linesDelta,
+    scoreDelta,
+    timeDeltaMs,
+    holesDelta,
+    boardScoreDelta,
+  } = options;
   const survivalBonus = 0.02;
   if (modeId === 'sprint') {
     return (
@@ -548,7 +683,12 @@ const computePieceReward = (options: {
     return linesDelta * 0.6 + scoreDelta * 0.002 + survivalBonus;
   }
   if (modeId === 'charcuterie') {
-    return linesDelta * 0.4 - Math.max(0, holesDelta) * 0.05 + survivalBonus;
+    return (
+      boardScoreDelta * 0.12 +
+      linesDelta * 0.15 -
+      timeDeltaMs / 2500 +
+      survivalBonus
+    );
   }
   if (modeId === 'cheese') {
     return linesDelta * 0.7 - Math.max(0, holesDelta) * 0.03 + survivalBonus;
@@ -564,6 +704,7 @@ const runRollout = (config: {
   model: LoadedModel;
   modelRunner: ModelRunner;
   modelAxes: ModelAxes;
+  pieceSourceProfile: BotPieceSourceProfile;
   policyParams: PolicyParams;
   seed: number;
   maxPieces: number;
@@ -576,6 +717,7 @@ const runRollout = (config: {
     model: config.model,
     modelRunner: config.modelRunner,
     modelAxes: config.modelAxes,
+    pieceSourceProfile: config.pieceSourceProfile,
     seed: config.seed,
     onDecision: (event) => {
       decisions.push(cloneDecision(event));
@@ -610,6 +752,13 @@ const runRollout = (config: {
   let previousScore = game.state.score;
   let previousTimeMs = game.state.timeMs;
   let previousHoles = countBoardHoles(game.state.board);
+  let previousBoardScore = scoreCharcuterieBoard(
+    game.state.board,
+    game.state.gameOver,
+    game.state.totalLinesCleared,
+  );
+  const boardScoreStart = previousBoardScore;
+  const boardScoreDeltas: number[] = [];
   const tickDurationsMs: number[] = [];
 
   while (
@@ -626,18 +775,27 @@ const runRollout = (config: {
 
     if (game.state.active !== lastActive) {
       const holes = countBoardHoles(game.state.board);
+      const nextBoardScore = scoreCharcuterieBoard(
+        game.state.board,
+        game.state.gameOver,
+        game.state.totalLinesCleared,
+      );
+      const boardScoreDelta = previousBoardScore - nextBoardScore;
+      boardScoreDeltas.push(boardScoreDelta);
       const reward = computePieceReward({
         modeId: config.modeId,
         linesDelta: game.state.totalLinesCleared - previousLines,
         scoreDelta: game.state.score - previousScore,
         timeDeltaMs: game.state.timeMs - previousTimeMs,
         holesDelta: holes - previousHoles,
+        boardScoreDelta,
       });
       bot.onPiecePlaced(reward);
       previousLines = game.state.totalLinesCleared;
       previousScore = game.state.score;
       previousTimeMs = game.state.timeMs;
       previousHoles = holes;
+      previousBoardScore = nextBoardScore;
       piecesPlaced += 1;
       lastActive = game.state.active;
     }
@@ -664,6 +822,10 @@ const runRollout = (config: {
     decisions,
     tickDurationsMs,
     steps,
+    piecesPlaced,
+    boardScoreDeltas,
+    boardScoreStart,
+    boardScoreEnd: previousBoardScore,
     startedAtMs,
     endedAtMs: Date.now(),
     outcome,
@@ -871,6 +1033,9 @@ export const trainBotPolicyOneShot = async (
   const valueWeight = clamp(config.valueWeight ?? 0.5, 0, 10);
   const epochs = Math.max(1, Math.trunc(config.epochs ?? 6));
   const seed = Math.max(1, Math.trunc(config.seed ?? Date.now()));
+  const pieceSourceProfile = normalizePieceSourceProfile(
+    config.pieceSourceProfile,
+  );
 
   const inputDim = encodeObservation(
     buildHeadlessGame({
@@ -879,6 +1044,7 @@ export const trainBotPolicyOneShot = async (
       model: config.model,
       modelRunner: config.modelRunner,
       modelAxes: config.modelAxes,
+      pieceSourceProfile,
       seed,
       onDecision: () => {},
     }).game.state,
@@ -899,6 +1065,7 @@ export const trainBotPolicyOneShot = async (
       model: config.model,
       modelRunner: config.modelRunner,
       modelAxes: config.modelAxes,
+      pieceSourceProfile,
       policyParams: params,
       seed: seed + episode * 997,
       maxPieces: maxPiecesPerEpisode,
@@ -948,6 +1115,10 @@ export const trainBotPolicyOneShot = async (
   });
   params = trained.params;
   const policyArtifact = toArtifact(config.modeId, params);
+  policyArtifact.archId = config.modelAxes.arch;
+  policyArtifact.queuePolicyId = config.modelAxes.queuePolicyId;
+  policyArtifact.pipelineId = 'bot_reinforce_v1';
+  policyArtifact.pieceSourceProfile = pieceSourceProfile;
 
   return {
     ok: true,
@@ -970,6 +1141,9 @@ export const generateBotTrajectoryBatch = async (
     Math.trunc(config.maxPiecesPerEpisode ?? 140),
   );
   const seed = Math.max(1, Math.trunc(config.seed ?? Date.now()));
+  const pieceSourceProfile = normalizePieceSourceProfile(
+    config.pieceSourceProfile ?? 'active_generator',
+  );
   const params = fromArtifact(config.policy);
   const drafts: BotTrajectoryDraft[] = [];
   let samplesGenerated = 0;
@@ -981,6 +1155,7 @@ export const generateBotTrajectoryBatch = async (
       model: config.model,
       modelRunner: config.modelRunner,
       modelAxes: config.modelAxes,
+      pieceSourceProfile,
       policyParams: params,
       seed: seed + index * 811,
       maxPieces: maxPiecesPerEpisode,
@@ -1019,6 +1194,9 @@ export const runCapabilityBenchmark = async (
     Math.trunc(config.maxPiecesPerEpisode ?? 160),
   );
   const seed = Math.max(1, Math.trunc(config.seed ?? 42_030));
+  const pieceSourceProfile = normalizePieceSourceProfile(
+    config.pieceSourceProfile,
+  );
   const params = fromArtifact(config.policy);
   const decisionDurations: number[] = [];
   const tickDurations: number[] = [];
@@ -1032,6 +1210,7 @@ export const runCapabilityBenchmark = async (
       model: config.model,
       modelRunner: config.modelRunner,
       modelAxes: config.modelAxes,
+      pieceSourceProfile,
       policyParams: params,
       seed: seed + episode * 101,
       maxPieces: maxPiecesPerEpisode,
@@ -1082,6 +1261,193 @@ export const runCapabilityBenchmark = async (
       p95TickMs,
       simThroughput,
       targetSimFps,
+    },
+  };
+};
+
+export const runHeadlessBotValidation = async (
+  config: BotHeadlessValidateConfig,
+): Promise<BotHeadlessValidateResult> => {
+  const maxPieces = Math.max(1, Math.trunc(config.maxPieces ?? 10_000));
+  const seed = Math.max(1, Math.trunc(config.seed ?? 42_030));
+  const pieceSourceProfile = normalizePieceSourceProfile(
+    config.pieceSourceProfile,
+  );
+  const params = fromArtifact(config.policy);
+  const rollout = runRollout({
+    modeId: config.modeId,
+    settings: config.settings,
+    model: config.model,
+    modelRunner: config.modelRunner,
+    modelAxes: config.modelAxes,
+    pieceSourceProfile,
+    policyParams: params,
+    seed,
+    maxPieces,
+    greedy: true,
+  });
+  const decisionDurations = rollout.decisions
+    .map((decision) =>
+      Number.isFinite(decision.totalMs) ? Math.max(0, decision.totalMs) : null,
+    )
+    .filter((value): value is number => value != null);
+  const totalReward = rollout.transitions.reduce(
+    (sum, transition) => sum + (transition.reward ?? 0),
+    0,
+  );
+  return {
+    piecesSurvived: rollout.piecesPlaced,
+    outcome: rollout.outcome,
+    meanDecisionMs: mean(decisionDurations),
+    p95DecisionMs: percentile(decisionDurations, 0.95),
+    meanTickMs: mean(rollout.tickDurationsMs),
+    p95TickMs: percentile(rollout.tickDurationsMs, 0.95),
+    meanBoardScoreDelta: mean(rollout.boardScoreDeltas),
+    totalReward,
+    startedAtMs: rollout.startedAtMs,
+    endedAtMs: rollout.endedAtMs,
+    durationMs: Math.max(0, rollout.endedAtMs - rollout.startedAtMs),
+  };
+};
+
+export type BotGuiInputSourceConfig = {
+  policy: BotPolicyArtifact;
+  apmInput: number;
+  seed?: number;
+  greedy?: boolean;
+};
+
+export const createGuiInspectBotInputSource = (
+  config: BotGuiInputSourceConfig,
+): InputSource => {
+  const params = fromArtifact(config.policy);
+  const seed = Math.max(1, Math.trunc(config.seed ?? Date.now()));
+  const greedy = config.greedy !== false;
+  const clampedApm = clamp(config.apmInput, 20, 1200);
+  const actionIntervalMs = 60_000 / clampedApm;
+  let rng = new XorShift32(seed ^ 0x517cc1b7);
+  let activeRef: GameState['active'] | null = null;
+  let queue: InputFrame[] = [];
+  let cooldownMs = 0;
+
+  const nextFrame = (frame: InputFrame): InputFrame => ({
+    ...EMPTY_INPUT,
+    moveX: frame.moveX,
+    rotate: frame.rotate,
+    rotate180: frame.rotate180,
+    softDrop: frame.softDrop,
+    hardDrop: frame.hardDrop,
+    hold: frame.hold,
+  });
+
+  const queueFromMacro = (action: BotMacroAction): InputFrame[] => {
+    const frames: InputFrame[] = [];
+    if (action.rotation === 'cw') {
+      frames.push(
+        nextFrame({
+          ...EMPTY_INPUT,
+          moveX: 0,
+          rotate: 1,
+          rotate180: false,
+          softDrop: false,
+          hardDrop: false,
+          hold: false,
+          restart: false,
+        }),
+      );
+    } else if (action.rotation === 'ccw') {
+      frames.push(
+        nextFrame({
+          ...EMPTY_INPUT,
+          moveX: 0,
+          rotate: -1,
+          rotate180: false,
+          softDrop: false,
+          hardDrop: false,
+          hold: false,
+          restart: false,
+        }),
+      );
+    } else if (action.rotation === '180') {
+      frames.push(
+        nextFrame({
+          ...EMPTY_INPUT,
+          moveX: 0,
+          rotate: 0,
+          rotate180: true,
+          softDrop: false,
+          hardDrop: false,
+          hold: false,
+          restart: false,
+        }),
+      );
+    }
+
+    const steps = Math.max(0, Math.min(10, Math.abs(Math.trunc(action.moveX))));
+    const dir = action.moveX < 0 ? -1 : 1;
+    for (let i = 0; i < steps; i += 1) {
+      frames.push(
+        nextFrame({
+          ...EMPTY_INPUT,
+          moveX: dir,
+          rotate: 0,
+          rotate180: false,
+          softDrop: false,
+          hardDrop: false,
+          hold: false,
+          restart: false,
+        }),
+      );
+    }
+
+    frames.push(
+      nextFrame({
+        ...EMPTY_INPUT,
+        moveX: 0,
+        rotate: 0,
+        rotate180: false,
+        softDrop: false,
+        hardDrop: true,
+        hold: false,
+        restart: false,
+      }),
+    );
+    return frames;
+  };
+
+  return {
+    sample: (state, dtMs) => {
+      cooldownMs = Math.max(0, cooldownMs - Math.max(0, dtMs));
+      if (state.active !== activeRef) {
+        activeRef = state.active;
+        const observation = encodeObservation(state);
+        const forward = forwardPolicy(params, observation);
+        let actionIndex = 0;
+        if (greedy) {
+          let best = forward.logits[0] ?? Number.NEGATIVE_INFINITY;
+          for (let i = 1; i < forward.logits.length; i += 1) {
+            if (forward.logits[i] > best) {
+              best = forward.logits[i];
+              actionIndex = i;
+            }
+          }
+        } else {
+          actionIndex = sampleIndex(forward.probabilities, rng);
+        }
+        const action = actionSpace[actionIndex] ?? actionSpace[0];
+        queue = queueFromMacro(action);
+      }
+      if (queue.length === 0) return EMPTY_INPUT;
+      if (cooldownMs > 0) return EMPTY_INPUT;
+      cooldownMs = actionIntervalMs;
+      return queue.shift() ?? EMPTY_INPUT;
+    },
+    reset: (nextSeed) => {
+      const seeded = Math.max(1, Math.trunc(nextSeed));
+      rng = new XorShift32(seeded ^ 0x517cc1b7);
+      activeRef = null;
+      queue = [];
+      cooldownMs = 0;
     },
   };
 };
