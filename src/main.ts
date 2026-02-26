@@ -34,6 +34,13 @@ import {
   type TrajectoryDecisionSample,
 } from './app/trajectoryBuffer';
 import { createTrajectoryRecordingService } from './app/trajectoryRecordingService';
+import {
+  computeTrajectoryRewards,
+  resolveTrajectoryRewardPolicyId,
+  type TrajectoryRewardComputation,
+  type TrajectoryRewardPolicyId,
+  type TrajectoryRewardTerminalStats,
+} from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import {
   TRAJECTORY_SESSION_SCHEMA_V1,
@@ -428,6 +435,10 @@ async function boot() {
   };
   void modelService.ensureLoaded();
   const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
+  const trajectoryRewardPolicyId: TrajectoryRewardPolicyId =
+    resolveTrajectoryRewardPolicyId(
+      import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined,
+    );
   const personalTrainer = createPersonalTrainerTfjs();
   let menuUi: MenuScreen | null = null;
   const modeController = createModeController({
@@ -735,7 +746,10 @@ async function boot() {
   let lastTrajectoryUploadSamples = 0;
   let lastTrajectoryUploadError: string | null = null;
 
-  const toTrajectoryMeta = (outcome: string): TrajectorySessionMetaV1 => {
+  const toTrajectoryMeta = (
+    outcome: string,
+    rewards: TrajectoryRewardComputation | null,
+  ): TrajectorySessionMetaV1 => {
     const meta: TrajectorySessionMetaV1 = {
       outcome,
       channel: import.meta.env.MODE,
@@ -747,28 +761,40 @@ async function boot() {
         meta.modelVersion = activeModelSource.version;
       }
     }
+    if (rewards) {
+      meta.rewardPolicy = rewards.policyId;
+      meta.rewardKind = rewards.kind;
+      meta.rewardGamma = rewards.gamma;
+    }
     return meta;
   };
 
   const toTrajectorySamples = (
     samples: TrajectoryDecisionSample[],
+    rewards: number[],
   ): TrajectorySessionV1['samples'] =>
-    samples.map((sample) => ({
-      id: sample.id,
-      createdAtMs: sample.createdAtMs,
-      deliberationMs: sample.deliberationMs,
-      boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
-      hold: sample.hold,
-      action: sample.action,
-      actionIndex: sample.actionIndex,
-      pieces: [...sample.pieces],
-      logits: [...sample.logits],
-      probabilities: [...sample.probabilities],
-      inferenceMs: sample.inferenceMs,
-      samplingMs: sample.samplingMs,
-      totalDecisionMs: sample.totalDecisionMs,
-      reward: sample.reward,
-    }));
+    samples.map((sample, index) => {
+      const reward = rewards[index];
+      return {
+        id: sample.id,
+        createdAtMs: sample.createdAtMs,
+        deliberationMs: sample.deliberationMs,
+        boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
+        hold: sample.hold,
+        action: sample.action,
+        actionIndex: sample.actionIndex,
+        pieces: [...sample.pieces],
+        logits: [...sample.logits],
+        probabilities: [...sample.probabilities],
+        inferenceMs: sample.inferenceMs,
+        samplingMs: sample.samplingMs,
+        totalDecisionMs: sample.totalDecisionMs,
+        reward:
+          typeof reward === 'number' && Number.isFinite(reward)
+            ? reward
+            : (sample.reward ?? null),
+      };
+    });
 
   const beginTrajectoryRun = (modeId: string): void => {
     activeTrajectoryRun = {
@@ -781,11 +807,21 @@ async function boot() {
   const buildTrajectorySession = (
     run: TrajectoryRunState,
     outcome: string,
+    terminal: TrajectoryRewardTerminalStats | null = null,
   ): TrajectorySessionV1 | null => {
     const runSamples = trajectoryBuffer
       .listSamples({ modeId: run.modeId })
       .filter((sample) => sample.createdAtMs >= run.startedAtMs);
     if (runSamples.length === 0) return null;
+    const rewards = computeTrajectoryRewards(
+      runSamples,
+      {
+        modeId: run.modeId,
+        outcome,
+        terminal,
+      },
+      trajectoryRewardPolicyId,
+    );
     const endedAtMs = Math.max(
       Date.now(),
       runSamples[runSamples.length - 1].createdAtMs,
@@ -798,18 +834,19 @@ async function boot() {
       startedAtMs: run.startedAtMs,
       endedAtMs,
       durationMs: Math.max(0, endedAtMs - run.startedAtMs),
-      samples: toTrajectorySamples(runSamples),
-      meta: toTrajectoryMeta(outcome),
+      samples: toTrajectorySamples(runSamples, rewards.rewards),
+      meta: toTrajectoryMeta(outcome, rewards),
     };
   };
 
   const finalizeTrajectoryRun = (
     outcome: string,
+    terminal: TrajectoryRewardTerminalStats | null = null,
   ): TrajectorySessionV1 | null => {
     const run = activeTrajectoryRun;
     activeTrajectoryRun = null;
     if (!run) return null;
-    const session = buildTrajectorySession(run, outcome);
+    const session = buildTrajectorySession(run, outcome, terminal);
     if (session) {
       pendingTrajectorySession = session;
     }
@@ -832,8 +869,9 @@ async function boot() {
 
   const finalizeAndUploadTrajectoryRun = async (
     outcome: string,
+    terminal: TrajectoryRewardTerminalStats | null = null,
   ): Promise<string> => {
-    const session = finalizeTrajectoryRun(outcome);
+    const session = finalizeTrajectoryRun(outcome, terminal);
     if (!session) {
       lastTrajectoryUploadMessage =
         'No trajectory samples captured for this run.';
@@ -866,6 +904,14 @@ async function boot() {
       throw error;
     }
   };
+
+  const toTrajectoryTerminalStats = (
+    state: GameState,
+  ): TrajectoryRewardTerminalStats => ({
+    totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+    score: Math.max(0, Math.trunc(state.score)),
+    timeMs: Math.max(0, Math.trunc(state.timeMs)),
+  });
 
   const getTrajectoryUploadSummary = (): string => {
     const lines: string[] = [];
@@ -1226,12 +1272,15 @@ async function boot() {
       if (ended && !previousRunEnded) {
         void snapshotService?.flushRemoteUploads();
         const outcome = state.gameWon ? 'game_won' : 'game_over';
+        const terminal = toTrajectoryTerminalStats(state);
         if (authState.authenticated) {
-          void finalizeAndUploadTrajectoryRun(outcome).catch((error) => {
-            console.warn('[trajectory] auto upload failed', error);
-          });
+          void finalizeAndUploadTrajectoryRun(outcome, terminal).catch(
+            (error) => {
+              console.warn('[trajectory] auto upload failed', error);
+            },
+          );
         } else {
-          const finalized = finalizeTrajectoryRun(outcome);
+          const finalized = finalizeTrajectoryRun(outcome, terminal);
           if (finalized) {
             lastTrajectoryUploadMessage =
               'Run captured locally. Sign in and use "UPLOAD TRAJECTORY".';

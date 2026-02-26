@@ -12,6 +12,9 @@ export type TrajectorySessionMetaV1 = {
   modelMode?: string;
   modelVersion?: number | null;
   channel?: string;
+  rewardPolicy?: string;
+  rewardKind?: string;
+  rewardGamma?: number;
 };
 
 export type TrajectorySessionSampleV1 = {
@@ -174,6 +177,12 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   const modelSource = asString(obj.modelSource, 1, 64);
   const modelMode = asString(obj.modelMode, 1, 64);
   const channel = asString(obj.channel, 1, 64);
+  const rewardPolicy = asString(obj.rewardPolicy, 1, 64);
+  const rewardKind = asString(obj.rewardKind, 1, 64);
+  const rewardGamma =
+    obj.rewardGamma == null
+      ? null
+      : asFiniteNumber(obj.rewardGamma, { min: 0, max: 1 });
   const modelVersion =
     obj.modelVersion == null
       ? null
@@ -183,7 +192,11 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   if (modelSource) meta.modelSource = modelSource;
   if (modelMode) meta.modelMode = modelMode;
   if (channel) meta.channel = channel;
+  if (rewardPolicy) meta.rewardPolicy = rewardPolicy;
+  if (rewardKind) meta.rewardKind = rewardKind;
+  if (rewardGamma != null) meta.rewardGamma = rewardGamma;
   if (modelVersion != null) meta.modelVersion = modelVersion;
+  if (obj.rewardGamma != null && rewardGamma == null) return null;
   return Object.keys(meta).length > 0 ? meta : null;
 };
 

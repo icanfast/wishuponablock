@@ -131,6 +131,42 @@ const clampFloat = (
   return Math.max(min, value);
 };
 
+const fallbackDeliberationAdvantage = (
+  sample: TrajectoryDecisionSample,
+): number => {
+  const deliberationPenalty =
+    sample.deliberationMs != null && Number.isFinite(sample.deliberationMs)
+      ? Math.max(0.1, Math.min(5, sample.deliberationMs / 1000))
+      : 1;
+  return 1 / deliberationPenalty;
+};
+
+const resolveSampleAdvantage = (sample: TrajectoryDecisionSample): number => {
+  if (sample.reward != null && Number.isFinite(sample.reward)) {
+    return sample.reward;
+  }
+  return fallbackDeliberationAdvantage(sample);
+};
+
+const normalizeInPlace = (values: Float32Array): void => {
+  if (values.length <= 1) return;
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+  }
+  const mean = sum / values.length;
+  let variance = 0;
+  for (let i = 0; i < values.length; i++) {
+    const diff = values[i] - mean;
+    variance += diff * diff;
+  }
+  variance /= values.length;
+  const std = Math.sqrt(Math.max(1e-8, variance));
+  for (let i = 0; i < values.length; i++) {
+    values[i] = (values[i] - mean) / std;
+  }
+};
+
 const buildBiasAdjustedModelBytes = (
   baseModel: LoadedModel,
   biasDelta: Float32Array,
@@ -213,20 +249,20 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
         const logitsFlat = new Float32Array(eligible.length * numOutputs);
         const actions = new Int32Array(eligible.length);
         const advantages = new Float32Array(eligible.length);
+        let rewardBackedCount = 0;
 
         for (let i = 0; i < eligible.length; i++) {
           const sample = eligible[i];
           actions[i] = sample.actionIndex;
-          const deliberationPenalty =
-            sample.deliberationMs != null &&
-            Number.isFinite(sample.deliberationMs)
-              ? Math.max(0.1, Math.min(5, sample.deliberationMs / 1000))
-              : 1;
-          advantages[i] = 1 / deliberationPenalty;
+          if (sample.reward != null && Number.isFinite(sample.reward)) {
+            rewardBackedCount += 1;
+          }
+          advantages[i] = resolveSampleAdvantage(sample);
           for (let j = 0; j < numOutputs; j++) {
             logitsFlat[i * numOutputs + j] = sample.logits[j];
           }
         }
+        normalizeInPlace(advantages);
 
         logitsTensor = tf.tensor2d(logitsFlat, [eligible.length, numOutputs]);
         actionTensor = tf.tensor1d(actions, 'int32');
@@ -273,7 +309,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
         );
         return {
           ok: true,
-          message: `Bias-only training complete (backend=${backend}).`,
+          message: `Bias-only training complete (backend=${backend}, rewards=${rewardBackedCount}/${eligible.length}).`,
           backend,
           samplesUsed: eligible.length,
           epochs,

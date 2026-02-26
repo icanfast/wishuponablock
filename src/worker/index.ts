@@ -2325,6 +2325,9 @@ const handlePostTrajectoryRecording = async (
     model_mode: recording.meta?.modelMode ?? null,
     model_version: recording.meta?.modelVersion ?? null,
     channel: recording.meta?.channel ?? null,
+    reward_policy: recording.meta?.rewardPolicy ?? null,
+    reward_kind: recording.meta?.rewardKind ?? null,
+    reward_gamma: recording.meta?.rewardGamma ?? null,
   });
 
   try {
