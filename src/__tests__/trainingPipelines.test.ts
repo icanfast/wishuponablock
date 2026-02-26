@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_PERSONAL_TRAINING_PIPELINE_ID,
   getPersonalTrainingPipeline,
+  resolvePersonalTrainingPipelineForContext,
   resolvePersonalTrainingPipelineForMode,
   resolvePersonalTrainingPipelineId,
 } from '../app/trainingPipelines';
@@ -9,6 +10,12 @@ import {
 describe('training pipelines', () => {
   it('resolves unknown ids to the default pipeline', () => {
     expect(resolvePersonalTrainingPipelineId('unknown_pipeline')).toBe(
+      DEFAULT_PERSONAL_TRAINING_PIPELINE_ID,
+    );
+  });
+
+  it('maps legacy personal_rl_v1 alias to the default pipeline', () => {
+    expect(resolvePersonalTrainingPipelineId('personal_rl_v1')).toBe(
       DEFAULT_PERSONAL_TRAINING_PIPELINE_ID,
     );
   });
@@ -37,5 +44,26 @@ describe('training pipelines', () => {
     expect(sprintPipeline.evalGate.holdoutRatio).toBe(0.25);
     expect(sprintPipeline.evalGate.minHoldoutSamples).toBe(4);
     expect(sprintPipeline.evalGate.minTrainSamples).toBe(8);
+  });
+
+  it('selects bag-shuffle pipeline when queue policy axis requests it', () => {
+    const pipeline = resolvePersonalTrainingPipelineForContext(null, {
+      modeId: 'practice',
+      arch: 'full',
+      rewardProfileId: 'default',
+      queuePolicyId: 'bag_shuffle_v1',
+    });
+    expect(pipeline.id).toBe('personal_rl_bag_shuffle_v1');
+  });
+
+  it('applies lean architecture defaults on top of mode defaults', () => {
+    const pipeline = resolvePersonalTrainingPipelineForContext(null, {
+      modeId: 'sprint',
+      arch: 'lean',
+      rewardProfileId: 'default',
+      queuePolicyId: 'next_piece_v1',
+    });
+    expect(pipeline.id).toBe(DEFAULT_PERSONAL_TRAINING_PIPELINE_ID);
+    expect(pipeline.trainDefaults.sampleLimit).toBe(384);
   });
 });

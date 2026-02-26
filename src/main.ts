@@ -46,7 +46,7 @@ import {
   type TrajectoryRewardTerminalStats,
 } from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
-import { resolvePersonalTrainingPipelineForMode } from './app/trainingPipelines';
+import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
@@ -479,24 +479,42 @@ async function boot() {
   const trainingPipelineValue = import.meta.env.VITE_TRAINING_PIPELINE as
     | string
     | undefined;
-  const getTrainingPipelineForMode = (modeId: string) =>
-    resolvePersonalTrainingPipelineForMode(trainingPipelineValue, modeId);
-  const defaultTrainingPipeline = getTrainingPipelineForMode(
+  const getTrainingPipelineForContext = (
+    modeId: string,
+    axes: {
+      arch: string;
+      rewardProfileId: string;
+      queuePolicyId: string;
+    },
+  ) =>
+    resolvePersonalTrainingPipelineForContext(trainingPipelineValue, {
+      modeId,
+      arch: axes.arch,
+      rewardProfileId: axes.rewardProfileId,
+      queuePolicyId: axes.queuePolicyId,
+    });
+  const initialModelAxes = normalizeModelAxes(settingsStore.get().modelAxes);
+  const defaultTrainingPipeline = getTrainingPipelineForContext(
     modeController.getState().mode.id,
+    initialModelAxes,
   );
-  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = Math.max(
+  const DEFAULT_MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = Math.max(
     MIN_TRAJECTORY_SAMPLES_PER_SESSION,
     defaultTrainingPipeline.minSamples,
   );
-  const TRAJECTORY_PIPELINE_ID = defaultTrainingPipeline.id;
   const configuredTrajectoryRewardPolicy = import.meta.env
     .VITE_TRAJECTORY_REWARD_POLICY as string | undefined;
   const getTrajectoryRewardPolicyId = (
     modeId: string,
+    axes: {
+      arch: string;
+      rewardProfileId: string;
+      queuePolicyId: string;
+    },
   ): TrajectoryRewardPolicyId =>
     resolveTrajectoryRewardPolicyId(
       configuredTrajectoryRewardPolicy ??
-        getTrainingPipelineForMode(modeId).rewardPolicyId,
+        getTrainingPipelineForContext(modeId, axes).rewardPolicyId,
     );
   const personalTrainer = createPersonalTrainerTfjs();
   let menuUi: MenuScreen | null = null;
@@ -1152,10 +1170,20 @@ async function boot() {
     sessionId: string;
     modeId: string;
     startedAtMs: number;
+    axes: {
+      arch: string;
+      rewardProfileId: string;
+      queuePolicyId: string;
+    };
+    pipelineId: string;
+    minSamplesForUpload: number;
+    rewardPolicyId: TrajectoryRewardPolicyId;
   };
   let activeTrajectoryRun: TrajectoryRunState | null = null;
   let pendingTrajectoryRunModeId: string | null = null;
   let pendingTrajectorySession: TrajectorySessionV1 | null = null;
+  let lastTrajectoryMinSamplesRequired =
+    DEFAULT_MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD;
   let lastTrajectoryUploadMessage = 'No uploads yet.';
   let lastTrajectoryUploadAtMs: number | null = null;
   let lastTrajectoryUploadSamples = 0;
@@ -1174,20 +1202,19 @@ async function boot() {
   };
 
   const toTrajectoryMeta = (
-    modeId: string,
+    run: TrajectoryRunState,
     outcome: string,
     rewards: TrajectoryRewardComputation | null,
   ): TrajectorySessionMetaV1 => {
-    const axes = getActiveModelAxes();
     const meta: TrajectorySessionMetaV1 = {
       outcome,
       channel: import.meta.env.MODE,
       modelSource: activeModelSource.kind,
-      pipelineId: TRAJECTORY_PIPELINE_ID,
-      pipelineMode: modeId,
-      modelArchId: axes.arch,
-      rewardProfileId: axes.rewardProfileId,
-      queuePolicyId: axes.queuePolicyId,
+      pipelineId: run.pipelineId,
+      pipelineMode: run.modeId,
+      modelArchId: run.axes.arch,
+      rewardProfileId: run.axes.rewardProfileId,
+      queuePolicyId: run.axes.queuePolicyId,
       modelArch: getTrajectoryModelArch(),
     };
     if (activeModelSource.kind === 'personal') {
@@ -1233,10 +1260,19 @@ async function boot() {
     });
 
   const beginTrajectoryRun = (modeId: string): void => {
+    const axes = getActiveModelAxes();
+    const pipeline = getTrainingPipelineForContext(modeId, axes);
     activeTrajectoryRun = {
       sessionId: crypto.randomUUID(),
       modeId,
       startedAtMs: Date.now(),
+      axes,
+      pipelineId: pipeline.id,
+      minSamplesForUpload: Math.max(
+        MIN_TRAJECTORY_SAMPLES_PER_SESSION,
+        pipeline.minSamples,
+      ),
+      rewardPolicyId: getTrajectoryRewardPolicyId(modeId, axes),
     };
   };
 
@@ -1248,7 +1284,10 @@ async function boot() {
     run: TrajectoryRunState,
   ): TrajectoryDecisionSample[] =>
     trajectoryBuffer
-      .listSamples({ modeId: run.modeId })
+      .listSamples({
+        modeId: run.modeId,
+        modelAxes: run.axes,
+      })
       .filter((sample) => sample.createdAtMs >= run.startedAtMs);
 
   const buildTrajectorySession = (
@@ -1257,7 +1296,7 @@ async function boot() {
     terminal: TrajectoryRewardTerminalStats | null = null,
   ): TrajectorySessionV1 | null => {
     const runSamples = listRunSamples(run);
-    if (runSamples.length < MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD) return null;
+    if (runSamples.length < run.minSamplesForUpload) return null;
     const rewards = computeTrajectoryRewards(
       runSamples,
       {
@@ -1265,7 +1304,7 @@ async function boot() {
         outcome,
         terminal,
       },
-      getTrajectoryRewardPolicyId(run.modeId),
+      run.rewardPolicyId,
     );
     const endedAtMs = Math.max(
       Date.now(),
@@ -1280,7 +1319,7 @@ async function boot() {
       endedAtMs,
       durationMs: Math.max(0, endedAtMs - run.startedAtMs),
       samples: toTrajectorySamples(runSamples, rewards.rewards),
-      meta: toTrajectoryMeta(run.modeId, outcome, rewards),
+      meta: toTrajectoryMeta(run, outcome, rewards),
     };
   };
 
@@ -1292,6 +1331,7 @@ async function boot() {
     activeTrajectoryRun = null;
     pendingTrajectoryRunModeId = null;
     if (!run) return null;
+    lastTrajectoryMinSamplesRequired = run.minSamplesForUpload;
     const session = buildTrajectorySession(run, outcome, terminal);
     if (session) {
       pendingTrajectorySession = session;
@@ -1342,7 +1382,7 @@ async function boot() {
       if (activeTrajectoryRun) {
         const count = listRunSamples(activeTrajectoryRun).length;
         throw new Error(
-          `Need at least ${MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD} samples before upload (currently ${count}).`,
+          `Need at least ${activeTrajectoryRun.minSamplesForUpload} samples before upload (currently ${count}).`,
         );
       }
       throw new Error('No trajectory recording available to upload.');
@@ -1416,8 +1456,8 @@ async function boot() {
       };
     }
     const modeId = options?.modeId ?? modeController.getState().mode.id;
-    const trainingPipeline = getTrainingPipelineForMode(modeId);
     const axes = getActiveModelAxes();
+    const trainingPipeline = getTrainingPipelineForContext(modeId, axes);
     const samples = trajectoryBuffer.listSamples({
       modeId,
       modelAxes: axes,
@@ -1458,7 +1498,10 @@ async function boot() {
   };
   const getLocalTrainingPreset = () => {
     const modeId = modeController.getState().mode.id;
-    const pipeline = getTrainingPipelineForMode(modeId);
+    const pipeline = getTrainingPipelineForContext(
+      modeId,
+      getActiveModelAxes(),
+    );
     return {
       pipelineId: pipeline.id,
       modeId,
@@ -1763,7 +1806,7 @@ async function boot() {
               'Run captured locally. Sign in and use "UPLOAD TRAJECTORY".';
             lastTrajectoryUploadError = null;
           } else if (activeTrajectoryRun == null) {
-            lastTrajectoryUploadMessage = `Run ignored (need >= ${MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD} samples).`;
+            lastTrajectoryUploadMessage = `Run ignored (need >= ${lastTrajectoryMinSamplesRequired} samples).`;
             lastTrajectoryUploadError = null;
           }
         }
