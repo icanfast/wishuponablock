@@ -18,13 +18,15 @@ type MenuPanel =
   | 'tools'
   | 'feedback'
   | 'account'
-  | 'my_models';
+  | 'my_models'
+  | 'admin';
 
 export type MenuAuthUser = {
   id: string;
   username: string;
   email: string | null;
   emailVerifiedAtMs: number | null;
+  isAdmin: boolean;
 };
 
 export type MenuAuthState = {
@@ -297,6 +299,7 @@ input[type=number] {
   const feedbackPanel = makeMenuPanel();
   const accountPanel = makeMenuPanel();
   const myModelsPanel = makeMenuPanel();
+  const adminPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
 
@@ -338,6 +341,12 @@ input[type=number] {
     maxHeight: '520px',
     overflowY: 'auto',
   });
+  Object.assign(adminPanel.style, {
+    minHeight: '260px',
+    width: '360px',
+    display: 'none',
+    textAlign: 'left',
+  });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
@@ -357,6 +366,8 @@ input[type=number] {
   }
   const accountButton = makeMenuButton('ACCOUNT');
   const myModelsButton = makeMenuButton('MY MODELS');
+  const adminButton = makeMenuButton('ADMIN');
+  adminButton.style.display = 'none';
   const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
@@ -364,6 +375,7 @@ input[type=number] {
   menuMainPanel.appendChild(toolsButton);
   menuMainPanel.appendChild(accountButton);
   menuMainPanel.appendChild(myModelsButton);
+  menuMainPanel.appendChild(adminButton);
   menuMainPanel.appendChild(aboutButton);
 
   const optionsTitle = document.createElement('div');
@@ -2331,11 +2343,58 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsUploadTrajectoryButton);
   myModelsPanel.appendChild(myModelsBackButton);
 
+  const adminTitle = document.createElement('div');
+  adminTitle.textContent = 'ADMIN';
+  Object.assign(adminTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+  const adminSummary = document.createElement('div');
+  Object.assign(adminSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const adminStatus = document.createElement('div');
+  Object.assign(adminStatus.style, {
+    minHeight: '28px',
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    marginTop: '2px',
+    whiteSpace: 'pre-wrap',
+  });
+  const adminActions = document.createElement('div');
+  Object.assign(adminActions.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  const adminWhoAmIButton = makeMenuButton('CHECK ADMIN API');
+  const adminOpenRouteButton = makeMenuButton('OPEN /admin');
+  adminActions.appendChild(adminWhoAmIButton);
+  adminActions.appendChild(adminOpenRouteButton);
+  const adminBackButton = makeMenuButton('BACK');
+  Object.assign(adminBackButton.style, { marginTop: 'auto' });
+  adminPanel.appendChild(adminTitle);
+  adminPanel.appendChild(adminSummary);
+  adminPanel.appendChild(adminStatus);
+  adminPanel.appendChild(adminActions);
+  adminPanel.appendChild(adminBackButton);
+
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
   let signedOutStage: SignedOutStage = hiddenResetToken ? 'reset' : 'email';
   let currentAuthState: MenuAuthState = authState;
   let authActionPending = false;
   let modelActionPending = false;
+  let adminActionPending = false;
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
     if (tone === 'error') return '#f28b82';
@@ -2354,6 +2413,13 @@ input[type=number] {
   ) => {
     myModelsActionStatus.textContent = message;
     myModelsActionStatus.style.color = statusColor(tone);
+  };
+  const setAdminActionStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
+    adminStatus.textContent = message;
+    adminStatus.style.color = statusColor(tone);
   };
   const readField = (input: HTMLInputElement): string => input.value.trim();
   const toErrorMessage = (error: unknown, fallback: string): string => {
@@ -2403,7 +2469,13 @@ input[type=number] {
       state.user.emailVerifiedAtMs == null
         ? 'Email verification: pending'
         : 'Email verification: complete';
-    return [`Signed in as ${state.user.username}`, emailLine, verificationLine]
+    const roleLine = state.user.isAdmin ? 'Role: admin' : 'Role: user';
+    return [
+      `Signed in as ${state.user.username}`,
+      emailLine,
+      verificationLine,
+      roleLine,
+    ]
       .filter((line) => line.length > 0)
       .join('\n');
   };
@@ -2416,6 +2488,19 @@ input[type=number] {
       return 'Not signed in.';
     }
     return `Signed in as ${state.user.username}\nManage your cloud model for the current game mode.`;
+  };
+
+  const formatAdminSummary = (state: MenuAuthState): string => {
+    if (state.loading) {
+      return 'Checking session...';
+    }
+    if (!state.authenticated || !state.user) {
+      return 'Admin tools are locked.\nSign in with an admin account.';
+    }
+    if (!state.user.isAdmin) {
+      return 'Admin tools are locked.\nThis account does not have admin access.';
+    }
+    return `Signed in as ${state.user.username}\nAdmin access: granted\nUse this panel for privileged training and data operations.`;
   };
 
   const formatMyModelsTrainingSummary = (
@@ -2463,6 +2548,23 @@ input[type=number] {
       !authenticated || busy ? 'default' : 'pointer';
   };
 
+  const updateAdminControls = () => {
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    adminSummary.textContent = formatAdminSummary(currentAuthState);
+    adminButton.style.display = isAdmin ? 'block' : 'none';
+    adminActions.style.display = isAdmin ? 'flex' : 'none';
+    const busy = adminActionPending || currentAuthState.loading;
+    adminWhoAmIButton.disabled = !isAdmin || busy;
+    adminOpenRouteButton.disabled = busy;
+    adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
+    adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
+    adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
+  };
+
   const updateAccountControls = () => {
     accountSummary.textContent = formatAccountSummary(currentAuthState);
     const authenticated =
@@ -2506,6 +2608,7 @@ input[type=number] {
         ? 'block'
         : 'none';
     updateMyModelsControls();
+    updateAdminControls();
   };
 
   const setAuthState = (state: MenuAuthState) => {
@@ -2685,6 +2788,56 @@ input[type=number] {
     }
   });
 
+  adminWhoAmIButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Checking admin API access...');
+    updateAdminControls();
+    try {
+      const response = await fetch('/api/admin/whoami', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        const message =
+          typeof payload?.error === 'string' && payload.error.trim()
+            ? payload.error
+            : `Request failed (${response.status}).`;
+        throw new Error(message);
+      }
+      const payload = (await response.json().catch(() => null)) as {
+        admin?: { username?: unknown; email?: unknown } | null;
+      } | null;
+      const username =
+        typeof payload?.admin?.username === 'string'
+          ? payload.admin.username
+          : 'admin';
+      const email =
+        typeof payload?.admin?.email === 'string' ? payload.admin.email : '';
+      const suffix = email ? ` (${email})` : '';
+      setAdminActionStatus(
+        `Admin API access confirmed: ${username}${suffix}.`,
+        'success',
+      );
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Admin API access check failed.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminOpenRouteButton.addEventListener('click', () => {
+    window.location.assign('/admin');
+  });
+
   accountLogoutButton.addEventListener('click', async () => {
     if (authActionPending) return;
     authActionPending = true;
@@ -2829,6 +2982,7 @@ input[type=number] {
     setAccountActionStatus('');
   }
   setMyModelsActionStatus('');
+  setAdminActionStatus('');
   setAuthState(currentAuthState);
 
   const menuLayer = document.createElement('div');
@@ -2855,6 +3009,7 @@ input[type=number] {
   menuLayer.appendChild(feedbackPanel);
   menuLayer.appendChild(accountPanel);
   menuLayer.appendChild(myModelsPanel);
+  menuLayer.appendChild(adminPanel);
   root.appendChild(menuLayer);
 
   const feedbackMenuButton = makeMenuButton('LEAVE FEEDBACK');
@@ -2950,14 +3105,20 @@ input[type=number] {
     feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     myModelsPanel.style.display = panel === 'my_models' ? 'flex' : 'none';
+    adminPanel.style.display = panel === 'admin' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display =
-      panel === 'options' || panel === 'my_models' ? 'none' : 'block';
+      panel === 'options' || panel === 'my_models' || panel === 'admin'
+        ? 'none'
+        : 'block';
     if (panel === 'options') {
       syncMlRuntimeSummary();
     }
     if (panel === 'my_models') {
       updateMyModelsControls();
+    }
+    if (panel === 'admin') {
+      updateAdminControls();
     }
   };
 
@@ -2970,6 +3131,7 @@ input[type=number] {
   }
   accountButton.addEventListener('click', () => show('account'));
   myModelsButton.addEventListener('click', () => show('my_models'));
+  adminButton.addEventListener('click', () => show('admin'));
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 
@@ -3017,6 +3179,7 @@ input[type=number] {
   feedbackBackButton.addEventListener('click', showMain);
   accountBackButton.addEventListener('click', showMain);
   myModelsBackButton.addEventListener('click', showMain);
+  adminBackButton.addEventListener('click', showMain);
 
   window.addEventListener('keydown', (event) => {
     if (event.code !== 'Escape') return;

@@ -3,6 +3,7 @@ export type AuthUser = {
   username: string;
   email: string | null;
   emailVerifiedAtMs: number | null;
+  isAdmin: boolean;
 };
 
 export type AuthState = {
@@ -44,6 +45,7 @@ type AuthMePayload = {
     username?: unknown;
     email?: unknown;
     emailVerifiedAtMs?: unknown;
+    isAdmin?: unknown;
   } | null;
   session?: {
     expiresAtMs?: unknown;
@@ -60,6 +62,16 @@ const asInt = (value: unknown): number | null => {
   if (typeof value === 'string' && value.trim()) {
     const parsed = Number(value);
     if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return null;
+};
+
+const asBoolean = (value: unknown): boolean | null => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
   }
   return null;
 };
@@ -108,6 +120,7 @@ const toAuthState = (payload: AuthMePayload | null | undefined): AuthState => {
       username,
       email: asString(payload.user.email),
       emailVerifiedAtMs: asInt(payload.user.emailVerifiedAtMs),
+      isAdmin: asBoolean(payload.user.isAdmin) === true,
     },
     sessionExpiresAtMs: asInt(payload.session?.expiresAtMs),
   };

@@ -261,13 +261,13 @@ async function boot() {
     message: string;
     tone: MenuAuthStatusTone;
   } | null = null;
-  let openAccountOnBoot = false;
+  let openPanelOnBoot: 'account' | 'admin' | null = null;
 
   const authError = startupUrl.searchParams.get('auth_error');
   if (authError) {
     const message = authErrorMessages[authError] ?? 'Authentication failed.';
     authInitialStatus = { message, tone: 'error' };
-    openAccountOnBoot = true;
+    openPanelOnBoot = 'account';
     startupUrl.searchParams.delete('auth_error');
   }
 
@@ -279,7 +279,7 @@ async function boot() {
         : 'Missing password reset token.',
       tone: authInitialResetToken ? 'neutral' : 'error',
     };
-    openAccountOnBoot = true;
+    openPanelOnBoot = 'account';
     startupUrl.pathname = '/';
     startupUrl.searchParams.delete('token');
   }
@@ -305,9 +305,14 @@ async function boot() {
         };
       }
     }
-    openAccountOnBoot = true;
+    openPanelOnBoot = 'account';
     startupUrl.pathname = '/';
     startupUrl.searchParams.delete('token');
+  }
+
+  if (startupUrl.pathname === '/admin') {
+    openPanelOnBoot = 'admin';
+    startupUrl.pathname = '/';
   }
 
   const cleanedHref = `${startupUrl.pathname}${startupUrl.search}${startupUrl.hash}`;
@@ -1567,8 +1572,10 @@ async function boot() {
   };
 
   setScreen('menu');
-  if (openAccountOnBoot) {
+  if (openPanelOnBoot === 'account') {
     menuUi?.show('account');
+  } else if (openPanelOnBoot === 'admin') {
+    menuUi?.show('admin');
   }
 
   const identityConsole = window as Window & {

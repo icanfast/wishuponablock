@@ -41,6 +41,8 @@ type Env = {
   RELEASE_CHANNEL?: string;
   FEATURE_FLAGS?: string;
   AUTH_TOKEN_PEPPER?: string;
+  AUTH_ADMIN_EMAILS?: string;
+  AUTH_ADMIN_USER_IDS?: string;
   RESEND_API_KEY?: string;
   AUTH_EMAIL_FROM?: string;
   AUTH_APP_BASE_URL?: string;
@@ -421,6 +423,28 @@ const normalizeEmail = (value: unknown): string | null => {
   return normalized;
 };
 
+const splitTokenList = (value: string | null): string[] => {
+  if (!value) return [];
+  return value
+    .split(/[,\n;\s]+/g)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+};
+
+const isAdminUser = (
+  env: Env,
+  userId: string,
+  emailNorm: string | null,
+): boolean => {
+  const adminUserIds = splitTokenList(asString(env.AUTH_ADMIN_USER_IDS));
+  if (adminUserIds.includes(userId)) return true;
+  if (!emailNorm) return false;
+  const adminEmails = splitTokenList(asString(env.AUTH_ADMIN_EMAILS)).map(
+    (entry) => entry.toLowerCase(),
+  );
+  return adminEmails.includes(emailNorm.toLowerCase());
+};
+
 const normalizeUsername = (requested: unknown, emailNorm: string): string => {
   if (typeof requested === 'string') {
     const collapsed = requested.trim().replace(/\s+/g, ' ');
@@ -465,6 +489,7 @@ type SessionContext = {
   username: string;
   emailNorm: string | null;
   emailVerifiedAtMs: number | null;
+  isAdmin: boolean;
   expiresAtMs: number;
   lastSeenAtMs: number | null;
 };
@@ -474,6 +499,7 @@ type AuthUser = {
   username: string;
   emailNorm: string | null;
   emailVerifiedAtMs: number | null;
+  isAdmin: boolean;
 };
 
 type OAuthProvider = 'google' | 'discord';
@@ -706,11 +732,13 @@ const readUserByEmail = async (
   const id = asString(row.id);
   const username = asString(row.username);
   if (!id || !username) return null;
+  const resolvedEmailNorm = asString(row.email_norm);
   return {
     id,
     username,
-    emailNorm: asString(row.email_norm),
+    emailNorm: resolvedEmailNorm,
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+    isAdmin: isAdminUser(env, id, resolvedEmailNorm),
     passwordHash: asString(row.password_hash),
     googleSub: asString(row.google_sub),
     discordSub: asString(row.discord_sub),
@@ -743,11 +771,13 @@ const readUserByOAuthSub = async (
   const id = asString(row.id);
   const username = asString(row.username);
   if (!id || !username) return null;
+  const resolvedEmailNorm = asString(row.email_norm);
   return {
     id,
     username,
-    emailNorm: asString(row.email_norm),
+    emailNorm: resolvedEmailNorm,
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+    isAdmin: isAdminUser(env, id, resolvedEmailNorm),
     passwordHash: asString(row.password_hash),
     googleSub: asString(row.google_sub),
     discordSub: asString(row.discord_sub),
@@ -793,11 +823,13 @@ const readUserById = async (
   const id = asString(row.id);
   const username = asString(row.username);
   if (!id || !username) return null;
+  const emailNorm = asString(row.email_norm);
   return {
     id,
     username,
-    emailNorm: asString(row.email_norm),
+    emailNorm,
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+    isAdmin: isAdminUser(env, id, emailNorm),
   };
 };
 
@@ -1260,6 +1292,7 @@ const buildAuthenticatedPayload = (
     username: user.username,
     email: user.emailNorm,
     emailVerifiedAtMs: user.emailVerifiedAtMs,
+    isAdmin: user.isAdmin,
   },
   session: {
     expiresAtMs,
@@ -1299,13 +1332,15 @@ const readSessionContext = async (
   if (!sessionId || !userId || !username || expiresAtMs == null) {
     return null;
   }
+  const emailNorm = asString(row.email_norm);
 
   return {
     sessionId,
     userId,
     username,
-    emailNorm: asString(row.email_norm),
+    emailNorm,
     emailVerifiedAtMs: asInt(row.email_verified_at_ms),
+    isAdmin: isAdminUser(env, userId, emailNorm),
     expiresAtMs,
     lastSeenAtMs: asInt(row.last_seen_at_ms),
   };
@@ -1351,6 +1386,24 @@ const requireAuthenticatedSession = async (
       ),
     };
   }
+};
+
+const requireAdminSession = async (
+  request: Request,
+  env: Env,
+  nowMs: number,
+): Promise<{ session: SessionContext | null; response?: Response }> => {
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth;
+  if (!auth.session || !auth.session.isAdmin) {
+    return {
+      session: null,
+      response: jsonResponse({ error: 'Forbidden.' }, 403, {
+        'cache-control': 'no-store',
+      }),
+    };
+  }
+  return auth;
 };
 
 const touchSessionIfStale = async (
@@ -1436,6 +1489,7 @@ const handleEmailSignup = async (
       username,
       emailNorm,
       emailVerifiedAtMs: null,
+      isAdmin: isAdminUser(env, userId, emailNorm),
     };
 
     return jsonResponse(
@@ -1509,6 +1563,7 @@ const handleEmailLogin = async (
       username: user.username,
       emailNorm: user.emailNorm,
       emailVerifiedAtMs: user.emailVerifiedAtMs,
+      isAdmin: isAdminUser(env, user.id, user.emailNorm),
     };
     return jsonResponse(
       buildAuthenticatedPayload(authUser, session.expiresAtMs),
@@ -1657,6 +1712,7 @@ const handleEmailVerifyConsume = async (
           username: user.username,
           emailNorm: user.emailNorm,
           emailVerifiedAtMs: user.emailVerifiedAtMs ?? nowMs,
+          isAdmin: user.isAdmin,
         },
         session.expiresAtMs,
       ),
@@ -1995,6 +2051,7 @@ const handleAuthMe = async (request: Request, env: Env): Promise<Response> => {
         username: session.username,
         emailNorm: session.emailNorm,
         emailVerifiedAtMs: session.emailVerifiedAtMs,
+        isAdmin: session.isAdmin,
       },
       session.expiresAtMs,
     ),
@@ -2397,6 +2454,40 @@ const handlePostTrajectoryRecording = async (
   }
 };
 
+const handleAdminWhoAmI = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  return jsonResponse(
+    {
+      ok: true,
+      admin: {
+        userId: session.userId,
+        username: session.username,
+        email: session.emailNorm,
+      },
+    },
+    200,
+    { 'cache-control': 'no-store' },
+  );
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -2576,6 +2667,10 @@ export default {
 
     if (url.pathname === '/api/recordings/me/trajectory') {
       return handlePostTrajectoryRecording(request, env);
+    }
+
+    if (url.pathname === '/api/admin/whoami') {
+      return handleAdminWhoAmI(request, env);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {
