@@ -109,6 +109,14 @@ const formatMlRuntimeSummary = (info: ModelRunnerInfo): string => {
   return `Requested: ${info.requestedBackend}\nActive: ${info.activeBackend}${runtime}${fallback}`;
 };
 
+type ActiveModelSource =
+  | { kind: 'global' }
+  | {
+      kind: 'personal';
+      mode: string;
+      version: number | null;
+    };
+
 async function boot() {
   const APP_VERSION = pkg.version;
   const GAME_SCREEN_Y_OFFSET = 20;
@@ -302,6 +310,10 @@ async function boot() {
     getMlBackendPreferenceParts(storedMlBackendPreference);
   let modelStatusLabel: HTMLDivElement | null = null;
   let pausedByModel = false;
+  let activeModelSource: ActiveModelSource = { kind: 'global' };
+  let activeModelContextKey: string | null = null;
+  let modelSyncRequestId = 0;
+  const syncedModelShaByMode = new Map<string, string>();
   let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
   let requestStartGame: () => void = () => {};
   let runtime: GameRuntime | null = null;
@@ -316,6 +328,36 @@ async function boot() {
   const getModelGeneratorLabel = (): string => {
     const type = settingsStore.get().generator.type;
     return type === 'curse' ? 'Curse Upon a Block' : 'Wish Upon a Block';
+  };
+  const getModelSourceLabel = (): string => {
+    if (activeModelSource.kind === 'personal') {
+      const version =
+        activeModelSource.version != null
+          ? ` v${activeModelSource.version}`
+          : '';
+      return `personal:${activeModelSource.mode}${version}`;
+    }
+    return 'global';
+  };
+  const setActiveModelSource = (next: ActiveModelSource): void => {
+    activeModelSource = next;
+    updateModelStatusUI(modelService.getStatus());
+  };
+  const getHttpStatus = (error: unknown): number | null => {
+    if (
+      typeof (error as { status?: unknown })?.status === 'number' &&
+      Number.isFinite((error as { status: number }).status)
+    ) {
+      return Math.trunc((error as { status: number }).status);
+    }
+    return null;
+  };
+  const sha256HexFromBuffer = async (buffer: ArrayBuffer): Promise<string> => {
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    const bytes = new Uint8Array(digest);
+    return Array.from(bytes, (value) =>
+      value.toString(16).padStart(2, '0'),
+    ).join('');
   };
   const updateModelStatusUI = (status: ModelStatus): void => {
     if (!modelStatusLabel) return;
@@ -339,20 +381,21 @@ async function boot() {
       runnerInfo.requestedBackend === runnerInfo.activeBackend
         ? ` (${runnerInfo.activeBackend}${runtimeLabel})`
         : ` (${runnerInfo.activeBackend}${runtimeLabel} fallback)`;
+    const sourceSuffix = ` [${getModelSourceLabel()}]`;
     modelStatusLabel.style.display = 'block';
-    let text = `${generatorLabel}: idle (RNG fallback)${backendSuffix}`;
+    let text = `${generatorLabel}: idle (RNG fallback)${backendSuffix}${sourceSuffix}`;
     let color = '#f4b266';
     let shouldPause = false;
     if (status === 'ready') {
-      text = `${generatorLabel}: loaded${backendSuffix}`;
+      text = `${generatorLabel}: loaded${backendSuffix}${sourceSuffix}`;
       color = '#8fd19e';
       shouldPause = false;
     } else if (status === 'loading') {
-      text = `${generatorLabel}: loading (RNG fallback)${backendSuffix}`;
+      text = `${generatorLabel}: loading (RNG fallback)${backendSuffix}${sourceSuffix}`;
       color = '#f4b266';
       shouldPause = false;
     } else if (status === 'failed') {
-      text = `${generatorLabel}: failed to load model${backendSuffix}`;
+      text = `${generatorLabel}: failed to load model${backendSuffix}${sourceSuffix}`;
       color = '#f28b82';
       shouldPause = true;
     }
@@ -364,7 +407,7 @@ async function boot() {
     }
   };
   const getMlRuntimeSummary = (): string =>
-    formatMlRuntimeSummary(modelService.getRunnerInfo());
+    `${formatMlRuntimeSummary(modelService.getRunnerInfo())}\nModel source: ${getModelSourceLabel()}`;
   const applyMlBackendPreference = (next: MenuMlBackendPreference): void => {
     localStorage.setItem(ML_BACKEND_PREFERENCE_STORAGE_KEY, next);
     window.location.reload();
@@ -403,6 +446,164 @@ async function boot() {
     );
   };
 
+  const buildModelContextKey = (userId: string | null, mode: string): string =>
+    `${userId ?? 'anon'}:${mode}`;
+
+  const syncActiveModelForContext = async (options: {
+    mode: string;
+    reason: string;
+    force?: boolean;
+    interactive?: boolean;
+  }): Promise<{ source: 'global' | 'personal'; message: string }> => {
+    const { mode, reason, force = false, interactive = false } = options;
+    const userId =
+      authState.authenticated && authState.user ? authState.user.id : null;
+    const contextKey = buildModelContextKey(userId, mode);
+    if (!force && activeModelContextKey === contextKey) {
+      return {
+        source: activeModelSource.kind,
+        message: `Using ${getModelSourceLabel()} model.`,
+      };
+    }
+
+    const requestId = ++modelSyncRequestId;
+    const isCurrentRequest = (): boolean => requestId === modelSyncRequestId;
+
+    if (!userId) {
+      if (activeModelSource.kind !== 'global' || force) {
+        await modelService.reloadDefaultModel();
+        if (!isCurrentRequest()) {
+          return {
+            source: activeModelSource.kind,
+            message: 'Model context was superseded.',
+          };
+        }
+        setActiveModelSource({ kind: 'global' });
+        sessionController.rebuildSession();
+      }
+      activeModelContextKey = contextKey;
+      return {
+        source: 'global',
+        message: 'Using global model.',
+      };
+    }
+
+    try {
+      const result = await personalModelService.downloadCurrent(mode);
+      if (!isCurrentRequest()) {
+        return {
+          source: activeModelSource.kind,
+          message: 'Model context was superseded.',
+        };
+      }
+
+      await modelService.replaceModelFromBytes(
+        result.bytes,
+        `personal model (${mode})`,
+      );
+      if (!isCurrentRequest()) {
+        return {
+          source: activeModelSource.kind,
+          message: 'Model context was superseded.',
+        };
+      }
+
+      const resolvedSha =
+        result.sha256 ?? (await sha256HexFromBuffer(result.bytes));
+      syncedModelShaByMode.set(mode, resolvedSha);
+      setActiveModelSource({
+        kind: 'personal',
+        mode: result.mode,
+        version: result.version,
+      });
+      activeModelContextKey = contextKey;
+      sessionController.rebuildSession();
+      const versionLabel =
+        result.version != null ? `v${result.version}` : 'latest';
+      return {
+        source: 'personal',
+        message: `Loaded ${versionLabel} personal model for mode "${result.mode}".`,
+      };
+    } catch (error) {
+      if (!isCurrentRequest()) {
+        return {
+          source: activeModelSource.kind,
+          message: 'Model context was superseded.',
+        };
+      }
+      const status = getHttpStatus(error);
+      if (status !== 404) {
+        console.warn(
+          `[models] personal model load failed (mode=${mode}, reason=${reason})`,
+          error,
+        );
+      }
+
+      await modelService.reloadDefaultModel();
+      if (!isCurrentRequest()) {
+        return {
+          source: activeModelSource.kind,
+          message: 'Model context was superseded.',
+        };
+      }
+
+      setActiveModelSource({ kind: 'global' });
+      activeModelContextKey = contextKey;
+      sessionController.rebuildSession();
+
+      if (status === 404) {
+        if (interactive) {
+          throw new Error(`No cloud model saved for mode "${mode}" yet.`);
+        }
+        return {
+          source: 'global',
+          message: `No personal model for mode "${mode}", using global model.`,
+        };
+      }
+      if (interactive) throw error;
+      return {
+        source: 'global',
+        message: `Using global model (personal load failed for mode "${mode}").`,
+      };
+    }
+  };
+
+  const autoSavePersonalModelIfDirty = async (
+    mode: string,
+    reason: string,
+  ): Promise<void> => {
+    if (!authState.authenticated || !authState.user) return;
+    if (
+      activeModelSource.kind !== 'personal' ||
+      activeModelSource.mode !== mode
+    )
+      return;
+
+    const bytes = await modelService.ensureModelBytes();
+    if (!bytes) return;
+    const currentSha = await sha256HexFromBuffer(bytes);
+    const syncedSha = syncedModelShaByMode.get(mode) ?? null;
+    if (syncedSha && syncedSha === currentSha) return;
+
+    try {
+      const result = await personalModelService.uploadCurrent(mode, bytes);
+      syncedModelShaByMode.set(mode, result.sha256 ?? currentSha);
+      setActiveModelSource({
+        kind: 'personal',
+        mode,
+        version: result.version ?? activeModelSource.version,
+      });
+      console.info(
+        `[models] auto-saved personal model (mode=${mode}, reason=${reason})`,
+      );
+    } catch (error) {
+      console.warn(
+        `[models] auto-save failed (mode=${mode}, reason=${reason})`,
+        error,
+      );
+    }
+  };
+
   const refreshAuthState = async () => {
     applyAuthState({ ...authState, loading: true });
     try {
@@ -411,6 +612,11 @@ async function boot() {
         loading: false,
         authenticated: session.authenticated,
         user: session.user,
+      });
+      const currentMode = modeController.getState().mode.id;
+      await syncActiveModelForContext({
+        mode: currentMode,
+        reason: 'auth_refresh',
       });
     } catch (error) {
       console.error('[auth] /me failed', error);
@@ -424,10 +630,10 @@ async function boot() {
   };
 
   const logoutAuthState = async () => {
+    const currentMode = modeController.getState().mode.id;
+    await autoSavePersonalModelIfDirty(currentMode, 'logout');
     await authService.logout();
-    await modelService.reloadDefaultModel();
-    sessionController.rebuildSession();
-    updateModelStatusUI(modelService.getStatus());
+    activeModelContextKey = null;
     await refreshAuthState();
   };
 
@@ -462,36 +668,40 @@ async function boot() {
     await refreshAuthState();
   };
   const loadCurrentModePersonalModel = async (): Promise<string> => {
-    const mode = modeController.getState().mode.id;
-    try {
-      const result = await personalModelService.downloadCurrent(mode);
-      await modelService.replaceModelFromBytes(
-        result.bytes,
-        `personal model (${mode})`,
-      );
-      sessionController.rebuildSession();
-      updateModelStatusUI(modelService.getStatus());
-      const versionLabel =
-        result.version != null ? `v${result.version}` : 'latest';
-      return `Loaded ${versionLabel} model for mode "${result.mode}".`;
-    } catch (error) {
-      const status =
-        typeof (error as { status?: unknown })?.status === 'number'
-          ? Math.trunc((error as { status?: number }).status ?? 0)
-          : null;
-      if (status === 404) {
-        throw new Error(`No cloud model saved for mode "${mode}" yet.`);
-      }
-      throw error;
+    if (!authState.authenticated) {
+      throw new Error('Sign in to load a personal model.');
     }
+    const mode = modeController.getState().mode.id;
+    const result = await syncActiveModelForContext({
+      mode,
+      reason: 'manual_load',
+      force: true,
+      interactive: true,
+    });
+    return result.message;
   };
   const saveCurrentModePersonalModel = async (): Promise<string> => {
+    if (!authState.authenticated) {
+      throw new Error('Sign in to save a personal model.');
+    }
     const mode = modeController.getState().mode.id;
     const bytes = await modelService.ensureModelBytes();
     if (!bytes) {
       throw new Error('No model is loaded to upload.');
     }
+    const currentSha = await sha256HexFromBuffer(bytes);
     const result = await personalModelService.uploadCurrent(mode, bytes);
+    syncedModelShaByMode.set(mode, result.sha256 ?? currentSha);
+    if (
+      activeModelSource.kind === 'personal' &&
+      activeModelSource.mode === mode
+    ) {
+      setActiveModelSource({
+        kind: 'personal',
+        mode,
+        version: result.version ?? activeModelSource.version,
+      });
+    }
     const versionLabel =
       result.version != null ? `v${result.version}` : 'saved';
     return `Saved ${versionLabel} model for mode "${result.mode}".`;
@@ -555,6 +765,7 @@ async function boot() {
   };
 
   const initialModeState = modeController.getState();
+  let currentModeForModelSync = initialModeState.mode.id;
   const session: GameSession = createGameSessionFactory({
     settings,
     initialMode: initialModeState.mode,
@@ -835,11 +1046,20 @@ async function boot() {
   }
 
   modeController.setOnModeChange((mode, options) => {
+    const previousMode = currentModeForModelSync;
+    currentModeForModelSync = mode.id;
     snapshotService?.setModeInfo({
       id: mode.id,
       options: { ...options },
     });
     sessionController.setMode(mode, options);
+    void (async () => {
+      await autoSavePersonalModelIfDirty(previousMode, 'mode_change');
+      await syncActiveModelForContext({
+        mode: mode.id,
+        reason: 'mode_change',
+      });
+    })();
   });
 
   const toolHost: ToolHost = createToolHost(toolScreen);
@@ -996,6 +1216,10 @@ async function boot() {
             return;
           }
         }
+        await syncActiveModelForContext({
+          mode: modeController.getState().mode.id,
+          reason: 'start_game',
+        });
       }
       await screenManager.setActive('game');
     } finally {
