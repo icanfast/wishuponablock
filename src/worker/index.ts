@@ -6,6 +6,9 @@ import {
 type D1PreparedStatement = {
   bind: (...values: unknown[]) => D1PreparedStatement;
   run: () => Promise<unknown>;
+  all: <T = Record<string, unknown>>() => Promise<{
+    results?: T[];
+  }>;
   first: <T = Record<string, unknown>>(
     columnName?: string,
   ) => Promise<T | null>;
@@ -189,6 +192,56 @@ const normalizeGameMode = (value: unknown): string | null => {
   if (mode.length > 64) return null;
   if (!/^[a-z0-9_-]+$/.test(mode)) return null;
   return mode;
+};
+
+const clampInt = (
+  value: number | null,
+  options: { min: number; max: number; fallback: number },
+): number => {
+  if (value == null || !Number.isFinite(value)) return options.fallback;
+  return Math.max(options.min, Math.min(options.max, Math.trunc(value)));
+};
+
+const isValidRecordingId = (value: string): boolean =>
+  value.length >= 8 && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value);
+
+type RecordingCursor = {
+  startedAtMs: number;
+  id: string;
+};
+
+const parseRecordingsCursor = (
+  value: string | null,
+): RecordingCursor | null => {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const separator = trimmed.indexOf(':');
+  if (separator <= 0 || separator >= trimmed.length - 1) return null;
+  const startedAtMs = asInt(trimmed.slice(0, separator));
+  const id = trimmed.slice(separator + 1);
+  if (startedAtMs == null || startedAtMs < 0 || !isValidRecordingId(id)) {
+    return null;
+  }
+  return { startedAtMs, id };
+};
+
+const formatRecordingsCursor = (cursor: RecordingCursor): string =>
+  `${cursor.startedAtMs}:${cursor.id}`;
+
+const parseJsonObjectString = (
+  value: string | null,
+): Record<string, unknown> | null => {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 };
 
 const readGameModeFromRequest = (request: Request): string | null => {
@@ -2488,6 +2541,310 @@ const handleAdminWhoAmI = async (
   );
 };
 
+type AdminRecordingSummary = {
+  id: string;
+  userId: string;
+  mode: string;
+  buildVersion: string;
+  r2Key: string;
+  startedAtMs: number;
+  endedAtMs: number;
+  durationMs: number;
+  samples: number;
+  createdAtMs: number;
+  meta: Record<string, unknown> | null;
+};
+
+const toAdminRecordingSummary = (
+  row: Record<string, unknown>,
+): AdminRecordingSummary | null => {
+  const id = asString(row.id);
+  const userId = asString(row.user_id);
+  const mode = normalizeGameMode(row.game_mode);
+  const buildVersion = asString(row.build_version);
+  const r2Key = asString(row.r2_key);
+  const startedAtMs = asInt(row.started_at_ms);
+  const endedAtMs = asInt(row.ended_at_ms);
+  const durationMs = asInt(row.duration_ms);
+  const samples = asInt(row.snapshots_total);
+  const createdAtMs = asInt(row.created_at_ms);
+  if (
+    !id ||
+    !userId ||
+    !mode ||
+    !buildVersion ||
+    !r2Key ||
+    startedAtMs == null ||
+    endedAtMs == null ||
+    durationMs == null ||
+    samples == null ||
+    createdAtMs == null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    userId,
+    mode,
+    buildVersion,
+    r2Key,
+    startedAtMs,
+    endedAtMs,
+    durationMs,
+    samples,
+    createdAtMs,
+    meta: parseJsonObjectString(asString(row.meta_json)),
+  };
+};
+
+const handleAdminRecordingsIndex = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const url = new URL(request.url);
+  const requestedMode = url.searchParams.get('mode');
+  const modeFilter = normalizeGameMode(requestedMode);
+  if (requestedMode != null && !modeFilter) {
+    return jsonResponse({ error: 'Invalid mode filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedBuild = url.searchParams.get('build');
+  const buildFilter = asString(requestedBuild);
+  if (requestedBuild != null && !buildFilter) {
+    return jsonResponse({ error: 'Invalid build filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedUserId = asString(url.searchParams.get('user_id'));
+  if (requestedUserId != null && !isValidRecordingId(requestedUserId)) {
+    return jsonResponse({ error: 'Invalid user filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const startedFromMs = asInt(url.searchParams.get('started_from_ms'));
+  const startedToMs = asInt(url.searchParams.get('started_to_ms'));
+  if (
+    (startedFromMs != null && startedFromMs < 0) ||
+    (startedToMs != null && startedToMs < 0)
+  ) {
+    return jsonResponse({ error: 'Invalid time range filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (
+    startedFromMs != null &&
+    startedToMs != null &&
+    startedFromMs > startedToMs
+  ) {
+    return jsonResponse({ error: 'Invalid time range filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedCursor = url.searchParams.get('cursor');
+  const cursor = parseRecordingsCursor(requestedCursor);
+  if (requestedCursor != null && !cursor) {
+    return jsonResponse({ error: 'Invalid cursor.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const limit = clampInt(asInt(url.searchParams.get('limit')), {
+    min: 1,
+    max: 200,
+    fallback: 50,
+  });
+
+  const whereParts: string[] = [];
+  const values: unknown[] = [];
+  if (modeFilter) {
+    whereParts.push('game_mode = ?');
+    values.push(modeFilter);
+  }
+  if (buildFilter) {
+    whereParts.push('build_version = ?');
+    values.push(buildFilter);
+  }
+  if (requestedUserId) {
+    whereParts.push('user_id = ?');
+    values.push(requestedUserId);
+  }
+  if (startedFromMs != null) {
+    whereParts.push('started_at_ms >= ?');
+    values.push(startedFromMs);
+  }
+  if (startedToMs != null) {
+    whereParts.push('started_at_ms <= ?');
+    values.push(startedToMs);
+  }
+  if (cursor) {
+    whereParts.push('(started_at_ms < ? OR (started_at_ms = ? AND id < ?))');
+    values.push(cursor.startedAtMs, cursor.startedAtMs, cursor.id);
+  }
+
+  const whereClause =
+    whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+  try {
+    const result = await env.DB.prepare(
+      `SELECT
+         id,
+         user_id,
+         game_mode,
+         build_version,
+         r2_key,
+         started_at_ms,
+         ended_at_ms,
+         duration_ms,
+         snapshots_total,
+         meta_json,
+         created_at_ms
+       FROM recordings_index
+       ${whereClause}
+       ORDER BY started_at_ms DESC, id DESC
+       LIMIT ?`,
+    )
+      .bind(...values, limit)
+      .all<Record<string, unknown>>();
+    const rows = Array.isArray(result.results) ? result.results : [];
+    const recordings: AdminRecordingSummary[] = [];
+    for (const row of rows) {
+      const summary = toAdminRecordingSummary(row);
+      if (summary) recordings.push(summary);
+    }
+    const nextCursor =
+      rows.length >= limit && recordings.length > 0
+        ? formatRecordingsCursor({
+            startedAtMs: recordings[recordings.length - 1].startedAtMs,
+            id: recordings[recordings.length - 1].id,
+          })
+        : null;
+    return jsonResponse(
+      {
+        ok: true,
+        recordings,
+        page: {
+          limit,
+          nextCursor,
+          returned: recordings.length,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] recordings index failed', error);
+    return jsonResponse(
+      { error: 'Recording index is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminRecordingObject = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.RECORDINGS_BUCKET) {
+    return jsonResponse(
+      { error: 'Recording storage is not configured.' },
+      503,
+      {
+        'cache-control': 'no-store',
+      },
+    );
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const url = new URL(request.url);
+  const recordingId = asString(url.searchParams.get('id'));
+  if (!recordingId || !isValidRecordingId(recordingId)) {
+    return jsonResponse({ error: 'Missing or invalid recording id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  try {
+    const row = await env.DB.prepare(
+      `SELECT id, user_id, game_mode, build_version, r2_key
+       FROM recordings_index
+       WHERE id = ?
+       LIMIT 1`,
+    )
+      .bind(recordingId)
+      .first<Record<string, unknown>>();
+    if (!row) {
+      return jsonResponse({ error: 'Recording not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const r2Key = asString(row.r2_key);
+    if (!r2Key) {
+      return jsonResponse({ error: 'Recording metadata is invalid.' }, 500, {
+        'cache-control': 'no-store',
+      });
+    }
+    const object = await env.RECORDINGS_BUCKET.get(r2Key);
+    if (!object) {
+      return jsonResponse({ error: 'Recording object not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const body = await object.arrayBuffer();
+    return binaryResponse(body, 200, {
+      'cache-control': 'no-store',
+      'content-type': 'application/json; charset=utf-8',
+      'x-wub-recording-id': recordingId,
+      'x-wub-recording-user-id': asString(row.user_id) ?? '',
+      'x-wub-recording-mode': asString(row.game_mode) ?? '',
+      'x-wub-recording-build': asString(row.build_version) ?? '',
+      'x-wub-recording-r2-key': r2Key,
+    });
+  } catch (error) {
+    console.error('[admin] recording object fetch failed', error);
+    return jsonResponse(
+      { error: 'Recording storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -2671,6 +3028,14 @@ export default {
 
     if (url.pathname === '/api/admin/whoami') {
       return handleAdminWhoAmI(request, env);
+    }
+
+    if (url.pathname === '/api/admin/recordings/index') {
+      return handleAdminRecordingsIndex(request, env);
+    }
+
+    if (url.pathname === '/api/admin/recordings/object') {
+      return handleAdminRecordingObject(request, env);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {
