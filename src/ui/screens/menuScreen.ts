@@ -58,6 +58,49 @@ export type MenuLocalTrainingResult = {
   finalLoss: number | null;
 };
 
+export type MenuAdminRecordingSummary = {
+  id: string;
+  userId: string;
+  mode: string;
+  buildVersion: string;
+  startedAtMs: number;
+  durationMs: number;
+  samples: number;
+};
+
+export type MenuAdminRecordingsPage = {
+  recordings: MenuAdminRecordingSummary[];
+  page: {
+    limit: number;
+    nextCursor: string | null;
+    returned: number;
+  };
+};
+
+export type MenuAdminRecordingsQuery = {
+  mode?: string;
+  build?: string;
+  limit?: number;
+  cursor?: string | null;
+};
+
+export type MenuAdminRecordingPreview = {
+  id: string;
+  sessionId: string;
+  modeId: string;
+  buildVersion: string;
+  samples: number;
+  durationMs: number;
+  startedAtMs: number;
+  endedAtMs: number;
+  avgReward: number | null;
+  meanDeliberationMs: number | null;
+  rewardPolicy: string | null;
+  rewardKind: string | null;
+  rewardGamma: number | null;
+  outcome: string | null;
+};
+
 export type LabelingProgressState = {
   buildVersion: string;
   labeledBoards: number | null;
@@ -115,6 +158,10 @@ export type MenuScreenOptions = {
   }) => Promise<void>;
   onAuthLoadCurrentModel: () => Promise<string>;
   onAuthSaveCurrentModel: () => Promise<string>;
+  onAdminListRecordings: (
+    query: MenuAdminRecordingsQuery,
+  ) => Promise<MenuAdminRecordingsPage>;
+  onAdminLoadRecording: (id: string) => Promise<MenuAdminRecordingPreview>;
 };
 
 export type MenuScreen = {
@@ -165,6 +212,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthPasswordReset,
     onAuthLoadCurrentModel,
     onAuthSaveCurrentModel,
+    onAdminListRecordings,
+    onAdminLoadRecording,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -2381,12 +2430,129 @@ input[type=number] {
   const adminOpenRouteButton = makeMenuButton('OPEN /admin');
   adminActions.appendChild(adminWhoAmIButton);
   adminActions.appendChild(adminOpenRouteButton);
+  const adminDatasetLabel = makeSectionLabel('RECORDINGS DATASET');
+  Object.assign(adminDatasetLabel.style, { marginTop: '4px' });
+  const adminDatasetControls = document.createElement('div');
+  Object.assign(adminDatasetControls.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  const adminModeFilterInput = document.createElement('input');
+  adminModeFilterInput.type = 'text';
+  adminModeFilterInput.placeholder = 'mode (optional)';
+  Object.assign(adminModeFilterInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminBuildFilterInput = document.createElement('input');
+  adminBuildFilterInput.type = 'text';
+  adminBuildFilterInput.placeholder = 'build version (optional)';
+  Object.assign(adminBuildFilterInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminLimitInput = document.createElement('input');
+  adminLimitInput.type = 'number';
+  adminLimitInput.min = '1';
+  adminLimitInput.max = '200';
+  adminLimitInput.step = '1';
+  adminLimitInput.value = '25';
+  adminLimitInput.placeholder = 'limit';
+  Object.assign(adminLimitInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  adminLimitInput.addEventListener('wheel', (event) => {
+    if (document.activeElement === adminLimitInput) {
+      event.preventDefault();
+    }
+  });
+  adminLimitInput.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+    }
+  });
+  const adminDatasetButtons = document.createElement('div');
+  Object.assign(adminDatasetButtons.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const adminQueryButton = makeMenuButton('QUERY');
+  const adminNextPageButton = makeMenuButton('NEXT PAGE');
+  Object.assign(adminQueryButton.style, { flex: '1' });
+  Object.assign(adminNextPageButton.style, { flex: '1' });
+  adminDatasetButtons.appendChild(adminQueryButton);
+  adminDatasetButtons.appendChild(adminNextPageButton);
+  const adminDatasetSummary = document.createElement('div');
+  Object.assign(adminDatasetSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const adminRecordingsSelect = document.createElement('select');
+  adminRecordingsSelect.size = 8;
+  Object.assign(adminRecordingsSelect.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  const adminLoadSelectedButton = makeMenuButton('LOAD SELECTED RECORDING');
+  const adminLoadedSummary = document.createElement('div');
+  Object.assign(adminLoadedSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  adminDatasetControls.appendChild(adminModeFilterInput);
+  adminDatasetControls.appendChild(adminBuildFilterInput);
+  adminDatasetControls.appendChild(adminLimitInput);
+  adminDatasetControls.appendChild(adminDatasetButtons);
+  adminDatasetControls.appendChild(adminDatasetSummary);
+  adminDatasetControls.appendChild(adminRecordingsSelect);
+  adminDatasetControls.appendChild(adminLoadSelectedButton);
+  adminDatasetControls.appendChild(adminLoadedSummary);
   const adminBackButton = makeMenuButton('BACK');
   Object.assign(adminBackButton.style, { marginTop: 'auto' });
   adminPanel.appendChild(adminTitle);
   adminPanel.appendChild(adminSummary);
   adminPanel.appendChild(adminStatus);
   adminPanel.appendChild(adminActions);
+  adminPanel.appendChild(adminDatasetLabel);
+  adminPanel.appendChild(adminDatasetControls);
   adminPanel.appendChild(adminBackButton);
 
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
@@ -2395,6 +2561,11 @@ input[type=number] {
   let authActionPending = false;
   let modelActionPending = false;
   let adminActionPending = false;
+  let adminDatasetPending = false;
+  let adminCurrentCursor: string | null = null;
+  let adminCurrentRecordings: MenuAdminRecordingSummary[] = [];
+  let adminSelectedRecordingId: string | null = null;
+  let adminLastPage: MenuAdminRecordingsPage | null = null;
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
     if (tone === 'error') return '#f28b82';
@@ -2503,6 +2674,90 @@ input[type=number] {
     return `Signed in as ${state.user.username}\nAdmin access: granted\nUse this panel for privileged training and data operations.`;
   };
 
+  const getAdminQueryLimit = (): number => {
+    const raw = Number(adminLimitInput.value);
+    if (!Number.isFinite(raw)) return 25;
+    return Math.max(1, Math.min(200, Math.trunc(raw)));
+  };
+
+  const formatAdminDatasetSummary = (
+    page: MenuAdminRecordingsPage | null,
+  ): string => {
+    if (!page) {
+      return 'No query run yet.';
+    }
+    const next =
+      page.page.nextCursor != null && page.page.nextCursor.length > 0
+        ? 'available'
+        : 'none';
+    return [
+      `Returned: ${page.page.returned}`,
+      `Limit: ${page.page.limit}`,
+      `Next page: ${next}`,
+    ].join('\n');
+  };
+
+  const formatAdminRecordingOption = (
+    recording: MenuAdminRecordingSummary,
+  ): string => {
+    const time = new Date(recording.startedAtMs).toLocaleTimeString();
+    return `${recording.mode} · ${recording.samples} samples · ${time}`;
+  };
+
+  const renderAdminRecordingsSelect = (): void => {
+    adminRecordingsSelect.innerHTML = '';
+    for (const recording of adminCurrentRecordings) {
+      const option = document.createElement('option');
+      option.value = recording.id;
+      option.textContent = formatAdminRecordingOption(recording);
+      adminRecordingsSelect.appendChild(option);
+    }
+    if (adminCurrentRecordings.length > 0) {
+      const activeId =
+        adminSelectedRecordingId &&
+        adminCurrentRecordings.some(
+          (recording) => recording.id === adminSelectedRecordingId,
+        )
+          ? adminSelectedRecordingId
+          : adminCurrentRecordings[0].id;
+      adminRecordingsSelect.value = activeId;
+      adminSelectedRecordingId = activeId;
+    } else {
+      adminSelectedRecordingId = null;
+    }
+  };
+
+  const formatAdminRecordingPreview = (
+    preview: MenuAdminRecordingPreview,
+  ): string => {
+    const lines = [
+      `Loaded id: ${preview.id}`,
+      `Session: ${preview.sessionId}`,
+      `Mode: ${preview.modeId}`,
+      `Build: ${preview.buildVersion}`,
+      `Samples: ${preview.samples}`,
+      `Duration: ${Math.max(0, Math.trunc(preview.durationMs / 1000))}s`,
+      `Started: ${new Date(preview.startedAtMs).toLocaleTimeString()}`,
+      preview.rewardPolicy
+        ? `Reward policy: ${preview.rewardPolicy}`
+        : 'Reward policy: (none)',
+      preview.rewardKind
+        ? `Reward kind: ${preview.rewardKind}`
+        : 'Reward kind: (none)',
+      preview.rewardGamma != null
+        ? `Reward gamma: ${preview.rewardGamma.toFixed(3)}`
+        : 'Reward gamma: (none)',
+      preview.avgReward != null
+        ? `Avg reward: ${preview.avgReward.toFixed(4)}`
+        : 'Avg reward: (n/a)',
+      preview.meanDeliberationMs != null
+        ? `Mean deliberation: ${preview.meanDeliberationMs.toFixed(1)} ms`
+        : 'Mean deliberation: (n/a)',
+      preview.outcome ? `Outcome: ${preview.outcome}` : 'Outcome: (n/a)',
+    ];
+    return lines.join('\n');
+  };
+
   const formatMyModelsTrainingSummary = (
     stats: MenuLocalTrainingStats,
   ): string => {
@@ -2554,15 +2809,47 @@ input[type=number] {
       currentAuthState.user != null &&
       currentAuthState.user.isAdmin;
     adminSummary.textContent = formatAdminSummary(currentAuthState);
+    adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
     adminButton.style.display = isAdmin ? 'block' : 'none';
     adminActions.style.display = isAdmin ? 'flex' : 'none';
+    adminDatasetLabel.style.display = isAdmin ? 'block' : 'none';
+    adminDatasetControls.style.display = isAdmin ? 'flex' : 'none';
     const busy = adminActionPending || currentAuthState.loading;
+    const datasetBusy = adminDatasetPending || busy;
     adminWhoAmIButton.disabled = !isAdmin || busy;
     adminOpenRouteButton.disabled = busy;
+    adminModeFilterInput.disabled = datasetBusy || !isAdmin;
+    adminBuildFilterInput.disabled = datasetBusy || !isAdmin;
+    adminLimitInput.disabled = datasetBusy || !isAdmin;
+    adminQueryButton.disabled = datasetBusy || !isAdmin;
+    adminNextPageButton.disabled =
+      datasetBusy ||
+      !isAdmin ||
+      adminCurrentCursor == null ||
+      adminCurrentCursor.length === 0;
+    adminRecordingsSelect.disabled =
+      datasetBusy || !isAdmin || adminCurrentRecordings.length === 0;
+    adminLoadSelectedButton.disabled =
+      datasetBusy || !isAdmin || adminSelectedRecordingId == null;
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
+    adminQueryButton.style.opacity = !isAdmin || datasetBusy ? '0.65' : '1';
+    adminNextPageButton.style.opacity =
+      !isAdmin || datasetBusy || !adminCurrentCursor ? '0.65' : '1';
+    adminLoadSelectedButton.style.opacity =
+      !isAdmin || datasetBusy || adminSelectedRecordingId == null
+        ? '0.65'
+        : '1';
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
+    adminQueryButton.style.cursor =
+      !isAdmin || datasetBusy ? 'default' : 'pointer';
+    adminNextPageButton.style.cursor =
+      !isAdmin || datasetBusy || !adminCurrentCursor ? 'default' : 'pointer';
+    adminLoadSelectedButton.style.cursor =
+      !isAdmin || datasetBusy || adminSelectedRecordingId == null
+        ? 'default'
+        : 'pointer';
   };
 
   const updateAccountControls = () => {
@@ -2838,6 +3125,96 @@ input[type=number] {
     window.location.assign('/admin');
   });
 
+  adminRecordingsSelect.addEventListener('change', () => {
+    const value = adminRecordingsSelect.value.trim();
+    adminSelectedRecordingId = value.length > 0 ? value : null;
+    updateAdminControls();
+  });
+
+  const runAdminRecordingsQuery = async (options: {
+    useNextCursor: boolean;
+  }): Promise<void> => {
+    if (adminDatasetPending) return;
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    if (!isAdmin) {
+      setAdminActionStatus('Admin account required.', 'error');
+      return;
+    }
+    const mode = adminModeFilterInput.value.trim();
+    const build = adminBuildFilterInput.value.trim();
+    const limit = getAdminQueryLimit();
+    adminDatasetPending = true;
+    setAdminActionStatus(
+      options.useNextCursor
+        ? 'Loading next recordings page...'
+        : 'Loading recordings...',
+    );
+    updateAdminControls();
+    try {
+      const page = await onAdminListRecordings({
+        ...(mode ? { mode } : {}),
+        ...(build ? { build } : {}),
+        limit,
+        ...(options.useNextCursor && adminCurrentCursor
+          ? { cursor: adminCurrentCursor }
+          : {}),
+      });
+      adminLastPage = page;
+      adminCurrentRecordings = page.recordings;
+      adminCurrentCursor = page.page.nextCursor;
+      renderAdminRecordingsSelect();
+      adminDatasetSummary.textContent = formatAdminDatasetSummary(page);
+      setAdminActionStatus(
+        `Loaded ${page.page.returned} recordings.`,
+        'success',
+      );
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not load recordings list.'),
+        'error',
+      );
+    } finally {
+      adminDatasetPending = false;
+      updateAdminControls();
+    }
+  };
+
+  adminQueryButton.addEventListener('click', () => {
+    adminCurrentCursor = null;
+    void runAdminRecordingsQuery({ useNextCursor: false });
+  });
+
+  adminNextPageButton.addEventListener('click', () => {
+    void runAdminRecordingsQuery({ useNextCursor: true });
+  });
+
+  adminLoadSelectedButton.addEventListener('click', async () => {
+    if (adminDatasetPending) return;
+    if (!adminSelectedRecordingId) {
+      setAdminActionStatus('Select a recording first.', 'error');
+      return;
+    }
+    adminDatasetPending = true;
+    setAdminActionStatus('Loading selected recording...');
+    updateAdminControls();
+    try {
+      const preview = await onAdminLoadRecording(adminSelectedRecordingId);
+      adminLoadedSummary.textContent = formatAdminRecordingPreview(preview);
+      setAdminActionStatus('Recording loaded.', 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not load selected recording.'),
+        'error',
+      );
+    } finally {
+      adminDatasetPending = false;
+      updateAdminControls();
+    }
+  });
+
   accountLogoutButton.addEventListener('click', async () => {
     if (authActionPending) return;
     authActionPending = true;
@@ -2983,6 +3360,8 @@ input[type=number] {
   }
   setMyModelsActionStatus('');
   setAdminActionStatus('');
+  adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
+  adminLoadedSummary.textContent = 'No recording loaded.';
   setAuthState(currentAuthState);
 
   const menuLayer = document.createElement('div');

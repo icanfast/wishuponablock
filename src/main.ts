@@ -35,6 +35,10 @@ import {
 } from './app/trajectoryBuffer';
 import { createTrajectoryRecordingService } from './app/trajectoryRecordingService';
 import {
+  createAdminRecordingsService,
+  type AdminRecordingsPage,
+} from './app/adminRecordingsService';
+import {
   computeTrajectoryRewards,
   resolveTrajectoryRewardPolicyId,
   type TrajectoryRewardComputation,
@@ -65,6 +69,9 @@ import {
   type MenuMlBackendPreference,
   type MenuMlParityResult,
   type MenuAuthStatusTone,
+  type MenuAdminRecordingsPage,
+  type MenuAdminRecordingPreview,
+  type MenuAdminRecordingsQuery,
   type MenuScreen,
 } from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
@@ -238,6 +245,9 @@ async function boot() {
     baseUrl: uploadBaseUrl,
   });
   const trajectoryRecordingService = createTrajectoryRecordingService({
+    baseUrl: uploadBaseUrl,
+  });
+  const adminRecordingsService = createAdminRecordingsService({
     baseUrl: uploadBaseUrl,
   });
   const authErrorMessages: Record<string, string> = {
@@ -737,6 +747,73 @@ async function boot() {
     const versionLabel =
       result.version != null ? `v${result.version}` : 'saved';
     return `Saved ${versionLabel} model for mode "${result.mode}".`;
+  };
+
+  const toMenuAdminRecordingsPage = (
+    page: AdminRecordingsPage,
+  ): MenuAdminRecordingsPage => ({
+    recordings: page.recordings.map((recording) => ({
+      id: recording.id,
+      userId: recording.userId,
+      mode: recording.mode,
+      buildVersion: recording.buildVersion,
+      startedAtMs: recording.startedAtMs,
+      durationMs: recording.durationMs,
+      samples: recording.samples,
+    })),
+    page: {
+      limit: page.page.limit,
+      nextCursor: page.page.nextCursor,
+      returned: page.page.returned,
+    },
+  });
+
+  const listAdminRecordings = async (
+    query: MenuAdminRecordingsQuery,
+  ): Promise<MenuAdminRecordingsPage> =>
+    toMenuAdminRecordingsPage(
+      await adminRecordingsService.listRecordings(query),
+    );
+
+  const loadAdminRecordingPreview = async (
+    id: string,
+  ): Promise<MenuAdminRecordingPreview> => {
+    const session = await adminRecordingsService.loadRecordingObject(id);
+    const rewards = session.samples
+      .map((sample) => sample.reward)
+      .filter(
+        (value): value is number => value != null && Number.isFinite(value),
+      );
+    const avgReward =
+      rewards.length > 0
+        ? rewards.reduce((sum, value) => sum + value, 0) / rewards.length
+        : null;
+    const deliberations = session.samples
+      .map((sample) => sample.deliberationMs)
+      .filter(
+        (value): value is number => value != null && Number.isFinite(value),
+      );
+    const meanDeliberationMs =
+      deliberations.length > 0
+        ? deliberations.reduce((sum, value) => sum + value, 0) /
+          deliberations.length
+        : null;
+    return {
+      id,
+      sessionId: session.sessionId,
+      modeId: session.modeId,
+      buildVersion: session.buildVersion,
+      samples: session.samples.length,
+      durationMs: session.durationMs,
+      startedAtMs: session.startedAtMs,
+      endedAtMs: session.endedAtMs,
+      avgReward,
+      meanDeliberationMs,
+      rewardPolicy: session.meta?.rewardPolicy ?? null,
+      rewardKind: session.meta?.rewardKind ?? null,
+      rewardGamma: session.meta?.rewardGamma ?? null,
+      outcome: session.meta?.outcome ?? null,
+    };
   };
 
   type TrajectoryRunState = {
@@ -1466,6 +1543,8 @@ async function boot() {
     onAuthPasswordReset: resetPasswordWithToken,
     onAuthLoadCurrentModel: loadCurrentModePersonalModel,
     onAuthSaveCurrentModel: saveCurrentModePersonalModel,
+    onAdminListRecordings: listAdminRecordings,
+    onAdminLoadRecording: loadAdminRecordingPreview,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
