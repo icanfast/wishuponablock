@@ -43,6 +43,18 @@ export type MenuMlParityResult = {
   ok: boolean;
   message: string;
 };
+export type MenuLocalTrainingStats = {
+  currentModeId: string;
+  currentModeSamples: number;
+  totalSamples: number;
+  lastSampleAtMs: number | null;
+};
+export type MenuLocalTrainingResult = {
+  ok: boolean;
+  message: string;
+  samplesUsed: number;
+  finalLoss: number | null;
+};
 
 export type LabelingProgressState = {
   buildVersion: string;
@@ -67,6 +79,8 @@ export type MenuScreenOptions = {
   onMlRunParityCheck: (
     preference: MenuMlBackendPreference,
   ) => Promise<MenuMlParityResult>;
+  getLocalTrainingStats: () => MenuLocalTrainingStats;
+  onRunLocalBiasTraining: () => Promise<MenuLocalTrainingResult>;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -126,6 +140,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     getMlRuntimeSummary,
     onMlBackendPreferenceChange,
     onMlRunParityCheck,
+    getLocalTrainingStats,
+    onRunLocalBiasTraining,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -311,7 +327,7 @@ input[type=number] {
     textAlign: 'left',
   });
   Object.assign(myModelsPanel.style, {
-    minHeight: '260px',
+    minHeight: '320px',
     width: '320px',
     display: 'none',
     textAlign: 'left',
@@ -2259,8 +2275,24 @@ input[type=number] {
     flexDirection: 'column',
     gap: '8px',
   });
+  const myModelsCloudLabel = makeSectionLabel('CLOUD MODEL');
+  Object.assign(myModelsCloudLabel.style, { marginTop: '4px' });
   const myModelsLoadButton = makeMenuButton('LOAD CLOUD MODEL');
   const myModelsSaveButton = makeMenuButton('SAVE CURRENT MODEL');
+  const myModelsTrainingLabel = makeSectionLabel('LOCAL TRAINING');
+  Object.assign(myModelsTrainingLabel.style, { marginTop: '4px' });
+  const myModelsTrainingSummary = document.createElement('div');
+  Object.assign(myModelsTrainingSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const myModelsTrainButton = makeMenuButton('TRAIN ON CLIENT SAMPLES');
   const myModelsBackButton = makeMenuButton('BACK');
   Object.assign(myModelsBackButton.style, { marginTop: 'auto' });
   myModelsActions.appendChild(myModelsLoadButton);
@@ -2268,8 +2300,12 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsTitle);
   myModelsPanel.appendChild(myModelsSummary);
   myModelsPanel.appendChild(myModelsActionStatus);
+  myModelsPanel.appendChild(myModelsCloudLabel);
   myModelsPanel.appendChild(myModelsSignedOutHint);
   myModelsPanel.appendChild(myModelsActions);
+  myModelsPanel.appendChild(myModelsTrainingLabel);
+  myModelsPanel.appendChild(myModelsTrainingSummary);
+  myModelsPanel.appendChild(myModelsTrainButton);
   myModelsPanel.appendChild(myModelsBackButton);
 
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
@@ -2359,15 +2395,43 @@ input[type=number] {
     return `Signed in as ${state.user.username}\nManage your cloud model for the current game mode.`;
   };
 
+  const formatMyModelsTrainingSummary = (
+    stats: MenuLocalTrainingStats,
+  ): string => {
+    const eligibilityLine =
+      stats.currentModeSamples >= 8
+        ? 'Ready to train'
+        : `Need ${8 - stats.currentModeSamples} more mode samples`;
+    const lastSampleLine =
+      stats.lastSampleAtMs == null
+        ? 'Last sample: none yet'
+        : `Last sample: ${new Date(stats.lastSampleAtMs).toLocaleTimeString()}`;
+    return [
+      `Mode: ${stats.currentModeId}`,
+      `Client samples (mode): ${stats.currentModeSamples}`,
+      `Client samples (total): ${stats.totalSamples}`,
+      eligibilityLine,
+      lastSampleLine,
+    ].join('\n');
+  };
+
   const updateMyModelsControls = () => {
     const authenticated =
       currentAuthState.authenticated && currentAuthState.user != null;
+    const trainingStats = getLocalTrainingStats();
+    const hasTrainSamples = trainingStats.currentModeSamples >= 8;
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
+    myModelsTrainingSummary.textContent =
+      formatMyModelsTrainingSummary(trainingStats);
     myModelsSignedOutHint.style.display = authenticated ? 'none' : 'block';
     myModelsActions.style.display = authenticated ? 'flex' : 'none';
     const busy = modelActionPending || currentAuthState.loading;
     myModelsLoadButton.disabled = !authenticated || busy;
     myModelsSaveButton.disabled = !authenticated || busy;
+    myModelsTrainButton.disabled = busy || !hasTrainSamples;
+    myModelsTrainButton.style.opacity = busy || !hasTrainSamples ? '0.65' : '1';
+    myModelsTrainButton.style.cursor =
+      busy || !hasTrainSamples ? 'default' : 'pointer';
   };
 
   const updateAccountControls = () => {
@@ -2539,6 +2603,32 @@ input[type=number] {
     } catch (error) {
       setMyModelsActionStatus(
         toErrorMessage(error, 'Could not save current model.'),
+        'error',
+      );
+    } finally {
+      modelActionPending = false;
+      updateMyModelsControls();
+    }
+  });
+
+  myModelsTrainButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    modelActionPending = true;
+    setMyModelsActionStatus('Training on local client samples...');
+    updateMyModelsControls();
+    try {
+      const result = await onRunLocalBiasTraining();
+      const lossSuffix =
+        result.finalLoss != null
+          ? `\nFinal loss: ${result.finalLoss.toExponential(3)}`
+          : '';
+      setMyModelsActionStatus(
+        `${result.message}\nSamples used: ${result.samplesUsed}${lossSuffix}`,
+        result.ok ? 'success' : 'error',
+      );
+    } catch (error) {
+      setMyModelsActionStatus(
+        toErrorMessage(error, 'Could not run local training.'),
         'error',
       );
     } finally {
@@ -2816,6 +2906,9 @@ input[type=number] {
     menuTitle.style.display = panel === 'options' ? 'none' : 'block';
     if (panel === 'options') {
       syncMlRuntimeSummary();
+    }
+    if (panel === 'my_models') {
+      updateMyModelsControls();
     }
   };
 

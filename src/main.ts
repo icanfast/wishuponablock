@@ -770,6 +770,16 @@ async function boot() {
       finalLoss: result.finalLoss,
     };
   };
+  const getLocalTrainingStats = () => {
+    const stats = trajectoryBuffer.getStats();
+    const currentModeId = modeController.getState().mode.id;
+    return {
+      currentModeId,
+      currentModeSamples: stats.byMode[currentModeId] ?? 0,
+      totalSamples: stats.totalSamples,
+      lastSampleAtMs: stats.lastSampleAtMs,
+    };
+  };
   applyAuthState(authState);
 
   const soundService = createSoundService({ settings });
@@ -1185,6 +1195,8 @@ async function boot() {
     getMlRuntimeSummary,
     onMlBackendPreferenceChange: applyMlBackendPreference,
     onMlRunParityCheck: runMlParityCheck,
+    getLocalTrainingStats,
+    onRunLocalBiasTraining: () => runLocalBiasTraining(),
     onAuthRefresh: refreshAuthState,
     onAuthStartOAuth: (provider) => authService.startOAuth(provider),
     onAuthLogout: logoutAuthState,
