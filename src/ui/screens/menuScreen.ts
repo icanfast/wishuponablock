@@ -17,7 +17,8 @@ type MenuPanel =
   | 'charcuterie'
   | 'tools'
   | 'feedback'
-  | 'account';
+  | 'account'
+  | 'my_models';
 
 export type MenuAuthUser = {
   id: string;
@@ -275,6 +276,7 @@ input[type=number] {
   const toolsPanel = makeMenuPanel();
   const feedbackPanel = makeMenuPanel();
   const accountPanel = makeMenuPanel();
+  const myModelsPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
 
@@ -308,6 +310,12 @@ input[type=number] {
     display: 'none',
     textAlign: 'left',
   });
+  Object.assign(myModelsPanel.style, {
+    minHeight: '260px',
+    width: '320px',
+    display: 'none',
+    textAlign: 'left',
+  });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
     width: '240px',
@@ -326,12 +334,14 @@ input[type=number] {
     toolsButton.style.display = 'none';
   }
   const accountButton = makeMenuButton('ACCOUNT');
+  const myModelsButton = makeMenuButton('MY MODELS');
   const aboutButton = makeMenuButton('ABOUT');
 
   menuMainPanel.appendChild(playButton);
   menuMainPanel.appendChild(optionsButton);
   menuMainPanel.appendChild(toolsButton);
   menuMainPanel.appendChild(accountButton);
+  menuMainPanel.appendChild(myModelsButton);
   menuMainPanel.appendChild(aboutButton);
 
   const optionsTitle = document.createElement('div');
@@ -2094,8 +2104,6 @@ input[type=number] {
   const accountGoogleButton = makeMenuButton('SIGN IN WITH GOOGLE');
   const accountDiscordButton = makeMenuButton('SIGN IN WITH DISCORD');
   const accountVerifyButton = makeMenuButton('SEND VERIFICATION EMAIL');
-  const accountLoadModelButton = makeMenuButton('LOAD CLOUD MODEL');
-  const accountSaveModelButton = makeMenuButton('SAVE CURRENT MODEL');
   const accountLogoutButton = makeMenuButton('LOG OUT');
   const accountEmailContinueButton = makeMenuButton('CONTINUE WITH EMAIL');
   const accountEmailSubmitButton = makeMenuButton('LOG IN');
@@ -2205,14 +2213,70 @@ input[type=number] {
 
   accountSignedInActions.appendChild(accountRefreshButton);
   accountSignedInActions.appendChild(accountVerifyButton);
-  accountSignedInActions.appendChild(accountLoadModelButton);
-  accountSignedInActions.appendChild(accountSaveModelButton);
   accountSignedInActions.appendChild(accountLogoutButton);
+
+  const myModelsTitle = document.createElement('div');
+  myModelsTitle.textContent = 'MY MODELS';
+  Object.assign(myModelsTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '6px',
+    textAlign: 'center',
+  });
+  const myModelsSummary = document.createElement('div');
+  Object.assign(myModelsSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.45',
+    minHeight: '44px',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const myModelsActionStatus = document.createElement('div');
+  Object.assign(myModelsActionStatus.style, {
+    marginTop: '4px',
+    fontSize: '12px',
+    color: '#8fa0b8',
+    minHeight: '16px',
+    textAlign: 'center',
+  });
+  const myModelsSignedOutHint = document.createElement('div');
+  myModelsSignedOutHint.textContent = 'Sign in from ACCOUNT to manage models.';
+  Object.assign(myModelsSignedOutHint.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    textAlign: 'center',
+    marginTop: '2px',
+  });
+  const myModelsActions = document.createElement('div');
+  Object.assign(myModelsActions.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  });
+  const myModelsLoadButton = makeMenuButton('LOAD CLOUD MODEL');
+  const myModelsSaveButton = makeMenuButton('SAVE CURRENT MODEL');
+  const myModelsBackButton = makeMenuButton('BACK');
+  Object.assign(myModelsBackButton.style, { marginTop: 'auto' });
+  myModelsActions.appendChild(myModelsLoadButton);
+  myModelsActions.appendChild(myModelsSaveButton);
+  myModelsPanel.appendChild(myModelsTitle);
+  myModelsPanel.appendChild(myModelsSummary);
+  myModelsPanel.appendChild(myModelsActionStatus);
+  myModelsPanel.appendChild(myModelsSignedOutHint);
+  myModelsPanel.appendChild(myModelsActions);
+  myModelsPanel.appendChild(myModelsBackButton);
 
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
   let signedOutStage: SignedOutStage = hiddenResetToken ? 'reset' : 'email';
   let currentAuthState: MenuAuthState = authState;
   let authActionPending = false;
+  let modelActionPending = false;
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
     if (tone === 'error') return '#f28b82';
@@ -2224,6 +2288,13 @@ input[type=number] {
   ) => {
     accountActionStatus.textContent = message;
     accountActionStatus.style.color = statusColor(tone);
+  };
+  const setMyModelsActionStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
+    myModelsActionStatus.textContent = message;
+    myModelsActionStatus.style.color = statusColor(tone);
   };
   const readField = (input: HTMLInputElement): string => input.value.trim();
   const toErrorMessage = (error: unknown, fallback: string): string => {
@@ -2278,6 +2349,27 @@ input[type=number] {
       .join('\n');
   };
 
+  const formatMyModelsSummary = (state: MenuAuthState): string => {
+    if (state.loading) {
+      return 'Checking session...';
+    }
+    if (!state.authenticated || !state.user) {
+      return 'Not signed in.';
+    }
+    return `Signed in as ${state.user.username}\nManage your cloud model for the current game mode.`;
+  };
+
+  const updateMyModelsControls = () => {
+    const authenticated =
+      currentAuthState.authenticated && currentAuthState.user != null;
+    myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
+    myModelsSignedOutHint.style.display = authenticated ? 'none' : 'block';
+    myModelsActions.style.display = authenticated ? 'flex' : 'none';
+    const busy = modelActionPending || currentAuthState.loading;
+    myModelsLoadButton.disabled = !authenticated || busy;
+    myModelsSaveButton.disabled = !authenticated || busy;
+  };
+
   const updateAccountControls = () => {
     accountSummary.textContent = formatAccountSummary(currentAuthState);
     const authenticated =
@@ -2301,8 +2393,6 @@ input[type=number] {
       accountDiscordButton,
       accountLogoutButton,
       accountVerifyButton,
-      accountLoadModelButton,
-      accountSaveModelButton,
       accountEmailContinueButton,
       accountEmailSubmitButton,
       accountResetSubmitButton,
@@ -2322,6 +2412,7 @@ input[type=number] {
       currentAuthState.user.emailVerifiedAtMs == null
         ? 'block'
         : 'none';
+    updateMyModelsControls();
   };
 
   const setAuthState = (state: MenuAuthState) => {
@@ -2418,41 +2509,41 @@ input[type=number] {
     }
   });
 
-  accountLoadModelButton.addEventListener('click', async () => {
-    if (authActionPending) return;
-    authActionPending = true;
-    setAccountActionStatus('Loading cloud model...');
-    updateAccountControls();
+  myModelsLoadButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    modelActionPending = true;
+    setMyModelsActionStatus('Loading cloud model...');
+    updateMyModelsControls();
     try {
       const message = await onAuthLoadCurrentModel();
-      setAccountActionStatus(message || 'Cloud model loaded.', 'success');
+      setMyModelsActionStatus(message || 'Cloud model loaded.', 'success');
     } catch (error) {
-      setAccountActionStatus(
+      setMyModelsActionStatus(
         toErrorMessage(error, 'Could not load cloud model.'),
         'error',
       );
     } finally {
-      authActionPending = false;
-      updateAccountControls();
+      modelActionPending = false;
+      updateMyModelsControls();
     }
   });
 
-  accountSaveModelButton.addEventListener('click', async () => {
-    if (authActionPending) return;
-    authActionPending = true;
-    setAccountActionStatus('Saving current model...');
-    updateAccountControls();
+  myModelsSaveButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    modelActionPending = true;
+    setMyModelsActionStatus('Saving current model...');
+    updateMyModelsControls();
     try {
       const message = await onAuthSaveCurrentModel();
-      setAccountActionStatus(message || 'Current model saved.', 'success');
+      setMyModelsActionStatus(message || 'Current model saved.', 'success');
     } catch (error) {
-      setAccountActionStatus(
+      setMyModelsActionStatus(
         toErrorMessage(error, 'Could not save current model.'),
         'error',
       );
     } finally {
-      authActionPending = false;
-      updateAccountControls();
+      modelActionPending = false;
+      updateMyModelsControls();
     }
   });
 
@@ -2599,6 +2690,7 @@ input[type=number] {
   } else {
     setAccountActionStatus('');
   }
+  setMyModelsActionStatus('');
   setAuthState(currentAuthState);
 
   const menuLayer = document.createElement('div');
@@ -2624,6 +2716,7 @@ input[type=number] {
   menuLayer.appendChild(toolsPanel);
   menuLayer.appendChild(feedbackPanel);
   menuLayer.appendChild(accountPanel);
+  menuLayer.appendChild(myModelsPanel);
   root.appendChild(menuLayer);
 
   const feedbackMenuButton = makeMenuButton('LEAVE FEEDBACK');
@@ -2718,6 +2811,7 @@ input[type=number] {
     toolsPanel.style.display = panel === 'tools' ? 'flex' : 'none';
     feedbackPanel.style.display = panel === 'feedback' ? 'flex' : 'none';
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
+    myModelsPanel.style.display = panel === 'my_models' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display = panel === 'options' ? 'none' : 'block';
     if (panel === 'options') {
@@ -2733,6 +2827,7 @@ input[type=number] {
     toolsButton.addEventListener('click', () => show('tools'));
   }
   accountButton.addEventListener('click', () => show('account'));
+  myModelsButton.addEventListener('click', () => show('my_models'));
   aboutButton.addEventListener('click', () => show('about'));
   feedbackMenuButton.addEventListener('click', () => show('feedback'));
 
@@ -2779,6 +2874,7 @@ input[type=number] {
   toolsBackButton.addEventListener('click', showMain);
   feedbackBackButton.addEventListener('click', showMain);
   accountBackButton.addEventListener('click', showMain);
+  myModelsBackButton.addEventListener('click', showMain);
 
   window.addEventListener('keydown', (event) => {
     if (event.code !== 'Escape') return;
