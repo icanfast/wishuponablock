@@ -2192,12 +2192,14 @@ const handlePutCurrentPersonalModel = async (
     });
 
     if (existing && existing.r2Key !== nextR2Key) {
-      env.MODELS_BUCKET.delete(existing.r2Key).catch((error) => {
+      try {
+        await env.MODELS_BUCKET.delete(existing.r2Key);
+      } catch (error) {
         console.warn(
           `[models] failed to delete previous model blob (${existing.r2Key})`,
           error,
         );
-      });
+      }
     }
 
     return jsonResponse(
