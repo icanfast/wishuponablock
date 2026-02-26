@@ -63,7 +63,7 @@ type TfjsModule = {
   square: (x: TfTensor) => TfTensor;
   sqrt: (x: TfTensor) => TfTensor;
   div: (a: TfTensor, b: TfTensor) => TfTensor;
-  stopGradient: (x: TfTensor) => TfTensor;
+  stopGradient?: (x: TfTensor) => TfTensor;
   neg: (x: TfTensor) => TfTensor;
   train: {
     adam: (learningRate: number) => TfOptimizer;
@@ -918,9 +918,16 @@ const trainWithTfjs = async (options: {
       const advVar = tf.mean(tf.square(centeredAdv));
       const advStd = tf.sqrt(tf.add(advVar, tf.scalar(1e-8)));
       const normAdv = tf.div(centeredAdv, advStd);
+      const detachedNormAdv =
+        typeof tf.stopGradient === 'function'
+          ? tf.stopGradient(normAdv)
+          : tf.tensor1d(new Float32Array(normAdv.dataSync() as Float32Array));
       const policyLoss = tf.neg(
-        tf.mean(tf.mul(selectedLogProb, tf.stopGradient(normAdv))),
+        tf.mean(tf.mul(selectedLogProb, detachedNormAdv)),
       );
+      if (detachedNormAdv !== normAdv) {
+        detachedNormAdv.dispose();
+      }
       const entropy = tf.neg(tf.mean(tf.sum(tf.mul(probs, logProbs), 1)));
       const valueLoss = tf.mean(tf.square(rawAdvantage));
       return tf.add(
