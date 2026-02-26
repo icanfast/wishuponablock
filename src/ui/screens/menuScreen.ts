@@ -97,6 +97,20 @@ export type MenuGlobalModelSummary = {
   updatedAtMs: number | null;
 };
 
+export type MenuAdminGlobalBaselineSummary = {
+  id: string;
+  mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  pipelineId: string | null;
+  label: string | null;
+  isDefault: boolean;
+  sizeBytes: number | null;
+  updatedAtMs: number | null;
+  retiredAtMs: number | null;
+};
+
 export type MenuAdminRecordingSummary = {
   id: string;
   userId: string;
@@ -212,7 +226,13 @@ export type MenuScreenOptions = {
     query: MenuAdminRecordingsQuery,
   ) => Promise<MenuAdminRecordingsPage>;
   onAdminLoadRecording: (id: string) => Promise<MenuAdminRecordingPreview>;
-  onAdminPublishCurrentModelBaseline: () => Promise<string>;
+  onAdminPublishCurrentModelBaseline: (payload?: {
+    label?: string;
+    setDefault?: boolean;
+  }) => Promise<string>;
+  onAdminListGlobalBaselines: () => Promise<MenuAdminGlobalBaselineSummary[]>;
+  onAdminSetGlobalBaselineDefault: (id: string) => Promise<string>;
+  onAdminRetireGlobalBaseline: (id: string) => Promise<string>;
 };
 
 export type MenuScreen = {
@@ -269,6 +289,9 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminListRecordings,
     onAdminLoadRecording,
     onAdminPublishCurrentModelBaseline,
+    onAdminListGlobalBaselines,
+    onAdminSetGlobalBaselineDefault,
+    onAdminRetireGlobalBaseline,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -2597,9 +2620,89 @@ input[type=number] {
   const adminPublishBaselineButton = makeMenuButton(
     'PUBLISH CURRENT MODEL AS BASELINE',
   );
+  const adminPublishLabelInput = document.createElement('input');
+  adminPublishLabelInput.type = 'text';
+  adminPublishLabelInput.placeholder = 'baseline label (optional)';
+  Object.assign(adminPublishLabelInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminPublishDefaultRow = document.createElement('label');
+  Object.assign(adminPublishDefaultRow.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    color: '#b6c2d4',
+    fontSize: '12px',
+  });
+  const adminPublishDefaultCheckbox = document.createElement('input');
+  adminPublishDefaultCheckbox.type = 'checkbox';
+  adminPublishDefaultCheckbox.checked = false;
+  adminPublishDefaultRow.appendChild(adminPublishDefaultCheckbox);
+  adminPublishDefaultRow.appendChild(
+    document.createTextNode('Set as default baseline'),
+  );
   adminActions.appendChild(adminWhoAmIButton);
   adminActions.appendChild(adminOpenRouteButton);
+  adminActions.appendChild(adminPublishLabelInput);
+  adminActions.appendChild(adminPublishDefaultRow);
   adminActions.appendChild(adminPublishBaselineButton);
+
+  const adminBaselinesLabel = makeSectionLabel('GLOBAL BASELINES');
+  Object.assign(adminBaselinesLabel.style, { marginTop: '4px' });
+  const adminBaselinesControls = document.createElement('div');
+  Object.assign(adminBaselinesControls.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  const adminBaselinesButtons = document.createElement('div');
+  Object.assign(adminBaselinesButtons.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const adminBaselinesRefreshButton = makeMenuButton('REFRESH');
+  const adminBaselinesSetDefaultButton = makeMenuButton('SET DEFAULT');
+  const adminBaselinesRetireButton = makeMenuButton('RETIRE');
+  Object.assign(adminBaselinesRefreshButton.style, { flex: '1' });
+  Object.assign(adminBaselinesSetDefaultButton.style, { flex: '1' });
+  Object.assign(adminBaselinesRetireButton.style, { flex: '1' });
+  adminBaselinesButtons.appendChild(adminBaselinesRefreshButton);
+  adminBaselinesButtons.appendChild(adminBaselinesSetDefaultButton);
+  adminBaselinesButtons.appendChild(adminBaselinesRetireButton);
+  const adminBaselinesSummary = document.createElement('div');
+  Object.assign(adminBaselinesSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const adminBaselinesSelect = document.createElement('select');
+  adminBaselinesSelect.size = 6;
+  Object.assign(adminBaselinesSelect.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  adminBaselinesControls.appendChild(adminBaselinesButtons);
+  adminBaselinesControls.appendChild(adminBaselinesSummary);
+  adminBaselinesControls.appendChild(adminBaselinesSelect);
+
   const adminDatasetLabel = makeSectionLabel('RECORDINGS DATASET');
   Object.assign(adminDatasetLabel.style, { marginTop: '4px' });
   const adminDatasetControls = document.createElement('div');
@@ -2721,6 +2824,8 @@ input[type=number] {
   adminPanel.appendChild(adminSummary);
   adminPanel.appendChild(adminStatus);
   adminPanel.appendChild(adminActions);
+  adminPanel.appendChild(adminBaselinesLabel);
+  adminPanel.appendChild(adminBaselinesControls);
   adminPanel.appendChild(adminDatasetLabel);
   adminPanel.appendChild(adminDatasetControls);
   adminPanel.appendChild(adminBackButton);
@@ -2736,6 +2841,10 @@ input[type=number] {
   let adminCurrentRecordings: MenuAdminRecordingSummary[] = [];
   let adminSelectedRecordingId: string | null = null;
   let adminLastPage: MenuAdminRecordingsPage | null = null;
+  let adminGlobalBaselines: MenuAdminGlobalBaselineSummary[] = [];
+  let adminSelectedBaselineId: string | null = null;
+  let adminBaselinesPending = false;
+  let adminBaselinesModeId: string | null = null;
   let myModelsGlobalBaselines: MenuGlobalModelSummary[] = [];
   let myModelsSelectedBaselineId: string | null = null;
   let myModelsBaselinesLoading = false;
@@ -2948,12 +3057,12 @@ input[type=number] {
       return;
     }
     const modeId = getLocalTrainingStats().currentModeId;
+    myModelsBaselinesModeId = modeId;
     myModelsBaselinesLoading = true;
     updateMyModelsControls();
     try {
       const baselines = await onAuthListGlobalModels();
       myModelsGlobalBaselines = baselines;
-      myModelsBaselinesModeId = modeId;
       renderMyModelsBaselinesSelect();
       if (!options?.silent) {
         if (baselines.length === 0) {
@@ -2992,6 +3101,119 @@ input[type=number] {
       return 'Admin tools are locked.\nThis account does not have admin access.';
     }
     return `Signed in as ${state.user.username}\nAdmin access: granted\nUse this panel for privileged training and data operations.`;
+  };
+
+  const formatAdminBaselineOption = (
+    baseline: MenuAdminGlobalBaselineSummary,
+  ): string => {
+    const prefix = baseline.isDefault ? '[default] ' : '';
+    const head = baseline.label || baseline.pipelineId || baseline.id;
+    return `${prefix}${head}`;
+  };
+
+  const renderAdminBaselinesSelect = (): void => {
+    adminBaselinesSelect.innerHTML = '';
+    for (const baseline of adminGlobalBaselines) {
+      const option = document.createElement('option');
+      option.value = baseline.id;
+      option.textContent = formatAdminBaselineOption(baseline);
+      adminBaselinesSelect.appendChild(option);
+    }
+    if (adminGlobalBaselines.length > 0) {
+      const activeId =
+        adminSelectedBaselineId &&
+        adminGlobalBaselines.some(
+          (baseline) => baseline.id === adminSelectedBaselineId,
+        )
+          ? adminSelectedBaselineId
+          : adminGlobalBaselines[0].id;
+      adminBaselinesSelect.value = activeId;
+      adminSelectedBaselineId = activeId;
+    } else {
+      adminSelectedBaselineId = null;
+    }
+  };
+
+  const getSelectedAdminBaseline =
+    (): MenuAdminGlobalBaselineSummary | null => {
+      if (!adminSelectedBaselineId) return null;
+      return (
+        adminGlobalBaselines.find(
+          (baseline) => baseline.id === adminSelectedBaselineId,
+        ) ?? null
+      );
+    };
+
+  const formatAdminBaselinesSummary = (isAdmin: boolean): string => {
+    if (!isAdmin) return 'Admin account required.';
+    const modeId = getLocalTrainingStats().currentModeId;
+    if (adminBaselinesPending) {
+      return `Loading baselines for mode "${modeId}"...`;
+    }
+    if (adminGlobalBaselines.length === 0) {
+      return `No published baselines for mode "${modeId}".`;
+    }
+    const selected = getSelectedAdminBaseline();
+    if (!selected) {
+      return `Published baselines: ${adminGlobalBaselines.length}`;
+    }
+    const updated =
+      selected.updatedAtMs != null
+        ? new Date(selected.updatedAtMs).toLocaleString()
+        : 'n/a';
+    return [
+      `Published baselines: ${adminGlobalBaselines.length}`,
+      `Selected: ${selected.label || selected.id}`,
+      selected.pipelineId
+        ? `Pipeline: ${selected.pipelineId}`
+        : 'Pipeline: (none)',
+      `Size: ${formatApproxBytes(selected.sizeBytes)}`,
+      `Updated: ${updated}`,
+    ].join('\n');
+  };
+
+  const refreshAdminBaselines = async (options?: {
+    silent?: boolean;
+  }): Promise<void> => {
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    if (!isAdmin) {
+      adminGlobalBaselines = [];
+      adminSelectedBaselineId = null;
+      adminBaselinesModeId = null;
+      renderAdminBaselinesSelect();
+      updateAdminControls();
+      return;
+    }
+    const modeId = getLocalTrainingStats().currentModeId;
+    adminBaselinesModeId = modeId;
+    adminBaselinesPending = true;
+    updateAdminControls();
+    try {
+      const baselines = await onAdminListGlobalBaselines();
+      adminGlobalBaselines = baselines;
+      renderAdminBaselinesSelect();
+      if (!options?.silent) {
+        setAdminActionStatus(
+          baselines.length === 0
+            ? `No baselines found for mode "${modeId}".`
+            : `Loaded ${baselines.length} baseline${baselines.length === 1 ? '' : 's'}.`,
+          baselines.length === 0 ? 'neutral' : 'success',
+        );
+      }
+    } catch (error) {
+      if (!options?.silent) {
+        setAdminActionStatus(
+          toErrorMessage(error, 'Could not load global baselines.'),
+          'error',
+        );
+      }
+    } finally {
+      adminBaselinesPending = false;
+      updateAdminControls();
+    }
   };
 
   const getAdminQueryLimit = (): number => {
@@ -3224,17 +3446,39 @@ input[type=number] {
       currentAuthState.authenticated &&
       currentAuthState.user != null &&
       currentAuthState.user.isAdmin;
+    const currentModeId = getLocalTrainingStats().currentModeId;
+    if (
+      isAdmin &&
+      !adminActionPending &&
+      !adminBaselinesPending &&
+      adminBaselinesModeId !== currentModeId
+    ) {
+      void refreshAdminBaselines({ silent: true });
+    }
     adminSummary.textContent = formatAdminSummary(currentAuthState);
+    adminBaselinesSummary.textContent = formatAdminBaselinesSummary(isAdmin);
     adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
     adminButton.style.display = isAdmin ? 'block' : 'none';
     adminActions.style.display = isAdmin ? 'flex' : 'none';
+    adminBaselinesLabel.style.display = isAdmin ? 'block' : 'none';
+    adminBaselinesControls.style.display = isAdmin ? 'flex' : 'none';
     adminDatasetLabel.style.display = isAdmin ? 'block' : 'none';
     adminDatasetControls.style.display = isAdmin ? 'flex' : 'none';
     const busy = adminActionPending || currentAuthState.loading;
+    const baselinesBusy = adminBaselinesPending || busy;
     const datasetBusy = adminDatasetPending || busy;
     adminWhoAmIButton.disabled = !isAdmin || busy;
     adminOpenRouteButton.disabled = busy;
     adminPublishBaselineButton.disabled = !isAdmin || busy;
+    adminPublishLabelInput.disabled = !isAdmin || busy;
+    adminPublishDefaultCheckbox.disabled = !isAdmin || busy;
+    adminBaselinesRefreshButton.disabled = !isAdmin || baselinesBusy;
+    adminBaselinesSelect.disabled =
+      !isAdmin || baselinesBusy || adminGlobalBaselines.length === 0;
+    adminBaselinesSetDefaultButton.disabled =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null;
+    adminBaselinesRetireButton.disabled =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null;
     adminModeFilterInput.disabled = datasetBusy || !isAdmin;
     adminBuildFilterInput.disabled = datasetBusy || !isAdmin;
     adminLimitInput.disabled = datasetBusy || !isAdmin;
@@ -3251,6 +3495,16 @@ input[type=number] {
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
     adminPublishBaselineButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminBaselinesRefreshButton.style.opacity =
+      !isAdmin || baselinesBusy ? '0.65' : '1';
+    adminBaselinesSetDefaultButton.style.opacity =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null
+        ? '0.65'
+        : '1';
+    adminBaselinesRetireButton.style.opacity =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null
+        ? '0.65'
+        : '1';
     adminQueryButton.style.opacity = !isAdmin || datasetBusy ? '0.65' : '1';
     adminNextPageButton.style.opacity =
       !isAdmin || datasetBusy || !adminCurrentCursor ? '0.65' : '1';
@@ -3262,6 +3516,16 @@ input[type=number] {
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
     adminPublishBaselineButton.style.cursor =
       !isAdmin || busy ? 'default' : 'pointer';
+    adminBaselinesRefreshButton.style.cursor =
+      !isAdmin || baselinesBusy ? 'default' : 'pointer';
+    adminBaselinesSetDefaultButton.style.cursor =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null
+        ? 'default'
+        : 'pointer';
+    adminBaselinesRetireButton.style.cursor =
+      !isAdmin || baselinesBusy || adminSelectedBaselineId == null
+        ? 'default'
+        : 'pointer';
     adminQueryButton.style.cursor =
       !isAdmin || datasetBusy ? 'default' : 'pointer';
     adminNextPageButton.style.cursor =
@@ -3602,8 +3866,12 @@ input[type=number] {
     setAdminActionStatus('Publishing current model as global baseline...');
     updateAdminControls();
     try {
-      const message = await onAdminPublishCurrentModelBaseline();
+      const message = await onAdminPublishCurrentModelBaseline({
+        label: adminPublishLabelInput.value.trim(),
+        setDefault: adminPublishDefaultCheckbox.checked,
+      });
       setAdminActionStatus(message, 'success');
+      await refreshAdminBaselines({ silent: true });
     } catch (error) {
       setAdminActionStatus(
         toErrorMessage(error, 'Global baseline publish failed.'),
@@ -3611,6 +3879,70 @@ input[type=number] {
       );
     } finally {
       adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminBaselinesSelect.addEventListener('change', () => {
+    const value = adminBaselinesSelect.value.trim();
+    adminSelectedBaselineId = value.length > 0 ? value : null;
+    updateAdminControls();
+  });
+
+  adminBaselinesRefreshButton.addEventListener('click', async () => {
+    if (adminBaselinesPending) return;
+    setAdminActionStatus('Refreshing global baselines...');
+    await refreshAdminBaselines();
+  });
+
+  adminBaselinesSetDefaultButton.addEventListener('click', async () => {
+    if (adminBaselinesPending) return;
+    if (!adminSelectedBaselineId) {
+      setAdminActionStatus('Select a baseline first.', 'error');
+      return;
+    }
+    adminBaselinesPending = true;
+    setAdminActionStatus('Setting default baseline...');
+    updateAdminControls();
+    try {
+      const message = await onAdminSetGlobalBaselineDefault(
+        adminSelectedBaselineId,
+      );
+      setAdminActionStatus(message, 'success');
+      await refreshAdminBaselines({ silent: true });
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not set default baseline.'),
+        'error',
+      );
+    } finally {
+      adminBaselinesPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminBaselinesRetireButton.addEventListener('click', async () => {
+    if (adminBaselinesPending) return;
+    if (!adminSelectedBaselineId) {
+      setAdminActionStatus('Select a baseline first.', 'error');
+      return;
+    }
+    adminBaselinesPending = true;
+    setAdminActionStatus('Retiring selected baseline...');
+    updateAdminControls();
+    try {
+      const message = await onAdminRetireGlobalBaseline(
+        adminSelectedBaselineId,
+      );
+      setAdminActionStatus(message, 'success');
+      await refreshAdminBaselines({ silent: true });
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not retire baseline.'),
+        'error',
+      );
+    } finally {
+      adminBaselinesPending = false;
       updateAdminControls();
     }
   });
@@ -3854,6 +4186,8 @@ input[type=number] {
   }
   setMyModelsActionStatus('');
   setAdminActionStatus('');
+  adminBaselinesSummary.textContent = formatAdminBaselinesSummary(false);
+  renderAdminBaselinesSelect();
   adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
   adminLoadedSummary.textContent = 'No recording loaded.';
   setAuthState(currentAuthState);

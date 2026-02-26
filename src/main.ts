@@ -74,6 +74,7 @@ import {
   type MenuAdminRecordingsPage,
   type MenuAdminRecordingPreview,
   type MenuAdminRecordingsQuery,
+  type MenuAdminGlobalBaselineSummary,
   type MenuScreen,
 } from './ui/screens/menuScreen';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
@@ -881,7 +882,146 @@ async function boot() {
       outcome: session.meta?.outcome ?? null,
     };
   };
-  const publishCurrentModelAsGlobalBaseline = async (): Promise<string> => {
+  const listAdminGlobalBaselines = async (): Promise<
+    MenuAdminGlobalBaselineSummary[]
+  > => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const mode = modeController.getState().mode.id;
+    const url = new URL(
+      `${uploadBaseUrl}/admin/models/global/index`,
+      window.location.origin,
+    );
+    url.searchParams.set('mode', mode);
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      throw new Error(
+        await parseApiErrorMessage(
+          response,
+          `Baseline list failed (${response.status}).`,
+        ),
+      );
+    }
+    const payload = (await response.json().catch(() => null)) as {
+      models?: Array<Record<string, unknown>> | null;
+    } | null;
+    const rows = Array.isArray(payload?.models) ? payload.models : [];
+    const baselines: MenuAdminGlobalBaselineSummary[] = [];
+    for (const row of rows) {
+      const id = typeof row.id === 'string' ? row.id : null;
+      const modeValue = typeof row.mode === 'string' ? row.mode : null;
+      if (!id || !modeValue) continue;
+      baselines.push({
+        id,
+        mode: modeValue,
+        arch: typeof row.arch === 'string' ? row.arch : null,
+        rewardProfileId:
+          typeof row.rewardProfileId === 'string' ? row.rewardProfileId : null,
+        queuePolicyId:
+          typeof row.queuePolicyId === 'string' ? row.queuePolicyId : null,
+        pipelineId: typeof row.pipelineId === 'string' ? row.pipelineId : null,
+        label: typeof row.label === 'string' ? row.label : null,
+        isDefault: row.isDefault === true || row.isDefault === 1,
+        sizeBytes:
+          typeof row.sizeBytes === 'number' && Number.isFinite(row.sizeBytes)
+            ? Math.trunc(row.sizeBytes)
+            : null,
+        updatedAtMs:
+          typeof row.updatedAtMs === 'number' &&
+          Number.isFinite(row.updatedAtMs)
+            ? Math.trunc(row.updatedAtMs)
+            : null,
+        retiredAtMs:
+          typeof row.retiredAtMs === 'number' &&
+          Number.isFinite(row.retiredAtMs)
+            ? Math.trunc(row.retiredAtMs)
+            : null,
+      });
+    }
+    return baselines;
+  };
+  const setAdminGlobalBaselineDefault = async (id: string): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const response = await fetch(
+      `${uploadBaseUrl}/admin/models/global/set-default`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ id }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        await parseApiErrorMessage(
+          response,
+          `Set default failed (${response.status}).`,
+        ),
+      );
+    }
+    return 'Default baseline updated.';
+  };
+  const retireAdminGlobalBaseline = async (id: string): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const response = await fetch(
+      `${uploadBaseUrl}/admin/models/global/retire`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ id }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        await parseApiErrorMessage(
+          response,
+          `Retire failed (${response.status}).`,
+        ),
+      );
+    }
+    const payload = (await response.json().catch(() => null)) as {
+      replacementDefaultId?: unknown;
+    } | null;
+    const replacementId =
+      typeof payload?.replacementDefaultId === 'string'
+        ? payload.replacementDefaultId
+        : null;
+    return replacementId
+      ? `Baseline retired. New default: ${replacementId}.`
+      : 'Baseline retired.';
+  };
+  const publishCurrentModelAsGlobalBaseline = async (options?: {
+    label?: string;
+    setDefault?: boolean;
+  }): Promise<string> => {
     if (
       !authState.authenticated ||
       !authState.user ||
@@ -895,12 +1035,23 @@ async function boot() {
     }
     const mode = modeController.getState().mode.id;
     const pipelineId = getLocalTrainingPreset().pipelineId;
+    const label =
+      typeof options?.label === 'string' && options.label.trim()
+        ? options.label.trim()
+        : '';
+    const setDefault = options?.setDefault === true;
     const url = new URL(
       `${uploadBaseUrl}/admin/models/global/publish`,
       window.location.origin,
     );
     url.searchParams.set('mode', mode);
     url.searchParams.set('pipeline_id', pipelineId);
+    if (label) {
+      url.searchParams.set('label', label);
+    }
+    if (setDefault) {
+      url.searchParams.set('set_default', '1');
+    }
     const response = await fetch(url.toString(), {
       method: 'POST',
       credentials: 'include',
@@ -918,15 +1069,19 @@ async function boot() {
         ),
       );
     }
-    const payload = (await response.json().catch(() => null)) as {
+    const responsePayload = (await response.json().catch(() => null)) as {
       model?: { id?: unknown; label?: unknown } | null;
     } | null;
     const id =
-      typeof payload?.model?.id === 'string' ? payload.model.id : 'unknown';
-    const label =
-      typeof payload?.model?.label === 'string' ? payload.model.label : '';
-    return label
-      ? `Published baseline: ${label} (${id}).`
+      typeof responsePayload?.model?.id === 'string'
+        ? responsePayload.model.id
+        : 'unknown';
+    const createdLabel =
+      typeof responsePayload?.model?.label === 'string'
+        ? responsePayload.model.label
+        : '';
+    return createdLabel
+      ? `Published baseline: ${createdLabel} (${id}).`
       : `Published baseline id: ${id}.`;
   };
 
@@ -1716,6 +1871,9 @@ async function boot() {
     onAdminListRecordings: listAdminRecordings,
     onAdminLoadRecording: loadAdminRecordingPreview,
     onAdminPublishCurrentModelBaseline: publishCurrentModelAsGlobalBaseline,
+    onAdminListGlobalBaselines: listAdminGlobalBaselines,
+    onAdminSetGlobalBaselineDefault: setAdminGlobalBaselineDefault,
+    onAdminRetireGlobalBaseline: retireAdminGlobalBaseline,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);

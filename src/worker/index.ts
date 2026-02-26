@@ -211,6 +211,9 @@ const clampInt = (
 const isValidRecordingId = (value: string): boolean =>
   value.length >= 8 && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value);
 
+const isValidGlobalModelId = (value: string): boolean =>
+  value.length >= 8 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
+
 type RecordingCursor = {
   startedAtMs: number;
   id: string;
@@ -905,6 +908,36 @@ const readGlobalModelById = async (
       selector.rewardProfileId,
       selector.queuePolicyId,
     )
+    .first<Record<string, unknown>>();
+  if (!row) return null;
+  return readGlobalModelRecord(row);
+};
+
+const readGlobalModelByIdAnyAxes = async (
+  env: Env,
+  id: string,
+): Promise<GlobalModelRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       id,
+       mode_id,
+       model_arch,
+       reward_profile_id,
+       queue_policy_id,
+       pipeline_id,
+       label,
+       r2_key,
+       sha256,
+       size_bytes,
+       is_default,
+       created_at_ms,
+       updated_at_ms,
+       retired_at_ms
+     FROM global_models
+     WHERE id = ?
+     LIMIT 1`,
+  )
+    .bind(id)
     .first<Record<string, unknown>>();
   if (!row) return null;
   return readGlobalModelRecord(row);
@@ -3586,6 +3619,334 @@ const handleAdminPublishGlobalModel = async (
   }
 };
 
+const handleAdminGlobalModelsIndex = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const includeRetired = parseBooleanFlag(
+    new URL(request.url).searchParams.get('include_retired'),
+  );
+  try {
+    const rows = includeRetired
+      ? await env.DB.prepare(
+          `SELECT
+             id,
+             mode_id,
+             model_arch,
+             reward_profile_id,
+             queue_policy_id,
+             pipeline_id,
+             label,
+             r2_key,
+             sha256,
+             size_bytes,
+             is_default,
+             created_at_ms,
+             updated_at_ms,
+             retired_at_ms
+           FROM global_models
+           WHERE
+             mode_id = ?
+             AND model_arch = ?
+             AND reward_profile_id = ?
+             AND queue_policy_id = ?
+           ORDER BY retired_at_ms IS NULL DESC, is_default DESC, created_at_ms DESC
+           LIMIT 300`,
+        )
+          .bind(
+            selector.gameMode,
+            selector.modelArch,
+            selector.rewardProfileId,
+            selector.queuePolicyId,
+          )
+          .all<Record<string, unknown>>()
+      : await env.DB.prepare(
+          `SELECT
+             id,
+             mode_id,
+             model_arch,
+             reward_profile_id,
+             queue_policy_id,
+             pipeline_id,
+             label,
+             r2_key,
+             sha256,
+             size_bytes,
+             is_default,
+             created_at_ms,
+             updated_at_ms,
+             retired_at_ms
+           FROM global_models
+           WHERE
+             mode_id = ?
+             AND model_arch = ?
+             AND reward_profile_id = ?
+             AND queue_policy_id = ?
+             AND retired_at_ms IS NULL
+           ORDER BY is_default DESC, created_at_ms DESC
+           LIMIT 300`,
+        )
+          .bind(
+            selector.gameMode,
+            selector.modelArch,
+            selector.rewardProfileId,
+            selector.queuePolicyId,
+          )
+          .all<Record<string, unknown>>();
+    const results = Array.isArray(rows.results) ? rows.results : [];
+    const models: GlobalModelRecord[] = [];
+    for (const row of results) {
+      const model = readGlobalModelRecord(row);
+      if (model) models.push(model);
+    }
+    return jsonResponse(
+      {
+        ok: true,
+        selector: {
+          mode: selector.gameMode,
+          arch: selector.modelArch,
+          rewardProfileId: selector.rewardProfileId,
+          queuePolicyId: selector.queuePolicyId,
+        },
+        includeRetired,
+        models: models.map((model) => ({
+          id: model.id,
+          mode: model.modeId,
+          arch: model.modelArch,
+          rewardProfileId: model.rewardProfileId,
+          queuePolicyId: model.queuePolicyId,
+          pipelineId: model.pipelineId,
+          label: model.label,
+          r2Key: model.r2Key,
+          sha256: model.sha256,
+          sizeBytes: model.sizeBytes,
+          isDefault: model.isDefault,
+          createdAtMs: model.createdAtMs,
+          updatedAtMs: model.updatedAtMs,
+          retiredAtMs: model.retiredAtMs,
+        })),
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] global models index failed', error);
+    return jsonResponse(
+      { error: 'Global model registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminSetGlobalModelDefault = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const payload = (await request.json().catch(() => null)) as {
+    id?: unknown;
+  } | null;
+  const modelId = asString(payload?.id);
+  if (!modelId || !isValidGlobalModelId(modelId)) {
+    return jsonResponse({ error: 'Missing or invalid model id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  try {
+    const model = await readGlobalModelByIdAnyAxes(env, modelId);
+    if (!model || model.retiredAtMs != null) {
+      return jsonResponse({ error: 'Global model not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    await env.DB.prepare(
+      `UPDATE global_models
+       SET is_default = 0, updated_at_ms = ?
+       WHERE
+         mode_id = ?
+         AND model_arch = ?
+         AND reward_profile_id = ?
+         AND queue_policy_id = ?
+         AND retired_at_ms IS NULL`,
+    )
+      .bind(
+        nowMs,
+        model.modeId,
+        model.modelArch,
+        model.rewardProfileId,
+        model.queuePolicyId,
+      )
+      .run();
+    await env.DB.prepare(
+      `UPDATE global_models
+       SET is_default = 1, updated_at_ms = ?
+       WHERE id = ?`,
+    )
+      .bind(nowMs, model.id)
+      .run();
+    return jsonResponse(
+      {
+        ok: true,
+        model: {
+          id: model.id,
+          mode: model.modeId,
+          arch: model.modelArch,
+          rewardProfileId: model.rewardProfileId,
+          queuePolicyId: model.queuePolicyId,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] global model set default failed', error);
+    return jsonResponse(
+      { error: 'Global model registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminRetireGlobalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const payload = (await request.json().catch(() => null)) as {
+    id?: unknown;
+  } | null;
+  const modelId = asString(payload?.id);
+  if (!modelId || !isValidGlobalModelId(modelId)) {
+    return jsonResponse({ error: 'Missing or invalid model id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  try {
+    const model = await readGlobalModelByIdAnyAxes(env, modelId);
+    if (!model || model.retiredAtMs != null) {
+      return jsonResponse({ error: 'Global model not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    await env.DB.prepare(
+      `UPDATE global_models
+       SET retired_at_ms = ?, is_default = 0, updated_at_ms = ?
+       WHERE id = ?`,
+    )
+      .bind(nowMs, nowMs, model.id)
+      .run();
+
+    let replacementId: string | null = null;
+    if (model.isDefault) {
+      const replacement = await env.DB.prepare(
+        `SELECT id
+         FROM global_models
+         WHERE
+           mode_id = ?
+           AND model_arch = ?
+           AND reward_profile_id = ?
+           AND queue_policy_id = ?
+           AND retired_at_ms IS NULL
+           AND id != ?
+         ORDER BY created_at_ms DESC
+         LIMIT 1`,
+      )
+        .bind(
+          model.modeId,
+          model.modelArch,
+          model.rewardProfileId,
+          model.queuePolicyId,
+          model.id,
+        )
+        .first<Record<string, unknown>>();
+      replacementId = asString(replacement?.id);
+      if (replacementId) {
+        await env.DB.prepare(
+          `UPDATE global_models
+           SET is_default = 1, updated_at_ms = ?
+           WHERE id = ?`,
+        )
+          .bind(nowMs, replacementId)
+          .run();
+      }
+    }
+
+    return jsonResponse(
+      {
+        ok: true,
+        retiredModelId: model.id,
+        replacementDefaultId: replacementId,
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] global model retire failed', error);
+    return jsonResponse(
+      { error: 'Global model registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -3789,6 +4150,18 @@ export default {
 
     if (url.pathname === '/api/admin/models/global/publish') {
       return handleAdminPublishGlobalModel(request, env);
+    }
+
+    if (url.pathname === '/api/admin/models/global/index') {
+      return handleAdminGlobalModelsIndex(request, env);
+    }
+
+    if (url.pathname === '/api/admin/models/global/set-default') {
+      return handleAdminSetGlobalModelDefault(request, env);
+    }
+
+    if (url.pathname === '/api/admin/models/global/retire') {
+      return handleAdminRetireGlobalModel(request, env);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {
