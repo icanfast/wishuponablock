@@ -9,6 +9,7 @@ import { CurseModelGenerator } from './curseModelGenerator';
 import { DEFAULT_ML_INFERENCE } from './constants';
 import type { ModelRunner } from './modelRunner';
 import type { LoadedModel } from './wubModel';
+import type { ModelGeneratorDecisionEvent } from './modelGenerator';
 
 export const GENERATOR_TYPES = [
   'bag7',
@@ -38,6 +39,7 @@ export interface GeneratorFactoryOptions {
   mlModel?: LoadedModel | null;
   mlModelPromise?: Promise<LoadedModel | null>;
   mlRunner?: ModelRunner;
+  onModelDecision?: (event: ModelGeneratorDecisionEvent) => void;
 }
 
 export function isGeneratorType(value: unknown): value is GeneratorType {
@@ -77,7 +79,10 @@ export function createGeneratorFactory(
           options.mlModel ?? null,
           options.mlModelPromise,
           options.mlRunner,
-          settings.ml ?? DEFAULT_ML_INFERENCE,
+          {
+            ...(settings.ml ?? DEFAULT_ML_INFERENCE),
+            onDecision: options.onModelDecision,
+          },
         );
     case 'curse':
       return (seed) =>

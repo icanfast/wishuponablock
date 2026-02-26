@@ -29,6 +29,8 @@ import { createScreenFlowController } from './app/screenFlowController';
 import { createSettingsController } from './app/settingsController';
 import { createAuthService } from './app/authService';
 import { createPersonalModelService } from './app/personalModelService';
+import { createTrajectoryBuffer } from './app/trajectoryBuffer';
+import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import type {
   CharcuterieHoleWeights,
   CharcuterieScoreWeights,
@@ -413,6 +415,8 @@ async function boot() {
     window.location.reload();
   };
   void modelService.ensureLoaded();
+  const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
+  const personalTrainer = createPersonalTrainerTfjs();
   let menuUi: MenuScreen | null = null;
   const modeController = createModeController({
     initialModeId: 'practice',
@@ -706,6 +710,66 @@ async function boot() {
       result.version != null ? `v${result.version}` : 'saved';
     return `Saved ${versionLabel} model for mode "${result.mode}".`;
   };
+
+  const runLocalBiasTraining = async (options?: {
+    modeId?: string;
+    sampleLimit?: number;
+    epochs?: number;
+    learningRate?: number;
+    l2?: number;
+    backendPreference?: 'auto' | 'webgl' | 'cpu';
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    samplesUsed: number;
+    finalLoss: number | null;
+  }> => {
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      return {
+        ok: false,
+        message: 'Model is not loaded.',
+        samplesUsed: 0,
+        finalLoss: null,
+      };
+    }
+    const modeId = options?.modeId ?? modeController.getState().mode.id;
+    const samples = trajectoryBuffer.listSamples({
+      modeId,
+      limit: options?.sampleLimit,
+    });
+    const result = await personalTrainer.trainBiasOnly({
+      model,
+      samples,
+      train: {
+        sampleLimit: options?.sampleLimit,
+        epochs: options?.epochs,
+        learningRate: options?.learningRate,
+        l2: options?.l2,
+        backendPreference: options?.backendPreference,
+      },
+    });
+    if (!result.ok || !result.updatedModelBytes) {
+      return {
+        ok: false,
+        message: result.message,
+        samplesUsed: result.samplesUsed,
+        finalLoss: result.finalLoss,
+      };
+    }
+    await modelService.replaceModelFromBytes(
+      result.updatedModelBytes,
+      'local bias training',
+    );
+    sessionController.rebuildSession();
+    updateModelStatusUI(modelService.getStatus());
+    return {
+      ok: true,
+      message: result.message,
+      samplesUsed: result.samplesUsed,
+      finalLoss: result.finalLoss,
+    };
+  };
   applyAuthState(authState);
 
   const soundService = createSoundService({ settings });
@@ -775,6 +839,10 @@ async function boot() {
     onHold: handleHoldSnapshot,
     onLineClear: handleLineClear,
     onBeforeRestart: () => restartRecordingSession(),
+    onModelDecision: (decision) => {
+      const modeId = modeController.getState().mode.id;
+      trajectoryBuffer.recordDecision({ modeId, decision });
+    },
     setLockEffectsSuppressed: (value) => {
       suppressLockEffects = value;
     },
@@ -1239,11 +1307,36 @@ async function boot() {
     wubSetUserId?: (value: string | null) => void;
     wubSetSuperuser?: () => void;
     wubClearUserId?: () => void;
+    wubTrainingStats?: () => ReturnType<typeof trajectoryBuffer.getStats>;
+    wubTrainingClear?: () => number;
+    wubTrainingList?: (options?: {
+      modeId?: string;
+      limit?: number;
+    }) => ReturnType<typeof trajectoryBuffer.listSamples>;
+    wubTrainingRun?: (options?: {
+      modeId?: string;
+      sampleLimit?: number;
+      epochs?: number;
+      learningRate?: number;
+      l2?: number;
+      backendPreference?: 'auto' | 'webgl' | 'cpu';
+    }) => Promise<{
+      ok: boolean;
+      message: string;
+      samplesUsed: number;
+      finalLoss: number | null;
+    }>;
   };
   identityConsole.wubSetUserId = (value) => identityService.setUserId(value);
   identityConsole.wubSetSuperuser = () =>
     identityService.setUserId('superuser');
   identityConsole.wubClearUserId = () => identityService.setUserId(null);
+  identityConsole.wubTrainingStats = () => trajectoryBuffer.getStats();
+  identityConsole.wubTrainingClear = () => trajectoryBuffer.clear();
+  identityConsole.wubTrainingList = (options) =>
+    trajectoryBuffer.listSamples(options);
+  identityConsole.wubTrainingRun = async (options) =>
+    await runLocalBiasTraining(options);
 }
 
 boot().catch((e) => console.error(e));

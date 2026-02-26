@@ -13,6 +13,7 @@ import {
   type CharcuterieScoreWeights,
 } from './charcuterieService';
 import type { ModelService } from './modelService';
+import type { ModelGeneratorDecisionEvent } from '../core/modelGenerator';
 
 export type GameFactoryOptions = {
   settings: Settings;
@@ -24,6 +25,7 @@ export type GameFactoryOptions = {
   onLineClear?: (combo: number, clearedLines: number) => void;
   onBeforeRestart?: () => void;
   setLockEffectsSuppressed: (value: boolean) => void;
+  onModelDecision?: (event: ModelGeneratorDecisionEvent) => void;
   charcuterie: {
     rows: number;
     defaultSimCount: number;
@@ -51,6 +53,7 @@ export function createGameSessionFactory(
     onLineClear,
     onBeforeRestart,
     setLockEffectsSuppressed,
+    onModelDecision,
     charcuterie,
     runnerOptions = {
       fixedStepMs: 1000 / 120,
@@ -80,6 +83,7 @@ export function createGameSessionFactory(
         mlModel: modelService.getModel(),
         mlModelPromise: modelService.getModelPromise() ?? undefined,
         mlRunner: modelService.getRunner(),
+        onModelDecision,
       }),
       onPieceLock,
       onHold,

@@ -9,11 +9,25 @@ import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 type InferenceStrategy = 'clean_uniform' | 'threshold';
 
+export type ModelGeneratorDecisionEvent = {
+  board: Board;
+  hold: PieceKind | null;
+  action: PieceKind;
+  pieces: PieceKind[];
+  logits: Float32Array;
+  probabilities: Float32Array;
+  inferenceMs: number;
+  samplingMs: number;
+  totalMs: number;
+  wallTimeMs: number;
+};
+
 type InferenceOptions = {
   strategy?: InferenceStrategy;
   temperature?: number;
   threshold?: number;
   postSharpness?: number;
+  onDecision?: (event: ModelGeneratorDecisionEvent) => void;
 };
 
 export class ModelGenerator implements PieceGenerator {
@@ -27,6 +41,7 @@ export class ModelGenerator implements PieceGenerator {
   private temperature: number;
   private threshold: number;
   private postSharpness: number;
+  private onDecision: ((event: ModelGeneratorDecisionEvent) => void) | null;
 
   constructor(
     seed: number,
@@ -42,6 +57,7 @@ export class ModelGenerator implements PieceGenerator {
     this.temperature = options.temperature ?? 1;
     this.threshold = options.threshold ?? 0;
     this.postSharpness = options.postSharpness ?? 1;
+    this.onDecision = options.onDecision ?? null;
     modelPromise?.then((loaded) => {
       if (loaded) this.model = loaded;
     });
@@ -85,14 +101,18 @@ export class ModelGenerator implements PieceGenerator {
       return;
     }
     const perfEnabled = hasPerfMetricsSink();
-    const lockStartMs = perfEnabled ? performance.now() : 0;
-    const logitsStartMs = perfEnabled ? performance.now() : 0;
+    const lockStartMs = performance.now();
+    const logitsStartMs = performance.now();
     const logits = this.runner.predictLogits(this.model, board, hold);
+    const logitsEndMs = performance.now();
     if (perfEnabled) {
-      const nowMs = performance.now();
-      recordPerfDuration('ml.predict_logits_ms', nowMs - logitsStartMs, nowMs);
+      recordPerfDuration(
+        'ml.predict_logits_ms',
+        logitsEndMs - logitsStartMs,
+        logitsEndMs,
+      );
     }
-    const sampleStartMs = perfEnabled ? performance.now() : 0;
+    const sampleStartMs = performance.now();
     const probs =
       this.strategy === 'threshold'
         ? thresholdedSoftmax(
@@ -117,8 +137,25 @@ export class ModelGenerator implements PieceGenerator {
       probability: Number.isFinite(probs[index]) ? probs[index] : 0,
     }));
     this.pending = pieces[this.sampleIndex(probs)] ?? PIECES[0];
+    const nowMs = performance.now();
+    const inferenceMs = logitsEndMs - logitsStartMs;
+    const samplingMs = nowMs - sampleStartMs;
+    const totalMs = nowMs - lockStartMs;
+    if (this.onDecision) {
+      this.onDecision({
+        board,
+        hold,
+        action: this.pending,
+        pieces: [...pieces],
+        logits: new Float32Array(logits),
+        probabilities: new Float32Array(probs),
+        inferenceMs,
+        samplingMs,
+        totalMs,
+        wallTimeMs: nowMs,
+      });
+    }
     if (perfEnabled) {
-      const nowMs = performance.now();
       recordPerfDuration(
         'ml.sample_distribution_ms',
         nowMs - sampleStartMs,

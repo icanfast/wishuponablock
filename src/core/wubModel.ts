@@ -33,6 +33,7 @@ export type LoadedModel = {
 };
 
 const DEFAULT_BOARD_CHANNELS = ['occupancy', 'holes', 'row_fill'];
+const MODEL_SCHEMA_V1 = 'wishuponablock.model.v1';
 
 export async function loadWubModel(url: string): Promise<LoadedModel> {
   const res = await fetch(url);
@@ -89,6 +90,38 @@ export function parseWubModel(payload: ExportedModel): LoadedModel {
     pieces,
     boardChannels,
   };
+}
+
+export function serializeWubModel(model: LoadedModel): ExportedModel {
+  const params: Record<string, { shape: number[]; data: number[] }> = {};
+  for (const [name, tensor] of Object.entries(model.params)) {
+    params[name] = {
+      shape: [...tensor.shape],
+      data: Array.from(tensor.data),
+    };
+  }
+  return {
+    schema: MODEL_SCHEMA_V1,
+    model: {
+      ...model.config,
+      conv_channels: [...model.config.conv_channels],
+      pool_shape: model.config.pool_shape
+        ? [...model.config.pool_shape]
+        : undefined,
+    },
+    params,
+    pieces: [...model.pieces],
+    board_channels: [...model.boardChannels],
+  };
+}
+
+export function serializeWubModelToJsonText(model: LoadedModel): string {
+  return JSON.stringify(serializeWubModel(model));
+}
+
+export function serializeWubModelToBytes(model: LoadedModel): ArrayBuffer {
+  const text = serializeWubModelToJsonText(model);
+  return new TextEncoder().encode(text).buffer;
 }
 
 export function predictLogits(
