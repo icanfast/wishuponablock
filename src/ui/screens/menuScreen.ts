@@ -81,6 +81,8 @@ export type MenuScreenOptions = {
   ) => Promise<MenuMlParityResult>;
   getLocalTrainingStats: () => MenuLocalTrainingStats;
   onRunLocalBiasTraining: () => Promise<MenuLocalTrainingResult>;
+  getTrajectoryUploadSummary: () => string;
+  onUploadLatestTrajectory: () => Promise<string>;
   onStartPractice: () => void;
   onStartSprint: () => void;
   onStartClassic: () => void;
@@ -142,6 +144,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onMlRunParityCheck,
     getLocalTrainingStats,
     onRunLocalBiasTraining,
+    getTrajectoryUploadSummary,
+    onUploadLatestTrajectory,
     onStartPractice,
     onStartSprint,
     onStartClassic,
@@ -331,6 +335,8 @@ input[type=number] {
     width: '320px',
     display: 'none',
     textAlign: 'left',
+    maxHeight: '520px',
+    overflowY: 'auto',
   });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',
@@ -2293,6 +2299,20 @@ input[type=number] {
     whiteSpace: 'pre-wrap',
   });
   const myModelsTrainButton = makeMenuButton('TRAIN ON CLIENT SAMPLES');
+  const myModelsRecordingLabel = makeSectionLabel('TRAJECTORY RECORDINGS');
+  Object.assign(myModelsRecordingLabel.style, { marginTop: '4px' });
+  const myModelsRecordingSummary = document.createElement('div');
+  Object.assign(myModelsRecordingSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.4',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const myModelsUploadTrajectoryButton = makeMenuButton('UPLOAD TRAJECTORY');
   const myModelsBackButton = makeMenuButton('BACK');
   Object.assign(myModelsBackButton.style, { marginTop: 'auto' });
   myModelsActions.appendChild(myModelsLoadButton);
@@ -2306,6 +2326,9 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsTrainingLabel);
   myModelsPanel.appendChild(myModelsTrainingSummary);
   myModelsPanel.appendChild(myModelsTrainButton);
+  myModelsPanel.appendChild(myModelsRecordingLabel);
+  myModelsPanel.appendChild(myModelsRecordingSummary);
+  myModelsPanel.appendChild(myModelsUploadTrajectoryButton);
   myModelsPanel.appendChild(myModelsBackButton);
 
   type SignedOutStage = 'email' | 'login' | 'signup' | 'reset';
@@ -2423,6 +2446,7 @@ input[type=number] {
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
     myModelsTrainingSummary.textContent =
       formatMyModelsTrainingSummary(trainingStats);
+    myModelsRecordingSummary.textContent = getTrajectoryUploadSummary();
     myModelsSignedOutHint.style.display = authenticated ? 'none' : 'block';
     myModelsActions.style.display = authenticated ? 'flex' : 'none';
     const busy = modelActionPending || currentAuthState.loading;
@@ -2432,6 +2456,11 @@ input[type=number] {
     myModelsTrainButton.style.opacity = busy || !hasTrainSamples ? '0.65' : '1';
     myModelsTrainButton.style.cursor =
       busy || !hasTrainSamples ? 'default' : 'pointer';
+    myModelsUploadTrajectoryButton.disabled = !authenticated || busy;
+    myModelsUploadTrajectoryButton.style.opacity =
+      !authenticated || busy ? '0.65' : '1';
+    myModelsUploadTrajectoryButton.style.cursor =
+      !authenticated || busy ? 'default' : 'pointer';
   };
 
   const updateAccountControls = () => {
@@ -2629,6 +2658,25 @@ input[type=number] {
     } catch (error) {
       setMyModelsActionStatus(
         toErrorMessage(error, 'Could not run local training.'),
+        'error',
+      );
+    } finally {
+      modelActionPending = false;
+      updateMyModelsControls();
+    }
+  });
+
+  myModelsUploadTrajectoryButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    modelActionPending = true;
+    setMyModelsActionStatus('Uploading trajectory recording...');
+    updateMyModelsControls();
+    try {
+      const message = await onUploadLatestTrajectory();
+      setMyModelsActionStatus(message, 'success');
+    } catch (error) {
+      setMyModelsActionStatus(
+        toErrorMessage(error, 'Could not upload trajectory recording.'),
         'error',
       );
     } finally {

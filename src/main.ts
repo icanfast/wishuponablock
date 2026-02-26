@@ -29,8 +29,17 @@ import { createScreenFlowController } from './app/screenFlowController';
 import { createSettingsController } from './app/settingsController';
 import { createAuthService } from './app/authService';
 import { createPersonalModelService } from './app/personalModelService';
-import { createTrajectoryBuffer } from './app/trajectoryBuffer';
+import {
+  createTrajectoryBuffer,
+  type TrajectoryDecisionSample,
+} from './app/trajectoryBuffer';
+import { createTrajectoryRecordingService } from './app/trajectoryRecordingService';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
+import {
+  TRAJECTORY_SESSION_SCHEMA_V1,
+  type TrajectorySessionMetaV1,
+  type TrajectorySessionV1,
+} from './core/trajectoryProtocol';
 import type {
   CharcuterieHoleWeights,
   CharcuterieScoreWeights,
@@ -219,6 +228,9 @@ async function boot() {
   const uploadBaseUrl = uploadService.baseUrl;
   const authService = createAuthService({ baseUrl: uploadBaseUrl });
   const personalModelService = createPersonalModelService({
+    baseUrl: uploadBaseUrl,
+  });
+  const trajectoryRecordingService = createTrajectoryRecordingService({
     baseUrl: uploadBaseUrl,
   });
   const authErrorMessages: Record<string, string> = {
@@ -711,6 +723,180 @@ async function boot() {
     return `Saved ${versionLabel} model for mode "${result.mode}".`;
   };
 
+  type TrajectoryRunState = {
+    sessionId: string;
+    modeId: string;
+    startedAtMs: number;
+  };
+  let activeTrajectoryRun: TrajectoryRunState | null = null;
+  let pendingTrajectorySession: TrajectorySessionV1 | null = null;
+  let lastTrajectoryUploadMessage = 'No uploads yet.';
+  let lastTrajectoryUploadAtMs: number | null = null;
+  let lastTrajectoryUploadSamples = 0;
+  let lastTrajectoryUploadError: string | null = null;
+
+  const toTrajectoryMeta = (outcome: string): TrajectorySessionMetaV1 => {
+    const meta: TrajectorySessionMetaV1 = {
+      outcome,
+      channel: import.meta.env.MODE,
+      modelSource: activeModelSource.kind,
+    };
+    if (activeModelSource.kind === 'personal') {
+      meta.modelMode = activeModelSource.mode;
+      if (activeModelSource.version != null) {
+        meta.modelVersion = activeModelSource.version;
+      }
+    }
+    return meta;
+  };
+
+  const toTrajectorySamples = (
+    samples: TrajectoryDecisionSample[],
+  ): TrajectorySessionV1['samples'] =>
+    samples.map((sample) => ({
+      id: sample.id,
+      createdAtMs: sample.createdAtMs,
+      deliberationMs: sample.deliberationMs,
+      boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
+      hold: sample.hold,
+      action: sample.action,
+      actionIndex: sample.actionIndex,
+      pieces: [...sample.pieces],
+      logits: [...sample.logits],
+      probabilities: [...sample.probabilities],
+      inferenceMs: sample.inferenceMs,
+      samplingMs: sample.samplingMs,
+      totalDecisionMs: sample.totalDecisionMs,
+      reward: sample.reward,
+    }));
+
+  const beginTrajectoryRun = (modeId: string): void => {
+    activeTrajectoryRun = {
+      sessionId: crypto.randomUUID(),
+      modeId,
+      startedAtMs: Date.now(),
+    };
+  };
+
+  const buildTrajectorySession = (
+    run: TrajectoryRunState,
+    outcome: string,
+  ): TrajectorySessionV1 | null => {
+    const runSamples = trajectoryBuffer
+      .listSamples({ modeId: run.modeId })
+      .filter((sample) => sample.createdAtMs >= run.startedAtMs);
+    if (runSamples.length === 0) return null;
+    const endedAtMs = Math.max(
+      Date.now(),
+      runSamples[runSamples.length - 1].createdAtMs,
+    );
+    return {
+      schema: TRAJECTORY_SESSION_SCHEMA_V1,
+      sessionId: run.sessionId,
+      modeId: run.modeId,
+      buildVersion: APP_VERSION,
+      startedAtMs: run.startedAtMs,
+      endedAtMs,
+      durationMs: Math.max(0, endedAtMs - run.startedAtMs),
+      samples: toTrajectorySamples(runSamples),
+      meta: toTrajectoryMeta(outcome),
+    };
+  };
+
+  const finalizeTrajectoryRun = (
+    outcome: string,
+  ): TrajectorySessionV1 | null => {
+    const run = activeTrajectoryRun;
+    activeTrajectoryRun = null;
+    if (!run) return null;
+    const session = buildTrajectorySession(run, outcome);
+    if (session) {
+      pendingTrajectorySession = session;
+    }
+    return session;
+  };
+
+  const uploadTrajectorySession = async (
+    session: TrajectorySessionV1,
+  ): Promise<string> => {
+    const uploaded = await trajectoryRecordingService.uploadSession(session);
+    if (pendingTrajectorySession?.sessionId === session.sessionId) {
+      pendingTrajectorySession = null;
+    }
+    lastTrajectoryUploadAtMs = uploaded.createdAtMs;
+    lastTrajectoryUploadSamples = uploaded.samples;
+    lastTrajectoryUploadError = null;
+    lastTrajectoryUploadMessage = `Uploaded ${uploaded.samples} samples for mode "${uploaded.mode}".`;
+    return `${lastTrajectoryUploadMessage} (id: ${uploaded.id})`;
+  };
+
+  const finalizeAndUploadTrajectoryRun = async (
+    outcome: string,
+  ): Promise<string> => {
+    const session = finalizeTrajectoryRun(outcome);
+    if (!session) {
+      lastTrajectoryUploadMessage =
+        'No trajectory samples captured for this run.';
+      return lastTrajectoryUploadMessage;
+    }
+    try {
+      return await uploadTrajectorySession(session);
+    } catch (error) {
+      const message = toErrorMessage(error, 'Trajectory upload failed.');
+      lastTrajectoryUploadError = message;
+      lastTrajectoryUploadMessage = `Upload failed: ${message}`;
+      throw error;
+    }
+  };
+
+  const uploadLatestTrajectory = async (): Promise<string> => {
+    let candidate = pendingTrajectorySession;
+    if (!candidate && activeTrajectoryRun) {
+      candidate = buildTrajectorySession(activeTrajectoryRun, 'manual');
+    }
+    if (!candidate) {
+      throw new Error('No trajectory recording available to upload.');
+    }
+    try {
+      return await uploadTrajectorySession(candidate);
+    } catch (error) {
+      const message = toErrorMessage(error, 'Trajectory upload failed.');
+      lastTrajectoryUploadError = message;
+      lastTrajectoryUploadMessage = `Upload failed: ${message}`;
+      throw error;
+    }
+  };
+
+  const getTrajectoryUploadSummary = (): string => {
+    const lines: string[] = [];
+    const run = activeTrajectoryRun;
+    if (run) {
+      const activeSamples = trajectoryBuffer
+        .listSamples({ modeId: run.modeId })
+        .filter((sample) => sample.createdAtMs >= run.startedAtMs).length;
+      lines.push(`Active run: ${run.modeId} (${activeSamples} samples)`);
+    } else {
+      lines.push('Active run: none');
+    }
+    if (pendingTrajectorySession) {
+      lines.push(
+        `Pending upload: ${pendingTrajectorySession.modeId} (${pendingTrajectorySession.samples.length} samples)`,
+      );
+    } else {
+      lines.push('Pending upload: none');
+    }
+    lines.push(`Last upload: ${lastTrajectoryUploadMessage}`);
+    if (lastTrajectoryUploadAtMs != null) {
+      lines.push(
+        `Uploaded at: ${new Date(lastTrajectoryUploadAtMs).toLocaleTimeString()} (${lastTrajectoryUploadSamples} samples)`,
+      );
+    }
+    if (lastTrajectoryUploadError) {
+      lines.push(`Last error: ${lastTrajectoryUploadError}`);
+    }
+    return lines.join('\n');
+  };
+
   const runLocalBiasTraining = async (options?: {
     modeId?: string;
     sampleLimit?: number;
@@ -848,7 +1034,11 @@ async function boot() {
     onPieceLock: handlePieceLock,
     onHold: handleHoldSnapshot,
     onLineClear: handleLineClear,
-    onBeforeRestart: () => restartRecordingSession(),
+    onBeforeRestart: () => {
+      restartRecordingSession();
+      previousRunEnded = false;
+      beginTrajectoryRun(modeController.getState().mode.id);
+    },
     onModelDecision: (decision) => {
       const modeId = modeController.getState().mode.id;
       trajectoryBuffer.recordDecision({ modeId, decision });
@@ -1035,6 +1225,19 @@ async function boot() {
       const ended = state.gameOver || state.gameWon;
       if (ended && !previousRunEnded) {
         void snapshotService?.flushRemoteUploads();
+        const outcome = state.gameWon ? 'game_won' : 'game_over';
+        if (authState.authenticated) {
+          void finalizeAndUploadTrajectoryRun(outcome).catch((error) => {
+            console.warn('[trajectory] auto upload failed', error);
+          });
+        } else {
+          const finalized = finalizeTrajectoryRun(outcome);
+          if (finalized) {
+            lastTrajectoryUploadMessage =
+              'Run captured locally. Sign in and use "UPLOAD TRAJECTORY".';
+            lastTrajectoryUploadError = null;
+          }
+        }
       }
       previousRunEnded = ended;
     },
@@ -1197,6 +1400,8 @@ async function boot() {
     onMlRunParityCheck: runMlParityCheck,
     getLocalTrainingStats,
     onRunLocalBiasTraining: () => runLocalBiasTraining(),
+    getTrajectoryUploadSummary,
+    onUploadLatestTrajectory: uploadLatestTrajectory,
     onAuthRefresh: refreshAuthState,
     onAuthStartOAuth: (provider) => authService.startOAuth(provider),
     onAuthLogout: logoutAuthState,
@@ -1301,6 +1506,8 @@ async function boot() {
           reason: 'start_game',
         });
       }
+      beginTrajectoryRun(modeController.getState().mode.id);
+      previousRunEnded = false;
       await screenManager.setActive('game');
     } finally {
       startingGame = false;

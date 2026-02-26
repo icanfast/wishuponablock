@@ -1,3 +1,8 @@
+import {
+  MAX_TRAJECTORY_SAMPLES_PER_SESSION,
+  parseTrajectorySessionV1,
+} from '../core/trajectoryProtocol';
+
 type D1PreparedStatement = {
   bind: (...values: unknown[]) => D1PreparedStatement;
   run: () => Promise<unknown>;
@@ -56,6 +61,7 @@ const SESSION_SLIDING_WINDOW_DAYS = 90;
 const SESSION_REVOKED_RETENTION_MS = 30 * DAY_MS;
 const TOKEN_CONSUMED_RETENTION_MS = 7 * DAY_MS;
 const MAX_PERSONALIZED_MODEL_BYTES = 2 * 1024 * 1024;
+const MAX_TRAJECTORY_UPLOAD_BYTES = 3 * 1024 * 1024;
 const LEGACY_API_ERROR =
   'Legacy snapshot/label APIs were removed on the 0.3.0 dev branch.';
 const EMAIL_VERIFY_TOKEN_TTL_MS = DAY_MS;
@@ -2226,6 +2232,168 @@ const handlePutCurrentPersonalModel = async (
   }
 };
 
+const handlePostTrajectoryRecording = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  if (!env.RECORDINGS_BUCKET) {
+    return jsonResponse(
+      { error: 'Recording storage is not configured.' },
+      503,
+      {
+        'cache-control': 'no-store',
+      },
+    );
+  }
+
+  const contentLengthRaw = asInt(request.headers.get('content-length'));
+  const contentLength =
+    contentLengthRaw != null && contentLengthRaw >= 0 ? contentLengthRaw : null;
+  if (contentLength != null && contentLength > MAX_TRAJECTORY_UPLOAD_BYTES) {
+    return jsonResponse(
+      {
+        error: `Recording payload is too large. Max bytes: ${MAX_TRAJECTORY_UPLOAD_BYTES}.`,
+      },
+      413,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[recordings] touch session failed', error);
+  }
+
+  let rawBuffer: ArrayBuffer;
+  try {
+    rawBuffer = await request.arrayBuffer();
+  } catch {
+    return jsonResponse({ error: 'Invalid payload.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (rawBuffer.byteLength <= 0) {
+    return jsonResponse({ error: 'Recording payload is empty.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (rawBuffer.byteLength > MAX_TRAJECTORY_UPLOAD_BYTES) {
+    return jsonResponse(
+      {
+        error: `Recording payload is too large. Max bytes: ${MAX_TRAJECTORY_UPLOAD_BYTES}.`,
+      },
+      413,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(rawBuffer));
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON payload.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const parsed = parseTrajectorySessionV1(payload, {
+    maxSamples: MAX_TRAJECTORY_SAMPLES_PER_SESSION,
+  });
+  if (!parsed.ok) {
+    return jsonResponse({ error: parsed.error }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  const recording = parsed.value;
+  const recordingId = `${session.userId}_${recording.sessionId}`;
+  const monthPrefix = new Date(nowMs).toISOString().slice(0, 7);
+  const r2Key = `recordings/${monthPrefix}/${session.userId}/${recording.modeId}/${recording.sessionId}.json`;
+
+  const metaJson = JSON.stringify({
+    schema: recording.schema,
+    sample_count: recording.samples.length,
+    outcome: recording.meta?.outcome ?? null,
+    model_source: recording.meta?.modelSource ?? null,
+    model_mode: recording.meta?.modelMode ?? null,
+    model_version: recording.meta?.modelVersion ?? null,
+    channel: recording.meta?.channel ?? null,
+  });
+
+  try {
+    await env.RECORDINGS_BUCKET.put(r2Key, rawBuffer, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+    await env.DB.prepare(
+      `INSERT INTO recordings_index (
+         id,
+         user_id,
+         game_mode,
+         build_version,
+         r2_key,
+         started_at_ms,
+         ended_at_ms,
+         duration_ms,
+         snapshots_total,
+         meta_json,
+         created_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         game_mode = excluded.game_mode,
+         build_version = excluded.build_version,
+         r2_key = excluded.r2_key,
+         started_at_ms = excluded.started_at_ms,
+         ended_at_ms = excluded.ended_at_ms,
+         duration_ms = excluded.duration_ms,
+         snapshots_total = excluded.snapshots_total,
+         meta_json = excluded.meta_json`,
+    )
+      .bind(
+        recordingId,
+        session.userId,
+        recording.modeId,
+        recording.buildVersion,
+        r2Key,
+        recording.startedAtMs,
+        recording.endedAtMs,
+        recording.durationMs,
+        recording.samples.length,
+        metaJson,
+        nowMs,
+      )
+      .run();
+
+    return jsonResponse(
+      {
+        ok: true,
+        recording: {
+          id: recordingId,
+          mode: recording.modeId,
+          r2Key,
+          samples: recording.samples.length,
+          createdAtMs: nowMs,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[recordings] trajectory upload failed', error);
+    return jsonResponse(
+      { error: 'Recording storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -2401,6 +2569,10 @@ export default {
         return handlePutCurrentPersonalModel(request, env);
       }
       return jsonResponse({ error: 'Method not allowed.' }, 405);
+    }
+
+    if (url.pathname === '/api/recordings/me/trajectory') {
+      return handlePostTrajectoryRecording(request, env);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {
