@@ -3199,6 +3199,24 @@ input[type=number] {
     makeInlineToggle('set current', botLabPublishCurrentToggle),
   );
   const botLabPublishPolicyButton = makeMenuButton('PUBLISH LOADED POLICY');
+  const makeBotLabField = (labelText: string, control: HTMLElement) => {
+    const wrapper = document.createElement('label');
+    Object.assign(wrapper.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '4px',
+    });
+    const label = document.createElement('span');
+    label.textContent = labelText;
+    Object.assign(label.style, {
+      color: '#8fa0b8',
+      fontSize: '11px',
+      letterSpacing: '0.2px',
+    });
+    wrapper.appendChild(label);
+    wrapper.appendChild(control);
+    return wrapper;
+  };
 
   const botLabTrainLabel = makeSectionLabel('TRAIN / VALIDATE');
   Object.assign(botLabTrainLabel.style, { marginTop: '4px' });
@@ -3262,10 +3280,16 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
-  botLabTrainControls.appendChild(botLabEpisodesInput);
-  botLabTrainControls.appendChild(botLabMaxPiecesInput);
-  botLabTrainControls.appendChild(botLabSeedInput);
-  botLabTrainControls.appendChild(botLabTrainSourceSelect);
+  botLabTrainControls.appendChild(
+    makeBotLabField('Episodes', botLabEpisodesInput),
+  );
+  botLabTrainControls.appendChild(
+    makeBotLabField('Max Pieces / Episode', botLabMaxPiecesInput),
+  );
+  botLabTrainControls.appendChild(makeBotLabField('Seed', botLabSeedInput));
+  botLabTrainControls.appendChild(
+    makeBotLabField('Piece Source', botLabTrainSourceSelect),
+  );
   const botLabTrainButton = makeMenuButton('TRAIN POLICY (ONE-SHOT)');
   const botLabHeadlessValidateButton = makeMenuButton('HEADLESS VALIDATE 10K');
 
@@ -3332,10 +3356,16 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
-  botLabGuiControls.appendChild(botLabGuiApmInput);
-  botLabGuiControls.appendChild(botLabGuiSeedInput);
-  botLabGuiControls.appendChild(botLabGuiPiecesInput);
-  botLabGuiControls.appendChild(botLabGuiSourceSelect);
+  botLabGuiControls.appendChild(
+    makeBotLabField('APM (actions/min)', botLabGuiApmInput),
+  );
+  botLabGuiControls.appendChild(makeBotLabField('Seed', botLabGuiSeedInput));
+  botLabGuiControls.appendChild(
+    makeBotLabField('Pieces (GUI run)', botLabGuiPiecesInput),
+  );
+  botLabGuiControls.appendChild(
+    makeBotLabField('Piece Source', botLabGuiSourceSelect),
+  );
   const botLabGuiButtons = document.createElement('div');
   Object.assign(botLabGuiButtons.style, {
     display: 'flex',
@@ -3395,8 +3425,12 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
-  botLabDataControls.appendChild(botLabGenerateSessionsInput);
-  botLabDataControls.appendChild(botLabGenerateSourceSelect);
+  botLabDataControls.appendChild(
+    makeBotLabField('Sessions to Generate', botLabGenerateSessionsInput),
+  );
+  botLabDataControls.appendChild(
+    makeBotLabField('Piece Source', botLabGenerateSourceSelect),
+  );
   const botLabGenerateButton = makeMenuButton('GENERATE RECORDINGS');
   const botLabBenchmarkButton = makeMenuButton('RUN BENCHMARK');
   const botLabApplyBenchmarkArchButton = makeMenuButton('APPLY BENCHMARK ARCH');
