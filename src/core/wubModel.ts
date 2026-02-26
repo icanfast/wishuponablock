@@ -124,6 +124,63 @@ export function serializeWubModelToBytes(model: LoadedModel): ArrayBuffer {
   return new TextEncoder().encode(text).buffer;
 }
 
+export function buildModelHeadInput(
+  model: LoadedModel,
+  board: Board,
+  hold: PieceKind | null,
+): Float32Array {
+  const { config } = model;
+  const rows = board.length;
+  const cols = board[0]?.length ?? 0;
+
+  let input = buildModelInputChannels(board, model.boardChannels);
+  const expectedLength = config.input_channels * rows * cols;
+  if (input.length !== expectedLength) {
+    const padded = new Float32Array(expectedLength);
+    padded.set(input.subarray(0, expectedLength), 0);
+    input = padded;
+  }
+
+  let current = input;
+  let inChannels = config.input_channels;
+  const poolShape = getModelPoolShape(config.pool_shape);
+
+  for (let i = 0; i < config.conv_channels.length; i++) {
+    const layerIndex = i * 2;
+    const weight = getParam(model, `conv.${layerIndex}.weight`);
+    const bias = getParam(model, `conv.${layerIndex}.bias`);
+    current = conv2d(
+      current,
+      inChannels,
+      config.conv_channels[i],
+      rows,
+      cols,
+      weight.data,
+      bias.data,
+    );
+    inChannels = config.conv_channels[i];
+  }
+
+  const pooled = adaptiveAveragePool(
+    current,
+    inChannels,
+    rows,
+    cols,
+    poolShape[0],
+    poolShape[1],
+  );
+  const extra = buildModelExtraFeatures(
+    config.extra_features,
+    hold,
+    model.pieces,
+  );
+  let mlpInput = concatFeatures(pooled, extra);
+  if (config.feature_norm === 'layernorm') {
+    mlpInput = layerNorm1d(mlpInput, config.feature_norm_eps ?? 1e-5);
+  }
+  return mlpInput;
+}
+
 export function predictLogits(
   model: LoadedModel,
   board: Board,

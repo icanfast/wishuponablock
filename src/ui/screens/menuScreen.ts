@@ -400,6 +400,8 @@ input[type=number] {
     width: '360px',
     display: 'none',
     textAlign: 'left',
+    maxHeight: '520px',
+    overflowY: 'auto',
   });
   Object.assign(butterfingerPanel.style, {
     minHeight: '240px',

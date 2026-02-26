@@ -46,6 +46,7 @@ import {
   type TrajectoryRewardTerminalStats,
 } from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
+import { getPersonalTrainingPipeline } from './app/trainingPipelines';
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
@@ -451,11 +452,18 @@ async function boot() {
   };
   void modelService.ensureLoaded();
   const trajectoryBuffer = createTrajectoryBuffer({ maxSamples: 2500 });
-  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = MIN_TRAJECTORY_SAMPLES_PER_SESSION;
-  const TRAJECTORY_PIPELINE_ID = 'personal_rl_v1';
+  const trainingPipeline = getPersonalTrainingPipeline(
+    import.meta.env.VITE_TRAINING_PIPELINE as string | undefined,
+  );
+  const MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD = Math.max(
+    MIN_TRAJECTORY_SAMPLES_PER_SESSION,
+    trainingPipeline.minSamples,
+  );
+  const TRAJECTORY_PIPELINE_ID = trainingPipeline.id;
   const trajectoryRewardPolicyId: TrajectoryRewardPolicyId =
     resolveTrajectoryRewardPolicyId(
-      import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined,
+      (import.meta.env.VITE_TRAJECTORY_REWARD_POLICY as string | undefined) ??
+        trainingPipeline.rewardPolicyId,
     );
   const personalTrainer = createPersonalTrainerTfjs();
   let menuUi: MenuScreen | null = null;
@@ -1064,7 +1072,7 @@ async function boot() {
     return lines.join('\n');
   };
 
-  const runLocalBiasTraining = async (options?: {
+  const runLocalHeadTraining = async (options?: {
     modeId?: string;
     sampleLimit?: number;
     epochs?: number;
@@ -1091,9 +1099,10 @@ async function boot() {
       modeId,
       limit: options?.sampleLimit,
     });
-    const result = await personalTrainer.trainBiasOnly({
+    const result = await personalTrainer.trainHeadOnly({
       model,
       samples,
+      pipeline: trainingPipeline,
       train: {
         sampleLimit: options?.sampleLimit,
         epochs: options?.epochs,
@@ -1112,7 +1121,7 @@ async function boot() {
     }
     await modelService.replaceModelFromBytes(
       result.updatedModelBytes,
-      'local bias training',
+      `local ${result.pipelineId} training`,
     );
     sessionController.rebuildSession();
     updateModelStatusUI(modelService.getStatus());
@@ -1577,7 +1586,7 @@ async function boot() {
     onMlBackendPreferenceChange: applyMlBackendPreference,
     onMlRunParityCheck: runMlParityCheck,
     getLocalTrainingStats,
-    onRunLocalBiasTraining: () => runLocalBiasTraining(),
+    onRunLocalBiasTraining: () => runLocalHeadTraining(),
     getTrajectoryUploadSummary,
     onUploadLatestTrajectory: uploadLatestTrajectory,
     onAuthRefresh: refreshAuthState,
@@ -1738,7 +1747,7 @@ async function boot() {
   identityConsole.wubTrainingList = (options) =>
     trajectoryBuffer.listSamples(options);
   identityConsole.wubTrainingRun = async (options) =>
-    await runLocalBiasTraining(options);
+    await runLocalHeadTraining(options);
 }
 
 boot().catch((e) => console.error(e));
