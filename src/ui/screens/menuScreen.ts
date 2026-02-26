@@ -2903,7 +2903,8 @@ input[type=number] {
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     myModelsPanel.style.display = panel === 'my_models' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
-    menuTitle.style.display = panel === 'options' ? 'none' : 'block';
+    menuTitle.style.display =
+      panel === 'options' || panel === 'my_models' ? 'none' : 'block';
     if (panel === 'options') {
       syncMlRuntimeSummary();
     }
