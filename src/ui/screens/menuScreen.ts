@@ -97,6 +97,12 @@ export type MenuGlobalModelSummary = {
   updatedAtMs: number | null;
 };
 
+export type MenuModelAxes = {
+  arch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+};
+
 export type MenuAdminGlobalBaselineSummary = {
   id: string;
   mode: string;
@@ -216,6 +222,13 @@ export type MenuScreenOptions = {
     token: string;
     password: string;
   }) => Promise<void>;
+  getModelAxes: () => MenuModelAxes;
+  onModelAxesChange: (next: MenuModelAxes) => Promise<string>;
+  modelAxesOptions: {
+    arch: string[];
+    rewardProfile: string[];
+    queuePolicy: string[];
+  };
   onAuthListGlobalModels: () => Promise<MenuGlobalModelSummary[]>;
   onAuthResetCurrentModelToGlobal: (
     globalModelId: string | null,
@@ -282,6 +295,9 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthEmailLogin,
     onAuthPasswordForgot,
     onAuthPasswordReset,
+    getModelAxes,
+    onModelAxesChange,
+    modelAxesOptions,
     onAuthListGlobalModels,
     onAuthResetCurrentModelToGlobal,
     onAuthLoadCurrentModel,
@@ -2426,6 +2442,51 @@ input[type=number] {
   Object.assign(myModelsCloudLabel.style, { marginTop: '4px' });
   const myModelsLoadButton = makeMenuButton('LOAD CLOUD MODEL');
   const myModelsSaveButton = makeMenuButton('SAVE CURRENT MODEL');
+  const myModelsAxesLabel = makeSectionLabel('MODEL AXES');
+  const myModelsAxesControls = document.createElement('div');
+  Object.assign(myModelsAxesControls.style, {
+    display: 'grid',
+    gridTemplateColumns: '1fr',
+    gap: '6px',
+  });
+  const makeAxisSelect = (
+    options: string[],
+    fallbackLabel: string,
+  ): HTMLSelectElement => {
+    const select = document.createElement('select');
+    Object.assign(select.style, {
+      color: '#e2e8f0',
+      background: '#0b0f14',
+      border: '1px solid #1f2a37',
+      borderRadius: '4px',
+      fontSize: '12px',
+      padding: '6px 8px',
+      width: '100%',
+      boxSizing: 'border-box',
+    });
+    const values = options.length > 0 ? options : [fallbackLabel];
+    for (const value of values) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      select.appendChild(option);
+    }
+    return select;
+  };
+  const myModelsArchSelect = makeAxisSelect(modelAxesOptions.arch, 'full');
+  const myModelsRewardProfileSelect = makeAxisSelect(
+    modelAxesOptions.rewardProfile,
+    'default',
+  );
+  const myModelsQueuePolicySelect = makeAxisSelect(
+    modelAxesOptions.queuePolicy,
+    'next_piece_v1',
+  );
+  const myModelsApplyAxesButton = makeMenuButton('APPLY AXES');
+  myModelsAxesControls.appendChild(myModelsArchSelect);
+  myModelsAxesControls.appendChild(myModelsRewardProfileSelect);
+  myModelsAxesControls.appendChild(myModelsQueuePolicySelect);
+  myModelsAxesControls.appendChild(myModelsApplyAxesButton);
   const myModelsBaselinesLabel = makeSectionLabel('GLOBAL BASELINES');
   const myModelsBaselinesSummary = document.createElement('div');
   Object.assign(myModelsBaselinesSummary.style, {
@@ -2566,6 +2627,8 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsCloudLabel);
   myModelsPanel.appendChild(myModelsSignedOutHint);
   myModelsPanel.appendChild(myModelsActions);
+  myModelsPanel.appendChild(myModelsAxesLabel);
+  myModelsPanel.appendChild(myModelsAxesControls);
   myModelsPanel.appendChild(myModelsBaselinesLabel);
   myModelsPanel.appendChild(myModelsBaselinesSummary);
   myModelsPanel.appendChild(myModelsBaselinesSelect);
@@ -2844,11 +2907,12 @@ input[type=number] {
   let adminGlobalBaselines: MenuAdminGlobalBaselineSummary[] = [];
   let adminSelectedBaselineId: string | null = null;
   let adminBaselinesPending = false;
-  let adminBaselinesModeId: string | null = null;
+  let adminBaselinesSelectorKey: string | null = null;
+  let currentModelAxes = getModelAxes();
   let myModelsGlobalBaselines: MenuGlobalModelSummary[] = [];
   let myModelsSelectedBaselineId: string | null = null;
   let myModelsBaselinesLoading = false;
-  let myModelsBaselinesModeId: string | null = null;
+  let myModelsBaselinesSelectorKey: string | null = null;
   let lastTrainingPresetKey = '';
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
@@ -2954,6 +3018,61 @@ input[type=number] {
       .join('\n');
   };
 
+  const syncModelAxesControls = (): void => {
+    const ensureValue = (
+      select: HTMLSelectElement,
+      value: string,
+      fallback: string,
+    ): string => {
+      if (
+        Array.from(select.options).some(
+          (option) => option.value.trim() === value.trim(),
+        )
+      ) {
+        select.value = value;
+        return value;
+      }
+      select.value = fallback;
+      return fallback;
+    };
+    currentModelAxes = {
+      arch: ensureValue(
+        myModelsArchSelect,
+        currentModelAxes.arch,
+        myModelsArchSelect.options[0]?.value ?? 'full',
+      ),
+      rewardProfileId: ensureValue(
+        myModelsRewardProfileSelect,
+        currentModelAxes.rewardProfileId,
+        myModelsRewardProfileSelect.options[0]?.value ?? 'default',
+      ),
+      queuePolicyId: ensureValue(
+        myModelsQueuePolicySelect,
+        currentModelAxes.queuePolicyId,
+        myModelsQueuePolicySelect.options[0]?.value ?? 'next_piece_v1',
+      ),
+    };
+  };
+
+  const readModelAxesFromControls = (): MenuModelAxes => ({
+    arch: myModelsArchSelect.value.trim().toLowerCase(),
+    rewardProfileId: myModelsRewardProfileSelect.value.trim().toLowerCase(),
+    queuePolicyId: myModelsQueuePolicySelect.value.trim().toLowerCase(),
+  });
+
+  const modelAxesEqual = (a: MenuModelAxes, b: MenuModelAxes): boolean =>
+    a.arch === b.arch &&
+    a.rewardProfileId === b.rewardProfileId &&
+    a.queuePolicyId === b.queuePolicyId;
+
+  const formatModelAxesCompact = (axes: MenuModelAxes): string =>
+    `${axes.arch}/${axes.rewardProfileId}/${axes.queuePolicyId}`;
+
+  const buildModelAxesSelectorKey = (
+    modeId: string,
+    axes: MenuModelAxes,
+  ): string => `${modeId}:${formatModelAxesCompact(axes)}`;
+
   const formatMyModelsSummary = (state: MenuAuthState): string => {
     if (state.loading) {
       return 'Checking session...';
@@ -3014,19 +3133,23 @@ input[type=number] {
   const formatMyModelsBaselinesSummary = (
     authenticated: boolean,
     modeId: string,
+    axes: MenuModelAxes,
   ): string => {
     if (!authenticated) {
-      return 'Sign in to browse and reset to published global baselines.';
+      return `Sign in to browse and reset to published global baselines.\nAxes: ${formatModelAxesCompact(axes)}`;
     }
     if (myModelsBaselinesLoading) {
-      return `Loading baselines for mode "${modeId}"...`;
+      return `Loading baselines for mode "${modeId}"...\nAxes: ${formatModelAxesCompact(axes)}`;
     }
     if (myModelsGlobalBaselines.length === 0) {
-      return `No global baselines published for mode "${modeId}".`;
+      return `No global baselines published for mode "${modeId}".\nAxes: ${formatModelAxesCompact(axes)}`;
     }
     const selected = getSelectedMyModelsBaseline();
     if (!selected) {
-      return `Published baselines: ${myModelsGlobalBaselines.length}`;
+      return [
+        `Published baselines: ${myModelsGlobalBaselines.length}`,
+        `Axes: ${formatModelAxesCompact(axes)}`,
+      ].join('\n');
     }
     const lastUpdated =
       selected.updatedAtMs != null
@@ -3038,6 +3161,7 @@ input[type=number] {
       selected.pipelineId
         ? `Pipeline: ${selected.pipelineId}`
         : 'Pipeline: (none)',
+      `Axes: ${formatModelAxesCompact(axes)}`,
       `Size: ${formatApproxBytes(selected.sizeBytes)}`,
       `Updated: ${lastUpdated}`,
     ].join('\n');
@@ -3051,13 +3175,14 @@ input[type=number] {
     if (!authenticated) {
       myModelsGlobalBaselines = [];
       myModelsSelectedBaselineId = null;
-      myModelsBaselinesModeId = null;
+      myModelsBaselinesSelectorKey = null;
       renderMyModelsBaselinesSelect();
       updateMyModelsControls();
       return;
     }
     const modeId = getLocalTrainingStats().currentModeId;
-    myModelsBaselinesModeId = modeId;
+    const selectorKey = buildModelAxesSelectorKey(modeId, currentModelAxes);
+    myModelsBaselinesSelectorKey = selectorKey;
     myModelsBaselinesLoading = true;
     updateMyModelsControls();
     try {
@@ -3145,17 +3270,22 @@ input[type=number] {
     };
 
   const formatAdminBaselinesSummary = (isAdmin: boolean): string => {
-    if (!isAdmin) return 'Admin account required.';
+    if (!isAdmin) {
+      return `Admin account required.\nAxes: ${formatModelAxesCompact(currentModelAxes)}`;
+    }
     const modeId = getLocalTrainingStats().currentModeId;
     if (adminBaselinesPending) {
-      return `Loading baselines for mode "${modeId}"...`;
+      return `Loading baselines for mode "${modeId}"...\nAxes: ${formatModelAxesCompact(currentModelAxes)}`;
     }
     if (adminGlobalBaselines.length === 0) {
-      return `No published baselines for mode "${modeId}".`;
+      return `No published baselines for mode "${modeId}".\nAxes: ${formatModelAxesCompact(currentModelAxes)}`;
     }
     const selected = getSelectedAdminBaseline();
     if (!selected) {
-      return `Published baselines: ${adminGlobalBaselines.length}`;
+      return [
+        `Published baselines: ${adminGlobalBaselines.length}`,
+        `Axes: ${formatModelAxesCompact(currentModelAxes)}`,
+      ].join('\n');
     }
     const updated =
       selected.updatedAtMs != null
@@ -3167,6 +3297,7 @@ input[type=number] {
       selected.pipelineId
         ? `Pipeline: ${selected.pipelineId}`
         : 'Pipeline: (none)',
+      `Axes: ${formatModelAxesCompact(currentModelAxes)}`,
       `Size: ${formatApproxBytes(selected.sizeBytes)}`,
       `Updated: ${updated}`,
     ].join('\n');
@@ -3182,13 +3313,14 @@ input[type=number] {
     if (!isAdmin) {
       adminGlobalBaselines = [];
       adminSelectedBaselineId = null;
-      adminBaselinesModeId = null;
+      adminBaselinesSelectorKey = null;
       renderAdminBaselinesSelect();
       updateAdminControls();
       return;
     }
     const modeId = getLocalTrainingStats().currentModeId;
-    adminBaselinesModeId = modeId;
+    const selectorKey = buildModelAxesSelectorKey(modeId, currentModelAxes);
+    adminBaselinesSelectorKey = selectorKey;
     adminBaselinesPending = true;
     updateAdminControls();
     try {
@@ -3366,11 +3498,17 @@ input[type=number] {
     }
     const trainingStats = getLocalTrainingStats();
     const currentModeId = trainingStats.currentModeId;
+    const selectorKey = buildModelAxesSelectorKey(
+      currentModeId,
+      currentModelAxes,
+    );
+    const pendingAxes = readModelAxesFromControls();
+    const axesDirty = !modelAxesEqual(pendingAxes, currentModelAxes);
     if (
       authenticated &&
       !modelActionPending &&
       !myModelsBaselinesLoading &&
-      myModelsBaselinesModeId !== currentModeId
+      myModelsBaselinesSelectorKey !== selectorKey
     ) {
       void refreshMyModelsBaselines({ silent: true });
     }
@@ -3381,6 +3519,7 @@ input[type=number] {
     myModelsBaselinesSummary.textContent = formatMyModelsBaselinesSummary(
       authenticated,
       currentModeId,
+      currentModelAxes,
     );
     myModelsTrainingSummary.textContent = formatMyModelsTrainingSummary(
       trainingStats,
@@ -3394,6 +3533,10 @@ input[type=number] {
     const busy = modelActionPending || currentAuthState.loading;
     myModelsLoadButton.disabled = !authenticated || busy;
     myModelsSaveButton.disabled = !authenticated || busy;
+    myModelsArchSelect.disabled = busy;
+    myModelsRewardProfileSelect.disabled = busy;
+    myModelsQueuePolicySelect.disabled = busy;
+    myModelsApplyAxesButton.disabled = busy || !axesDirty;
     myModelsBaselinesSelect.disabled =
       !authenticated ||
       busy ||
@@ -3419,6 +3562,9 @@ input[type=number] {
       !authenticated || busy ? '0.65' : '1';
     myModelsUploadTrajectoryButton.style.cursor =
       !authenticated || busy ? 'default' : 'pointer';
+    myModelsApplyAxesButton.style.opacity = busy || !axesDirty ? '0.65' : '1';
+    myModelsApplyAxesButton.style.cursor =
+      busy || !axesDirty ? 'default' : 'pointer';
     myModelsBaselinesRefreshButton.style.opacity =
       !authenticated || busy || myModelsBaselinesLoading ? '0.65' : '1';
     myModelsBaselinesRefreshButton.style.cursor =
@@ -3451,7 +3597,8 @@ input[type=number] {
       isAdmin &&
       !adminActionPending &&
       !adminBaselinesPending &&
-      adminBaselinesModeId !== currentModeId
+      adminBaselinesSelectorKey !==
+        buildModelAxesSelectorKey(currentModeId, currentModelAxes)
     ) {
       void refreshAdminBaselines({ silent: true });
     }
@@ -3706,6 +3853,41 @@ input[type=number] {
     } catch (error) {
       setMyModelsActionStatus(
         toErrorMessage(error, 'Could not save current model.'),
+        'error',
+      );
+    } finally {
+      modelActionPending = false;
+      updateMyModelsControls();
+    }
+  });
+
+  myModelsApplyAxesButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    const nextAxes = readModelAxesFromControls();
+    if (modelAxesEqual(nextAxes, currentModelAxes)) {
+      setMyModelsActionStatus('Model axes unchanged.');
+      updateMyModelsControls();
+      return;
+    }
+    modelActionPending = true;
+    setMyModelsActionStatus(
+      `Applying model axes (${formatModelAxesCompact(nextAxes)})...`,
+    );
+    updateMyModelsControls();
+    try {
+      const message = await onModelAxesChange(nextAxes);
+      currentModelAxes = getModelAxes();
+      syncModelAxesControls();
+      myModelsBaselinesSelectorKey = null;
+      adminBaselinesSelectorKey = null;
+      await refreshMyModelsBaselines({ silent: true });
+      await refreshAdminBaselines({ silent: true });
+      setMyModelsActionStatus(message, 'success');
+    } catch (error) {
+      currentModelAxes = getModelAxes();
+      syncModelAxesControls();
+      setMyModelsActionStatus(
+        toErrorMessage(error, 'Could not apply model axes.'),
         'error',
       );
     } finally {
@@ -4184,6 +4366,7 @@ input[type=number] {
   } else {
     setAccountActionStatus('');
   }
+  syncModelAxesControls();
   setMyModelsActionStatus('');
   setAdminActionStatus('');
   adminBaselinesSummary.textContent = formatAdminBaselinesSummary(false);
@@ -4449,6 +4632,13 @@ input[type=number] {
     shareToggle.checked = settings.privacy.shareSnapshots;
     updateKeybindButtons(settings.input.bindings);
     updateButterfingerUI(settings.butterfinger);
+    const nextModelAxes = getModelAxes();
+    if (!modelAxesEqual(currentModelAxes, nextModelAxes)) {
+      currentModelAxes = nextModelAxes;
+      syncModelAxesControls();
+      myModelsBaselinesSelectorKey = null;
+      adminBaselinesSelectorKey = null;
+    }
   };
 
   syncSettings(settingsStore.get());

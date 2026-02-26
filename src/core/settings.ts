@@ -23,6 +23,11 @@ import {
   SETTINGS_STORAGE_KEY,
 } from './constants';
 import {
+  DEFAULT_MODEL_ARCH,
+  DEFAULT_QUEUE_POLICY_ID,
+  DEFAULT_REWARD_PROFILE_ID,
+} from './modelAxes';
+import {
   type GeneratorSettings,
   isGeneratorType,
   isMlInferenceStrategy,
@@ -41,10 +46,17 @@ export interface Settings {
   game: GameSettings;
   input: InputConfig;
   generator: GeneratorSettings;
+  modelAxes: ModelAxesSettings;
   audio: AudioSettings;
   privacy: PrivacySettings;
   graphics: GraphicsSettings;
   butterfinger: ButterfingerSettings;
+}
+
+export interface ModelAxesSettings {
+  arch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
 }
 
 export interface AudioSettings {
@@ -87,6 +99,11 @@ export const DEFAULT_SETTINGS: Settings = {
   generator: {
     type: 'ml',
     ml: { ...DEFAULT_ML_INFERENCE },
+  },
+  modelAxes: {
+    arch: DEFAULT_MODEL_ARCH,
+    rewardProfileId: DEFAULT_REWARD_PROFILE_ID,
+    queuePolicyId: DEFAULT_QUEUE_POLICY_ID,
   },
   audio: {
     masterVolume: DEFAULT_MASTER_VOLUME,
@@ -180,6 +197,23 @@ function mergeGenerator(
   };
 }
 
+function mergeModelAxes(
+  base: ModelAxesSettings,
+  patch?: Partial<ModelAxesSettings>,
+): ModelAxesSettings {
+  const normalize = (value: unknown, fallback: string): string => {
+    if (typeof value !== 'string') return fallback;
+    const normalized = value.trim().toLowerCase();
+    if (!/^[a-z0-9_-]{1,64}$/.test(normalized)) return fallback;
+    return normalized;
+  };
+  return {
+    arch: normalize(patch?.arch, base.arch),
+    rewardProfileId: normalize(patch?.rewardProfileId, base.rewardProfileId),
+    queuePolicyId: normalize(patch?.queuePolicyId, base.queuePolicyId),
+  };
+}
+
 function mergeAudio(
   base: AudioSettings,
   patch?: Partial<AudioSettings>,
@@ -233,6 +267,7 @@ export function mergeSettings(
     game: mergeGame(base.game, patch.game),
     input: mergeInput(base.input, patch.input),
     generator: mergeGenerator(base.generator, patch.generator),
+    modelAxes: mergeModelAxes(base.modelAxes, patch.modelAxes),
     audio: mergeAudio(base.audio, patch.audio),
     privacy: mergePrivacy(base.privacy, patch.privacy),
     graphics: mergeGraphics(base.graphics, patch.graphics),

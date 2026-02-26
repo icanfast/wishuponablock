@@ -71,12 +71,20 @@ import {
   type MenuMlBackendPreference,
   type MenuMlParityResult,
   type MenuAuthStatusTone,
+  type MenuModelAxes,
   type MenuAdminRecordingsPage,
   type MenuAdminRecordingPreview,
   type MenuAdminRecordingsQuery,
   type MenuAdminGlobalBaselineSummary,
   type MenuScreen,
 } from './ui/screens/menuScreen';
+import {
+  MODEL_ARCH_OPTIONS,
+  QUEUE_POLICY_OPTIONS,
+  REWARD_PROFILE_OPTIONS,
+  modelAxesKey,
+  normalizeModelAxes,
+} from './core/modelAxes';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
 import {
   createToolHost,
@@ -521,8 +529,12 @@ async function boot() {
     );
   };
 
+  const getActiveModelAxes = () =>
+    normalizeModelAxes(settingsStore.get().modelAxes);
+  const buildModelSyncKey = (mode: string): string =>
+    `${mode}:${modelAxesKey(getActiveModelAxes())}`;
   const buildModelContextKey = (userId: string | null, mode: string): string =>
-    `${userId ?? 'anon'}:${mode}`;
+    `${userId ?? 'anon'}:${buildModelSyncKey(mode)}`;
 
   const syncActiveModelForContext = async (options: {
     mode: string;
@@ -534,6 +546,7 @@ async function boot() {
     const userId =
       authState.authenticated && authState.user ? authState.user.id : null;
     const contextKey = buildModelContextKey(userId, mode);
+    const selector = getActiveModelAxes();
     if (!force && activeModelContextKey === contextKey) {
       return {
         source: activeModelSource.kind,
@@ -564,7 +577,7 @@ async function boot() {
     }
 
     try {
-      const result = await personalModelService.downloadCurrent(mode);
+      const result = await personalModelService.downloadCurrent(mode, selector);
       if (!isCurrentRequest()) {
         return {
           source: activeModelSource.kind,
@@ -585,7 +598,7 @@ async function boot() {
 
       const resolvedSha =
         result.sha256 ?? (await sha256HexFromBuffer(result.bytes));
-      syncedModelShaByMode.set(mode, resolvedSha);
+      syncedModelShaByMode.set(buildModelSyncKey(mode), resolvedSha);
       setActiveModelSource({
         kind: 'personal',
         mode: result.mode,
@@ -654,15 +667,21 @@ async function boot() {
     )
       return;
 
+    const selector = getActiveModelAxes();
     const bytes = await modelService.ensureModelBytes();
     if (!bytes) return;
     const currentSha = await sha256HexFromBuffer(bytes);
-    const syncedSha = syncedModelShaByMode.get(mode) ?? null;
+    const syncKey = buildModelSyncKey(mode);
+    const syncedSha = syncedModelShaByMode.get(syncKey) ?? null;
     if (syncedSha && syncedSha === currentSha) return;
 
     try {
-      const result = await personalModelService.uploadCurrent(mode, bytes);
-      syncedModelShaByMode.set(mode, result.sha256 ?? currentSha);
+      const result = await personalModelService.uploadCurrent(
+        mode,
+        bytes,
+        selector,
+      );
+      syncedModelShaByMode.set(syncKey, result.sha256 ?? currentSha);
       setActiveModelSource({
         kind: 'personal',
         mode,
@@ -760,13 +779,21 @@ async function boot() {
       throw new Error('Sign in to save a personal model.');
     }
     const mode = modeController.getState().mode.id;
+    const selector = getActiveModelAxes();
     const bytes = await modelService.ensureModelBytes();
     if (!bytes) {
       throw new Error('No model is loaded to upload.');
     }
     const currentSha = await sha256HexFromBuffer(bytes);
-    const result = await personalModelService.uploadCurrent(mode, bytes);
-    syncedModelShaByMode.set(mode, result.sha256 ?? currentSha);
+    const result = await personalModelService.uploadCurrent(
+      mode,
+      bytes,
+      selector,
+    );
+    syncedModelShaByMode.set(
+      buildModelSyncKey(mode),
+      result.sha256 ?? currentSha,
+    );
     if (
       activeModelSource.kind === 'personal' &&
       activeModelSource.mode === mode
@@ -786,7 +813,7 @@ async function boot() {
       throw new Error('Sign in to browse global baselines.');
     }
     const mode = modeController.getState().mode.id;
-    return await personalModelService.listGlobal(mode);
+    return await personalModelService.listGlobal(mode, getActiveModelAxes());
   };
   const resetCurrentModeToGlobalModel = async (
     globalModelId: string | null,
@@ -795,9 +822,11 @@ async function boot() {
       throw new Error('Sign in to reset your model.');
     }
     const mode = modeController.getState().mode.id;
+    const selector = getActiveModelAxes();
     const result = await personalModelService.resetCurrentFromGlobal(
       mode,
       globalModelId,
+      selector,
     );
     await syncActiveModelForContext({
       mode,
@@ -893,11 +922,15 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const mode = modeController.getState().mode.id;
+    const selector = getActiveModelAxes();
     const url = new URL(
       `${uploadBaseUrl}/admin/models/global/index`,
       window.location.origin,
     );
     url.searchParams.set('mode', mode);
+    url.searchParams.set('arch', selector.arch);
+    url.searchParams.set('reward_profile', selector.rewardProfileId);
+    url.searchParams.set('queue_policy', selector.queuePolicyId);
     const response = await fetch(url.toString(), {
       method: 'GET',
       credentials: 'include',
@@ -1034,6 +1067,7 @@ async function boot() {
       throw new Error('No model is loaded to publish.');
     }
     const mode = modeController.getState().mode.id;
+    const selector = getActiveModelAxes();
     const pipelineId = getLocalTrainingPreset().pipelineId;
     const label =
       typeof options?.label === 'string' && options.label.trim()
@@ -1045,6 +1079,9 @@ async function boot() {
       window.location.origin,
     );
     url.searchParams.set('mode', mode);
+    url.searchParams.set('arch', selector.arch);
+    url.searchParams.set('reward_profile', selector.rewardProfileId);
+    url.searchParams.set('queue_policy', selector.queuePolicyId);
     url.searchParams.set('pipeline_id', pipelineId);
     if (label) {
       url.searchParams.set('label', label);
@@ -1083,6 +1120,29 @@ async function boot() {
     return createdLabel
       ? `Published baseline: ${createdLabel} (${id}).`
       : `Published baseline id: ${id}.`;
+  };
+  const getMenuModelAxes = (): MenuModelAxes => {
+    const axes = getActiveModelAxes();
+    return {
+      arch: axes.arch,
+      rewardProfileId: axes.rewardProfileId,
+      queuePolicyId: axes.queuePolicyId,
+    };
+  };
+  const setMenuModelAxes = async (next: MenuModelAxes): Promise<string> => {
+    const current = getActiveModelAxes();
+    const normalized = normalizeModelAxes(next);
+    if (modelAxesKey(current) === modelAxesKey(normalized)) {
+      return 'Model axes unchanged.';
+    }
+    settingsStore.apply({ modelAxes: normalized });
+    const mode = modeController.getState().mode.id;
+    const result = await syncActiveModelForContext({
+      mode,
+      reason: 'model_axes_change',
+      force: true,
+    });
+    return `Model axes updated (${normalized.arch}/${normalized.rewardProfileId}/${normalized.queuePolicyId}). ${result.message}`;
   };
 
   type TrajectoryRunState = {
@@ -1864,6 +1924,13 @@ async function boot() {
     onAuthEmailLogin: loginWithEmail,
     onAuthPasswordForgot: sendPasswordReset,
     onAuthPasswordReset: resetPasswordWithToken,
+    getModelAxes: getMenuModelAxes,
+    onModelAxesChange: setMenuModelAxes,
+    modelAxesOptions: {
+      arch: [...MODEL_ARCH_OPTIONS],
+      rewardProfile: [...REWARD_PROFILE_OPTIONS],
+      queuePolicy: [...QUEUE_POLICY_OPTIONS],
+    },
     onAuthListGlobalModels: listCurrentModeGlobalModels,
     onAuthResetCurrentModelToGlobal: resetCurrentModeToGlobalModel,
     onAuthLoadCurrentModel: loadCurrentModePersonalModel,

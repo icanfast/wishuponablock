@@ -11,6 +11,12 @@ export type PersonalModelDownload = {
   bytes: ArrayBuffer;
 };
 
+export type PersonalModelSelector = {
+  arch?: string;
+  rewardProfileId?: string;
+  queuePolicyId?: string;
+};
+
 export type PersonalModelUpload = {
   mode: string;
   arch: string | null;
@@ -50,15 +56,23 @@ export type PersonalModelHttpError = Error & {
 };
 
 export type PersonalModelService = {
-  downloadCurrent: (mode: string) => Promise<PersonalModelDownload>;
+  downloadCurrent: (
+    mode: string,
+    selector?: PersonalModelSelector,
+  ) => Promise<PersonalModelDownload>;
   uploadCurrent: (
     mode: string,
     payload: ArrayBuffer | ArrayBufferView,
+    selector?: PersonalModelSelector,
   ) => Promise<PersonalModelUpload>;
-  listGlobal: (mode: string) => Promise<PersonalGlobalModel[]>;
+  listGlobal: (
+    mode: string,
+    selector?: PersonalModelSelector,
+  ) => Promise<PersonalGlobalModel[]>;
   resetCurrentFromGlobal: (
     mode: string,
     globalModelId?: string | null,
+    selector?: PersonalModelSelector,
   ) => Promise<PersonalModelResetResult>;
 };
 
@@ -147,6 +161,14 @@ const normalizeMode = (value: string): string => {
   return mode;
 };
 
+const normalizeAxis = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (!/^[a-z0-9_-]{1,64}$/.test(normalized)) return null;
+  return normalized;
+};
+
 const toByteView = (payload: ArrayBuffer | ArrayBufferView): Uint8Array => {
   if (payload instanceof ArrayBuffer) {
     return new Uint8Array(payload);
@@ -159,20 +181,36 @@ export function createPersonalModelService(
 ): PersonalModelService {
   const baseUrl = normalizeBaseUrl(options.baseUrl || '/api');
 
-  const buildPath = (mode: string): string =>
-    `${baseUrl}/models/me/current?mode=${encodeURIComponent(normalizeMode(mode))}`;
-  const buildGlobalListPath = (mode: string): string =>
-    `${baseUrl}/models/global/list?mode=${encodeURIComponent(normalizeMode(mode))}`;
-  const buildResetPath = (mode: string): string =>
-    `${baseUrl}/models/me/reset?mode=${encodeURIComponent(normalizeMode(mode))}`;
+  const withSelector = (
+    path: string,
+    mode: string,
+    selector?: PersonalModelSelector,
+  ): string => {
+    const url = new URL(`${baseUrl}${path}`, window.location.origin);
+    url.searchParams.set('mode', normalizeMode(mode));
+    const arch = normalizeAxis(selector?.arch);
+    const rewardProfileId = normalizeAxis(selector?.rewardProfileId);
+    const queuePolicyId = normalizeAxis(selector?.queuePolicyId);
+    if (arch) url.searchParams.set('arch', arch);
+    if (rewardProfileId) {
+      url.searchParams.set('reward_profile', rewardProfileId);
+    }
+    if (queuePolicyId) {
+      url.searchParams.set('queue_policy', queuePolicyId);
+    }
+    return url.toString();
+  };
 
   return {
-    downloadCurrent: async (mode) => {
-      const response = await fetch(buildPath(mode), {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-      });
+    downloadCurrent: async (mode, selector) => {
+      const response = await fetch(
+        withSelector('/models/me/current', mode, selector),
+        {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+        },
+      );
       if (!response.ok) {
         throw withStatusError(
           await parseErrorMessage(response),
@@ -210,17 +248,20 @@ export function createPersonalModelService(
         bytes,
       };
     },
-    uploadCurrent: async (mode, payload) => {
+    uploadCurrent: async (mode, payload, selector) => {
       const bytes = toByteView(payload);
-      const response = await fetch(buildPath(mode), {
-        method: 'PUT',
-        credentials: 'include',
-        cache: 'no-store',
-        headers: {
-          'content-type': 'application/octet-stream',
+      const response = await fetch(
+        withSelector('/models/me/current', mode, selector),
+        {
+          method: 'PUT',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: {
+            'content-type': 'application/octet-stream',
+          },
+          body: bytes,
         },
-        body: bytes,
-      });
+      );
       if (!response.ok) {
         throw withStatusError(
           await parseErrorMessage(response),
@@ -244,12 +285,15 @@ export function createPersonalModelService(
         baseGlobalModelId: asString(model?.baseGlobalModelId),
       };
     },
-    listGlobal: async (mode) => {
-      const response = await fetch(buildGlobalListPath(mode), {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-      });
+    listGlobal: async (mode, selector) => {
+      const response = await fetch(
+        withSelector('/models/global/list', mode, selector),
+        {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+        },
+      );
       if (!response.ok) {
         throw withStatusError(
           await parseErrorMessage(response),
@@ -282,19 +326,22 @@ export function createPersonalModelService(
       }
       return models;
     },
-    resetCurrentFromGlobal: async (mode, globalModelId) => {
+    resetCurrentFromGlobal: async (mode, globalModelId, selector) => {
       const normalizedGlobalModelId = asString(globalModelId);
-      const response = await fetch(buildResetPath(mode), {
-        method: 'POST',
-        credentials: 'include',
-        cache: 'no-store',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(
-          normalizedGlobalModelId
-            ? { globalModelId: normalizedGlobalModelId }
-            : {},
-        ),
-      });
+      const response = await fetch(
+        withSelector('/models/me/reset', mode, selector),
+        {
+          method: 'POST',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(
+            normalizedGlobalModelId
+              ? { globalModelId: normalizedGlobalModelId }
+              : {},
+          ),
+        },
+      );
       if (!response.ok) {
         throw withStatusError(
           await parseErrorMessage(response),
