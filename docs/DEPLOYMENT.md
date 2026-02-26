@@ -11,8 +11,9 @@ This file is for deployment and ops details that don’t belong in `README.md`.
 1. Cloudflare does not apply D1 migrations automatically.
 2. Run migrations manually from your machine:
    - `npx wrangler login`
-   - `npx wrangler d1 migrations apply DB --remote`
-3. SQL lives in `tools/db/migrations/`. The initial schema is `tools/db/migrations/0001_init.sql`.
+   - `npx wrangler d1 migrations apply DB --env dev --remote`
+3. 0.3.0 SQL lives in `tools/db/migrations_030/`. The initial schema is `tools/db/migrations_030/0001_030_core_identity.sql`.
+4. `tools/db/migrations/` is legacy history and should not be used for new 0.3.0 databases.
 
 **Wrangler Bindings**
 

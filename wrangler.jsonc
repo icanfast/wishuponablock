@@ -18,7 +18,7 @@
 			"binding": "DB",
 			"database_name": "wishuponablock",
 			"database_id": "eac41a1a-239a-49d2-ae56-06a0464447ee",
-			"migrations_dir": "./tools/db/migrations",
+			"migrations_dir": "./tools/db/migrations_030",
 		},
 	],
 	"env": {
@@ -38,7 +38,7 @@
 					"binding": "DB",
 					"database_name": "wishuponablock",
 					"database_id": "eac41a1a-239a-49d2-ae56-06a0464447ee",
-					"migrations_dir": "./tools/db/migrations",
+					"migrations_dir": "./tools/db/migrations_030",
 				},
 			],
 			"r2_buckets": [
