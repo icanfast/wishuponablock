@@ -273,6 +273,17 @@ const normalizeOptionalModelAxis = (
   return normalized;
 };
 
+const parseBooleanFlag = (value: string | null): boolean => {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === '1' ||
+    normalized === 'true' ||
+    normalized === 'yes' ||
+    normalized === 'on'
+  );
+};
+
 type PersonalModelSelector = {
   gameMode: string;
   modelArch: string;
@@ -3398,6 +3409,183 @@ const handleAdminRecordingObject = async (
   }
 };
 
+const handleAdminPublishGlobalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const url = new URL(request.url);
+  const label = asString(url.searchParams.get('label'))?.slice(0, 120) ?? null;
+  const pipelineId =
+    normalizeOptionalModelAxis(url.searchParams.get('pipeline_id')) ??
+    'manual_publish';
+  const setDefault = parseBooleanFlag(url.searchParams.get('set_default'));
+
+  let modelBuffer: ArrayBuffer;
+  try {
+    modelBuffer = await request.arrayBuffer();
+  } catch {
+    return jsonResponse({ error: 'Invalid model payload.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (modelBuffer.byteLength <= 0) {
+    return jsonResponse({ error: 'Model payload is empty.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (modelBuffer.byteLength > MAX_PERSONALIZED_MODEL_BYTES) {
+    return jsonResponse(
+      {
+        error: `Model payload is too large. Max bytes: ${MAX_PERSONALIZED_MODEL_BYTES}.`,
+      },
+      413,
+      { 'cache-control': 'no-store' },
+    );
+  }
+
+  const globalModelId = `global_${crypto.randomUUID()}`;
+  const r2Key =
+    `global/${selector.gameMode}` +
+    `/${selector.modelArch}` +
+    `/${selector.rewardProfileId}` +
+    `/${selector.queuePolicyId}` +
+    `/${nowMs}-${globalModelId}.json`;
+
+  let stored = false;
+  try {
+    const modelSha256 = await sha256HexFromBuffer(modelBuffer);
+    await env.MODELS_BUCKET.put(r2Key, modelBuffer, {
+      httpMetadata: { contentType: 'application/json' },
+    });
+    stored = true;
+
+    if (setDefault) {
+      await env.DB.prepare(
+        `UPDATE global_models
+         SET is_default = 0, updated_at_ms = ?
+         WHERE
+           mode_id = ?
+           AND model_arch = ?
+           AND reward_profile_id = ?
+           AND queue_policy_id = ?
+           AND retired_at_ms IS NULL`,
+      )
+        .bind(
+          nowMs,
+          selector.gameMode,
+          selector.modelArch,
+          selector.rewardProfileId,
+          selector.queuePolicyId,
+        )
+        .run();
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO global_models (
+         id,
+         mode_id,
+         model_arch,
+         reward_profile_id,
+         queue_policy_id,
+         pipeline_id,
+         label,
+         r2_key,
+         sha256,
+         size_bytes,
+         metrics_json,
+         is_default,
+         created_at_ms,
+         updated_at_ms,
+         retired_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        globalModelId,
+        selector.gameMode,
+        selector.modelArch,
+        selector.rewardProfileId,
+        selector.queuePolicyId,
+        pipelineId,
+        label,
+        r2Key,
+        modelSha256,
+        modelBuffer.byteLength,
+        null,
+        setDefault ? 1 : 0,
+        nowMs,
+        nowMs,
+        null,
+      )
+      .run();
+
+    return jsonResponse(
+      {
+        ok: true,
+        model: {
+          id: globalModelId,
+          mode: selector.gameMode,
+          arch: selector.modelArch,
+          rewardProfileId: selector.rewardProfileId,
+          queuePolicyId: selector.queuePolicyId,
+          pipelineId,
+          label,
+          r2Key,
+          sha256: modelSha256,
+          sizeBytes: modelBuffer.byteLength,
+          isDefault: setDefault,
+          createdAtMs: nowMs,
+          updatedAtMs: nowMs,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    if (stored) {
+      await env.MODELS_BUCKET.delete(r2Key).catch((cleanupError) => {
+        console.warn(
+          '[admin] global model publish cleanup failed',
+          cleanupError,
+        );
+      });
+    }
+    console.error('[admin] global model publish failed', error);
+    return jsonResponse(
+      { error: 'Global model publishing is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const parseFeatureFlags = (raw: unknown): Record<string, unknown> => {
   if (typeof raw !== 'string' || !raw.trim()) {
     return {};
@@ -3597,6 +3785,10 @@ export default {
 
     if (url.pathname === '/api/admin/recordings/object') {
       return handleAdminRecordingObject(request, env);
+    }
+
+    if (url.pathname === '/api/admin/models/global/publish') {
+      return handleAdminPublishGlobalModel(request, env);
     }
 
     if (url.pathname.startsWith('/api/feedback')) {

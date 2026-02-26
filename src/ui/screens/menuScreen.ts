@@ -212,6 +212,7 @@ export type MenuScreenOptions = {
     query: MenuAdminRecordingsQuery,
   ) => Promise<MenuAdminRecordingsPage>;
   onAdminLoadRecording: (id: string) => Promise<MenuAdminRecordingPreview>;
+  onAdminPublishCurrentModelBaseline: () => Promise<string>;
 };
 
 export type MenuScreen = {
@@ -267,6 +268,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthSaveCurrentModel,
     onAdminListRecordings,
     onAdminLoadRecording,
+    onAdminPublishCurrentModelBaseline,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -2592,8 +2594,12 @@ input[type=number] {
   });
   const adminWhoAmIButton = makeMenuButton('CHECK ADMIN API');
   const adminOpenRouteButton = makeMenuButton('OPEN /admin');
+  const adminPublishBaselineButton = makeMenuButton(
+    'PUBLISH CURRENT MODEL AS BASELINE',
+  );
   adminActions.appendChild(adminWhoAmIButton);
   adminActions.appendChild(adminOpenRouteButton);
+  adminActions.appendChild(adminPublishBaselineButton);
   const adminDatasetLabel = makeSectionLabel('RECORDINGS DATASET');
   Object.assign(adminDatasetLabel.style, { marginTop: '4px' });
   const adminDatasetControls = document.createElement('div');
@@ -3228,6 +3234,7 @@ input[type=number] {
     const datasetBusy = adminDatasetPending || busy;
     adminWhoAmIButton.disabled = !isAdmin || busy;
     adminOpenRouteButton.disabled = busy;
+    adminPublishBaselineButton.disabled = !isAdmin || busy;
     adminModeFilterInput.disabled = datasetBusy || !isAdmin;
     adminBuildFilterInput.disabled = datasetBusy || !isAdmin;
     adminLimitInput.disabled = datasetBusy || !isAdmin;
@@ -3243,6 +3250,7 @@ input[type=number] {
       datasetBusy || !isAdmin || adminSelectedRecordingId == null;
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
+    adminPublishBaselineButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminQueryButton.style.opacity = !isAdmin || datasetBusy ? '0.65' : '1';
     adminNextPageButton.style.opacity =
       !isAdmin || datasetBusy || !adminCurrentCursor ? '0.65' : '1';
@@ -3252,6 +3260,8 @@ input[type=number] {
         : '1';
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
+    adminPublishBaselineButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
     adminQueryButton.style.cursor =
       !isAdmin || datasetBusy ? 'default' : 'pointer';
     adminNextPageButton.style.cursor =
@@ -3578,6 +3588,25 @@ input[type=number] {
     } catch (error) {
       setAdminActionStatus(
         toErrorMessage(error, 'Admin API access check failed.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminPublishBaselineButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Publishing current model as global baseline...');
+    updateAdminControls();
+    try {
+      const message = await onAdminPublishCurrentModelBaseline();
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Global baseline publish failed.'),
         'error',
       );
     } finally {

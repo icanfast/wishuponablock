@@ -262,6 +262,18 @@ async function boot() {
     if (error instanceof Error && error.message.trim()) return error.message;
     return fallback;
   };
+  const parseApiErrorMessage = async (
+    response: Response,
+    fallback: string,
+  ): Promise<string> => {
+    const payload = (await response.json().catch(() => null)) as {
+      error?: unknown;
+    } | null;
+    if (typeof payload?.error === 'string' && payload.error.trim()) {
+      return payload.error;
+    }
+    return fallback;
+  };
   const readUrlToken = (value: string | null): string | null => {
     if (!value) return null;
     const token = value.trim();
@@ -868,6 +880,54 @@ async function boot() {
       modelArch: session.meta?.modelArch ?? null,
       outcome: session.meta?.outcome ?? null,
     };
+  };
+  const publishCurrentModelAsGlobalBaseline = async (): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const bytes = await modelService.ensureModelBytes();
+    if (!bytes) {
+      throw new Error('No model is loaded to publish.');
+    }
+    const mode = modeController.getState().mode.id;
+    const pipelineId = getLocalTrainingPreset().pipelineId;
+    const url = new URL(
+      `${uploadBaseUrl}/admin/models/global/publish`,
+      window.location.origin,
+    );
+    url.searchParams.set('mode', mode);
+    url.searchParams.set('pipeline_id', pipelineId);
+    const response = await fetch(url.toString(), {
+      method: 'POST',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/octet-stream',
+      },
+      body: bytes,
+    });
+    if (!response.ok) {
+      throw new Error(
+        await parseApiErrorMessage(
+          response,
+          `Publish failed (${response.status}).`,
+        ),
+      );
+    }
+    const payload = (await response.json().catch(() => null)) as {
+      model?: { id?: unknown; label?: unknown } | null;
+    } | null;
+    const id =
+      typeof payload?.model?.id === 'string' ? payload.model.id : 'unknown';
+    const label =
+      typeof payload?.model?.label === 'string' ? payload.model.label : '';
+    return label
+      ? `Published baseline: ${label} (${id}).`
+      : `Published baseline id: ${id}.`;
   };
 
   type TrajectoryRunState = {
@@ -1655,6 +1715,7 @@ async function boot() {
     onAuthSaveCurrentModel: saveCurrentModePersonalModel,
     onAdminListRecordings: listAdminRecordings,
     onAdminLoadRecording: loadAdminRecordingPreview,
+    onAdminPublishCurrentModelBaseline: publishCurrentModelAsGlobalBaseline,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);
