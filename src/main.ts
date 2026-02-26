@@ -768,6 +768,36 @@ async function boot() {
       result.version != null ? `v${result.version}` : 'saved';
     return `Saved ${versionLabel} model for mode "${result.mode}".`;
   };
+  const listCurrentModeGlobalModels = async () => {
+    if (!authState.authenticated) {
+      throw new Error('Sign in to browse global baselines.');
+    }
+    const mode = modeController.getState().mode.id;
+    return await personalModelService.listGlobal(mode);
+  };
+  const resetCurrentModeToGlobalModel = async (
+    globalModelId: string | null,
+  ): Promise<string> => {
+    if (!authState.authenticated) {
+      throw new Error('Sign in to reset your model.');
+    }
+    const mode = modeController.getState().mode.id;
+    const result = await personalModelService.resetCurrentFromGlobal(
+      mode,
+      globalModelId,
+    );
+    await syncActiveModelForContext({
+      mode,
+      reason: 'global_reset',
+      force: true,
+      interactive: true,
+    });
+    const versionLabel =
+      result.model.version != null ? `v${result.model.version}` : 'latest';
+    const globalLabel = result.globalModelLabel ?? result.globalModelId;
+    const globalSuffix = globalLabel ? ` from "${globalLabel}"` : '';
+    return `Reset and loaded ${versionLabel} personal model${globalSuffix}.`;
+  };
 
   const toMenuAdminRecordingsPage = (
     page: AdminRecordingsPage,
@@ -1619,6 +1649,8 @@ async function boot() {
     onAuthEmailLogin: loginWithEmail,
     onAuthPasswordForgot: sendPasswordReset,
     onAuthPasswordReset: resetPasswordWithToken,
+    onAuthListGlobalModels: listCurrentModeGlobalModels,
+    onAuthResetCurrentModelToGlobal: resetCurrentModeToGlobalModel,
     onAuthLoadCurrentModel: loadCurrentModePersonalModel,
     onAuthSaveCurrentModel: saveCurrentModePersonalModel,
     onAdminListRecordings: listAdminRecordings,

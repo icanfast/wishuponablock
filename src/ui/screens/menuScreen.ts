@@ -84,6 +84,19 @@ export type MenuLocalTrainingPreset = {
   };
 };
 
+export type MenuGlobalModelSummary = {
+  id: string;
+  mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  pipelineId: string | null;
+  label: string | null;
+  isDefault: boolean;
+  sizeBytes: number | null;
+  updatedAtMs: number | null;
+};
+
 export type MenuAdminRecordingSummary = {
   id: string;
   userId: string;
@@ -189,6 +202,10 @@ export type MenuScreenOptions = {
     token: string;
     password: string;
   }) => Promise<void>;
+  onAuthListGlobalModels: () => Promise<MenuGlobalModelSummary[]>;
+  onAuthResetCurrentModelToGlobal: (
+    globalModelId: string | null,
+  ) => Promise<string>;
   onAuthLoadCurrentModel: () => Promise<string>;
   onAuthSaveCurrentModel: () => Promise<string>;
   onAdminListRecordings: (
@@ -244,6 +261,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthEmailLogin,
     onAuthPasswordForgot,
     onAuthPasswordReset,
+    onAuthListGlobalModels,
+    onAuthResetCurrentModelToGlobal,
     onAuthLoadCurrentModel,
     onAuthSaveCurrentModel,
     onAdminListRecordings,
@@ -2382,6 +2401,41 @@ input[type=number] {
   Object.assign(myModelsCloudLabel.style, { marginTop: '4px' });
   const myModelsLoadButton = makeMenuButton('LOAD CLOUD MODEL');
   const myModelsSaveButton = makeMenuButton('SAVE CURRENT MODEL');
+  const myModelsBaselinesLabel = makeSectionLabel('GLOBAL BASELINES');
+  const myModelsBaselinesSummary = document.createElement('div');
+  Object.assign(myModelsBaselinesSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const myModelsBaselinesSelect = document.createElement('select');
+  myModelsBaselinesSelect.size = 5;
+  Object.assign(myModelsBaselinesSelect.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+  const myModelsBaselinesButtons = document.createElement('div');
+  Object.assign(myModelsBaselinesButtons.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const myModelsBaselinesRefreshButton = makeMenuButton('REFRESH');
+  const myModelsResetToBaselineButton = makeMenuButton('RESET TO SELECTED');
+  Object.assign(myModelsBaselinesRefreshButton.style, { flex: '1' });
+  Object.assign(myModelsResetToBaselineButton.style, { flex: '1' });
+  myModelsBaselinesButtons.appendChild(myModelsBaselinesRefreshButton);
+  myModelsBaselinesButtons.appendChild(myModelsResetToBaselineButton);
   const myModelsTrainingLabel = makeSectionLabel('LOCAL TRAINING');
   Object.assign(myModelsTrainingLabel.style, { marginTop: '4px' });
   const myModelsTrainingSummary = document.createElement('div');
@@ -2487,6 +2541,10 @@ input[type=number] {
   myModelsPanel.appendChild(myModelsCloudLabel);
   myModelsPanel.appendChild(myModelsSignedOutHint);
   myModelsPanel.appendChild(myModelsActions);
+  myModelsPanel.appendChild(myModelsBaselinesLabel);
+  myModelsPanel.appendChild(myModelsBaselinesSummary);
+  myModelsPanel.appendChild(myModelsBaselinesSelect);
+  myModelsPanel.appendChild(myModelsBaselinesButtons);
   myModelsPanel.appendChild(myModelsTrainingLabel);
   myModelsPanel.appendChild(myModelsTrainingSummary);
   myModelsPanel.appendChild(myModelsAdvancedLabel);
@@ -2672,6 +2730,10 @@ input[type=number] {
   let adminCurrentRecordings: MenuAdminRecordingSummary[] = [];
   let adminSelectedRecordingId: string | null = null;
   let adminLastPage: MenuAdminRecordingsPage | null = null;
+  let myModelsGlobalBaselines: MenuGlobalModelSummary[] = [];
+  let myModelsSelectedBaselineId: string | null = null;
+  let myModelsBaselinesLoading = false;
+  let myModelsBaselinesModeId: string | null = null;
   let lastTrainingPresetKey = '';
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
@@ -2785,6 +2847,132 @@ input[type=number] {
       return 'Not signed in.';
     }
     return `Signed in as ${state.user.username}\nManage your cloud model for the current game mode.`;
+  };
+
+  const formatApproxBytes = (value: number | null): string => {
+    if (value == null || !Number.isFinite(value) || value <= 0) return 'n/a';
+    if (value < 1024) return `${Math.trunc(value)} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  const formatMyModelsBaselineOption = (
+    baseline: MenuGlobalModelSummary,
+  ): string => {
+    const head = baseline.label || baseline.pipelineId || baseline.id;
+    const prefix = baseline.isDefault ? '[default] ' : '';
+    return `${prefix}${head}`;
+  };
+
+  const renderMyModelsBaselinesSelect = (): void => {
+    myModelsBaselinesSelect.innerHTML = '';
+    for (const baseline of myModelsGlobalBaselines) {
+      const option = document.createElement('option');
+      option.value = baseline.id;
+      option.textContent = formatMyModelsBaselineOption(baseline);
+      myModelsBaselinesSelect.appendChild(option);
+    }
+    if (myModelsGlobalBaselines.length > 0) {
+      const activeId =
+        myModelsSelectedBaselineId &&
+        myModelsGlobalBaselines.some(
+          (baseline) => baseline.id === myModelsSelectedBaselineId,
+        )
+          ? myModelsSelectedBaselineId
+          : myModelsGlobalBaselines[0].id;
+      myModelsBaselinesSelect.value = activeId;
+      myModelsSelectedBaselineId = activeId;
+    } else {
+      myModelsSelectedBaselineId = null;
+    }
+  };
+
+  const getSelectedMyModelsBaseline = (): MenuGlobalModelSummary | null => {
+    if (!myModelsSelectedBaselineId) return null;
+    return (
+      myModelsGlobalBaselines.find(
+        (baseline) => baseline.id === myModelsSelectedBaselineId,
+      ) ?? null
+    );
+  };
+
+  const formatMyModelsBaselinesSummary = (
+    authenticated: boolean,
+    modeId: string,
+  ): string => {
+    if (!authenticated) {
+      return 'Sign in to browse and reset to published global baselines.';
+    }
+    if (myModelsBaselinesLoading) {
+      return `Loading baselines for mode "${modeId}"...`;
+    }
+    if (myModelsGlobalBaselines.length === 0) {
+      return `No global baselines published for mode "${modeId}".`;
+    }
+    const selected = getSelectedMyModelsBaseline();
+    if (!selected) {
+      return `Published baselines: ${myModelsGlobalBaselines.length}`;
+    }
+    const lastUpdated =
+      selected.updatedAtMs != null
+        ? new Date(selected.updatedAtMs).toLocaleString()
+        : 'n/a';
+    return [
+      `Published baselines: ${myModelsGlobalBaselines.length}`,
+      `Selected: ${selected.label || selected.id}`,
+      selected.pipelineId
+        ? `Pipeline: ${selected.pipelineId}`
+        : 'Pipeline: (none)',
+      `Size: ${formatApproxBytes(selected.sizeBytes)}`,
+      `Updated: ${lastUpdated}`,
+    ].join('\n');
+  };
+
+  const refreshMyModelsBaselines = async (options?: {
+    silent?: boolean;
+  }): Promise<void> => {
+    const authenticated =
+      currentAuthState.authenticated && currentAuthState.user != null;
+    if (!authenticated) {
+      myModelsGlobalBaselines = [];
+      myModelsSelectedBaselineId = null;
+      myModelsBaselinesModeId = null;
+      renderMyModelsBaselinesSelect();
+      updateMyModelsControls();
+      return;
+    }
+    const modeId = getLocalTrainingStats().currentModeId;
+    myModelsBaselinesLoading = true;
+    updateMyModelsControls();
+    try {
+      const baselines = await onAuthListGlobalModels();
+      myModelsGlobalBaselines = baselines;
+      myModelsBaselinesModeId = modeId;
+      renderMyModelsBaselinesSelect();
+      if (!options?.silent) {
+        if (baselines.length === 0) {
+          setMyModelsActionStatus(
+            `No global baselines found for mode "${modeId}".`,
+            'neutral',
+          );
+        } else {
+          setMyModelsActionStatus(
+            `Loaded ${baselines.length} global baseline${baselines.length === 1 ? '' : 's'}.`,
+            'success',
+          );
+        }
+      }
+    } catch (error) {
+      if (!options?.silent) {
+        setMyModelsActionStatus(
+          toErrorMessage(error, 'Could not refresh global baselines.'),
+          'error',
+        );
+      }
+    } finally {
+      myModelsBaselinesLoading = false;
+      updateMyModelsControls();
+    }
   };
 
   const formatAdminSummary = (state: MenuAuthState): string => {
@@ -2949,10 +3137,23 @@ input[type=number] {
       lastTrainingPresetKey = presetKey;
     }
     const trainingStats = getLocalTrainingStats();
+    const currentModeId = trainingStats.currentModeId;
+    if (
+      authenticated &&
+      !modelActionPending &&
+      !myModelsBaselinesLoading &&
+      myModelsBaselinesModeId !== currentModeId
+    ) {
+      void refreshMyModelsBaselines({ silent: true });
+    }
     const hasTrainSamples =
       trainingStats.currentModeSamples >=
       Math.max(1, Math.trunc(trainingPreset.minSamples));
     myModelsSummary.textContent = formatMyModelsSummary(currentAuthState);
+    myModelsBaselinesSummary.textContent = formatMyModelsBaselinesSummary(
+      authenticated,
+      currentModeId,
+    );
     myModelsTrainingSummary.textContent = formatMyModelsTrainingSummary(
       trainingStats,
       trainingPreset,
@@ -2965,6 +3166,18 @@ input[type=number] {
     const busy = modelActionPending || currentAuthState.loading;
     myModelsLoadButton.disabled = !authenticated || busy;
     myModelsSaveButton.disabled = !authenticated || busy;
+    myModelsBaselinesSelect.disabled =
+      !authenticated ||
+      busy ||
+      myModelsBaselinesLoading ||
+      myModelsGlobalBaselines.length === 0;
+    myModelsBaselinesRefreshButton.disabled =
+      !authenticated || busy || myModelsBaselinesLoading;
+    myModelsResetToBaselineButton.disabled =
+      !authenticated ||
+      busy ||
+      myModelsBaselinesLoading ||
+      myModelsSelectedBaselineId == null;
     myModelsEpochsInput.disabled = !authenticated || busy;
     myModelsLearningRateInput.disabled = !authenticated || busy;
     myModelsSampleLimitInput.disabled = !authenticated || busy;
@@ -2978,6 +3191,26 @@ input[type=number] {
       !authenticated || busy ? '0.65' : '1';
     myModelsUploadTrajectoryButton.style.cursor =
       !authenticated || busy ? 'default' : 'pointer';
+    myModelsBaselinesRefreshButton.style.opacity =
+      !authenticated || busy || myModelsBaselinesLoading ? '0.65' : '1';
+    myModelsBaselinesRefreshButton.style.cursor =
+      !authenticated || busy || myModelsBaselinesLoading
+        ? 'default'
+        : 'pointer';
+    myModelsResetToBaselineButton.style.opacity =
+      !authenticated ||
+      busy ||
+      myModelsBaselinesLoading ||
+      myModelsSelectedBaselineId == null
+        ? '0.65'
+        : '1';
+    myModelsResetToBaselineButton.style.cursor =
+      !authenticated ||
+      busy ||
+      myModelsBaselinesLoading ||
+      myModelsSelectedBaselineId == null
+        ? 'default'
+        : 'pointer';
   };
 
   const updateAdminControls = () => {
@@ -3199,6 +3432,50 @@ input[type=number] {
     } catch (error) {
       setMyModelsActionStatus(
         toErrorMessage(error, 'Could not save current model.'),
+        'error',
+      );
+    } finally {
+      modelActionPending = false;
+      updateMyModelsControls();
+    }
+  });
+
+  myModelsBaselinesSelect.addEventListener('change', () => {
+    const value = myModelsBaselinesSelect.value.trim();
+    myModelsSelectedBaselineId = value.length > 0 ? value : null;
+    updateMyModelsControls();
+  });
+
+  myModelsBaselinesRefreshButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    modelActionPending = true;
+    setMyModelsActionStatus('Refreshing global baselines...');
+    updateMyModelsControls();
+    try {
+      await refreshMyModelsBaselines();
+    } finally {
+      modelActionPending = false;
+      updateMyModelsControls();
+    }
+  });
+
+  myModelsResetToBaselineButton.addEventListener('click', async () => {
+    if (modelActionPending) return;
+    if (!myModelsSelectedBaselineId) {
+      setMyModelsActionStatus('Select a global baseline first.', 'error');
+      return;
+    }
+    modelActionPending = true;
+    setMyModelsActionStatus('Resetting to selected baseline...');
+    updateMyModelsControls();
+    try {
+      const message = await onAuthResetCurrentModelToGlobal(
+        myModelsSelectedBaselineId,
+      );
+      setMyModelsActionStatus(message, 'success');
+    } catch (error) {
+      setMyModelsActionStatus(
+        toErrorMessage(error, 'Could not reset to selected baseline.'),
         'error',
       );
     } finally {

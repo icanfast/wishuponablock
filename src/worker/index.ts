@@ -262,6 +262,17 @@ const normalizeModelAxis = (
   return normalized;
 };
 
+const normalizeOptionalModelAxis = (
+  value: string | null | undefined,
+): string | null => {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized.length > MAX_MODEL_AXIS_LENGTH) return null;
+  if (!/^[a-z0-9_-]+$/.test(normalized)) return null;
+  return normalized;
+};
+
 type PersonalModelSelector = {
   gameMode: string;
   modelArch: string;
@@ -648,6 +659,23 @@ type PersonalModelRecord = {
   baseGlobalModelId: string | null;
 };
 
+type GlobalModelRecord = {
+  id: string;
+  modeId: string;
+  modelArch: string;
+  rewardProfileId: string;
+  queuePolicyId: string;
+  pipelineId: string;
+  label: string | null;
+  r2Key: string;
+  sha256: string | null;
+  sizeBytes: number | null;
+  isDefault: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+  retiredAtMs: number | null;
+};
+
 const readPersonalModelRecord = (
   row: Record<string, unknown>,
 ): PersonalModelRecord | null => {
@@ -688,6 +716,49 @@ const readPersonalModelRecord = (
     source: asString(row.source),
     pipelineId: asString(row.pipeline_id),
     baseGlobalModelId: asString(row.base_global_model_id),
+  };
+};
+
+const readGlobalModelRecord = (
+  row: Record<string, unknown>,
+): GlobalModelRecord | null => {
+  const id = asString(row.id);
+  const modeId = normalizeGameMode(row.mode_id);
+  const modelArch = asString(row.model_arch);
+  const rewardProfileId = asString(row.reward_profile_id);
+  const queuePolicyId = asString(row.queue_policy_id);
+  const pipelineId = asString(row.pipeline_id);
+  const r2Key = asString(row.r2_key);
+  const createdAtMs = asInt(row.created_at_ms);
+  const updatedAtMs = asInt(row.updated_at_ms);
+  if (
+    !id ||
+    !modeId ||
+    !modelArch ||
+    !rewardProfileId ||
+    !queuePolicyId ||
+    !pipelineId ||
+    !r2Key ||
+    createdAtMs == null ||
+    updatedAtMs == null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    modeId,
+    modelArch,
+    rewardProfileId,
+    queuePolicyId,
+    pipelineId,
+    label: asString(row.label),
+    r2Key,
+    sha256: asString(row.sha256),
+    sizeBytes: asInt(row.size_bytes),
+    isDefault: asInt(row.is_default) === 1,
+    createdAtMs,
+    updatedAtMs,
+    retiredAtMs: asInt(row.retired_at_ms),
   };
 };
 
@@ -739,12 +810,26 @@ const sha256HexFromBuffer = async (buffer: ArrayBuffer): Promise<string> => {
   return toHex(new Uint8Array(digest));
 };
 
-const readDefaultGlobalModelId = async (
+const listGlobalModelsForSelector = async (
   env: Env,
   selector: PersonalModelSelector,
-): Promise<string | null> => {
-  const row = await env.DB.prepare(
-    `SELECT id
+): Promise<GlobalModelRecord[]> => {
+  const result = await env.DB.prepare(
+    `SELECT
+       id,
+       mode_id,
+       model_arch,
+       reward_profile_id,
+       queue_policy_id,
+       pipeline_id,
+       label,
+       r2_key,
+       sha256,
+       size_bytes,
+       is_default,
+       created_at_ms,
+       updated_at_ms,
+       retired_at_ms
      FROM global_models
      WHERE
        mode_id = ?
@@ -753,7 +838,7 @@ const readDefaultGlobalModelId = async (
        AND queue_policy_id = ?
        AND retired_at_ms IS NULL
      ORDER BY is_default DESC, created_at_ms DESC
-     LIMIT 1`,
+     LIMIT 200`,
   )
     .bind(
       selector.gameMode,
@@ -761,8 +846,65 @@ const readDefaultGlobalModelId = async (
       selector.rewardProfileId,
       selector.queuePolicyId,
     )
+    .all<Record<string, unknown>>();
+  const rows = Array.isArray(result.results) ? result.results : [];
+  const out: GlobalModelRecord[] = [];
+  for (const row of rows) {
+    const model = readGlobalModelRecord(row);
+    if (model) out.push(model);
+  }
+  return out;
+};
+
+const readGlobalModelById = async (
+  env: Env,
+  selector: PersonalModelSelector,
+  id: string,
+): Promise<GlobalModelRecord | null> => {
+  const row = await env.DB.prepare(
+    `SELECT
+       id,
+       mode_id,
+       model_arch,
+       reward_profile_id,
+       queue_policy_id,
+       pipeline_id,
+       label,
+       r2_key,
+       sha256,
+       size_bytes,
+       is_default,
+       created_at_ms,
+       updated_at_ms,
+       retired_at_ms
+     FROM global_models
+     WHERE
+       id = ?
+       AND mode_id = ?
+       AND model_arch = ?
+       AND reward_profile_id = ?
+       AND queue_policy_id = ?
+       AND retired_at_ms IS NULL
+     LIMIT 1`,
+  )
+    .bind(
+      id,
+      selector.gameMode,
+      selector.modelArch,
+      selector.rewardProfileId,
+      selector.queuePolicyId,
+    )
     .first<Record<string, unknown>>();
-  return asString(row?.id);
+  if (!row) return null;
+  return readGlobalModelRecord(row);
+};
+
+const readDefaultGlobalModelId = async (
+  env: Env,
+  selector: PersonalModelSelector,
+): Promise<string | null> => {
+  const rows = await listGlobalModelsForSelector(env, selector);
+  return rows[0]?.id ?? null;
 };
 
 const writeCurrentPersonalModelVersion = async (
@@ -778,6 +920,7 @@ const writeCurrentPersonalModelVersion = async (
     updatedAtMs: number;
     source?: string;
     pipelineId?: string | null;
+    baseGlobalModelId?: string | null;
   },
 ): Promise<PersonalModelRecord> => {
   const {
@@ -791,10 +934,12 @@ const writeCurrentPersonalModelVersion = async (
     updatedAtMs,
     source,
     pipelineId,
+    baseGlobalModelId,
   } = options;
   const versionId = crypto.randomUUID();
   const parentVersionId = existing?.versionId ?? null;
-  const baseGlobalModelId =
+  const resolvedBaseGlobalModelId =
+    baseGlobalModelId ??
     existing?.baseGlobalModelId ??
     (await readDefaultGlobalModelId(env, selector));
   const sourceTag = normalizeModelAxis(source, DEFAULT_PERSONAL_MODEL_SOURCE);
@@ -829,7 +974,7 @@ const writeCurrentPersonalModelVersion = async (
       selector.queuePolicyId,
       version,
       parentVersionId,
-      baseGlobalModelId,
+      resolvedBaseGlobalModelId,
       sourceTag,
       normalizedPipelineId,
       r2Key,
@@ -882,7 +1027,7 @@ const writeCurrentPersonalModelVersion = async (
     updatedAtMs,
     source: sourceTag,
     pipelineId: normalizedPipelineId,
-    baseGlobalModelId,
+    baseGlobalModelId: resolvedBaseGlobalModelId,
   };
 };
 
@@ -2508,6 +2653,210 @@ const handlePutCurrentPersonalModel = async (
   }
 };
 
+const handleListGlobalModels = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[models] touch session failed', error);
+  }
+
+  try {
+    const models = await listGlobalModelsForSelector(env, selector);
+    return jsonResponse(
+      {
+        ok: true,
+        selector: {
+          mode: selector.gameMode,
+          arch: selector.modelArch,
+          rewardProfileId: selector.rewardProfileId,
+          queuePolicyId: selector.queuePolicyId,
+        },
+        models: models.map((model) => ({
+          id: model.id,
+          mode: model.modeId,
+          arch: model.modelArch,
+          rewardProfileId: model.rewardProfileId,
+          queuePolicyId: model.queuePolicyId,
+          pipelineId: model.pipelineId,
+          label: model.label,
+          isDefault: model.isDefault,
+          sha256: model.sha256,
+          sizeBytes: model.sizeBytes,
+          createdAtMs: model.createdAtMs,
+          updatedAtMs: model.updatedAtMs,
+        })),
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[models] global list failed', error);
+    return jsonResponse(
+      { error: 'Global model registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleResetCurrentPersonalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[models] touch session failed', error);
+  }
+
+  let requestedGlobalModelId: string | null = null;
+  try {
+    const payload = (await request.json().catch(() => null)) as {
+      globalModelId?: unknown;
+    } | null;
+    requestedGlobalModelId = asString(payload?.globalModelId);
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON payload.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  try {
+    const globalModel = requestedGlobalModelId
+      ? await readGlobalModelById(env, selector, requestedGlobalModelId)
+      : ((await listGlobalModelsForSelector(env, selector))[0] ?? null);
+    if (!globalModel) {
+      return jsonResponse({ error: 'Global model not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+
+    const sourceObject = await env.MODELS_BUCKET.get(globalModel.r2Key);
+    if (!sourceObject) {
+      return jsonResponse({ error: 'Global model blob is missing.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const modelBuffer = await sourceObject.arrayBuffer();
+    if (modelBuffer.byteLength <= 0) {
+      return jsonResponse({ error: 'Global model payload is empty.' }, 503, {
+        'cache-control': 'no-store',
+      });
+    }
+    if (modelBuffer.byteLength > MAX_PERSONALIZED_MODEL_BYTES) {
+      return jsonResponse(
+        {
+          error: `Global model is too large for personalized storage. Max bytes: ${MAX_PERSONALIZED_MODEL_BYTES}.`,
+        },
+        413,
+        { 'cache-control': 'no-store' },
+      );
+    }
+
+    const existing = await readCurrentPersonalModel(
+      env,
+      session.userId,
+      selector,
+    );
+    const nextVersion = (existing?.version ?? 0) + 1;
+    const nextR2Key =
+      `models/${session.userId}` +
+      `/${selector.gameMode}` +
+      `/${selector.modelArch}` +
+      `/${selector.rewardProfileId}` +
+      `/${selector.queuePolicyId}` +
+      `/v${nextVersion}-${nowMs}.bin`;
+    const modelSha256 = await sha256HexFromBuffer(modelBuffer);
+    await env.MODELS_BUCKET.put(nextR2Key, modelBuffer, {
+      httpMetadata: { contentType: 'application/octet-stream' },
+    });
+    const nextRecord = await writeCurrentPersonalModelVersion(env, {
+      existing,
+      userId: session.userId,
+      selector,
+      r2Key: nextR2Key,
+      version: nextVersion,
+      modelSizeBytes: modelBuffer.byteLength,
+      modelSha256,
+      updatedAtMs: nowMs,
+      source: 'reset',
+      pipelineId: globalModel.pipelineId,
+      baseGlobalModelId: globalModel.id,
+    });
+
+    return jsonResponse(
+      {
+        ok: true,
+        model: {
+          mode: nextRecord.gameMode,
+          arch: nextRecord.modelArch,
+          rewardProfileId: nextRecord.rewardProfileId,
+          queuePolicyId: nextRecord.queuePolicyId,
+          versionId: nextRecord.versionId,
+          version: nextRecord.version,
+          sizeBytes: modelBuffer.byteLength,
+          sha256: modelSha256,
+          updatedAtMs: nextRecord.updatedAtMs,
+          baseGlobalModelId: nextRecord.baseGlobalModelId,
+          source: nextRecord.source,
+          pipelineId: nextRecord.pipelineId,
+        },
+        globalModel: {
+          id: globalModel.id,
+          label: globalModel.label,
+          pipelineId: globalModel.pipelineId,
+          isDefault: globalModel.isDefault,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[models] current model reset failed', error);
+    return jsonResponse(
+      { error: 'Model storage is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const handlePostTrajectoryRecording = async (
   request: Request,
   env: Env,
@@ -2593,6 +2942,21 @@ const handlePostTrajectoryRecording = async (
   const recordingId = `${session.userId}_${recording.sessionId}`;
   const monthPrefix = new Date(nowMs).toISOString().slice(0, 7);
   const r2Key = `recordings/${monthPrefix}/${session.userId}/${recording.modeId}/${recording.sessionId}.json`;
+  const modelArch = normalizeOptionalModelAxis(recording.meta?.modelArch);
+  const rewardProfileId = normalizeOptionalModelAxis(
+    recording.meta?.rewardPolicyId,
+  );
+  const queuePolicyId = normalizeOptionalModelAxis(
+    asString(
+      (recording.meta as { queuePolicyId?: unknown } | undefined)
+        ?.queuePolicyId,
+    ),
+  );
+  const modelSource = normalizeOptionalModelAxis(recording.meta?.modelSource);
+  const rewardPolicyId = normalizeOptionalModelAxis(
+    recording.meta?.rewardPolicyId,
+  );
+  const pipelineId = normalizeOptionalModelAxis(recording.meta?.pipelineId);
 
   const metaJson = JSON.stringify({
     schema: recording.schema,
@@ -2626,9 +2990,15 @@ const handlePostTrajectoryRecording = async (
          ended_at_ms,
          duration_ms,
          snapshots_total,
+         model_arch,
+         reward_profile_id,
+         queue_policy_id,
+         model_source,
+         reward_policy_id,
+         pipeline_id,
          meta_json,
          created_at_ms
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          game_mode = excluded.game_mode,
          build_version = excluded.build_version,
@@ -2637,6 +3007,12 @@ const handlePostTrajectoryRecording = async (
          ended_at_ms = excluded.ended_at_ms,
          duration_ms = excluded.duration_ms,
          snapshots_total = excluded.snapshots_total,
+         model_arch = excluded.model_arch,
+         reward_profile_id = excluded.reward_profile_id,
+         queue_policy_id = excluded.queue_policy_id,
+         model_source = excluded.model_source,
+         reward_policy_id = excluded.reward_policy_id,
+         pipeline_id = excluded.pipeline_id,
          meta_json = excluded.meta_json`,
     )
       .bind(
@@ -2649,6 +3025,12 @@ const handlePostTrajectoryRecording = async (
         recording.endedAtMs,
         recording.durationMs,
         recording.samples.length,
+        modelArch,
+        rewardProfileId,
+        queuePolicyId,
+        modelSource,
+        rewardPolicyId,
+        pipelineId,
         metaJson,
         nowMs,
       )
@@ -3191,6 +3573,14 @@ export default {
         return handlePutCurrentPersonalModel(request, env);
       }
       return jsonResponse({ error: 'Method not allowed.' }, 405);
+    }
+
+    if (url.pathname === '/api/models/global/list') {
+      return handleListGlobalModels(request, env);
+    }
+
+    if (url.pathname === '/api/models/me/reset') {
+      return handleResetCurrentPersonalModel(request, env);
     }
 
     if (url.pathname === '/api/recordings/me/trajectory') {

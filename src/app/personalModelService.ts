@@ -24,6 +24,27 @@ export type PersonalModelUpload = {
   baseGlobalModelId: string | null;
 };
 
+export type PersonalGlobalModel = {
+  id: string;
+  mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  pipelineId: string | null;
+  label: string | null;
+  isDefault: boolean;
+  sha256: string | null;
+  sizeBytes: number | null;
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+};
+
+export type PersonalModelResetResult = {
+  model: PersonalModelUpload;
+  globalModelId: string | null;
+  globalModelLabel: string | null;
+};
+
 export type PersonalModelHttpError = Error & {
   status: number;
 };
@@ -34,6 +55,11 @@ export type PersonalModelService = {
     mode: string,
     payload: ArrayBuffer | ArrayBufferView,
   ) => Promise<PersonalModelUpload>;
+  listGlobal: (mode: string) => Promise<PersonalGlobalModel[]>;
+  resetCurrentFromGlobal: (
+    mode: string,
+    globalModelId?: string | null,
+  ) => Promise<PersonalModelResetResult>;
 };
 
 type PersonalModelServiceOptions = {
@@ -52,6 +78,18 @@ type UploadPayload = {
     updatedAtMs?: unknown;
     sha256?: unknown;
     baseGlobalModelId?: unknown;
+  } | null;
+};
+
+type GlobalListPayload = {
+  models?: Array<Record<string, unknown>> | null;
+};
+
+type ResetPayload = {
+  model?: UploadPayload['model'];
+  globalModel?: {
+    id?: unknown;
+    label?: unknown;
   } | null;
 };
 
@@ -123,6 +161,10 @@ export function createPersonalModelService(
 
   const buildPath = (mode: string): string =>
     `${baseUrl}/models/me/current?mode=${encodeURIComponent(normalizeMode(mode))}`;
+  const buildGlobalListPath = (mode: string): string =>
+    `${baseUrl}/models/global/list?mode=${encodeURIComponent(normalizeMode(mode))}`;
+  const buildResetPath = (mode: string): string =>
+    `${baseUrl}/models/me/reset?mode=${encodeURIComponent(normalizeMode(mode))}`;
 
   return {
     downloadCurrent: async (mode) => {
@@ -200,6 +242,84 @@ export function createPersonalModelService(
         updatedAtMs: asInt(model?.updatedAtMs),
         sha256: asString(model?.sha256),
         baseGlobalModelId: asString(model?.baseGlobalModelId),
+      };
+    },
+    listGlobal: async (mode) => {
+      const response = await fetch(buildGlobalListPath(mode), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw withStatusError(
+          await parseErrorMessage(response),
+          response.status,
+        );
+      }
+      const body = (await response
+        .json()
+        .catch(() => null)) as GlobalListPayload | null;
+      const rows = Array.isArray(body?.models) ? body.models : [];
+      const models: PersonalGlobalModel[] = [];
+      for (const row of rows) {
+        const id = asString(row.id);
+        const resolvedMode = asString(row.mode);
+        if (!id || !resolvedMode) continue;
+        models.push({
+          id,
+          mode: resolvedMode,
+          arch: asString(row.arch),
+          rewardProfileId: asString(row.rewardProfileId),
+          queuePolicyId: asString(row.queuePolicyId),
+          pipelineId: asString(row.pipelineId),
+          label: asString(row.label),
+          isDefault: asInt(row.isDefault) === 1 || row.isDefault === true,
+          sha256: asString(row.sha256),
+          sizeBytes: asInt(row.sizeBytes),
+          createdAtMs: asInt(row.createdAtMs),
+          updatedAtMs: asInt(row.updatedAtMs),
+        });
+      }
+      return models;
+    },
+    resetCurrentFromGlobal: async (mode, globalModelId) => {
+      const normalizedGlobalModelId = asString(globalModelId);
+      const response = await fetch(buildResetPath(mode), {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(
+          normalizedGlobalModelId
+            ? { globalModelId: normalizedGlobalModelId }
+            : {},
+        ),
+      });
+      if (!response.ok) {
+        throw withStatusError(
+          await parseErrorMessage(response),
+          response.status,
+        );
+      }
+      const body = (await response
+        .json()
+        .catch(() => null)) as ResetPayload | null;
+      const model = body?.model ?? null;
+      return {
+        model: {
+          mode: asString(model?.mode) ?? normalizeMode(mode),
+          arch: asString(model?.arch),
+          rewardProfileId: asString(model?.rewardProfileId),
+          queuePolicyId: asString(model?.queuePolicyId),
+          versionId: asString(model?.versionId),
+          version: asInt(model?.version),
+          sizeBytes: asInt(model?.sizeBytes),
+          updatedAtMs: asInt(model?.updatedAtMs),
+          sha256: asString(model?.sha256),
+          baseGlobalModelId: asString(model?.baseGlobalModelId),
+        },
+        globalModelId: asString(body?.globalModel?.id),
+        globalModelLabel: asString(body?.globalModel?.label),
       };
     },
   };
