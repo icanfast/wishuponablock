@@ -144,6 +144,15 @@ export type MenuAdminRecordingsQuery = {
   cursor?: string | null;
 };
 
+export type MenuAdminManifestQuery = {
+  mode?: string;
+  build?: string;
+  limit?: number;
+  cursor?: string | null;
+  minSamples?: number;
+  actorType?: 'human' | 'bot' | '';
+};
+
 export type MenuAdminRecordingPreview = {
   id: string;
   sessionId: string;
@@ -250,6 +259,22 @@ export type MenuScreenOptions = {
   onAdminListGlobalBaselines: () => Promise<MenuAdminGlobalBaselineSummary[]>;
   onAdminSetGlobalBaselineDefault: (id: string) => Promise<string>;
   onAdminRetireGlobalBaseline: (id: string) => Promise<string>;
+  onAdminPrepareManifest: (query: MenuAdminManifestQuery) => Promise<string>;
+  onAdminTrainGlobalOneShot: () => Promise<string>;
+  onAdminPublishGlobalCandidate: () => Promise<string>;
+  onAdminTrainBotPolicyOneShot: (options: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+  }) => Promise<string>;
+  onAdminGenerateBotRecordings: (options: {
+    sessions?: number;
+    maxPiecesPerEpisode?: number;
+  }) => Promise<string>;
+  onAdminRunCapabilityBenchmark: (options?: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+  }) => Promise<string>;
+  onAdminApplyBenchmarkSuggestedArch: () => Promise<string>;
 };
 
 export type MenuScreen = {
@@ -312,6 +337,13 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminListGlobalBaselines,
     onAdminSetGlobalBaselineDefault,
     onAdminRetireGlobalBaseline,
+    onAdminPrepareManifest,
+    onAdminTrainGlobalOneShot,
+    onAdminPublishGlobalCandidate,
+    onAdminTrainBotPolicyOneShot,
+    onAdminGenerateBotRecordings,
+    onAdminRunCapabilityBenchmark,
+    onAdminApplyBenchmarkSuggestedArch,
   } = options;
 
   const ensureSpinnerStyle = () => {
@@ -2721,6 +2753,125 @@ input[type=number] {
   adminActions.appendChild(adminPublishDefaultRow);
   adminActions.appendChild(adminPublishBaselineButton);
 
+  const adminRlLabel = makeSectionLabel('RL DATA LOOP');
+  Object.assign(adminRlLabel.style, { marginTop: '4px' });
+  const adminRlControls = document.createElement('div');
+  Object.assign(adminRlControls.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  const adminManifestMinSamplesInput = document.createElement('input');
+  adminManifestMinSamplesInput.type = 'number';
+  adminManifestMinSamplesInput.min = '1';
+  adminManifestMinSamplesInput.step = '1';
+  adminManifestMinSamplesInput.value = '8';
+  adminManifestMinSamplesInput.placeholder = 'manifest min samples';
+  Object.assign(adminManifestMinSamplesInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminManifestActorTypeSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['', 'manifest actor: all'],
+    ['human', 'manifest actor: human'],
+    ['bot', 'manifest actor: bot'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    adminManifestActorTypeSelect.appendChild(option);
+  }
+  Object.assign(adminManifestActorTypeSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminPrepareManifestButton = makeMenuButton('PREPARE MANIFEST');
+  const adminTrainGlobalOneShotButton = makeMenuButton(
+    'TRAIN GLOBAL (ONE-SHOT)',
+  );
+  const adminPublishGlobalCandidateButton = makeMenuButton(
+    'PUBLISH GLOBAL CANDIDATE',
+  );
+  const adminBotEpisodesInput = document.createElement('input');
+  adminBotEpisodesInput.type = 'number';
+  adminBotEpisodesInput.min = '1';
+  adminBotEpisodesInput.step = '1';
+  adminBotEpisodesInput.value = '24';
+  adminBotEpisodesInput.placeholder = 'bot episodes';
+  Object.assign(adminBotEpisodesInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminBotPiecesInput = document.createElement('input');
+  adminBotPiecesInput.type = 'number';
+  adminBotPiecesInput.min = '8';
+  adminBotPiecesInput.step = '1';
+  adminBotPiecesInput.value = '120';
+  adminBotPiecesInput.placeholder = 'bot max pieces';
+  Object.assign(adminBotPiecesInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminTrainBotPolicyButton = makeMenuButton('TRAIN BOT POLICY');
+  const adminGenerateBotSessionsInput = document.createElement('input');
+  adminGenerateBotSessionsInput.type = 'number';
+  adminGenerateBotSessionsInput.min = '1';
+  adminGenerateBotSessionsInput.step = '1';
+  adminGenerateBotSessionsInput.value = '3';
+  adminGenerateBotSessionsInput.placeholder = 'bot sessions to generate';
+  Object.assign(adminGenerateBotSessionsInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminGenerateBotRecordingsButton = makeMenuButton(
+    'GENERATE BOT RECORDINGS',
+  );
+  const adminRunBenchmarkButton = makeMenuButton('RUN BENCHMARK');
+  const adminApplyBenchmarkArchButton = makeMenuButton('APPLY BENCHMARK ARCH');
+  adminRlControls.appendChild(adminManifestMinSamplesInput);
+  adminRlControls.appendChild(adminManifestActorTypeSelect);
+  adminRlControls.appendChild(adminPrepareManifestButton);
+  adminRlControls.appendChild(adminTrainGlobalOneShotButton);
+  adminRlControls.appendChild(adminPublishGlobalCandidateButton);
+  adminRlControls.appendChild(adminBotEpisodesInput);
+  adminRlControls.appendChild(adminBotPiecesInput);
+  adminRlControls.appendChild(adminTrainBotPolicyButton);
+  adminRlControls.appendChild(adminGenerateBotSessionsInput);
+  adminRlControls.appendChild(adminGenerateBotRecordingsButton);
+  adminRlControls.appendChild(adminRunBenchmarkButton);
+  adminRlControls.appendChild(adminApplyBenchmarkArchButton);
+
   const adminBaselinesLabel = makeSectionLabel('GLOBAL BASELINES');
   Object.assign(adminBaselinesLabel.style, { marginTop: '4px' });
   const adminBaselinesControls = document.createElement('div');
@@ -2891,6 +3042,8 @@ input[type=number] {
   adminPanel.appendChild(adminSummary);
   adminPanel.appendChild(adminStatus);
   adminPanel.appendChild(adminActions);
+  adminPanel.appendChild(adminRlLabel);
+  adminPanel.appendChild(adminRlControls);
   adminPanel.appendChild(adminBaselinesLabel);
   adminPanel.appendChild(adminBaselinesControls);
   adminPanel.appendChild(adminDatasetLabel);
@@ -3628,6 +3781,18 @@ input[type=number] {
     const busy = adminActionPending || currentAuthState.loading;
     const baselinesBusy = adminBaselinesPending || busy;
     const datasetBusy = adminDatasetPending || busy;
+    adminManifestMinSamplesInput.disabled = !isAdmin || busy;
+    adminManifestActorTypeSelect.disabled = !isAdmin || busy;
+    adminPrepareManifestButton.disabled = !isAdmin || busy;
+    adminTrainGlobalOneShotButton.disabled = !isAdmin || busy;
+    adminPublishGlobalCandidateButton.disabled = !isAdmin || busy;
+    adminBotEpisodesInput.disabled = !isAdmin || busy;
+    adminBotPiecesInput.disabled = !isAdmin || busy;
+    adminTrainBotPolicyButton.disabled = !isAdmin || busy;
+    adminGenerateBotSessionsInput.disabled = !isAdmin || busy;
+    adminGenerateBotRecordingsButton.disabled = !isAdmin || busy;
+    adminRunBenchmarkButton.disabled = !isAdmin || busy;
+    adminApplyBenchmarkArchButton.disabled = !isAdmin || busy;
     adminWhoAmIButton.disabled = !isAdmin || busy;
     adminOpenRouteButton.disabled = busy;
     adminPublishBaselineButton.disabled = !isAdmin || busy;
@@ -3656,6 +3821,17 @@ input[type=number] {
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
     adminPublishBaselineButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminPrepareManifestButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminTrainGlobalOneShotButton.style.opacity =
+      !isAdmin || busy ? '0.65' : '1';
+    adminPublishGlobalCandidateButton.style.opacity =
+      !isAdmin || busy ? '0.65' : '1';
+    adminTrainBotPolicyButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminGenerateBotRecordingsButton.style.opacity =
+      !isAdmin || busy ? '0.65' : '1';
+    adminRunBenchmarkButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
+    adminApplyBenchmarkArchButton.style.opacity =
+      !isAdmin || busy ? '0.65' : '1';
     adminBaselinesRefreshButton.style.opacity =
       !isAdmin || baselinesBusy ? '0.65' : '1';
     adminBaselinesSetDefaultButton.style.opacity =
@@ -3676,6 +3852,20 @@ input[type=number] {
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
     adminPublishBaselineButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminPrepareManifestButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminTrainGlobalOneShotButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminPublishGlobalCandidateButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminTrainBotPolicyButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminGenerateBotRecordingsButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminRunBenchmarkButton.style.cursor =
+      !isAdmin || busy ? 'default' : 'pointer';
+    adminApplyBenchmarkArchButton.style.cursor =
       !isAdmin || busy ? 'default' : 'pointer';
     adminBaselinesRefreshButton.style.cursor =
       !isAdmin || baselinesBusy ? 'default' : 'pointer';
@@ -4071,6 +4261,164 @@ input[type=number] {
     } catch (error) {
       setAdminActionStatus(
         toErrorMessage(error, 'Global baseline publish failed.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminPrepareManifestButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Preparing training manifest...');
+    updateAdminControls();
+    try {
+      const actorType = adminManifestActorTypeSelect.value.trim();
+      const message = await onAdminPrepareManifest({
+        ...(adminModeFilterInput.value.trim()
+          ? { mode: adminModeFilterInput.value.trim() }
+          : {}),
+        ...(adminBuildFilterInput.value.trim()
+          ? { build: adminBuildFilterInput.value.trim() }
+          : {}),
+        limit: getAdminQueryLimit(),
+        minSamples: parsePositiveIntInput(adminManifestMinSamplesInput),
+        actorType:
+          actorType === 'human' || actorType === 'bot' ? actorType : '',
+      });
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not prepare training manifest.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminTrainGlobalOneShotButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Running global one-shot training...');
+    updateAdminControls();
+    try {
+      const message = await onAdminTrainGlobalOneShot();
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not run global training.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminPublishGlobalCandidateButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Publishing global candidate...');
+    updateAdminControls();
+    try {
+      const message = await onAdminPublishGlobalCandidate();
+      setAdminActionStatus(message, 'success');
+      await refreshAdminBaselines({ silent: true });
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not publish global candidate.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminTrainBotPolicyButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Training bot policy...');
+    updateAdminControls();
+    try {
+      const message = await onAdminTrainBotPolicyOneShot({
+        episodes: parsePositiveIntInput(adminBotEpisodesInput),
+        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
+      });
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not train bot policy.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminGenerateBotRecordingsButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Generating bot recordings...');
+    updateAdminControls();
+    try {
+      const message = await onAdminGenerateBotRecordings({
+        sessions: parsePositiveIntInput(adminGenerateBotSessionsInput),
+        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
+      });
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not generate bot recordings.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminRunBenchmarkButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Running capability benchmark...');
+    updateAdminControls();
+    try {
+      const message = await onAdminRunCapabilityBenchmark({
+        episodes: Math.max(
+          1,
+          parsePositiveIntInput(adminBotEpisodesInput) ?? 3,
+        ),
+        maxPiecesPerEpisode: parsePositiveIntInput(adminBotPiecesInput),
+      });
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not run capability benchmark.'),
+        'error',
+      );
+    } finally {
+      adminActionPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminApplyBenchmarkArchButton.addEventListener('click', async () => {
+    if (adminActionPending) return;
+    adminActionPending = true;
+    setAdminActionStatus('Applying benchmark recommendation...');
+    updateAdminControls();
+    try {
+      const message = await onAdminApplyBenchmarkSuggestedArch();
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not apply benchmark recommendation.'),
         'error',
       );
     } finally {

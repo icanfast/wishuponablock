@@ -27,6 +27,44 @@ export type AdminRecordingsPage = {
   };
 };
 
+export type AdminRecordingsManifestQuery = {
+  mode?: string;
+  build?: string;
+  userId?: string;
+  arch?: string;
+  rewardProfileId?: string;
+  queuePolicyId?: string;
+  pipelineId?: string;
+  actorType?: 'human' | 'bot';
+  minSamples?: number;
+  limit?: number;
+  cursor?: string | null;
+  startedFromMs?: number;
+  startedToMs?: number;
+};
+
+export type AdminRecordingsManifestPage = {
+  selector: {
+    mode?: string;
+    build?: string;
+    userId?: string;
+    arch?: string;
+    rewardProfileId?: string;
+    queuePolicyId?: string;
+    pipelineId?: string;
+    actorType?: 'human' | 'bot';
+    minSamples?: number;
+    startedFromMs?: number;
+    startedToMs?: number;
+  };
+  recordings: AdminRecordingSummary[];
+  page: {
+    limit: number;
+    nextCursor: string | null;
+    returned: number;
+  };
+};
+
 export type AdminRecordingsListQuery = {
   mode?: string;
   build?: string;
@@ -41,6 +79,9 @@ export type AdminRecordingsService = {
   listRecordings: (
     query?: AdminRecordingsListQuery,
   ) => Promise<AdminRecordingsPage>;
+  listTrainingManifest: (
+    query?: AdminRecordingsManifestQuery,
+  ) => Promise<AdminRecordingsManifestPage>;
   loadRecordingObject: (id: string) => Promise<TrajectorySessionV1>;
 };
 
@@ -49,6 +90,7 @@ type AdminRecordingsServiceOptions = {
 };
 
 type ListPayload = {
+  selector?: Record<string, unknown> | null;
   recordings?: Array<Record<string, unknown>> | null;
   page?: {
     limit?: unknown;
@@ -140,6 +182,7 @@ export function createAdminRecordingsService(
 ): AdminRecordingsService {
   const baseUrl = normalizeBaseUrl(options.baseUrl || '/api');
   const listPath = `${baseUrl}/admin/recordings/index`;
+  const manifestPath = `${baseUrl}/admin/recordings/export-manifest`;
   const objectPath = `${baseUrl}/admin/recordings/object`;
 
   return {
@@ -195,6 +238,103 @@ export function createAdminRecordingsService(
         recordings,
         page: {
           limit: asInt(payload?.page?.limit) ?? 50,
+          nextCursor: asString(payload?.page?.nextCursor),
+          returned:
+            asInt(payload?.page?.returned) ??
+            asInt(payload?.recordings?.length) ??
+            recordings.length,
+        },
+      };
+    },
+    listTrainingManifest: async (query) => {
+      const url = new URL(manifestPath, window.location.origin);
+      if (query?.mode) url.searchParams.set('mode', query.mode);
+      if (query?.build) url.searchParams.set('build', query.build);
+      if (query?.userId) url.searchParams.set('user_id', query.userId);
+      if (query?.arch) url.searchParams.set('arch', query.arch);
+      if (query?.rewardProfileId) {
+        url.searchParams.set('reward_profile', query.rewardProfileId);
+      }
+      if (query?.queuePolicyId) {
+        url.searchParams.set('queue_policy', query.queuePolicyId);
+      }
+      if (query?.pipelineId) {
+        url.searchParams.set('pipeline_id', query.pipelineId);
+      }
+      if (query?.actorType) {
+        url.searchParams.set('actor_type', query.actorType);
+      }
+      if (query?.minSamples != null && Number.isFinite(query.minSamples)) {
+        url.searchParams.set(
+          'min_samples',
+          String(Math.trunc(query.minSamples)),
+        );
+      }
+      if (query?.limit != null && Number.isFinite(query.limit)) {
+        url.searchParams.set('limit', String(Math.trunc(query.limit)));
+      }
+      if (query?.cursor) {
+        url.searchParams.set('cursor', query.cursor);
+      }
+      if (
+        query?.startedFromMs != null &&
+        Number.isFinite(query.startedFromMs)
+      ) {
+        url.searchParams.set(
+          'started_from_ms',
+          String(Math.trunc(query.startedFromMs)),
+        );
+      }
+      if (query?.startedToMs != null && Number.isFinite(query.startedToMs)) {
+        url.searchParams.set(
+          'started_to_ms',
+          String(Math.trunc(query.startedToMs)),
+        );
+      }
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw withStatusError(
+          await parseErrorMessage(response),
+          response.status,
+        );
+      }
+      const payload = (await response
+        .json()
+        .catch(() => null)) as ListPayload | null;
+      const rawRows = Array.isArray(payload?.recordings)
+        ? payload.recordings
+        : [];
+      const recordings: AdminRecordingSummary[] = [];
+      for (const row of rawRows) {
+        const parsed = toRecordingSummary(row);
+        if (parsed) recordings.push(parsed);
+      }
+      const selector = asObject(payload?.selector);
+      const actorTypeRaw = asString(selector?.actorType);
+      return {
+        selector: {
+          mode: asString(selector?.mode) ?? undefined,
+          build: asString(selector?.build) ?? undefined,
+          userId: asString(selector?.userId) ?? undefined,
+          arch: asString(selector?.arch) ?? undefined,
+          rewardProfileId: asString(selector?.rewardProfileId) ?? undefined,
+          queuePolicyId: asString(selector?.queuePolicyId) ?? undefined,
+          pipelineId: asString(selector?.pipelineId) ?? undefined,
+          actorType:
+            actorTypeRaw === 'human' || actorTypeRaw === 'bot'
+              ? actorTypeRaw
+              : undefined,
+          minSamples: asInt(selector?.minSamples) ?? undefined,
+          startedFromMs: asInt(selector?.startedFromMs) ?? undefined,
+          startedToMs: asInt(selector?.startedToMs) ?? undefined,
+        },
+        recordings,
+        page: {
+          limit: asInt(payload?.page?.limit) ?? 100,
           nextCursor: asString(payload?.page?.nextCursor),
           returned:
             asInt(payload?.page?.returned) ??

@@ -36,6 +36,7 @@ import {
 import { createTrajectoryRecordingService } from './app/trajectoryRecordingService';
 import {
   createAdminRecordingsService,
+  type AdminRecordingsManifestPage,
   type AdminRecordingsPage,
 } from './app/adminRecordingsService';
 import {
@@ -46,7 +47,14 @@ import {
   type TrajectoryRewardTerminalStats,
 } from './app/trajectoryRewardPolicy';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
+import { runGlobalTrainingOneShot } from './app/globalTrainerTfjs';
 import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
+import {
+  generateBotTrajectoryBatch,
+  runCapabilityBenchmark,
+  trainBotPolicyOneShot,
+  type BotPolicyArtifact,
+} from './app/headlessBotService';
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
@@ -75,6 +83,7 @@ import {
   type MenuAdminRecordingsPage,
   type MenuAdminRecordingPreview,
   type MenuAdminRecordingsQuery,
+  type MenuAdminManifestQuery,
   type MenuAdminGlobalBaselineSummary,
   type MenuScreen,
 } from './ui/screens/menuScreen';
@@ -1072,7 +1081,9 @@ async function boot() {
       ? `Baseline retired. New default: ${replacementId}.`
       : 'Baseline retired.';
   };
-  const publishCurrentModelAsGlobalBaseline = async (options?: {
+  const publishModelBytesAsGlobalBaseline = async (options: {
+    bytes: ArrayBuffer;
+    pipelineId: string;
     label?: string;
     setDefault?: boolean;
   }): Promise<string> => {
@@ -1083,18 +1094,13 @@ async function boot() {
     ) {
       throw new Error('Admin account required.');
     }
-    const bytes = await modelService.ensureModelBytes();
-    if (!bytes) {
-      throw new Error('No model is loaded to publish.');
-    }
     const mode = modeController.getState().mode.id;
     const selector = getActiveModelAxes();
-    const pipelineId = getLocalTrainingPreset().pipelineId;
     const label =
-      typeof options?.label === 'string' && options.label.trim()
+      typeof options.label === 'string' && options.label.trim()
         ? options.label.trim()
         : '';
-    const setDefault = options?.setDefault === true;
+    const setDefault = options.setDefault === true;
     const url = new URL(
       `${uploadBaseUrl}/admin/models/global/publish`,
       window.location.origin,
@@ -1103,7 +1109,7 @@ async function boot() {
     url.searchParams.set('arch', selector.arch);
     url.searchParams.set('reward_profile', selector.rewardProfileId);
     url.searchParams.set('queue_policy', selector.queuePolicyId);
-    url.searchParams.set('pipeline_id', pipelineId);
+    url.searchParams.set('pipeline_id', options.pipelineId);
     if (label) {
       url.searchParams.set('label', label);
     }
@@ -1117,7 +1123,7 @@ async function boot() {
       headers: {
         'content-type': 'application/octet-stream',
       },
-      body: bytes,
+      body: options.bytes,
     });
     if (!response.ok) {
       throw new Error(
@@ -1141,6 +1147,397 @@ async function boot() {
     return createdLabel
       ? `Published baseline: ${createdLabel} (${id}).`
       : `Published baseline id: ${id}.`;
+  };
+  const publishCurrentModelAsGlobalBaseline = async (options?: {
+    label?: string;
+    setDefault?: boolean;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const bytes = await modelService.ensureModelBytes();
+    if (!bytes) {
+      throw new Error('No model is loaded to publish.');
+    }
+    return await publishModelBytesAsGlobalBaseline({
+      bytes,
+      pipelineId: getLocalTrainingPreset().pipelineId,
+      label: options?.label,
+      setDefault: options?.setDefault,
+    });
+  };
+
+  let adminManifestPage: AdminRecordingsManifestPage | null = null;
+  let adminManifestSessions: TrajectorySessionV1[] = [];
+  let adminGlobalTrainingCandidate: {
+    bytes: ArrayBuffer;
+    pipelineId: string;
+    samplesUsed: number;
+    holdoutDelta: number | null;
+    finalLoss: number | null;
+  } | null = null;
+  let adminBotPolicy: BotPolicyArtifact | null = null;
+  let adminBenchmarkSuggestedArch: 'full' | 'lean' | null = null;
+
+  const prepareAdminManifest = async (
+    query: MenuAdminManifestQuery,
+  ): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const mode = query.mode?.trim() || modeController.getState().mode.id;
+    const selector = getActiveModelAxes();
+    const pipeline = getTrainingPipelineForContext(mode, selector);
+    const page = await adminRecordingsService.listTrainingManifest({
+      mode,
+      build: query.build,
+      limit: query.limit,
+      cursor: query.cursor ?? null,
+      minSamples: query.minSamples,
+      actorType:
+        query.actorType === 'human' || query.actorType === 'bot'
+          ? query.actorType
+          : undefined,
+      arch: selector.arch,
+      rewardProfileId: selector.rewardProfileId,
+      queuePolicyId: selector.queuePolicyId,
+      pipelineId: pipeline.id,
+    });
+    adminManifestPage = page;
+    adminManifestSessions = [];
+    adminGlobalTrainingCandidate = null;
+    const sampleCount = page.recordings.reduce(
+      (sum, recording) => sum + Math.max(0, recording.samples),
+      0,
+    );
+    const next = page.page.nextCursor ? 'yes' : 'no';
+    return (
+      `Manifest ready: ${page.page.returned} recordings, ${sampleCount} samples, ` +
+      `pipeline=${pipeline.id}, next_page=${next}.`
+    );
+  };
+
+  const loadAdminManifestSessions = async (): Promise<
+    TrajectorySessionV1[]
+  > => {
+    if (!adminManifestPage || adminManifestPage.recordings.length === 0) {
+      throw new Error('Manifest is empty. Run PREPARE MANIFEST first.');
+    }
+    const sessions: TrajectorySessionV1[] = [];
+    for (const recording of adminManifestPage.recordings) {
+      const session = await adminRecordingsService.loadRecordingObject(
+        recording.id,
+      );
+      sessions.push(session);
+    }
+    adminManifestSessions = sessions;
+    return sessions;
+  };
+
+  const runAdminGlobalTrainingOneShot = async (): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const modeId = modeController.getState().mode.id;
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      throw new Error('Model is not loaded.');
+    }
+    const selector = getActiveModelAxes();
+    const pipeline = getTrainingPipelineForContext(modeId, selector);
+    const sessions =
+      adminManifestSessions.length > 0
+        ? adminManifestSessions
+        : await loadAdminManifestSessions();
+    const result = await runGlobalTrainingOneShot({
+      model,
+      recordings: sessions,
+      pipeline,
+      trainer: personalTrainer,
+      train: {
+        backendPreference: pipeline.trainDefaults.backendPreference,
+        epochs: pipeline.trainDefaults.epochs,
+        learningRate: pipeline.trainDefaults.learningRate,
+        l2: pipeline.trainDefaults.l2,
+        sampleLimit: pipeline.trainDefaults.sampleLimit,
+      },
+    });
+    if (!result.ok || !result.updatedModelBytes) {
+      throw new Error(result.message);
+    }
+    adminGlobalTrainingCandidate = {
+      bytes: result.updatedModelBytes,
+      pipelineId: result.pipelineId,
+      samplesUsed: result.samplesUsed,
+      holdoutDelta: result.holdoutDelta,
+      finalLoss: result.finalLoss,
+    };
+    const holdoutSuffix =
+      result.holdoutDelta != null
+        ? ` holdoutΔ=${result.holdoutDelta.toFixed(6)}`
+        : '';
+    const lossSuffix =
+      result.finalLoss != null
+        ? ` finalLoss=${result.finalLoss.toExponential(3)}`
+        : '';
+    return (
+      `Global training candidate ready (${result.pipelineId}). ` +
+      `samples=${result.samplesUsed}.${holdoutSuffix}${lossSuffix}`
+    );
+  };
+
+  const publishAdminGlobalTrainingCandidate = async (): Promise<string> => {
+    if (!adminGlobalTrainingCandidate) {
+      throw new Error('No global candidate ready. Run TRAIN GLOBAL first.');
+    }
+    return await publishModelBytesAsGlobalBaseline({
+      bytes: adminGlobalTrainingCandidate.bytes,
+      pipelineId: adminGlobalTrainingCandidate.pipelineId,
+      label: `candidate_${modeController.getState().mode.id}_${Date.now()}`,
+      setDefault: false,
+    });
+  };
+
+  const runAdminTrainBotPolicyOneShot = async (options: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      throw new Error('Model is not loaded.');
+    }
+    const modeId = modeController.getState().mode.id;
+    const result = await trainBotPolicyOneShot({
+      modeId,
+      settings: settingsStore.get(),
+      model,
+      modelRunner: modelService.getRunner(),
+      modelAxes: getActiveModelAxes(),
+      episodes: options.episodes,
+      maxPiecesPerEpisode: options.maxPiecesPerEpisode,
+    });
+    if (!result.ok || !result.policyArtifact) {
+      throw new Error(result.message);
+    }
+    adminBotPolicy = result.policyArtifact;
+    const lossSuffix =
+      result.finalLoss != null
+        ? ` finalLoss=${result.finalLoss.toExponential(3)}`
+        : '';
+    return (
+      `${result.message} meanReturn=${result.meanReturn.toFixed(4)}${lossSuffix}\n` +
+      `policyId=${result.policyArtifact.id}`
+    );
+  };
+
+  const runAdminGenerateBotRecordings = async (options: {
+    sessions?: number;
+    maxPiecesPerEpisode?: number;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    if (!adminBotPolicy) {
+      throw new Error('Train bot policy first.');
+    }
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      throw new Error('Model is not loaded.');
+    }
+    const modeId = modeController.getState().mode.id;
+    const generated = await generateBotTrajectoryBatch({
+      modeId,
+      settings: settingsStore.get(),
+      model,
+      modelRunner: modelService.getRunner(),
+      modelAxes: getActiveModelAxes(),
+      policy: adminBotPolicy,
+      sessions: Math.max(1, options.sessions ?? 1),
+      maxPiecesPerEpisode: options.maxPiecesPerEpisode,
+      trainingIntent: 'bot_generation_v1',
+    });
+
+    let uploadedSessions = 0;
+    let uploadedSamples = 0;
+    const axes = getActiveModelAxes();
+    const pipeline = getTrainingPipelineForContext(modeId, axes);
+    const modelArch = getTrajectoryModelArch();
+    for (const draft of generated.drafts) {
+      if (draft.samples.length < MIN_TRAJECTORY_SAMPLES_PER_SESSION) {
+        continue;
+      }
+      const rewardPolicyId = resolveTrajectoryRewardPolicyId(draft.modeId);
+      const rewardInput: TrajectoryDecisionSample[] = draft.samples.map(
+        (sample) => ({
+          schema: 'wishuponablock.trajectory.v1',
+          id: sample.id,
+          modeId: draft.modeId,
+          arch: axes.arch,
+          rewardProfileId: axes.rewardProfileId,
+          queuePolicyId: axes.queuePolicyId,
+          createdAtMs: sample.createdAtMs,
+          deliberationMs: sample.deliberationMs,
+          boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
+          hold: sample.hold,
+          action: sample.action,
+          actionIndex: sample.actionIndex,
+          pieces: [...sample.pieces],
+          logits: [...sample.logits],
+          probabilities: [...sample.probabilities],
+          inferenceMs: sample.inferenceMs,
+          samplingMs: sample.samplingMs,
+          totalDecisionMs: sample.totalDecisionMs,
+          reward: sample.reward,
+        }),
+      );
+      const rewards = computeTrajectoryRewards(
+        rewardInput,
+        {
+          modeId: draft.modeId,
+          outcome: draft.outcome,
+          terminal: draft.terminal,
+        },
+        rewardPolicyId,
+      );
+      const sessionId = crypto.randomUUID();
+      const session: TrajectorySessionV1 = {
+        schema: TRAJECTORY_SESSION_SCHEMA_V1,
+        sessionId,
+        modeId: draft.modeId,
+        buildVersion: APP_VERSION,
+        startedAtMs: draft.startedAtMs,
+        endedAtMs: draft.endedAtMs,
+        durationMs: draft.durationMs,
+        samples: draft.samples.map((sample, index) => ({
+          ...sample,
+          boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
+          pieces: [...sample.pieces],
+          logits: [...sample.logits],
+          probabilities: [...sample.probabilities],
+          reward: rewards.rewards[index] ?? null,
+        })),
+        meta: {
+          outcome: draft.outcome,
+          channel: import.meta.env.MODE,
+          modelSource: activeModelSource.kind,
+          modelMode:
+            activeModelSource.kind === 'personal'
+              ? activeModelSource.mode
+              : undefined,
+          modelVersion:
+            activeModelSource.kind === 'personal'
+              ? activeModelSource.version
+              : null,
+          modelArchId: axes.arch,
+          rewardProfileId: axes.rewardProfileId,
+          queuePolicyId: axes.queuePolicyId,
+          rewardPolicy: rewards.policyId,
+          rewardPolicyId: rewards.policyId,
+          rewardKind: rewards.kind,
+          rewardGamma: rewards.gamma,
+          pipelineId: pipeline.id,
+          pipelineMode: draft.modeId,
+          modelArch,
+          actorType: 'bot',
+          actorPolicyId: adminBotPolicy.id,
+          trainingIntent: generated.trainingIntent ?? undefined,
+        },
+      };
+      await trajectoryRecordingService.uploadSession(session);
+      uploadedSessions += 1;
+      uploadedSamples += session.samples.length;
+    }
+    return (
+      `Bot generation complete. sessions=${uploadedSessions}, samples=${uploadedSamples}, ` +
+      `policy=${adminBotPolicy.id}.`
+    );
+  };
+
+  const runAdminCapabilityBenchmark = async (options?: {
+    episodes?: number;
+    maxPiecesPerEpisode?: number;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    if (!adminBotPolicy) {
+      throw new Error('Train bot policy first.');
+    }
+    const model = await modelService.ensureLoaded();
+    if (!model) {
+      throw new Error('Model is not loaded.');
+    }
+    const modeId = modeController.getState().mode.id;
+    const result = await runCapabilityBenchmark({
+      modeId,
+      settings: settingsStore.get(),
+      model,
+      modelRunner: modelService.getRunner(),
+      modelAxes: getActiveModelAxes(),
+      policy: adminBotPolicy,
+      episodes: options?.episodes,
+      maxPiecesPerEpisode: options?.maxPiecesPerEpisode,
+    });
+    adminBenchmarkSuggestedArch = result.recommendedArch;
+    return (
+      `Benchmark: verdict=${result.verdict}, recommend=${result.recommendedArch}, ` +
+      `decision p95=${result.metrics.p95DecisionMs.toFixed(2)}ms, ` +
+      `tick p95=${result.metrics.p95TickMs.toFixed(2)}ms, ` +
+      `sim=${(result.metrics.simThroughput * 100).toFixed(1)}% of ${result.metrics.targetSimFps}fps.`
+    );
+  };
+
+  const applyAdminBenchmarkSuggestedArch = async (): Promise<string> => {
+    if (!adminBenchmarkSuggestedArch) {
+      throw new Error('No benchmark recommendation yet.');
+    }
+    const current = getActiveModelAxes();
+    if (current.arch === adminBenchmarkSuggestedArch) {
+      return `Model arch already "${current.arch}".`;
+    }
+    const next = {
+      ...current,
+      arch: adminBenchmarkSuggestedArch,
+    };
+    settingsStore.apply({ modelAxes: next });
+    const mode = modeController.getState().mode.id;
+    const sync = await syncActiveModelForContext({
+      mode,
+      reason: 'benchmark_arch_apply',
+      force: true,
+      interactive: true,
+    });
+    return (
+      `Applied benchmark recommendation: arch=${adminBenchmarkSuggestedArch}. ` +
+      sync.message
+    );
   };
   const getMenuModelAxes = (): MenuModelAxes => {
     const axes = getActiveModelAxes();
@@ -2000,6 +2397,13 @@ async function boot() {
     onAdminListGlobalBaselines: listAdminGlobalBaselines,
     onAdminSetGlobalBaselineDefault: setAdminGlobalBaselineDefault,
     onAdminRetireGlobalBaseline: retireAdminGlobalBaseline,
+    onAdminPrepareManifest: prepareAdminManifest,
+    onAdminTrainGlobalOneShot: runAdminGlobalTrainingOneShot,
+    onAdminPublishGlobalCandidate: publishAdminGlobalTrainingCandidate,
+    onAdminTrainBotPolicyOneShot: runAdminTrainBotPolicyOneShot,
+    onAdminGenerateBotRecordings: runAdminGenerateBotRecordings,
+    onAdminRunCapabilityBenchmark: runAdminCapabilityBenchmark,
+    onAdminApplyBenchmarkSuggestedArch: applyAdminBenchmarkSuggestedArch,
     ...uiController.getMenuHandlers(),
   });
   menuScreen.appendChild(menuUi.root);

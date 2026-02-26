@@ -3019,6 +3019,9 @@ const handlePostTrajectoryRecording = async (
     pipeline_mode: recording.meta?.pipelineMode ?? null,
     model_arch_id: recording.meta?.modelArchId ?? null,
     model_arch: recording.meta?.modelArch ?? null,
+    actor_type: recording.meta?.actorType ?? null,
+    actor_policy_id: recording.meta?.actorPolicyId ?? null,
+    training_intent: recording.meta?.trainingIntent ?? null,
   });
 
   try {
@@ -3355,6 +3358,241 @@ const handleAdminRecordingsIndex = async (
     console.error('[admin] recordings index failed', error);
     return jsonResponse(
       { error: 'Recording index is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
+const handleAdminRecordingsExportManifest = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAdminSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[admin] touch session failed', error);
+  }
+
+  const url = new URL(request.url);
+  const requestedMode = url.searchParams.get('mode');
+  const modeFilter = normalizeGameMode(requestedMode);
+  if (requestedMode != null && !modeFilter) {
+    return jsonResponse({ error: 'Invalid mode filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedBuild = url.searchParams.get('build');
+  const buildFilter = asString(requestedBuild);
+  if (requestedBuild != null && !buildFilter) {
+    return jsonResponse({ error: 'Invalid build filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedUserId = asString(url.searchParams.get('user_id'));
+  if (requestedUserId != null && !isValidRecordingId(requestedUserId)) {
+    return jsonResponse({ error: 'Invalid user filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const startedFromMs = asInt(url.searchParams.get('started_from_ms'));
+  const startedToMs = asInt(url.searchParams.get('started_to_ms'));
+  if (
+    (startedFromMs != null && startedFromMs < 0) ||
+    (startedToMs != null && startedToMs < 0)
+  ) {
+    return jsonResponse({ error: 'Invalid time range filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (
+    startedFromMs != null &&
+    startedToMs != null &&
+    startedFromMs > startedToMs
+  ) {
+    return jsonResponse({ error: 'Invalid time range filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const modelArch = normalizeOptionalModelAxis(url.searchParams.get('arch'));
+  const rewardProfileId = normalizeOptionalModelAxis(
+    url.searchParams.get('reward_profile'),
+  );
+  const queuePolicyId = normalizeOptionalModelAxis(
+    url.searchParams.get('queue_policy'),
+  );
+  const pipelineId = normalizeOptionalModelAxis(
+    url.searchParams.get('pipeline_id'),
+  );
+  const actorTypeRaw = asString(url.searchParams.get('actor_type'));
+  const actorType =
+    actorTypeRaw === 'human' || actorTypeRaw === 'bot' ? actorTypeRaw : null;
+  if (actorTypeRaw != null && actorTypeRaw !== actorType) {
+    return jsonResponse({ error: 'Invalid actor_type filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const minSamplesRaw = asInt(url.searchParams.get('min_samples'));
+  const minSamples =
+    minSamplesRaw == null
+      ? null
+      : clampInt(minSamplesRaw, {
+          min: 1,
+          max: MAX_TRAJECTORY_SAMPLES_PER_SESSION,
+          fallback: 1,
+        });
+  if (minSamplesRaw != null && minSamplesRaw < 1) {
+    return jsonResponse({ error: 'Invalid min_samples filter.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const requestedCursor = url.searchParams.get('cursor');
+  const cursor = parseRecordingsCursor(requestedCursor);
+  if (requestedCursor != null && !cursor) {
+    return jsonResponse({ error: 'Invalid cursor.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const limit = clampInt(asInt(url.searchParams.get('limit')), {
+    min: 1,
+    max: 500,
+    fallback: 100,
+  });
+
+  const whereParts: string[] = [];
+  const values: unknown[] = [];
+  if (modeFilter) {
+    whereParts.push('game_mode = ?');
+    values.push(modeFilter);
+  }
+  if (buildFilter) {
+    whereParts.push('build_version = ?');
+    values.push(buildFilter);
+  }
+  if (requestedUserId) {
+    whereParts.push('user_id = ?');
+    values.push(requestedUserId);
+  }
+  if (startedFromMs != null) {
+    whereParts.push('started_at_ms >= ?');
+    values.push(startedFromMs);
+  }
+  if (startedToMs != null) {
+    whereParts.push('started_at_ms <= ?');
+    values.push(startedToMs);
+  }
+  if (modelArch) {
+    whereParts.push('model_arch = ?');
+    values.push(modelArch);
+  }
+  if (rewardProfileId) {
+    whereParts.push('reward_profile_id = ?');
+    values.push(rewardProfileId);
+  }
+  if (queuePolicyId) {
+    whereParts.push('queue_policy_id = ?');
+    values.push(queuePolicyId);
+  }
+  if (pipelineId) {
+    whereParts.push('pipeline_id = ?');
+    values.push(pipelineId);
+  }
+  if (minSamples != null) {
+    whereParts.push('snapshots_total >= ?');
+    values.push(minSamples);
+  }
+  if (actorType) {
+    whereParts.push(`json_extract(meta_json, '$.actor_type') = ?`);
+    values.push(actorType);
+  }
+  if (cursor) {
+    whereParts.push('(started_at_ms < ? OR (started_at_ms = ? AND id < ?))');
+    values.push(cursor.startedAtMs, cursor.startedAtMs, cursor.id);
+  }
+  const whereClause =
+    whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+  try {
+    const result = await env.DB.prepare(
+      `SELECT
+         id,
+         user_id,
+         game_mode,
+         build_version,
+         r2_key,
+         started_at_ms,
+         ended_at_ms,
+         duration_ms,
+         snapshots_total,
+         meta_json,
+         created_at_ms
+       FROM recordings_index
+       ${whereClause}
+       ORDER BY started_at_ms DESC, id DESC
+       LIMIT ?`,
+    )
+      .bind(...values, limit)
+      .all<Record<string, unknown>>();
+    const rows = Array.isArray(result.results) ? result.results : [];
+    const recordings: AdminRecordingSummary[] = [];
+    for (const row of rows) {
+      const summary = toAdminRecordingSummary(row);
+      if (summary) recordings.push(summary);
+    }
+    const nextCursor =
+      rows.length >= limit && recordings.length > 0
+        ? formatRecordingsCursor({
+            startedAtMs: recordings[recordings.length - 1].startedAtMs,
+            id: recordings[recordings.length - 1].id,
+          })
+        : null;
+    return jsonResponse(
+      {
+        ok: true,
+        selector: {
+          mode: modeFilter,
+          build: buildFilter,
+          userId: requestedUserId,
+          arch: modelArch,
+          rewardProfileId,
+          queuePolicyId,
+          pipelineId,
+          actorType,
+          minSamples,
+          startedFromMs,
+          startedToMs,
+        },
+        recordings,
+        page: {
+          limit,
+          nextCursor,
+          returned: recordings.length,
+        },
+      },
+      200,
+      { 'cache-control': 'no-store' },
+    );
+  } catch (error) {
+    console.error('[admin] recordings export manifest failed', error);
+    return jsonResponse(
+      { error: 'Recording export manifest is currently unavailable.' },
       503,
       { 'cache-control': 'no-store' },
     );
@@ -4144,6 +4382,10 @@ export default {
 
     if (url.pathname === '/api/admin/recordings/index') {
       return handleAdminRecordingsIndex(request, env);
+    }
+
+    if (url.pathname === '/api/admin/recordings/export-manifest') {
+      return handleAdminRecordingsExportManifest(request, env);
     }
 
     if (url.pathname === '/api/admin/recordings/object') {

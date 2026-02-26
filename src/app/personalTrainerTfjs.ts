@@ -28,6 +28,7 @@ export type PersonalTrainerResult = {
   samplesUsed: number;
   epochs: number;
   finalLoss: number | null;
+  holdoutDelta: number | null;
   updatedModelBytes: ArrayBuffer | null;
 };
 
@@ -314,6 +315,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
           samplesUsed: 0,
           epochs: 0,
           finalLoss: null,
+          holdoutDelta: null,
           updatedModelBytes: null,
         };
       }
@@ -387,6 +389,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
             samplesUsed: eligibleCount,
             epochs: 0,
             finalLoss: null,
+            holdoutDelta: null,
             updatedModelBytes: null,
           };
         }
@@ -402,6 +405,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
             samplesUsed: eligibleCount,
             epochs: 0,
             finalLoss: null,
+            holdoutDelta: null,
             updatedModelBytes: null,
           };
         }
@@ -421,6 +425,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
             samplesUsed: eligibleCount,
             epochs: 0,
             finalLoss: null,
+            holdoutDelta: null,
             updatedModelBytes: null,
           };
         }
@@ -621,6 +626,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
             samplesUsed: eligibleCount,
             epochs,
             finalLoss,
+            holdoutDelta: objectiveDelta,
             updatedModelBytes: null,
           };
         }
@@ -645,6 +651,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
           samplesUsed: eligibleCount,
           epochs,
           finalLoss,
+          holdoutDelta: objectiveDelta,
           updatedModelBytes,
         };
       } catch (error) {
@@ -657,6 +664,7 @@ export function createPersonalTrainerTfjs(): PersonalTrainer {
           samplesUsed: eligibleCount,
           epochs: 0,
           finalLoss: null,
+          holdoutDelta: null,
           updatedModelBytes: null,
         };
       } finally {

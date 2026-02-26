@@ -23,6 +23,9 @@ export type TrajectorySessionMetaV1 = {
   pipelineId?: string;
   pipelineMode?: string;
   modelArch?: string;
+  actorType?: 'human' | 'bot';
+  actorPolicyId?: string;
+  trainingIntent?: string;
 };
 
 export type TrajectorySessionSampleV1 = {
@@ -195,6 +198,11 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   const pipelineId = asString(obj.pipelineId, 1, 64);
   const pipelineMode = asString(obj.pipelineMode, 1, 64);
   const modelArch = asString(obj.modelArch, 1, 128);
+  const actorTypeRaw = asString(obj.actorType, 1, 16);
+  const actorType =
+    actorTypeRaw === 'human' || actorTypeRaw === 'bot' ? actorTypeRaw : null;
+  const actorPolicyId = asString(obj.actorPolicyId, 1, 128);
+  const trainingIntent = asString(obj.trainingIntent, 1, 128);
   const rewardGamma =
     obj.rewardGamma == null
       ? null
@@ -217,6 +225,9 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   if (pipelineId) meta.pipelineId = pipelineId;
   if (pipelineMode) meta.pipelineMode = pipelineMode;
   if (modelArch) meta.modelArch = modelArch;
+  if (actorType) meta.actorType = actorType;
+  if (actorPolicyId) meta.actorPolicyId = actorPolicyId;
+  if (trainingIntent) meta.trainingIntent = trainingIntent;
   if (rewardGamma != null) meta.rewardGamma = rewardGamma;
   if (modelVersion != null) meta.modelVersion = modelVersion;
   if (obj.rewardGamma != null && rewardGamma == null) return null;
