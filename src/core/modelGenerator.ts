@@ -8,6 +8,10 @@ import { softmax } from './wubModel';
 import { hasPerfMetricsSink, recordPerfDuration } from './perfMetrics';
 
 type InferenceStrategy = 'clean_uniform' | 'threshold';
+type QueuePolicyId = 'next_piece_v1' | 'bag_shuffle_v1';
+
+const DEFAULT_QUEUE_POLICY_ID: QueuePolicyId = 'next_piece_v1';
+const BAG_ZERO_LOGIT = -30;
 
 export type ModelGeneratorDecisionEvent = {
   board: Board;
@@ -27,20 +31,29 @@ type InferenceOptions = {
   temperature?: number;
   threshold?: number;
   postSharpness?: number;
+  queuePolicyId?: string;
   onDecision?: (event: ModelGeneratorDecisionEvent) => void;
+};
+
+type QueuedDecision = {
+  action: PieceKind;
+  pieces: PieceKind[];
+  logits: Float32Array;
+  probabilities: Float32Array;
+  distribution: PieceProbability[];
 };
 
 export class ModelGenerator implements PieceGenerator {
   private rng: XorShift32;
   private model: LoadedModel | null;
   private runner: ModelRunner;
-  private pending: PieceKind | null = null;
-  private pendingDistribution: PieceProbability[] | null = null;
+  private queue: QueuedDecision[] = [];
   private lastSampleDistribution: PieceProbability[] | null = null;
   private strategy: InferenceStrategy;
   private temperature: number;
   private threshold: number;
   private postSharpness: number;
+  private queuePolicyId: QueuePolicyId;
   private onDecision: ((event: ModelGeneratorDecisionEvent) => void) | null;
 
   constructor(
@@ -57,6 +70,7 @@ export class ModelGenerator implements PieceGenerator {
     this.temperature = options.temperature ?? 1;
     this.threshold = options.threshold ?? 0;
     this.postSharpness = options.postSharpness ?? 1;
+    this.queuePolicyId = normalizeQueuePolicyId(options.queuePolicyId);
     this.onDecision = options.onDecision ?? null;
     modelPromise?.then((loaded) => {
       if (loaded) this.model = loaded;
@@ -65,28 +79,26 @@ export class ModelGenerator implements PieceGenerator {
 
   reset(seed: number): void {
     this.rng = new XorShift32(seed);
-    this.pending = null;
-    this.pendingDistribution = null;
+    this.queue = [];
     this.lastSampleDistribution = null;
   }
 
   next(): PieceKind {
-    if (this.pending) {
-      const next = this.pending;
-      this.pending = null;
-      this.lastSampleDistribution = this.pendingDistribution
-        ? this.pendingDistribution.map((entry) => ({ ...entry }))
-        : null;
-      this.pendingDistribution = null;
-      return next;
+    if (this.queue.length > 0) {
+      const nextDecision = this.queue.shift()!;
+      this.lastSampleDistribution = nextDecision.distribution.map((entry) => ({
+        ...entry,
+      }));
+      return nextDecision.action;
     }
     this.lastSampleDistribution = null;
     return this.sampleFallback();
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  peek(_n: number): PieceKind[] {
-    return [];
+  peek(n: number): PieceKind[] {
+    const limit = Math.max(0, Math.trunc(n));
+    if (limit === 0 || this.queue.length === 0) return [];
+    return this.queue.slice(0, limit).map((entry) => entry.action);
   }
 
   getLastSampleDistribution(): PieceProbability[] | null {
@@ -96,24 +108,76 @@ export class ModelGenerator implements PieceGenerator {
 
   onLock(board: Board, hold: PieceKind | null): void {
     if (!this.model) {
-      this.pending = null;
-      this.pendingDistribution = null;
+      this.queue = [];
+      this.lastSampleDistribution = null;
       return;
     }
+
     const perfEnabled = hasPerfMetricsSink();
     const lockStartMs = performance.now();
-    const logitsStartMs = performance.now();
-    const logits = this.runner.predictLogits(this.model, board, hold);
-    const logitsEndMs = performance.now();
-    if (perfEnabled) {
-      recordPerfDuration(
-        'ml.predict_logits_ms',
-        logitsEndMs - logitsStartMs,
-        logitsEndMs,
-      );
+    let inferenceMs = 0;
+    let samplingMs = 0;
+    const pieces = resolvePieces(this.model.pieces);
+
+    if (this.queuePolicyId === 'bag_shuffle_v1') {
+      if (this.queue.length === 0) {
+        const logitsStartMs = performance.now();
+        const logits = this.runner.predictLogits(this.model, board, hold);
+        const logitsEndMs = performance.now();
+        inferenceMs = logitsEndMs - logitsStartMs;
+
+        const sampleStartMs = performance.now();
+        const probabilities = this.resolveProbabilities(logits, board);
+        this.queue = this.buildBagQueue(pieces, probabilities);
+        samplingMs = performance.now() - sampleStartMs;
+      }
+    } else {
+      const logitsStartMs = performance.now();
+      const logits = this.runner.predictLogits(this.model, board, hold);
+      const logitsEndMs = performance.now();
+      inferenceMs = logitsEndMs - logitsStartMs;
+
+      const sampleStartMs = performance.now();
+      const probabilities = this.resolveProbabilities(logits, board);
+      this.queue = [this.buildSingleDecision(pieces, logits, probabilities)];
+      samplingMs = performance.now() - sampleStartMs;
     }
-    const sampleStartMs = performance.now();
-    const probs =
+
+    const nextDecision = this.queue[0] ?? null;
+    const nowMs = performance.now();
+    const totalMs = nowMs - lockStartMs;
+
+    if (this.onDecision && nextDecision) {
+      this.onDecision({
+        board,
+        hold,
+        action: nextDecision.action,
+        pieces: [...nextDecision.pieces],
+        logits: new Float32Array(nextDecision.logits),
+        probabilities: new Float32Array(nextDecision.probabilities),
+        inferenceMs,
+        samplingMs,
+        totalMs,
+        wallTimeMs: nowMs,
+      });
+    }
+
+    if (perfEnabled) {
+      if (inferenceMs > 0) {
+        recordPerfDuration('ml.predict_logits_ms', inferenceMs, nowMs);
+      }
+      if (samplingMs > 0) {
+        recordPerfDuration('ml.sample_distribution_ms', samplingMs, nowMs);
+      }
+      recordPerfDuration('ml.on_lock_ms', nowMs - lockStartMs, nowMs);
+    }
+  }
+
+  private resolveProbabilities(
+    logits: Float32Array,
+    board: Board,
+  ): Float32Array {
+    const probabilities =
       this.strategy === 'threshold'
         ? thresholdedSoftmax(
             logits,
@@ -125,44 +189,156 @@ export class ModelGenerator implements PieceGenerator {
     if (this.strategy === 'clean_uniform') {
       const blend = getCleanBlend(board);
       if (blend > 0) {
-        const uniform = 1 / probs.length;
-        for (let i = 0; i < probs.length; i++) {
-          probs[i] = probs[i] * (1 - blend) + uniform * blend;
+        const uniform = 1 / probabilities.length;
+        for (let i = 0; i < probabilities.length; i++) {
+          probabilities[i] = probabilities[i] * (1 - blend) + uniform * blend;
         }
       }
     }
-    const pieces = this.model.pieces ?? PIECES;
-    this.pendingDistribution = pieces.map((piece, index) => ({
-      piece,
-      probability: Number.isFinite(probs[index]) ? probs[index] : 0,
-    }));
-    this.pending = pieces[this.sampleIndex(probs)] ?? PIECES[0];
-    const nowMs = performance.now();
-    const inferenceMs = logitsEndMs - logitsStartMs;
-    const samplingMs = nowMs - sampleStartMs;
-    const totalMs = nowMs - lockStartMs;
-    if (this.onDecision) {
-      this.onDecision({
-        board,
-        hold,
-        action: this.pending,
+    return probabilities;
+  }
+
+  private buildSingleDecision(
+    pieces: PieceKind[],
+    logits: Float32Array,
+    probabilities: Float32Array,
+  ): QueuedDecision {
+    const sampledIndex = this.sampleIndex(probabilities);
+    const action = pieces[sampledIndex] ?? PIECES[0];
+    return {
+      action,
+      pieces: [...pieces],
+      logits: new Float32Array(logits),
+      probabilities: new Float32Array(probabilities),
+      distribution: this.buildDistributionFromProbabilities(
+        pieces,
+        probabilities,
+      ),
+    };
+  }
+
+  private buildBagQueue(
+    pieces: PieceKind[],
+    probabilities: Float32Array,
+  ): QueuedDecision[] {
+    const count = pieces.length;
+    if (count === 0) return [];
+
+    const weights = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const weight = probabilities[i];
+      weights[i] = Number.isFinite(weight) && weight > 0 ? weight : 0;
+    }
+
+    const available = new Array<boolean>(count).fill(true);
+    const queue: QueuedDecision[] = [];
+    for (let draw = 0; draw < count; draw++) {
+      const stepProbabilities = new Float32Array(count);
+      let totalWeight = 0;
+      let remaining = 0;
+      for (let i = 0; i < count; i++) {
+        if (!available[i]) continue;
+        remaining += 1;
+        totalWeight += weights[i];
+      }
+      if (remaining <= 0) break;
+
+      if (totalWeight <= 0) {
+        const uniform = 1 / remaining;
+        for (let i = 0; i < count; i++) {
+          if (!available[i]) continue;
+          stepProbabilities[i] = uniform;
+        }
+      } else {
+        for (let i = 0; i < count; i++) {
+          if (!available[i]) continue;
+          stepProbabilities[i] = weights[i] / totalWeight;
+        }
+      }
+
+      const sampledIndex = this.sampleFromAvailable(
+        stepProbabilities,
+        available,
+      );
+      const stepLogits = new Float32Array(count);
+      for (let i = 0; i < count; i++) {
+        const p = stepProbabilities[i];
+        stepLogits[i] = p > 0 ? Math.log(p) : BAG_ZERO_LOGIT;
+      }
+
+      queue.push({
+        action: pieces[sampledIndex] ?? PIECES[0],
         pieces: [...pieces],
-        logits: new Float32Array(logits),
-        probabilities: new Float32Array(probs),
-        inferenceMs,
-        samplingMs,
-        totalMs,
-        wallTimeMs: nowMs,
+        logits: stepLogits,
+        probabilities: stepProbabilities,
+        distribution: this.buildDistributionFromProbabilities(
+          pieces,
+          stepProbabilities,
+        ),
+      });
+
+      available[sampledIndex] = false;
+      weights[sampledIndex] = 0;
+    }
+    return queue;
+  }
+
+  private buildDistributionFromProbabilities(
+    pieces: PieceKind[],
+    probabilities: Float32Array,
+  ): PieceProbability[] {
+    const distribution: PieceProbability[] = [];
+    for (let i = 0; i < pieces.length; i++) {
+      distribution.push({
+        piece: pieces[i],
+        probability:
+          Number.isFinite(probabilities[i]) && probabilities[i] > 0
+            ? probabilities[i]
+            : 0,
       });
     }
-    if (perfEnabled) {
-      recordPerfDuration(
-        'ml.sample_distribution_ms',
-        nowMs - sampleStartMs,
-        nowMs,
-      );
-      recordPerfDuration('ml.on_lock_ms', nowMs - lockStartMs, nowMs);
+    return distribution;
+  }
+
+  private sampleFromAvailable(
+    probabilities: Float32Array,
+    available: boolean[],
+  ): number {
+    let total = 0;
+    let remaining = 0;
+    for (let i = 0; i < probabilities.length; i++) {
+      if (!available[i]) continue;
+      remaining += 1;
+      const p = probabilities[i];
+      if (p > 0 && Number.isFinite(p)) total += p;
     }
+
+    if (remaining <= 0) return 0;
+    if (total <= 0) {
+      const choices: number[] = [];
+      for (let i = 0; i < available.length; i++) {
+        if (available[i]) choices.push(i);
+      }
+      return choices[this.rng.nextInt(choices.length)] ?? 0;
+    }
+
+    const r = (this.rng.nextU32() / 0x100000000) * total;
+    let acc = 0;
+    let lastPositive = -1;
+    for (let i = 0; i < probabilities.length; i++) {
+      if (!available[i]) continue;
+      const p = probabilities[i];
+      if (!Number.isFinite(p) || p <= 0) continue;
+      acc += p;
+      lastPositive = i;
+      if (r <= acc) return i;
+    }
+
+    if (lastPositive >= 0) return lastPositive;
+    for (let i = 0; i < available.length; i++) {
+      if (available[i]) return i;
+    }
+    return 0;
   }
 
   private sampleFallback(): PieceKind {
@@ -172,17 +348,43 @@ export class ModelGenerator implements PieceGenerator {
 
   private sampleIndex(probs: Float32Array): number {
     let total = 0;
-    for (const p of probs) total += p;
+    for (const p of probs) {
+      if (Number.isFinite(p) && p > 0) total += p;
+    }
     if (total <= 0) return this.rng.nextInt(probs.length);
     const r = (this.rng.nextU32() / 0x100000000) * total;
     let acc = 0;
+    let lastPositive = -1;
     for (let i = 0; i < probs.length; i++) {
-      acc += probs[i];
+      const p = probs[i];
+      if (!Number.isFinite(p) || p <= 0) continue;
+      acc += p;
+      lastPositive = i;
       if (r <= acc) return i;
     }
-    return probs.length - 1;
+    if (lastPositive >= 0) return lastPositive;
+    return this.rng.nextInt(probs.length);
   }
 }
+
+const normalizeQueuePolicyId = (value: unknown): QueuePolicyId =>
+  value === 'bag_shuffle_v1' ? 'bag_shuffle_v1' : DEFAULT_QUEUE_POLICY_ID;
+
+const resolvePieces = (source: PieceKind[] | null | undefined): PieceKind[] => {
+  const resolved: PieceKind[] = [];
+  const seen = new Set<PieceKind>();
+  for (const piece of source ?? PIECES) {
+    if (seen.has(piece)) continue;
+    seen.add(piece);
+    resolved.push(piece);
+  }
+  for (const piece of PIECES) {
+    if (seen.has(piece)) continue;
+    seen.add(piece);
+    resolved.push(piece);
+  }
+  return resolved;
+};
 
 const thresholdedSoftmax = (
   logits: Float32Array,

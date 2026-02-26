@@ -83,6 +83,7 @@ export function createGameSessionFactory(
         mlModel: modelService.getModel(),
         mlModelPromise: modelService.getModelPromise() ?? undefined,
         mlRunner: modelService.getRunner(),
+        queuePolicyId: merged.modelAxes.queuePolicyId,
         onModelDecision,
       }),
       onPieceLock,

@@ -903,10 +903,13 @@ async function boot() {
       meanDeliberationMs,
       rewardPolicy: session.meta?.rewardPolicy ?? null,
       rewardPolicyId: session.meta?.rewardPolicyId ?? null,
+      rewardProfileId: session.meta?.rewardProfileId ?? null,
+      queuePolicyId: session.meta?.queuePolicyId ?? null,
       rewardKind: session.meta?.rewardKind ?? null,
       rewardGamma: session.meta?.rewardGamma ?? null,
       pipelineId: session.meta?.pipelineId ?? null,
       pipelineMode: session.meta?.pipelineMode ?? null,
+      modelArchId: session.meta?.modelArchId ?? null,
       modelArch: session.meta?.modelArch ?? null,
       outcome: session.meta?.outcome ?? null,
     };
@@ -1175,12 +1178,16 @@ async function boot() {
     outcome: string,
     rewards: TrajectoryRewardComputation | null,
   ): TrajectorySessionMetaV1 => {
+    const axes = getActiveModelAxes();
     const meta: TrajectorySessionMetaV1 = {
       outcome,
       channel: import.meta.env.MODE,
       modelSource: activeModelSource.kind,
       pipelineId: TRAJECTORY_PIPELINE_ID,
       pipelineMode: modeId,
+      modelArchId: axes.arch,
+      rewardProfileId: axes.rewardProfileId,
+      queuePolicyId: axes.queuePolicyId,
       modelArch: getTrajectoryModelArch(),
     };
     if (activeModelSource.kind === 'personal') {

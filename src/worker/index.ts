@@ -2986,15 +2986,14 @@ const handlePostTrajectoryRecording = async (
   const recordingId = `${session.userId}_${recording.sessionId}`;
   const monthPrefix = new Date(nowMs).toISOString().slice(0, 7);
   const r2Key = `recordings/${monthPrefix}/${session.userId}/${recording.modeId}/${recording.sessionId}.json`;
-  const modelArch = normalizeOptionalModelAxis(recording.meta?.modelArch);
+  const modelArch = normalizeOptionalModelAxis(
+    recording.meta?.modelArchId ?? recording.meta?.modelArch,
+  );
   const rewardProfileId = normalizeOptionalModelAxis(
-    recording.meta?.rewardPolicyId,
+    recording.meta?.rewardProfileId,
   );
   const queuePolicyId = normalizeOptionalModelAxis(
-    asString(
-      (recording.meta as { queuePolicyId?: unknown } | undefined)
-        ?.queuePolicyId,
-    ),
+    recording.meta?.queuePolicyId,
   );
   const modelSource = normalizeOptionalModelAxis(recording.meta?.modelSource);
   const rewardPolicyId = normalizeOptionalModelAxis(
@@ -3012,10 +3011,13 @@ const handlePostTrajectoryRecording = async (
     channel: recording.meta?.channel ?? null,
     reward_policy: recording.meta?.rewardPolicy ?? null,
     reward_policy_id: recording.meta?.rewardPolicyId ?? null,
+    reward_profile_id: recording.meta?.rewardProfileId ?? null,
+    queue_policy_id: recording.meta?.queuePolicyId ?? null,
     reward_kind: recording.meta?.rewardKind ?? null,
     reward_gamma: recording.meta?.rewardGamma ?? null,
     pipeline_id: recording.meta?.pipelineId ?? null,
     pipeline_mode: recording.meta?.pipelineMode ?? null,
+    model_arch_id: recording.meta?.modelArchId ?? null,
     model_arch: recording.meta?.modelArch ?? null,
   });
 

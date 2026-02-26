@@ -13,6 +13,9 @@ export type TrajectorySessionMetaV1 = {
   modelMode?: string;
   modelVersion?: number | null;
   channel?: string;
+  modelArchId?: string;
+  rewardProfileId?: string;
+  queuePolicyId?: string;
   rewardPolicy?: string;
   rewardPolicyId?: string;
   rewardKind?: string;
@@ -183,6 +186,9 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   const modelSource = asString(obj.modelSource, 1, 64);
   const modelMode = asString(obj.modelMode, 1, 64);
   const channel = asString(obj.channel, 1, 64);
+  const modelArchId = asString(obj.modelArchId, 1, 64);
+  const rewardProfileId = asString(obj.rewardProfileId, 1, 64);
+  const queuePolicyId = asString(obj.queuePolicyId, 1, 64);
   const rewardPolicy = asString(obj.rewardPolicy, 1, 64);
   const rewardPolicyId = asString(obj.rewardPolicyId, 1, 64);
   const rewardKind = asString(obj.rewardKind, 1, 64);
@@ -202,6 +208,9 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   if (modelSource) meta.modelSource = modelSource;
   if (modelMode) meta.modelMode = modelMode;
   if (channel) meta.channel = channel;
+  if (modelArchId) meta.modelArchId = modelArchId;
+  if (rewardProfileId) meta.rewardProfileId = rewardProfileId;
+  if (queuePolicyId) meta.queuePolicyId = queuePolicyId;
   if (rewardPolicy) meta.rewardPolicy = rewardPolicy;
   if (rewardPolicyId) meta.rewardPolicyId = rewardPolicyId;
   if (rewardKind) meta.rewardKind = rewardKind;

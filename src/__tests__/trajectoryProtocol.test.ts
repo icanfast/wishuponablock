@@ -63,7 +63,10 @@ describe('trajectory protocol parser', () => {
       makePayload(8, {
         pipelineId: 'personal_rl_v1',
         rewardPolicyId: 'comfort_v1',
+        rewardProfileId: 'default',
+        queuePolicyId: 'bag_shuffle_v1',
         pipelineMode: 'practice',
+        modelArchId: 'full',
         modelArch: 'ic11_conv12x12_pool1x1_mlp256_extra7_out7',
       }),
       { minSamples: 8 },
@@ -72,7 +75,10 @@ describe('trajectory protocol parser', () => {
     if (!parsed.ok) return;
     expect(parsed.value.meta?.pipelineId).toBe('personal_rl_v1');
     expect(parsed.value.meta?.rewardPolicyId).toBe('comfort_v1');
+    expect(parsed.value.meta?.rewardProfileId).toBe('default');
+    expect(parsed.value.meta?.queuePolicyId).toBe('bag_shuffle_v1');
     expect(parsed.value.meta?.pipelineMode).toBe('practice');
+    expect(parsed.value.meta?.modelArchId).toBe('full');
     expect(parsed.value.meta?.modelArch).toContain('conv12x12');
   });
 });

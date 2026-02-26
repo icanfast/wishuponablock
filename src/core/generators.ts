@@ -39,6 +39,7 @@ export interface GeneratorFactoryOptions {
   mlModel?: LoadedModel | null;
   mlModelPromise?: Promise<LoadedModel | null>;
   mlRunner?: ModelRunner;
+  queuePolicyId?: string;
   onModelDecision?: (event: ModelGeneratorDecisionEvent) => void;
 }
 
@@ -81,6 +82,7 @@ export function createGeneratorFactory(
           options.mlRunner,
           {
             ...(settings.ml ?? DEFAULT_ML_INFERENCE),
+            queuePolicyId: options.queuePolicyId,
             onDecision: options.onModelDecision,
           },
         );

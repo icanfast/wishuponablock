@@ -156,10 +156,13 @@ export type MenuAdminRecordingPreview = {
   meanDeliberationMs: number | null;
   rewardPolicy: string | null;
   rewardPolicyId: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
   rewardKind: string | null;
   rewardGamma: number | null;
   pipelineId: string | null;
   pipelineMode: string | null;
+  modelArchId: string | null;
   modelArch: string | null;
   outcome: string | null;
 };
@@ -3418,6 +3421,12 @@ input[type=number] {
       preview.rewardPolicyId
         ? `Reward policy id: ${preview.rewardPolicyId}`
         : 'Reward policy id: (none)',
+      preview.rewardProfileId
+        ? `Reward profile id: ${preview.rewardProfileId}`
+        : 'Reward profile id: (none)',
+      preview.queuePolicyId
+        ? `Queue policy id: ${preview.queuePolicyId}`
+        : 'Queue policy id: (none)',
       preview.rewardKind
         ? `Reward kind: ${preview.rewardKind}`
         : 'Reward kind: (none)',
@@ -3430,6 +3439,9 @@ input[type=number] {
       preview.pipelineMode
         ? `Pipeline mode: ${preview.pipelineMode}`
         : 'Pipeline mode: (none)',
+      preview.modelArchId
+        ? `Model arch id: ${preview.modelArchId}`
+        : 'Model arch id: (none)',
       preview.modelArch
         ? `Model arch: ${preview.modelArch}`
         : 'Model arch: (none)',
