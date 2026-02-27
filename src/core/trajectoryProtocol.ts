@@ -10,6 +10,7 @@ export const MAX_TRAJECTORY_COLS = 20;
 export type TrajectorySessionMetaV1 = {
   outcome?: string;
   modelSource?: string;
+  generatorType?: string;
   modelMode?: string;
   modelVersion?: number | null;
   channel?: string;
@@ -205,6 +206,7 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   const meta: TrajectorySessionMetaV1 = {};
   const outcome = asString(obj.outcome, 1, 64);
   const modelSource = asString(obj.modelSource, 1, 64);
+  const generatorType = asString(obj.generatorType, 1, 64);
   const modelMode = asString(obj.modelMode, 1, 64);
   const channel = asString(obj.channel, 1, 64);
   const modelArchId = asString(obj.modelArchId, 1, 64);
@@ -233,6 +235,7 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
 
   if (outcome) meta.outcome = outcome;
   if (modelSource) meta.modelSource = modelSource;
+  if (generatorType) meta.generatorType = generatorType;
   if (modelMode) meta.modelMode = modelMode;
   if (channel) meta.channel = channel;
   if (modelArchId) meta.modelArchId = modelArchId;

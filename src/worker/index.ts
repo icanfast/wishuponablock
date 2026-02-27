@@ -3363,6 +3363,7 @@ const handlePostTrajectoryRecording = async (
     sample_count: recording.samples.length,
     outcome: recording.meta?.outcome ?? null,
     model_source: recording.meta?.modelSource ?? null,
+    generator_type: recording.meta?.generatorType ?? null,
     model_mode: recording.meta?.modelMode ?? null,
     model_version: recording.meta?.modelVersion ?? null,
     channel: recording.meta?.channel ?? null,

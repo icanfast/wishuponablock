@@ -85,7 +85,7 @@ import {
 } from './app/snapshotService';
 import { createGameSessionFactory } from './app/gameFactory';
 import { PixiRenderer } from './render/pixiRenderer';
-import { type Board, type PieceKind, type GameState } from './core/types';
+import { PIECES, type Board, type PieceKind, type GameState } from './core/types';
 import {
   createMenuScreen,
   type MenuAuthState,
@@ -1705,6 +1705,10 @@ async function boot() {
         options.pieceSourceProfile ??
         policy.pieceSourceProfile ??
         'active_generator';
+      const generatorTypeForMeta =
+        pieceSourceProfile === 'bag7'
+          ? 'bag7'
+          : settingsStore.get().generator.type;
       const session: TrajectorySessionV1 = {
         schema: TRAJECTORY_SESSION_SCHEMA_V1,
         sessionId,
@@ -1737,6 +1741,7 @@ async function boot() {
           outcome: draft.outcome,
           channel: import.meta.env.MODE,
           modelSource: activeModelSource.kind,
+          generatorType: generatorTypeForMeta,
           modelMode:
             activeModelSource.kind === 'personal'
               ? activeModelSource.mode
@@ -2017,6 +2022,7 @@ async function boot() {
       outcome,
       channel: import.meta.env.MODE,
       modelSource: activeModelSource.kind,
+      generatorType: settingsStore.get().generator.type,
       pipelineId: run.pipelineId,
       pipelineMode: run.modeId,
       modelArchId: run.axes.arch,
@@ -2234,6 +2240,12 @@ async function boot() {
 
   const getTrajectoryUploadSummary = (): string => {
     const lines: string[] = [];
+    const generatorType = settingsStore.get().generator.type;
+    if (!usesModelGenerator(generatorType)) {
+      lines.push(
+        `Generator: "${generatorType}" (recording with surrogate decision metadata).`,
+      );
+    }
     const run = activeTrajectoryRun;
     if (run) {
       const activeSamples = listRunSamples(run).length;
@@ -2433,6 +2445,7 @@ async function boot() {
     onBeforeRestart: () => {
       restartRecordingSession();
       previousRunEnded = false;
+      lastRecordedActiveRef = null;
       activeTrajectoryRun = null;
       pendingTrajectoryReplayStep = null;
       holdUsedSinceLastLock = false;
@@ -2611,6 +2624,7 @@ async function boot() {
   };
 
   let previousRunEnded = false;
+  let lastRecordedActiveRef: GameState['active'] | null = null;
   modelStatusLabel = gameUi.modelStatusLabel;
 
   runtime = createGameRuntime({
@@ -2626,10 +2640,43 @@ async function boot() {
         beginTrajectoryRun(pendingTrajectoryRunModeId);
         pendingTrajectoryRunModeId = null;
       }
+      const generatorType = settingsStore.get().generator.type;
+      if (state.active !== lastRecordedActiveRef) {
+        lastRecordedActiveRef = state.active;
+        if (pendingTrajectoryReplayStep && !usesModelGenerator(generatorType)) {
+          const pieces = [...PIECES];
+          const action = state.active.k;
+          const actionIndex = Math.max(0, pieces.indexOf(action));
+          const logits = new Float32Array(pieces.length);
+          const probabilities = new Float32Array(pieces.length);
+          if (actionIndex >= 0 && actionIndex < pieces.length) {
+            logits[actionIndex] = 1;
+            probabilities[actionIndex] = 1;
+          }
+          trajectoryBuffer.recordDecision({
+            modeId: modeController.getState().mode.id,
+            modelAxes: getActiveModelAxes(),
+            decision: {
+              board: state.board,
+              hold: state.hold,
+              action,
+              pieces,
+              logits,
+              probabilities,
+              inferenceMs: 0,
+              samplingMs: 0,
+              totalMs: 0,
+              wallTimeMs: performance.now(),
+            },
+            replay: pendingTrajectoryReplayStep,
+          });
+          pendingTrajectoryReplayStep = null;
+        }
+      }
       updateSprintHud(state);
       updateClassicHud(state);
       gameUi.setQueueOddsMode(
-        usesModelGenerator(settingsStore.get().generator.type),
+        usesModelGenerator(generatorType),
       );
       gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
@@ -2942,6 +2989,9 @@ async function boot() {
     if (startingGame) return;
     startingGame = true;
     try {
+      if (!botGuiInspectEnabled && botGuiInspectGeneratorBackup) {
+        applyBotGuiPieceSourceProfile('active_generator');
+      }
       if (useRemoteUpload) {
         const buildCount = await uploadService
           .getSnapshotCountForBuild(APP_VERSION)
@@ -2966,6 +3016,7 @@ async function boot() {
       }
       activeTrajectoryRun = null;
       previousRunEnded = false;
+      lastRecordedActiveRef = null;
       scheduleTrajectoryRunStart(modeController.getState().mode.id);
       await screenManager.setActive('game');
     } finally {
