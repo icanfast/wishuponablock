@@ -316,6 +316,7 @@ export type MenuScreenOptions = {
     seed?: number;
     pieceSourceProfile?: 'bag7' | 'active_generator';
     warmStartFromLoaded?: boolean;
+    algorithm?: 'reinforce' | 'ppo';
   }) => Promise<string>;
   onBotLabRunHeadlessValidate: (options?: {
     maxPieces?: number;
@@ -3256,6 +3257,17 @@ input[type=number] {
     botLabTrainSourceSelect.appendChild(option);
   }
   botLabTrainSourceSelect.value = 'bag7';
+  const botLabTrainAlgorithmSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['reinforce', 'algorithm: reinforce'],
+    ['ppo', 'algorithm: ppo'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabTrainAlgorithmSelect.appendChild(option);
+  }
+  botLabTrainAlgorithmSelect.value = 'ppo';
   for (const input of [
     botLabEpisodesInput,
     botLabMaxPiecesInput,
@@ -3282,6 +3294,16 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
+  Object.assign(botLabTrainAlgorithmSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
   botLabTrainControls.appendChild(
     makeBotLabField('Episodes', botLabEpisodesInput),
   );
@@ -3291,6 +3313,9 @@ input[type=number] {
   botLabTrainControls.appendChild(makeBotLabField('Seed', botLabSeedInput));
   botLabTrainControls.appendChild(
     makeBotLabField('Piece Source', botLabTrainSourceSelect),
+  );
+  botLabTrainControls.appendChild(
+    makeBotLabField('Training Algorithm', botLabTrainAlgorithmSelect),
   );
   const botLabWarmStartToggle = document.createElement('input');
   botLabWarmStartToggle.type = 'checkbox';
@@ -4181,6 +4206,7 @@ input[type=number] {
     botLabMaxPiecesInput.disabled = !isAdmin || busy;
     botLabSeedInput.disabled = !isAdmin || busy;
     botLabTrainSourceSelect.disabled = !isAdmin || busy;
+    botLabTrainAlgorithmSelect.disabled = !isAdmin || busy;
     botLabWarmStartToggle.disabled = !isAdmin || busy;
     botLabTrainButton.disabled = !isAdmin || busy;
     botLabHeadlessValidateButton.disabled = !isAdmin || busy;
@@ -5328,6 +5354,8 @@ input[type=number] {
           'bag7',
         ),
         warmStartFromLoaded: botLabWarmStartToggle.checked,
+        algorithm:
+          botLabTrainAlgorithmSelect.value === 'ppo' ? 'ppo' : 'reinforce',
       });
       setBotLabActionStatus(message, 'success');
     } catch (error) {

@@ -64,6 +64,7 @@ import {
   runCapabilityBenchmark,
   trainBotPolicyOneShot,
   type BotPieceSourceProfile,
+  type BotTrainingAlgorithm,
   type BotPolicyArtifact,
 } from './app/headlessBotService';
 import {
@@ -106,6 +107,7 @@ import {
   modelAxesKey,
   normalizeModelAxes,
 } from './core/modelAxes';
+import { parseWubModelFromBytes, type LoadedModel } from './core/wubModel';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
 import {
   createToolHost,
@@ -406,6 +408,10 @@ async function boot() {
     preferredBackend: preferredMlBackend,
     tfjsBackendPreference,
   });
+  const botModelRunner = createModelRunner({
+    preferredBackend: preferredMlBackend,
+    tfjsBackendPreference,
+  }).runner;
   modelService.setStatusListener((status) => {
     updateModelStatusUI(status);
   });
@@ -592,6 +598,46 @@ async function boot() {
     `${mode}:${modelAxesKey(getActiveModelAxes())}`;
   const buildModelContextKey = (userId: string | null, mode: string): string =>
     `${userId ?? 'anon'}:${buildModelSyncKey(mode)}`;
+  let botGlobalModelCache: {
+    mode: string;
+    key: string;
+    modelId: string;
+    model: LoadedModel;
+  } | null = null;
+  const loadBotReferenceModel = async (
+    mode: string,
+  ): Promise<{ model: LoadedModel; modelId: string }> => {
+    if (!authState.authenticated || !authState.user) {
+      throw new Error('Sign in to use bot training.');
+    }
+    const selector = getActiveModelAxes();
+    const key = `${mode}:${modelAxesKey(selector)}`;
+    const globalModel = await personalModelService.downloadGlobalCurrent(
+      mode,
+      selector,
+    );
+    if (
+      botGlobalModelCache &&
+      botGlobalModelCache.mode === mode &&
+      botGlobalModelCache.key === key &&
+      botGlobalModelCache.modelId === globalModel.id
+    ) {
+      await botModelRunner.prepare(botGlobalModelCache.model);
+      return {
+        model: botGlobalModelCache.model,
+        modelId: botGlobalModelCache.modelId,
+      };
+    }
+    const parsed = parseWubModelFromBytes(globalModel.bytes);
+    await botModelRunner.prepare(parsed);
+    botGlobalModelCache = {
+      mode,
+      key,
+      modelId: globalModel.id,
+      model: parsed,
+    };
+    return { model: parsed, modelId: globalModel.id };
+  };
 
   const syncActiveModelForContext = async (options: {
     mode: string;
@@ -1454,6 +1500,8 @@ async function boot() {
     if (!adminBotPolicy) {
       throw new Error('No bot policy loaded to publish.');
     }
+    const pipelineId =
+      options?.pipelineId ?? adminBotPolicy.pipelineId ?? 'bot_reinforce_v2';
     const selector = getBotPolicySelector();
     const published = await adminBotPolicyService.publish({
       selector,
@@ -1463,10 +1511,10 @@ async function boot() {
         modeId: selector.modeId,
         archId: selector.archId,
         queuePolicyId: selector.queuePolicyId,
-        pipelineId: options?.pipelineId ?? 'bot_reinforce_v1',
+        pipelineId,
         pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
       },
-      pipelineId: options?.pipelineId ?? 'bot_reinforce_v1',
+      pipelineId,
       pieceSourceProfile: options?.pieceSourceProfile ?? 'bag7',
       metrics: options?.metrics ?? null,
       pin: options?.pin === true,
@@ -1528,6 +1576,7 @@ async function boot() {
     seed?: number;
     pieceSourceProfile?: BotPieceSourceProfile;
     warmStartFromLoaded?: boolean;
+    algorithm?: BotTrainingAlgorithm;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1536,20 +1585,18 @@ async function boot() {
     ) {
       throw new Error('Admin account required.');
     }
-    const model = await modelService.ensureLoaded();
-    if (!model) {
-      throw new Error('Model is not loaded.');
-    }
     const modeId = modeController.getState().mode.id;
+    const reference = await loadBotReferenceModel(modeId);
     const initialPolicy =
       options.warmStartFromLoaded === false ? null : adminBotPolicy;
     const result = await trainBotPolicyOneShot({
       modeId,
       settings: settingsStore.get(),
-      model,
-      modelRunner: modelService.getRunner(),
+      model: reference.model,
+      modelRunner: botModelRunner,
       modelAxes: getActiveModelAxes(),
       initialPolicy,
+      algorithm: options.algorithm ?? 'reinforce',
       episodes: options.episodes,
       maxPiecesPerEpisode: options.maxPiecesPerEpisode,
       seed: options.seed,
@@ -1566,7 +1613,7 @@ async function boot() {
         : '';
     return (
       `${result.message} meanReturn=${result.meanReturn.toFixed(4)}${lossSuffix}\n` +
-      `policyId=${result.policyArtifact.id}`
+      `policyId=${result.policyArtifact.id} baseGlobal=${reference.modelId}`
     );
   };
 
@@ -1583,16 +1630,13 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const { policy, policyId } = ensureBotPolicyLoaded();
-    const model = await modelService.ensureLoaded();
-    if (!model) {
-      throw new Error('Model is not loaded.');
-    }
     const modeId = modeController.getState().mode.id;
+    const reference = await loadBotReferenceModel(modeId);
     const generated = await generateBotTrajectoryBatch({
       modeId,
       settings: settingsStore.get(),
-      model,
-      modelRunner: modelService.getRunner(),
+      model: reference.model,
+      modelRunner: botModelRunner,
       modelAxes: getActiveModelAxes(),
       policy,
       sessions: Math.max(1, options.sessions ?? 1),
@@ -1715,16 +1759,13 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const { policy } = ensureBotPolicyLoaded();
-    const model = await modelService.ensureLoaded();
-    if (!model) {
-      throw new Error('Model is not loaded.');
-    }
     const modeId = modeController.getState().mode.id;
+    const reference = await loadBotReferenceModel(modeId);
     const result = await runCapabilityBenchmark({
       modeId,
       settings: settingsStore.get(),
-      model,
-      modelRunner: modelService.getRunner(),
+      model: reference.model,
+      modelRunner: botModelRunner,
       modelAxes: getActiveModelAxes(),
       policy,
       episodes: options?.episodes,
@@ -1753,16 +1794,13 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const { policy } = ensureBotPolicyLoaded();
-    const model = await modelService.ensureLoaded();
-    if (!model) {
-      throw new Error('Model is not loaded.');
-    }
     const modeId = modeController.getState().mode.id;
+    const reference = await loadBotReferenceModel(modeId);
     const validation = await runHeadlessBotValidation({
       modeId,
       settings: settingsStore.get(),
-      model,
-      modelRunner: modelService.getRunner(),
+      model: reference.model,
+      modelRunner: botModelRunner,
       modelAxes: getActiveModelAxes(),
       policy,
       maxPieces: options?.maxPieces ?? 10_000,
@@ -1822,6 +1860,8 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const { policy, policyId } = ensureBotPolicyLoaded();
+    const modeId = modeController.getState().mode.id;
+    const reference = await loadBotReferenceModel(modeId);
     const apmInput = Math.max(
       20,
       Math.min(1200, Math.trunc(options?.apmInput ?? 240)),
@@ -1830,6 +1870,7 @@ async function boot() {
     const pieceSourceProfile =
       options?.pieceSourceProfile ?? policy.pieceSourceProfile ?? 'bag7';
     botGuiInputSource = createGuiInspectBotInputSource({
+      model: reference.model,
       policy,
       apmInput,
       seed,

@@ -8,7 +8,7 @@ import { GameRunner, type InputSource } from '../core/runner';
 import type { Settings } from '../core/settings';
 import type { Board, GameState, InputFrame, PieceKind } from '../core/types';
 import { PIECES } from '../core/types';
-import type { LoadedModel } from '../core/wubModel';
+import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
 import { applyModeSettings, runModeStart } from './modeService';
 
@@ -29,7 +29,7 @@ const PIECE_INDEX = new Map(PIECES.map((piece, idx) => [piece, idx]));
 const BOT_TRAIN_MAX_EPISODES = 4096;
 const BOT_TRAIN_MAX_PIECES_PER_EPISODE = 512;
 const BOT_TRAIN_MAX_TRANSITIONS = 200_000;
-const HOLD_NONE_INDEX = PIECES.length;
+const BOT_PPO_CLIP_EPSILON = 0.2;
 
 type TfTensor = {
   dataSync: () => Float32Array | Int32Array | Uint8Array;
@@ -66,6 +66,8 @@ type TfjsModule = {
   square: (x: TfTensor) => TfTensor;
   sqrt: (x: TfTensor) => TfTensor;
   div: (a: TfTensor, b: TfTensor) => TfTensor;
+  exp: (x: TfTensor) => TfTensor;
+  minimum: (a: TfTensor, b: TfTensor) => TfTensor;
   clipByValue: (x: TfTensor, min: number, max: number) => TfTensor;
   stopGradient?: (x: TfTensor) => TfTensor;
   neg: (x: TfTensor) => TfTensor;
@@ -97,6 +99,7 @@ export type BotMacroAction = {
 };
 
 export type BotPieceSourceProfile = 'bag7' | 'active_generator';
+export type BotTrainingAlgorithm = 'reinforce' | 'ppo';
 
 export type BotPolicyArtifact = {
   id: string;
@@ -125,6 +128,7 @@ export type BotTrainOneShotConfig = {
   modelRunner: ModelRunner;
   modelAxes: ModelAxes;
   initialPolicy?: BotPolicyArtifact | null;
+  algorithm?: BotTrainingAlgorithm;
   episodes?: number;
   maxPiecesPerEpisode?: number;
   gamma?: number;
@@ -441,11 +445,16 @@ const CHARCUTERIE_HOLE_WEIGHTS = {
   bottom: 5,
   mid: 2,
 } as const;
+const CHARCUTERIE_WARMUP_TARGET_BLOCKS = 56;
 
 const normalizePieceSourceProfile = (
   value: BotPieceSourceProfile | undefined,
 ): BotPieceSourceProfile =>
   value === 'active_generator' ? 'active_generator' : 'bag7';
+
+const normalizeTrainingAlgorithm = (
+  value: BotTrainingAlgorithm | undefined,
+): BotTrainingAlgorithm => (value === 'ppo' ? 'ppo' : 'reinforce');
 
 const isFiniteArray = (values: Float32Array): boolean => {
   for (let i = 0; i < values.length; i += 1) {
@@ -518,30 +527,19 @@ const forwardPolicy = (
   return { logits, probabilities: softmax(logits) };
 };
 
-const encodeObservation = (state: GameState): Float32Array => {
-  const rows = state.board.length;
-  const cols = rows > 0 ? state.board[0].length : 0;
-  const boardSize = rows * cols;
-  const inputDim =
-    boardSize + PIECES.length + (PIECES.length + 1) + PIECES.length + 5;
-  const out = new Float32Array(inputDim);
-  let offset = 0;
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < cols; x += 1) {
-      out[offset++] = state.board[y][x] == null ? 0 : 1;
-    }
-  }
+const encodeObservation = (
+  model: LoadedModel,
+  state: GameState,
+): Float32Array => {
+  const headInput = buildModelHeadInput(model, state.board, state.hold);
+  const contextDim = PIECES.length + PIECES.length + 5;
+  const out = new Float32Array(headInput.length + contextDim);
+  out.set(headInput, 0);
 
+  let offset = headInput.length;
   const activeIdx = PIECE_INDEX.get(state.active.k);
   if (activeIdx != null) out[offset + activeIdx] = 1;
   offset += PIECES.length;
-
-  const holdIdx =
-    state.hold == null
-      ? HOLD_NONE_INDEX
-      : (PIECE_INDEX.get(state.hold) ?? HOLD_NONE_INDEX);
-  out[offset + holdIdx] = 1;
-  offset += PIECES.length + 1;
 
   const nextPiece = state.next[0] ?? null;
   const nextIdx = nextPiece == null ? null : PIECE_INDEX.get(nextPiece);
@@ -685,6 +683,7 @@ const computePieceReward = (options: {
   timeDeltaMs: number;
   holesDelta: number;
   boardScoreDelta: number;
+  charcuterieWarmupProgress?: number;
 }): number => {
   const {
     modeId,
@@ -693,6 +692,7 @@ const computePieceReward = (options: {
     timeDeltaMs,
     holesDelta,
     boardScoreDelta,
+    charcuterieWarmupProgress,
   } = options;
   const survivalBonus = 0.02;
   if (modeId === 'sprint') {
@@ -704,10 +704,13 @@ const computePieceReward = (options: {
     return linesDelta * 0.6 + scoreDelta * 0.002 + survivalBonus;
   }
   if (modeId === 'charcuterie') {
+    const warmupProgress = clamp(charcuterieWarmupProgress ?? 1, 0, 1);
+    const adjustedBoardScoreDelta =
+      boardScoreDelta >= 0 ? boardScoreDelta : boardScoreDelta * warmupProgress;
     return (
-      boardScoreDelta * 0.12 +
+      adjustedBoardScoreDelta * 0.12 +
       linesDelta * 0.15 -
-      timeDeltaMs / 2500 +
+      timeDeltaMs / 25000 +
       survivalBonus
     );
   }
@@ -746,7 +749,7 @@ const runRollout = (config: {
   });
   const rng = new XorShift32(config.seed ^ 0x9e3779b9);
   const bot = new MacroPolicyBot((state) => {
-    const observation = encodeObservation(state);
+    const observation = encodeObservation(config.model, state);
     const forward = forwardPolicy(config.policyParams, observation);
     let actionIndex = 0;
     if (config.greedy) {
@@ -803,6 +806,12 @@ const runRollout = (config: {
       );
       const boardScoreDelta = previousBoardScore - nextBoardScore;
       boardScoreDeltas.push(boardScoreDelta);
+      const blocks = countBoardBlocks(game.state.board);
+      const charcuterieWarmupProgress = clamp(
+        blocks / CHARCUTERIE_WARMUP_TARGET_BLOCKS,
+        0,
+        1,
+      );
       const reward = computePieceReward({
         modeId: config.modeId,
         linesDelta: game.state.totalLinesCleared - previousLines,
@@ -810,6 +819,7 @@ const runRollout = (config: {
         timeDeltaMs: game.state.timeMs - previousTimeMs,
         holesDelta: holes - previousHoles,
         boardScoreDelta,
+        charcuterieWarmupProgress,
       });
       bot.onPiecePlaced(reward);
       previousLines = game.state.totalLinesCleared;
@@ -871,7 +881,7 @@ const computeDiscountedReturns = (
   return out;
 };
 
-const trainWithTfjs = async (options: {
+const trainWithTfjsReinforce = async (options: {
   params: PolicyParams;
   observations: Float32Array;
   actions: Int32Array;
@@ -880,7 +890,12 @@ const trainWithTfjs = async (options: {
   entropyBeta: number;
   valueWeight: number;
   epochs: number;
-}): Promise<{ params: PolicyParams; finalLoss: number | null }> => {
+}): Promise<{
+  params: PolicyParams;
+  finalLoss: number | null;
+  bestLoss: number | null;
+  usedBestCheckpoint: boolean;
+}> => {
   const tf = await loadTf();
   await tf.ready();
   try {
@@ -893,7 +908,12 @@ const trainWithTfjs = async (options: {
 
   const count = options.actions.length;
   if (count <= 0) {
-    return { params: options.params, finalLoss: null };
+    return {
+      params: options.params,
+      finalLoss: null,
+      bestLoss: null,
+      usedBestCheckpoint: false,
+    };
   }
 
   const inputTensor = tf.tensor2d(options.observations, [
@@ -925,6 +945,9 @@ const trainWithTfjs = async (options: {
 
   const optimizer = tf.train.adam(options.learningRate);
   let finalLoss: number | null = null;
+  let bestLoss: number | null = null;
+  let bestParams: PolicyParams | null = null;
+  let divergenceDetected = false;
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
     const lossTensor = optimizer.minimize(() => {
       const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
@@ -963,12 +986,33 @@ const trainWithTfjs = async (options: {
       finalLoss = Number.isFinite(value) ? value : Number.NaN;
       lossTensor.dispose();
       if (!Number.isFinite(finalLoss)) {
+        divergenceDetected = true;
         break;
+      }
+      if (bestLoss == null || finalLoss < bestLoss) {
+        const candidate: PolicyParams = {
+          inputDim: options.params.inputDim,
+          hiddenDim: options.params.hiddenDim,
+          actionDim: options.params.actionDim,
+          w1: new Float32Array(w1.dataSync() as Float32Array),
+          b1: new Float32Array(b1.dataSync() as Float32Array),
+          wp: new Float32Array(wp.dataSync() as Float32Array),
+          bp: new Float32Array(bp.dataSync() as Float32Array),
+        };
+        if (
+          isFiniteArray(candidate.w1) &&
+          isFiniteArray(candidate.b1) &&
+          isFiniteArray(candidate.wp) &&
+          isFiniteArray(candidate.bp)
+        ) {
+          bestParams = candidate;
+          bestLoss = finalLoss;
+        }
       }
     }
   }
 
-  const trained: PolicyParams = {
+  const trainedCurrent: PolicyParams = {
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
@@ -977,6 +1021,17 @@ const trainWithTfjs = async (options: {
     wp: new Float32Array(wp.dataSync() as Float32Array),
     bp: new Float32Array(bp.dataSync() as Float32Array),
   };
+  let trained = trainedCurrent;
+  let usedBestCheckpoint = false;
+  if (bestParams) {
+    trained = bestParams;
+    usedBestCheckpoint =
+      divergenceDetected ||
+      finalLoss == null ||
+      !Number.isFinite(finalLoss) ||
+      (bestLoss != null && bestLoss < finalLoss);
+    finalLoss = bestLoss;
+  }
 
   tf.dispose([
     inputTensor,
@@ -990,7 +1045,177 @@ const trainWithTfjs = async (options: {
     wv,
     bv,
   ]);
-  return { params: trained, finalLoss };
+  return { params: trained, finalLoss, bestLoss, usedBestCheckpoint };
+};
+
+const trainWithTfjsPpo = async (options: {
+  params: PolicyParams;
+  observations: Float32Array;
+  actions: Int32Array;
+  returns: Float32Array;
+  oldLogProbs: Float32Array;
+  advantages: Float32Array;
+  learningRate: number;
+  entropyBeta: number;
+  valueWeight: number;
+  epochs: number;
+  clipEpsilon: number;
+}): Promise<{
+  params: PolicyParams;
+  finalLoss: number | null;
+  bestLoss: number | null;
+  usedBestCheckpoint: boolean;
+}> => {
+  const tf = await loadTf();
+  await tf.ready();
+  try {
+    await tf.setBackend('webgl');
+    await tf.ready();
+  } catch {
+    await tf.setBackend('cpu');
+    await tf.ready();
+  }
+
+  const count = options.actions.length;
+  if (count <= 0) {
+    return {
+      params: options.params,
+      finalLoss: null,
+      bestLoss: null,
+      usedBestCheckpoint: false,
+    };
+  }
+
+  const inputTensor = tf.tensor2d(options.observations, [
+    count,
+    options.params.inputDim,
+  ]);
+  const actionTensor = tf.tensor1d(options.actions, 'int32');
+  const returnsTensor = tf.tensor1d(options.returns);
+  const oldLogProbTensor = tf.tensor1d(options.oldLogProbs);
+  const advantageTensor = tf.tensor1d(options.advantages);
+  const oneHot = tf.oneHot(actionTensor, options.params.actionDim);
+
+  const w1 = tf.variable(
+    tf.tensor2d(options.params.w1, [
+      options.params.inputDim,
+      options.params.hiddenDim,
+    ]),
+  );
+  const b1 = tf.variable(tf.tensor1d(options.params.b1));
+  const wp = tf.variable(
+    tf.tensor2d(options.params.wp, [
+      options.params.hiddenDim,
+      options.params.actionDim,
+    ]),
+  );
+  const bp = tf.variable(tf.tensor1d(options.params.bp));
+  const wv = tf.variable(
+    tf.randomNormal([options.params.hiddenDim, 1], 0, 0.02),
+  );
+  const bv = tf.variable(tf.scalar(0));
+
+  const optimizer = tf.train.adam(options.learningRate);
+  let finalLoss: number | null = null;
+  let bestLoss: number | null = null;
+  let bestParams: PolicyParams | null = null;
+  let divergenceDetected = false;
+  const clipLo = 1 - options.clipEpsilon;
+  const clipHi = 1 + options.clipEpsilon;
+  for (let epoch = 0; epoch < options.epochs; epoch += 1) {
+    const lossTensor = optimizer.minimize(() => {
+      const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
+      const logits = tf.add(tf.matMul(hidden, wp), bp);
+      const logProbs = tf.logSoftmax(logits, 1);
+      const probs = tf.softmax(logits, 1);
+      const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
+
+      const ratio = tf.exp(tf.sub(selectedLogProb, oldLogProbTensor));
+      const clippedRatio = tf.clipByValue(ratio, clipLo, clipHi);
+      const surrogateA = tf.mul(ratio, advantageTensor);
+      const surrogateB = tf.mul(clippedRatio, advantageTensor);
+      const policyLoss = tf.neg(tf.mean(tf.minimum(surrogateA, surrogateB)));
+
+      const values = tf.squeeze(tf.add(tf.matMul(hidden, wv), bv), [1]);
+      const valueResidual = tf.sub(values, returnsTensor);
+      const valueLoss = tf.mean(
+        tf.square(tf.clipByValue(valueResidual, -20, 20)),
+      );
+
+      const entropy = tf.neg(tf.mean(tf.sum(tf.mul(probs, logProbs), 1)));
+      return tf.add(
+        tf.add(policyLoss, tf.mul(valueLoss, tf.scalar(options.valueWeight))),
+        tf.neg(tf.mul(entropy, tf.scalar(options.entropyBeta))),
+      );
+    }, true);
+    if (lossTensor) {
+      const data = lossTensor.dataSync() as Float32Array;
+      const value = Number(data[0]);
+      finalLoss = Number.isFinite(value) ? value : Number.NaN;
+      lossTensor.dispose();
+      if (!Number.isFinite(finalLoss)) {
+        divergenceDetected = true;
+        break;
+      }
+      if (bestLoss == null || finalLoss < bestLoss) {
+        const candidate: PolicyParams = {
+          inputDim: options.params.inputDim,
+          hiddenDim: options.params.hiddenDim,
+          actionDim: options.params.actionDim,
+          w1: new Float32Array(w1.dataSync() as Float32Array),
+          b1: new Float32Array(b1.dataSync() as Float32Array),
+          wp: new Float32Array(wp.dataSync() as Float32Array),
+          bp: new Float32Array(bp.dataSync() as Float32Array),
+        };
+        if (
+          isFiniteArray(candidate.w1) &&
+          isFiniteArray(candidate.b1) &&
+          isFiniteArray(candidate.wp) &&
+          isFiniteArray(candidate.bp)
+        ) {
+          bestParams = candidate;
+          bestLoss = finalLoss;
+        }
+      }
+    }
+  }
+
+  const trainedCurrent: PolicyParams = {
+    inputDim: options.params.inputDim,
+    hiddenDim: options.params.hiddenDim,
+    actionDim: options.params.actionDim,
+    w1: new Float32Array(w1.dataSync() as Float32Array),
+    b1: new Float32Array(b1.dataSync() as Float32Array),
+    wp: new Float32Array(wp.dataSync() as Float32Array),
+    bp: new Float32Array(bp.dataSync() as Float32Array),
+  };
+  let trained = trainedCurrent;
+  let usedBestCheckpoint = false;
+  if (bestParams) {
+    trained = bestParams;
+    usedBestCheckpoint =
+      divergenceDetected ||
+      finalLoss == null ||
+      !Number.isFinite(finalLoss) ||
+      (bestLoss != null && bestLoss < finalLoss);
+    finalLoss = bestLoss;
+  }
+
+  tf.dispose([
+    inputTensor,
+    actionTensor,
+    returnsTensor,
+    oldLogProbTensor,
+    advantageTensor,
+    oneHot,
+    w1,
+    b1,
+    wp,
+    bp,
+    wv,
+    bv,
+  ]);
+  return { params: trained, finalLoss, bestLoss, usedBestCheckpoint };
 };
 
 const toArtifact = (
@@ -1080,6 +1305,7 @@ const toDraftSamples = (
 export const trainBotPolicyOneShot = async (
   config: BotTrainOneShotConfig,
 ): Promise<BotTrainOneShotResult> => {
+  const algorithm = normalizeTrainingAlgorithm(config.algorithm);
   const requestedEpisodes = Math.max(1, Math.trunc(config.episodes ?? 24));
   const episodes = Math.min(requestedEpisodes, BOT_TRAIN_MAX_EPISODES);
   const maxPiecesPerEpisode = Math.max(
@@ -1090,7 +1316,12 @@ export const trainBotPolicyOneShot = async (
     ),
   );
   const gamma = clamp(config.gamma ?? 0.995, 0.8, 0.9999);
-  const learningRate = clamp(config.learningRate ?? 0.0015, 1e-5, 0.05);
+  const defaultLearningRate = algorithm === 'ppo' ? 0.0003 : 0.0015;
+  const learningRate = clamp(
+    config.learningRate ?? defaultLearningRate,
+    1e-5,
+    0.05,
+  );
   const entropyBeta = clamp(config.entropyBeta ?? 0.01, 0, 1);
   const valueWeight = clamp(config.valueWeight ?? 0.5, 0, 10);
   const epochs = Math.max(1, Math.trunc(config.epochs ?? 6));
@@ -1103,6 +1334,7 @@ export const trainBotPolicyOneShot = async (
   );
 
   const inputDim = encodeObservation(
+    config.model,
     buildHeadlessGame({
       modeId: config.modeId,
       settings: config.settings,
@@ -1194,6 +1426,7 @@ export const trainBotPolicyOneShot = async (
   const observations = new Float32Array(transitions.length * inputDim);
   const actions = new Int32Array(transitions.length);
   const returns = new Float32Array(transitions.length);
+  const oldLogProbs = new Float32Array(transitions.length);
   for (let i = 0; i < transitions.length; i += 1) {
     const rowOffset = i * inputDim;
     const sourceObs = transitions[i].observation;
@@ -1210,18 +1443,59 @@ export const trainBotPolicyOneShot = async (
         : 0;
     const reward = transitions[i].reward ?? 0;
     returns[i] = Number.isFinite(reward) ? reward : 0;
+    const forward = forwardPolicy(params, sourceObs);
+    const probability = forward.probabilities[actions[i]] ?? 0;
+    const safeProb =
+      Number.isFinite(probability) && probability > 1e-8 ? probability : 1e-8;
+    oldLogProbs[i] = Math.log(safeProb);
   }
 
-  const trained = await trainWithTfjs({
-    params,
-    observations,
-    actions,
-    returns,
-    learningRate,
-    entropyBeta,
-    valueWeight,
-    epochs,
-  });
+  const advantages = new Float32Array(returns.length);
+  let advantageMean = 0;
+  for (let i = 0; i < returns.length; i += 1) {
+    const value = returns[i];
+    advantages[i] = value;
+    advantageMean += value;
+  }
+  advantageMean /= Math.max(1, advantages.length);
+  let advantageVar = 0;
+  for (let i = 0; i < advantages.length; i += 1) {
+    const centered = advantages[i] - advantageMean;
+    advantages[i] = centered;
+    advantageVar += centered * centered;
+  }
+  const advantageStd = Math.sqrt(
+    advantageVar / Math.max(1, advantages.length) + 1e-8,
+  );
+  for (let i = 0; i < advantages.length; i += 1) {
+    advantages[i] /= advantageStd;
+  }
+
+  const trained =
+    algorithm === 'ppo'
+      ? await trainWithTfjsPpo({
+          params,
+          observations,
+          actions,
+          returns,
+          oldLogProbs,
+          advantages,
+          learningRate,
+          entropyBeta,
+          valueWeight,
+          epochs,
+          clipEpsilon: BOT_PPO_CLIP_EPSILON,
+        })
+      : await trainWithTfjsReinforce({
+          params,
+          observations,
+          actions,
+          returns,
+          learningRate,
+          entropyBeta,
+          valueWeight,
+          epochs,
+        });
   if (
     !isFiniteArray(trained.params.w1) ||
     !isFiniteArray(trained.params.b1) ||
@@ -1256,16 +1530,18 @@ export const trainBotPolicyOneShot = async (
   const policyArtifact = toArtifact(config.modeId, params);
   policyArtifact.archId = config.modelAxes.arch;
   policyArtifact.queuePolicyId = config.modelAxes.queuePolicyId;
-  policyArtifact.pipelineId = 'bot_reinforce_v1';
+  policyArtifact.pipelineId =
+    algorithm === 'ppo' ? 'bot_ppo_v2' : 'bot_reinforce_v2';
   policyArtifact.pieceSourceProfile = pieceSourceProfile;
 
   return {
     ok: true,
     message:
-      `Bot policy training complete (episodes=${episodes}, transitions=${transitions.length}, ` +
+      `Bot policy training complete (${algorithm}, episodes=${episodes}, transitions=${transitions.length}, ` +
       `gamma=${gamma.toFixed(4)}, init=${initSource}, seed=${seed}` +
       `${requestedEpisodes > episodes ? `, episodes_capped=${episodes}` : ''}` +
       `${transitionCapHit ? `, transition_cap=${BOT_TRAIN_MAX_TRANSITIONS}` : ''}` +
+      `${trained.usedBestCheckpoint ? ', checkpoint=best_loss' : ''}` +
       ').',
     episodes,
     meanReturn: mean(episodeReturns),
@@ -1453,6 +1729,7 @@ export const runHeadlessBotValidation = async (
 };
 
 export type BotGuiInputSourceConfig = {
+  model: LoadedModel;
   policy: BotPolicyArtifact;
   apmInput: number;
   seed?: number;
@@ -1562,7 +1839,7 @@ export const createGuiInspectBotInputSource = (
       cooldownMs = Math.max(0, cooldownMs - Math.max(0, dtMs));
       if (state.active !== activeRef) {
         activeRef = state.active;
-        const observation = encodeObservation(state);
+        const observation = encodeObservation(config.model, state);
         const forward = forwardPolicy(params, observation);
         let actionIndex = 0;
         if (greedy) {

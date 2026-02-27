@@ -315,7 +315,7 @@ export function createAdminBotPolicyService(
         pipelineId:
           normalizeAxis(
             (artifactPayload as Record<string, unknown>).pipelineId,
-          ) ?? 'bot_reinforce_v1',
+          ) ?? 'bot_reinforce_v2',
         pieceSourceProfile:
           normalizeAxis(
             (artifactPayload as Record<string, unknown>).pieceSourceProfile,
@@ -347,7 +347,7 @@ export function createAdminBotPolicyService(
             archId: normalizeAxis(payload.selector.archId) ?? 'full',
             queuePolicyId:
               normalizeAxis(payload.selector.queuePolicyId) ?? 'default',
-            pipelineId: normalizeAxis(payload.pipelineId) ?? 'bot_reinforce_v1',
+            pipelineId: normalizeAxis(payload.pipelineId) ?? 'bot_reinforce_v2',
             pieceSourceProfile:
               normalizeAxis(payload.pieceSourceProfile) ?? 'bag7',
             policyArtifact: payload.policyArtifact,

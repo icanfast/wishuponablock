@@ -92,7 +92,7 @@ const DEFAULT_QUEUE_POLICY_ID = 'next_piece_v1';
 const DEFAULT_PERSONAL_MODEL_SOURCE = 'upload';
 const DEFAULT_BOT_ARCH_ID = 'full';
 const DEFAULT_BOT_QUEUE_POLICY_ID = 'default';
-const DEFAULT_BOT_PIPELINE_ID = 'bot_reinforce_v1';
+const DEFAULT_BOT_PIPELINE_ID = 'bot_reinforce_v2';
 const DEFAULT_BOT_PIECE_SOURCE_PROFILE = 'bag7';
 const OAUTH_STATE_COOKIE_NAME = 'wub_oauth_state';
 const OAUTH_STATE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -3028,6 +3028,95 @@ const handleListGlobalModels = async (
   }
 };
 
+const handleGetCurrentGlobalModel = async (
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  if (request.method !== 'GET') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405);
+  }
+  const selector = readPersonalModelSelectorFromRequest(request);
+  if (!selector) {
+    return jsonResponse({ error: 'Missing or invalid mode.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+  if (!env.MODELS_BUCKET) {
+    return jsonResponse({ error: 'Model storage is not configured.' }, 503, {
+      'cache-control': 'no-store',
+    });
+  }
+  const requestedGlobalModelId = asString(
+    new URL(request.url).searchParams.get('global_model_id'),
+  );
+  if (requestedGlobalModelId && !isValidGlobalModelId(requestedGlobalModelId)) {
+    return jsonResponse({ error: 'Missing or invalid global model id.' }, 400, {
+      'cache-control': 'no-store',
+    });
+  }
+
+  const nowMs = Date.now();
+  const auth = await requireAuthenticatedSession(request, env, nowMs);
+  if (auth.response) return auth.response;
+  const session = auth.session!;
+  try {
+    await touchSessionIfStale(env, session, nowMs);
+  } catch (error) {
+    console.error('[models] touch session failed', error);
+  }
+
+  try {
+    const globalModel = requestedGlobalModelId
+      ? await readGlobalModelById(env, selector, requestedGlobalModelId)
+      : ((await listGlobalModelsForSelector(env, selector))[0] ?? null);
+    if (!globalModel) {
+      return jsonResponse({ error: 'Global model not found.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+
+    const object = await env.MODELS_BUCKET.get(globalModel.r2Key);
+    if (!object) {
+      return jsonResponse({ error: 'Global model blob is missing.' }, 404, {
+        'cache-control': 'no-store',
+      });
+    }
+    const bytes = await object.arrayBuffer();
+    if (bytes.byteLength <= 0) {
+      return jsonResponse({ error: 'Global model payload is empty.' }, 503, {
+        'cache-control': 'no-store',
+      });
+    }
+    const responseHeaders = withBaseHeaders({
+      'cache-control': 'no-store',
+      'content-type': 'application/octet-stream',
+      'x-wub-global-model-id': globalModel.id,
+      'x-wub-global-model-mode': globalModel.modeId,
+      'x-wub-global-model-arch': globalModel.modelArch,
+      'x-wub-global-model-reward-profile': globalModel.rewardProfileId,
+      'x-wub-global-model-queue-policy': globalModel.queuePolicyId,
+      'x-wub-global-model-pipeline': globalModel.pipelineId,
+      'x-wub-global-model-size': String(bytes.byteLength),
+      'x-wub-global-model-created-at-ms': String(globalModel.createdAtMs),
+      'x-wub-global-model-updated-at-ms': String(globalModel.updatedAtMs),
+    });
+    if (globalModel.label) {
+      responseHeaders.set('x-wub-global-model-label', globalModel.label);
+    }
+    if (globalModel.sha256) {
+      responseHeaders.set('x-wub-global-model-sha256', globalModel.sha256);
+    }
+    return binaryResponse(bytes, 200, responseHeaders);
+  } catch (error) {
+    console.error('[models] global current get failed', error);
+    return jsonResponse(
+      { error: 'Global model registry is currently unavailable.' },
+      503,
+      { 'cache-control': 'no-store' },
+    );
+  }
+};
+
 const handleResetCurrentPersonalModel = async (
   request: Request,
   env: Env,
@@ -5131,6 +5220,10 @@ export default {
 
     if (url.pathname === '/api/models/global/list') {
       return handleListGlobalModels(request, env);
+    }
+
+    if (url.pathname === '/api/models/global/current') {
+      return handleGetCurrentGlobalModel(request, env);
     }
 
     if (url.pathname === '/api/models/me/reset') {

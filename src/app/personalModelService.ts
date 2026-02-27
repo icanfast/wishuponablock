@@ -45,6 +45,21 @@ export type PersonalGlobalModel = {
   updatedAtMs: number | null;
 };
 
+export type PersonalGlobalModelDownload = {
+  id: string;
+  mode: string;
+  arch: string | null;
+  rewardProfileId: string | null;
+  queuePolicyId: string | null;
+  pipelineId: string | null;
+  label: string | null;
+  sha256: string | null;
+  sizeBytes: number;
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+  bytes: ArrayBuffer;
+};
+
 export type PersonalModelResetResult = {
   model: PersonalModelUpload;
   globalModelId: string | null;
@@ -69,6 +84,11 @@ export type PersonalModelService = {
     mode: string,
     selector?: PersonalModelSelector,
   ) => Promise<PersonalGlobalModel[]>;
+  downloadGlobalCurrent: (
+    mode: string,
+    selector?: PersonalModelSelector,
+    globalModelId?: string | null,
+  ) => Promise<PersonalGlobalModelDownload>;
   resetCurrentFromGlobal: (
     mode: string,
     globalModelId?: string | null,
@@ -325,6 +345,70 @@ export function createPersonalModelService(
         });
       }
       return models;
+    },
+    downloadGlobalCurrent: async (mode, selector, globalModelId) => {
+      const normalizedGlobalModelId = asString(globalModelId);
+      const url = new URL(
+        withSelector('/models/global/current', mode, selector),
+        window.location.origin,
+      );
+      if (normalizedGlobalModelId) {
+        url.searchParams.set('global_model_id', normalizedGlobalModelId);
+      }
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw withStatusError(
+          await parseErrorMessage(response),
+          response.status,
+        );
+      }
+      const bytes = await response.arrayBuffer();
+      const id = asString(response.headers.get('x-wub-global-model-id'));
+      if (!id) {
+        throw new Error('Global model response is missing id metadata.');
+      }
+      const modeHeader = asString(
+        response.headers.get('x-wub-global-model-mode'),
+      );
+      const arch = asString(response.headers.get('x-wub-global-model-arch'));
+      const rewardProfileId = asString(
+        response.headers.get('x-wub-global-model-reward-profile'),
+      );
+      const queuePolicyId = asString(
+        response.headers.get('x-wub-global-model-queue-policy'),
+      );
+      const pipelineId = asString(
+        response.headers.get('x-wub-global-model-pipeline'),
+      );
+      const label = asString(response.headers.get('x-wub-global-model-label'));
+      const sha256 = asString(
+        response.headers.get('x-wub-global-model-sha256'),
+      );
+      const sizeHeader = asInt(response.headers.get('x-wub-global-model-size'));
+      const createdAtMs = asInt(
+        response.headers.get('x-wub-global-model-created-at-ms'),
+      );
+      const updatedAtMs = asInt(
+        response.headers.get('x-wub-global-model-updated-at-ms'),
+      );
+      return {
+        id,
+        mode: modeHeader ?? normalizeMode(mode),
+        arch,
+        rewardProfileId,
+        queuePolicyId,
+        pipelineId,
+        label,
+        sha256,
+        sizeBytes: sizeHeader ?? bytes.byteLength,
+        createdAtMs,
+        updatedAtMs,
+        bytes,
+      };
     },
     resetCurrentFromGlobal: async (mode, globalModelId, selector) => {
       const normalizedGlobalModelId = asString(globalModelId);
