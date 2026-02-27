@@ -269,6 +269,16 @@ type Transition = {
   reward: number | null;
 };
 
+const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
+  inputDim: params.inputDim,
+  hiddenDim: params.hiddenDim,
+  actionDim: params.actionDim,
+  w1: new Float32Array(params.w1),
+  b1: new Float32Array(params.b1),
+  wp: new Float32Array(params.wp),
+  bp: new Float32Array(params.bp),
+});
+
 type RolloutResult = {
   transitions: Transition[];
   episodeReturn: number;
@@ -946,9 +956,20 @@ const trainWithTfjsReinforce = async (options: {
   const optimizer = tf.train.adam(options.learningRate);
   let finalLoss: number | null = null;
   let bestLoss: number | null = null;
-  let bestParams: PolicyParams | null = null;
+  let bestParams: PolicyParams = clonePolicyParams(options.params);
+  let hasBestFiniteLoss = false;
   let divergenceDetected = false;
+  const snapshotCurrentParams = (): PolicyParams => ({
+    inputDim: options.params.inputDim,
+    hiddenDim: options.params.hiddenDim,
+    actionDim: options.params.actionDim,
+    w1: new Float32Array(w1.dataSync() as Float32Array),
+    b1: new Float32Array(b1.dataSync() as Float32Array),
+    wp: new Float32Array(wp.dataSync() as Float32Array),
+    bp: new Float32Array(bp.dataSync() as Float32Array),
+  });
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
+    const checkpointBeforeStep = snapshotCurrentParams();
     const lossTensor = optimizer.minimize(() => {
       const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
       const logits = tf.add(tf.matMul(hidden, wp), bp);
@@ -989,49 +1010,30 @@ const trainWithTfjsReinforce = async (options: {
         divergenceDetected = true;
         break;
       }
-      if (bestLoss == null || finalLoss < bestLoss) {
-        const candidate: PolicyParams = {
-          inputDim: options.params.inputDim,
-          hiddenDim: options.params.hiddenDim,
-          actionDim: options.params.actionDim,
-          w1: new Float32Array(w1.dataSync() as Float32Array),
-          b1: new Float32Array(b1.dataSync() as Float32Array),
-          wp: new Float32Array(wp.dataSync() as Float32Array),
-          bp: new Float32Array(bp.dataSync() as Float32Array),
-        };
-        if (
-          isFiniteArray(candidate.w1) &&
-          isFiniteArray(candidate.b1) &&
-          isFiniteArray(candidate.wp) &&
-          isFiniteArray(candidate.bp)
-        ) {
-          bestParams = candidate;
-          bestLoss = finalLoss;
-        }
+      if (
+        isFiniteArray(checkpointBeforeStep.w1) &&
+        isFiniteArray(checkpointBeforeStep.b1) &&
+        isFiniteArray(checkpointBeforeStep.wp) &&
+        isFiniteArray(checkpointBeforeStep.bp) &&
+        (!hasBestFiniteLoss || bestLoss == null || finalLoss < bestLoss)
+      ) {
+        bestParams = checkpointBeforeStep;
+        bestLoss = finalLoss;
+        hasBestFiniteLoss = true;
       }
     }
   }
 
-  const trainedCurrent: PolicyParams = {
-    inputDim: options.params.inputDim,
-    hiddenDim: options.params.hiddenDim,
-    actionDim: options.params.actionDim,
-    w1: new Float32Array(w1.dataSync() as Float32Array),
-    b1: new Float32Array(b1.dataSync() as Float32Array),
-    wp: new Float32Array(wp.dataSync() as Float32Array),
-    bp: new Float32Array(bp.dataSync() as Float32Array),
-  };
-  let trained = trainedCurrent;
-  let usedBestCheckpoint = false;
-  if (bestParams) {
-    trained = bestParams;
-    usedBestCheckpoint =
-      divergenceDetected ||
+  const trained = hasBestFiniteLoss
+    ? bestParams
+    : clonePolicyParams(options.params);
+  const usedBestCheckpoint =
+    hasBestFiniteLoss &&
+    (divergenceDetected ||
       finalLoss == null ||
       !Number.isFinite(finalLoss) ||
-      (bestLoss != null && bestLoss < finalLoss);
-    finalLoss = bestLoss;
-  }
+      (bestLoss != null && bestLoss < finalLoss));
+  finalLoss = hasBestFiniteLoss ? bestLoss : null;
 
   tf.dispose([
     inputTensor,
@@ -1118,11 +1120,22 @@ const trainWithTfjsPpo = async (options: {
   const optimizer = tf.train.adam(options.learningRate);
   let finalLoss: number | null = null;
   let bestLoss: number | null = null;
-  let bestParams: PolicyParams | null = null;
+  let bestParams: PolicyParams = clonePolicyParams(options.params);
+  let hasBestFiniteLoss = false;
   let divergenceDetected = false;
+  const snapshotCurrentParams = (): PolicyParams => ({
+    inputDim: options.params.inputDim,
+    hiddenDim: options.params.hiddenDim,
+    actionDim: options.params.actionDim,
+    w1: new Float32Array(w1.dataSync() as Float32Array),
+    b1: new Float32Array(b1.dataSync() as Float32Array),
+    wp: new Float32Array(wp.dataSync() as Float32Array),
+    bp: new Float32Array(bp.dataSync() as Float32Array),
+  });
   const clipLo = 1 - options.clipEpsilon;
   const clipHi = 1 + options.clipEpsilon;
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
+    const checkpointBeforeStep = snapshotCurrentParams();
     const lossTensor = optimizer.minimize(() => {
       const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
       const logits = tf.add(tf.matMul(hidden, wp), bp);
@@ -1157,49 +1170,30 @@ const trainWithTfjsPpo = async (options: {
         divergenceDetected = true;
         break;
       }
-      if (bestLoss == null || finalLoss < bestLoss) {
-        const candidate: PolicyParams = {
-          inputDim: options.params.inputDim,
-          hiddenDim: options.params.hiddenDim,
-          actionDim: options.params.actionDim,
-          w1: new Float32Array(w1.dataSync() as Float32Array),
-          b1: new Float32Array(b1.dataSync() as Float32Array),
-          wp: new Float32Array(wp.dataSync() as Float32Array),
-          bp: new Float32Array(bp.dataSync() as Float32Array),
-        };
-        if (
-          isFiniteArray(candidate.w1) &&
-          isFiniteArray(candidate.b1) &&
-          isFiniteArray(candidate.wp) &&
-          isFiniteArray(candidate.bp)
-        ) {
-          bestParams = candidate;
-          bestLoss = finalLoss;
-        }
+      if (
+        isFiniteArray(checkpointBeforeStep.w1) &&
+        isFiniteArray(checkpointBeforeStep.b1) &&
+        isFiniteArray(checkpointBeforeStep.wp) &&
+        isFiniteArray(checkpointBeforeStep.bp) &&
+        (!hasBestFiniteLoss || bestLoss == null || finalLoss < bestLoss)
+      ) {
+        bestParams = checkpointBeforeStep;
+        bestLoss = finalLoss;
+        hasBestFiniteLoss = true;
       }
     }
   }
 
-  const trainedCurrent: PolicyParams = {
-    inputDim: options.params.inputDim,
-    hiddenDim: options.params.hiddenDim,
-    actionDim: options.params.actionDim,
-    w1: new Float32Array(w1.dataSync() as Float32Array),
-    b1: new Float32Array(b1.dataSync() as Float32Array),
-    wp: new Float32Array(wp.dataSync() as Float32Array),
-    bp: new Float32Array(bp.dataSync() as Float32Array),
-  };
-  let trained = trainedCurrent;
-  let usedBestCheckpoint = false;
-  if (bestParams) {
-    trained = bestParams;
-    usedBestCheckpoint =
-      divergenceDetected ||
+  const trained = hasBestFiniteLoss
+    ? bestParams
+    : clonePolicyParams(options.params);
+  const usedBestCheckpoint =
+    hasBestFiniteLoss &&
+    (divergenceDetected ||
       finalLoss == null ||
       !Number.isFinite(finalLoss) ||
-      (bestLoss != null && bestLoss < finalLoss);
-    finalLoss = bestLoss;
-  }
+      (bestLoss != null && bestLoss < finalLoss));
+  finalLoss = hasBestFiniteLoss ? bestLoss : null;
 
   tf.dispose([
     inputTensor,
