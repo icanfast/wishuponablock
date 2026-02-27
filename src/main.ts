@@ -70,6 +70,7 @@ import {
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
+  type TrajectoryReplayStepV1,
   type TrajectorySessionMetaV1,
   type TrajectorySessionV1,
 } from './core/trajectoryProtocol';
@@ -1676,6 +1677,18 @@ async function boot() {
           samplingMs: sample.samplingMs,
           totalDecisionMs: sample.totalDecisionMs,
           reward: sample.reward,
+          replay: sample.replay
+            ? {
+                lockPiece: sample.replay.lockPiece,
+                lockRotation: sample.replay.lockRotation,
+                lockX: sample.replay.lockX,
+                lockY: sample.replay.lockY,
+                holdUsed: sample.replay.holdUsed,
+                gameTimeMs: sample.replay.gameTimeMs,
+                totalLinesCleared: sample.replay.totalLinesCleared,
+                score: sample.replay.score,
+              }
+            : undefined,
         }),
       );
       const rewards = computeTrajectoryRewards(
@@ -1707,6 +1720,18 @@ async function boot() {
           logits: [...sample.logits],
           probabilities: [...sample.probabilities],
           reward: rewards.rewards[index] ?? null,
+          replay: sample.replay
+            ? {
+                lockPiece: sample.replay.lockPiece,
+                lockRotation: sample.replay.lockRotation,
+                lockX: sample.replay.lockX,
+                lockY: sample.replay.lockY,
+                holdUsed: sample.replay.holdUsed,
+                gameTimeMs: sample.replay.gameTimeMs,
+                totalLinesCleared: sample.replay.totalLinesCleared,
+                score: sample.replay.score,
+              }
+            : undefined,
         })),
         meta: {
           outcome: draft.outcome,
@@ -1962,6 +1987,8 @@ async function boot() {
   let activeTrajectoryRun: TrajectoryRunState | null = null;
   let pendingTrajectoryRunModeId: string | null = null;
   let pendingTrajectorySession: TrajectorySessionV1 | null = null;
+  let pendingTrajectoryReplayStep: TrajectoryReplayStepV1 | null = null;
+  let holdUsedSinceLastLock = false;
   let lastTrajectoryMinSamplesRequired =
     DEFAULT_MIN_TRAJECTORY_SAMPLES_FOR_UPLOAD;
   let lastTrajectoryUploadMessage = 'No uploads yet.';
@@ -2040,6 +2067,20 @@ async function boot() {
           typeof reward === 'number' && Number.isFinite(reward)
             ? reward
             : (sample.reward ?? null),
+        ...(sample.replay
+          ? {
+              replay: {
+                lockPiece: sample.replay.lockPiece,
+                lockRotation: sample.replay.lockRotation,
+                lockX: sample.replay.lockX,
+                lockY: sample.replay.lockY,
+                holdUsed: sample.replay.holdUsed,
+                gameTimeMs: sample.replay.gameTimeMs,
+                totalLinesCleared: sample.replay.totalLinesCleared,
+                score: sample.replay.score,
+              },
+            }
+          : {}),
       };
     });
 
@@ -2114,6 +2155,8 @@ async function boot() {
     const run = activeTrajectoryRun;
     activeTrajectoryRun = null;
     pendingTrajectoryRunModeId = null;
+    pendingTrajectoryReplayStep = null;
+    holdUsedSinceLastLock = false;
     if (!run) return null;
     lastTrajectoryMinSamplesRequired = run.minSamplesForUpload;
     const session = buildTrajectorySession(run, outcome, terminal);
@@ -2330,6 +2373,17 @@ async function boot() {
     }
     pendingLineClearSound = false;
     const state = session.getGame().state;
+    pendingTrajectoryReplayStep = {
+      lockPiece: state.active.k,
+      lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+      lockX: Math.trunc(state.active.x),
+      lockY: Math.trunc(state.active.y),
+      holdUsed: holdUsedSinceLastLock,
+      gameTimeMs: Math.max(0, Math.trunc(state.timeMs)),
+      totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+      score: Math.max(0, Math.trunc(state.score)),
+    };
+    holdUsedSinceLastLock = false;
     const linesLeft =
       state.lineGoal != null
         ? Math.max(0, state.lineGoal - state.totalLinesCleared)
@@ -2350,6 +2404,7 @@ async function boot() {
   };
   const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
+    holdUsedSinceLastLock = true;
     const state = session.getGame().state;
     const linesLeft =
       state.lineGoal != null
@@ -2379,14 +2434,19 @@ async function boot() {
       restartRecordingSession();
       previousRunEnded = false;
       activeTrajectoryRun = null;
+      pendingTrajectoryReplayStep = null;
+      holdUsedSinceLastLock = false;
       scheduleTrajectoryRunStart(modeController.getState().mode.id);
     },
     onModelDecision: (decision) => {
       const modeId = modeController.getState().mode.id;
+      const replay = pendingTrajectoryReplayStep;
+      pendingTrajectoryReplayStep = null;
       trajectoryBuffer.recordDecision({
         modeId,
         modelAxes: getActiveModelAxes(),
         decision,
+        replay,
       });
     },
     setLockEffectsSuppressed: (value) => {

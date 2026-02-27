@@ -40,3 +40,6 @@ tools/ml/exports/
 *.njsproj
 *.sln
 *.sw?
+
+# Other
+RL-bot-deep-research-report.md

@@ -81,4 +81,41 @@ describe('trajectory protocol parser', () => {
     expect(parsed.value.meta?.modelArchId).toBe('full');
     expect(parsed.value.meta?.modelArch).toContain('conv12x12');
   });
+
+  it('parses optional replay telemetry on samples', () => {
+    const payload = makePayload(8);
+    (payload.samples[0] as Record<string, unknown>).replay = {
+      lockPiece: 'T',
+      lockRotation: 1,
+      lockX: 4,
+      lockY: 18,
+      holdUsed: true,
+      gameTimeMs: 5000,
+      totalLinesCleared: 7,
+      score: 1200,
+    };
+    const parsed = parseTrajectorySessionV1(payload, { minSamples: 8 });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.samples[0].replay?.lockPiece).toBe('T');
+    expect(parsed.value.samples[0].replay?.holdUsed).toBe(true);
+  });
+
+  it('rejects invalid replay telemetry payloads', () => {
+    const payload = makePayload(8);
+    (payload.samples[0] as Record<string, unknown>).replay = {
+      lockPiece: 'I',
+      lockRotation: 9,
+      lockX: 4,
+      lockY: 18,
+      holdUsed: false,
+      gameTimeMs: 1000,
+      totalLinesCleared: 0,
+      score: 0,
+    };
+    const parsed = parseTrajectorySessionV1(payload, { minSamples: 8 });
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain('Invalid trajectory sample');
+  });
 });

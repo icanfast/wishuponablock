@@ -29,6 +29,17 @@ export type TrajectorySessionMetaV1 = {
   pieceSourceProfile?: string;
 };
 
+export type TrajectoryReplayStepV1 = {
+  lockPiece: PieceKind;
+  lockRotation: number;
+  lockX: number;
+  lockY: number;
+  holdUsed: boolean;
+  gameTimeMs: number;
+  totalLinesCleared: number;
+  score: number;
+};
+
 export type TrajectorySessionSampleV1 = {
   id: string;
   createdAtMs: number;
@@ -44,6 +55,7 @@ export type TrajectorySessionSampleV1 = {
   samplingMs: number;
   totalDecisionMs: number;
   reward: number | null;
+  replay?: TrajectoryReplayStepV1;
 };
 
 export type TrajectorySessionV1 = {
@@ -117,6 +129,11 @@ const asFiniteNumber = (
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   if (options.min != null && value < options.min) return null;
   if (options.max != null && value > options.max) return null;
+  return value;
+};
+
+const asBoolean = (value: unknown): boolean | null => {
+  if (typeof value !== 'boolean') return null;
   return value;
 };
 
@@ -237,6 +254,51 @@ const parseMeta = (value: unknown): TrajectorySessionMetaV1 | null => {
   return Object.keys(meta).length > 0 ? meta : null;
 };
 
+const parseReplay = (
+  value: unknown,
+  options: { maxRows: number; maxCols: number },
+): TrajectoryReplayStepV1 | null => {
+  const obj = asObject(value);
+  if (!obj) return null;
+
+  const lockPiece = asPiece(obj.lockPiece);
+  const lockRotation = asInt(obj.lockRotation, { min: 0, max: 3 });
+  const lockX = asInt(obj.lockX, { min: -8, max: options.maxCols + 8 });
+  const lockY = asInt(obj.lockY, { min: -8, max: options.maxRows + 8 });
+  const holdUsed = asBoolean(obj.holdUsed);
+  const gameTimeMs = asInt(obj.gameTimeMs, {
+    min: 0,
+    max: 7 * 24 * 60 * 60 * 1000,
+  });
+  const totalLinesCleared = asInt(obj.totalLinesCleared, {
+    min: 0,
+    max: 1_000_000,
+  });
+  const score = asInt(obj.score, { min: 0, max: 1_000_000_000 });
+  if (
+    !lockPiece ||
+    lockRotation == null ||
+    lockX == null ||
+    lockY == null ||
+    holdUsed == null ||
+    gameTimeMs == null ||
+    totalLinesCleared == null ||
+    score == null
+  ) {
+    return null;
+  }
+  return {
+    lockPiece,
+    lockRotation,
+    lockX,
+    lockY,
+    holdUsed,
+    gameTimeMs,
+    totalLinesCleared,
+    score,
+  };
+};
+
 const parseSample = (
   value: unknown,
   options: { maxRows: number; maxCols: number },
@@ -291,6 +353,9 @@ const parseSample = (
       : asFiniteNumber(obj.reward, { min: -1e9, max: 1e9 });
   if (obj.reward != null && reward == null) return null;
 
+  const replay = obj.replay == null ? null : parseReplay(obj.replay, options);
+  if (obj.replay != null && replay == null) return null;
+
   return {
     id,
     createdAtMs,
@@ -306,6 +371,7 @@ const parseSample = (
     samplingMs,
     totalDecisionMs,
     reward,
+    ...(replay ? { replay } : {}),
   };
 };
 

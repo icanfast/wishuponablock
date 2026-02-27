@@ -10,6 +10,7 @@ import type { Board, GameState, InputFrame, PieceKind } from '../core/types';
 import { PIECES } from '../core/types';
 import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
+import type { TrajectoryReplayStepV1 } from '../core/trajectoryProtocol';
 import { applyModeSettings, runModeStart } from './modeService';
 
 const TFJS_CDN_URL = 'https://esm.sh/@tensorflow/tfjs@4.22.0';
@@ -164,6 +165,7 @@ export type BotTrajectoryDecisionSample = {
   samplingMs: number;
   totalDecisionMs: number;
   reward: number | null;
+  replay?: TrajectoryReplayStepV1;
 };
 
 export type BotTrajectoryDraft = {
@@ -282,7 +284,10 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
 type RolloutResult = {
   transitions: Transition[];
   episodeReturn: number;
-  decisions: ModelGeneratorDecisionEvent[];
+  decisions: Array<{
+    event: ModelGeneratorDecisionEvent;
+    replay: TrajectoryReplayStepV1 | null;
+  }>;
   tickDurationsMs: number[];
   steps: number;
   piecesPlaced: number;
@@ -644,6 +649,8 @@ const buildHeadlessGame = (config: {
   pieceSourceProfile: BotPieceSourceProfile;
   seed: number;
   onDecision: (event: ModelGeneratorDecisionEvent) => void;
+  onPieceLock?: (state: GameState) => void;
+  onHold?: (state: GameState) => void;
 }): { game: Game; runner: GameRunner } => {
   const mode = getMode(config.modeId);
   const merged = applyModeSettings(
@@ -678,6 +685,12 @@ const buildHeadlessGame = (config: {
       queuePolicyId: config.modelAxes.queuePolicyId,
       onModelDecision: config.onDecision,
     }),
+    onPieceLock: () => {
+      config.onPieceLock?.(game.state);
+    },
+    onHold: () => {
+      config.onHold?.(game.state);
+    },
   });
   runModeStart(game, mode, {});
   return {
@@ -744,7 +757,12 @@ const runRollout = (config: {
   maxPieces: number;
   greedy: boolean;
 }): RolloutResult => {
-  const decisions: ModelGeneratorDecisionEvent[] = [];
+  const decisions: Array<{
+    event: ModelGeneratorDecisionEvent;
+    replay: TrajectoryReplayStepV1 | null;
+  }> = [];
+  let pendingReplayStep: TrajectoryReplayStepV1 | null = null;
+  let holdUsedSinceLastLock = false;
   const { game, runner } = buildHeadlessGame({
     modeId: config.modeId,
     settings: config.settings,
@@ -753,8 +771,40 @@ const runRollout = (config: {
     modelAxes: config.modelAxes,
     pieceSourceProfile: config.pieceSourceProfile,
     seed: config.seed,
+    onPieceLock: (state) => {
+      pendingReplayStep = {
+        lockPiece: state.active.k,
+        lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+        lockX: Math.trunc(state.active.x),
+        lockY: Math.trunc(state.active.y),
+        holdUsed: holdUsedSinceLastLock,
+        gameTimeMs: Math.max(0, Math.trunc(state.timeMs)),
+        totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+        score: Math.max(0, Math.trunc(state.score)),
+      };
+      holdUsedSinceLastLock = false;
+    },
+    onHold: () => {
+      holdUsedSinceLastLock = true;
+    },
     onDecision: (event) => {
-      decisions.push(cloneDecision(event));
+      const replay = pendingReplayStep;
+      pendingReplayStep = null;
+      decisions.push({
+        event: cloneDecision(event),
+        replay: replay
+          ? {
+              lockPiece: replay.lockPiece,
+              lockRotation: replay.lockRotation,
+              lockX: replay.lockX,
+              lockY: replay.lockY,
+              holdUsed: replay.holdUsed,
+              gameTimeMs: replay.gameTimeMs,
+              totalLinesCleared: replay.totalLinesCleared,
+              score: replay.score,
+            }
+          : null,
+      });
     },
   });
   const rng = new XorShift32(config.seed ^ 0x9e3779b9);
@@ -1267,11 +1317,16 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
 };
 
 const toDraftSamples = (
-  decisions: ModelGeneratorDecisionEvent[],
+  decisions: Array<{
+    event: ModelGeneratorDecisionEvent;
+    replay: TrajectoryReplayStepV1 | null;
+  }>,
   startedAtMs: number,
 ): BotTrajectoryDecisionSample[] => {
-  const startedPerfMs = decisions.length > 0 ? decisions[0].wallTimeMs : 0;
-  return decisions.map((decision, index) => {
+  const startedPerfMs =
+    decisions.length > 0 ? decisions[0].event.wallTimeMs : 0;
+  return decisions.map((entry, index) => {
+    const decision = entry.event;
     const createdAtMs =
       startedAtMs +
       Math.max(0, Math.trunc(decision.wallTimeMs - startedPerfMs));
@@ -1292,6 +1347,18 @@ const toDraftSamples = (
       samplingMs: decision.samplingMs,
       totalDecisionMs: decision.totalMs,
       reward: null,
+      replay: entry.replay
+        ? {
+            lockPiece: entry.replay.lockPiece,
+            lockRotation: entry.replay.lockRotation,
+            lockX: entry.replay.lockX,
+            lockY: entry.replay.lockY,
+            holdUsed: entry.replay.holdUsed,
+            gameTimeMs: entry.replay.gameTimeMs,
+            totalLinesCleared: entry.replay.totalLinesCleared,
+            score: entry.replay.score,
+          }
+        : undefined,
     };
   });
 };
@@ -1629,8 +1696,8 @@ export const runCapabilityBenchmark = async (
       greedy: true,
     });
     for (const decision of rollout.decisions) {
-      if (Number.isFinite(decision.totalMs)) {
-        decisionDurations.push(Math.max(0, decision.totalMs));
+      if (Number.isFinite(decision.event.totalMs)) {
+        decisionDurations.push(Math.max(0, decision.event.totalMs));
       }
     }
     tickDurations.push(...rollout.tickDurationsMs);
@@ -1700,7 +1767,9 @@ export const runHeadlessBotValidation = async (
   });
   const decisionDurations = rollout.decisions
     .map((decision) =>
-      Number.isFinite(decision.totalMs) ? Math.max(0, decision.totalMs) : null,
+      Number.isFinite(decision.event.totalMs)
+        ? Math.max(0, decision.event.totalMs)
+        : null,
     )
     .filter((value): value is number => value != null);
   const totalReward = rollout.transitions.reduce(

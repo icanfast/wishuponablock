@@ -1,5 +1,6 @@
 import type { Board, PieceKind } from '../core/types';
 import type { ModelGeneratorDecisionEvent } from '../core/modelGenerator';
+import type { TrajectoryReplayStepV1 } from '../core/trajectoryProtocol';
 
 export const TRAJECTORY_SCHEMA_V1 = 'wishuponablock.trajectory.v1';
 
@@ -29,6 +30,7 @@ export type TrajectoryDecisionSample = {
   samplingMs: number;
   totalDecisionMs: number;
   reward: number | null;
+  replay?: TrajectoryReplayStepV1;
 };
 
 export type TrajectoryBufferStats = {
@@ -43,6 +45,7 @@ export type TrajectoryBuffer = {
     modeId: string;
     modelAxes: TrajectorySampleAxes;
     decision: ModelGeneratorDecisionEvent;
+    replay?: TrajectoryReplayStepV1 | null;
   }) => TrajectoryDecisionSample;
   listSamples: (options?: {
     modeId?: string;
@@ -91,6 +94,20 @@ const cloneDecision = (
   pieces: [...sample.pieces],
   logits: [...sample.logits],
   probabilities: [...sample.probabilities],
+  ...(sample.replay
+    ? {
+        replay: {
+          lockPiece: sample.replay.lockPiece,
+          lockRotation: sample.replay.lockRotation,
+          lockX: sample.replay.lockX,
+          lockY: sample.replay.lockY,
+          holdUsed: sample.replay.holdUsed,
+          gameTimeMs: sample.replay.gameTimeMs,
+          totalLinesCleared: sample.replay.totalLinesCleared,
+          score: sample.replay.score,
+        },
+      }
+    : {}),
 });
 
 export function createTrajectoryBuffer(
@@ -107,7 +124,7 @@ export function createTrajectoryBuffer(
   };
 
   return {
-    recordDecision: ({ modeId, modelAxes, decision }) => {
+    recordDecision: ({ modeId, modelAxes, decision, replay }) => {
       const actionIndex = decision.pieces.indexOf(decision.action);
       const deliberationMs =
         lastDecisionAtMs == null
@@ -144,6 +161,26 @@ export function createTrajectoryBuffer(
         samplingMs: decision.samplingMs,
         totalDecisionMs: decision.totalMs,
         reward: null,
+        ...(replay
+          ? {
+              replay: {
+                lockPiece: replay.lockPiece,
+                lockRotation: Math.max(
+                  0,
+                  Math.min(3, Math.trunc(replay.lockRotation)),
+                ),
+                lockX: Math.trunc(replay.lockX),
+                lockY: Math.trunc(replay.lockY),
+                holdUsed: Boolean(replay.holdUsed),
+                gameTimeMs: Math.max(0, Math.trunc(replay.gameTimeMs)),
+                totalLinesCleared: Math.max(
+                  0,
+                  Math.trunc(replay.totalLinesCleared),
+                ),
+                score: Math.max(0, Math.trunc(replay.score)),
+              },
+            }
+          : {}),
       };
       samples.push(sample);
       trimToMax();
