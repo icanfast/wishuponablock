@@ -26,6 +26,9 @@ const EMPTY_INPUT: InputFrame = {
 const ACTION_ROTATIONS = ['none', 'cw', 'ccw', '180'] as const;
 const ACTION_MOVE_X = [-3, -2, -1, 0, 1, 2, 3, 4] as const;
 const PIECE_INDEX = new Map(PIECES.map((piece, idx) => [piece, idx]));
+const BOT_TRAIN_MAX_EPISODES = 4096;
+const BOT_TRAIN_MAX_PIECES_PER_EPISODE = 512;
+const BOT_TRAIN_MAX_TRANSITIONS = 200_000;
 const HOLD_NONE_INDEX = PIECES.length;
 
 type TfTensor = {
@@ -63,6 +66,7 @@ type TfjsModule = {
   square: (x: TfTensor) => TfTensor;
   sqrt: (x: TfTensor) => TfTensor;
   div: (a: TfTensor, b: TfTensor) => TfTensor;
+  clipByValue: (x: TfTensor, min: number, max: number) => TfTensor;
   stopGradient?: (x: TfTensor) => TfTensor;
   neg: (x: TfTensor) => TfTensor;
   train: {
@@ -442,6 +446,13 @@ const normalizePieceSourceProfile = (
   value: BotPieceSourceProfile | undefined,
 ): BotPieceSourceProfile =>
   value === 'active_generator' ? 'active_generator' : 'bag7';
+
+const isFiniteArray = (values: Float32Array): boolean => {
+  for (let i = 0; i < values.length; i += 1) {
+    if (!Number.isFinite(values[i])) return false;
+  }
+  return true;
+};
 
 const nextRandomSeed = (): number => {
   if (typeof globalThis.crypto?.getRandomValues === 'function') {
@@ -939,7 +950,8 @@ const trainWithTfjs = async (options: {
         detachedNormAdv.dispose();
       }
       const entropy = tf.neg(tf.mean(tf.sum(tf.mul(probs, logProbs), 1)));
-      const valueLoss = tf.mean(tf.square(rawAdvantage));
+      const clippedAdvantage = tf.clipByValue(rawAdvantage, -20, 20);
+      const valueLoss = tf.mean(tf.square(clippedAdvantage));
       return tf.add(
         tf.add(policyLoss, tf.mul(valueLoss, tf.scalar(options.valueWeight))),
         tf.neg(tf.mul(entropy, tf.scalar(options.entropyBeta))),
@@ -947,8 +959,12 @@ const trainWithTfjs = async (options: {
     }, true);
     if (lossTensor) {
       const data = lossTensor.dataSync() as Float32Array;
-      finalLoss = Number(data[0]);
+      const value = Number(data[0]);
+      finalLoss = Number.isFinite(value) ? value : Number.NaN;
       lossTensor.dispose();
+      if (!Number.isFinite(finalLoss)) {
+        break;
+      }
     }
   }
 
@@ -996,15 +1012,40 @@ const toArtifact = (
   },
 });
 
-const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => ({
-  inputDim: policy.inputDim,
-  hiddenDim: policy.hiddenDim,
-  actionDim: policy.actionDim,
-  w1: new Float32Array(policy.weights.w1),
-  b1: new Float32Array(policy.weights.b1),
-  wp: new Float32Array(policy.weights.wp),
-  bp: new Float32Array(policy.weights.bp),
-});
+const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
+  const inputDim = Math.max(1, Math.trunc(policy.inputDim));
+  const hiddenDim = Math.max(1, Math.trunc(policy.hiddenDim));
+  const actionDim = Math.max(1, Math.trunc(policy.actionDim));
+  const w1 = new Float32Array(policy.weights.w1);
+  const b1 = new Float32Array(policy.weights.b1);
+  const wp = new Float32Array(policy.weights.wp);
+  const bp = new Float32Array(policy.weights.bp);
+  if (
+    w1.length !== inputDim * hiddenDim ||
+    b1.length !== hiddenDim ||
+    wp.length !== hiddenDim * actionDim ||
+    bp.length !== actionDim
+  ) {
+    throw new Error('Invalid bot policy artifact dimensions.');
+  }
+  if (
+    !isFiniteArray(w1) ||
+    !isFiniteArray(b1) ||
+    !isFiniteArray(wp) ||
+    !isFiniteArray(bp)
+  ) {
+    throw new Error('Bot policy artifact contains non-finite values.');
+  }
+  return {
+    inputDim,
+    hiddenDim,
+    actionDim,
+    w1,
+    b1,
+    wp,
+    bp,
+  };
+};
 
 const toDraftSamples = (
   decisions: ModelGeneratorDecisionEvent[],
@@ -1039,10 +1080,14 @@ const toDraftSamples = (
 export const trainBotPolicyOneShot = async (
   config: BotTrainOneShotConfig,
 ): Promise<BotTrainOneShotResult> => {
-  const episodes = Math.max(1, Math.trunc(config.episodes ?? 24));
+  const requestedEpisodes = Math.max(1, Math.trunc(config.episodes ?? 24));
+  const episodes = Math.min(requestedEpisodes, BOT_TRAIN_MAX_EPISODES);
   const maxPiecesPerEpisode = Math.max(
     8,
-    Math.trunc(config.maxPiecesPerEpisode ?? 120),
+    Math.min(
+      BOT_TRAIN_MAX_PIECES_PER_EPISODE,
+      Math.trunc(config.maxPiecesPerEpisode ?? 120),
+    ),
   );
   const gamma = clamp(config.gamma ?? 0.995, 0.8, 0.9999);
   const learningRate = clamp(config.learningRate ?? 0.0015, 1e-5, 0.05);
@@ -1078,7 +1123,11 @@ export const trainBotPolicyOneShot = async (
       const compatible =
         sameMode &&
         warmParams.inputDim === inputDim &&
-        warmParams.actionDim === actionSpace.length;
+        warmParams.actionDim === actionSpace.length &&
+        isFiniteArray(warmParams.w1) &&
+        isFiniteArray(warmParams.b1) &&
+        isFiniteArray(warmParams.wp) &&
+        isFiniteArray(warmParams.bp);
       if (compatible) {
         params = warmParams;
         initSource = 'warm';
@@ -1097,6 +1146,7 @@ export const trainBotPolicyOneShot = async (
   }
   const transitions: Transition[] = [];
   const episodeReturns: number[] = [];
+  let transitionCapHit = false;
 
   for (let episode = 0; episode < episodes; episode += 1) {
     const rollout = runRollout({
@@ -1120,6 +1170,13 @@ export const trainBotPolicyOneShot = async (
         actionIndex: rollout.transitions[i].actionIndex,
         reward: discounted[i],
       });
+      if (transitions.length >= BOT_TRAIN_MAX_TRANSITIONS) {
+        transitionCapHit = true;
+        break;
+      }
+    }
+    if (transitionCapHit) {
+      break;
     }
   }
 
@@ -1138,9 +1195,21 @@ export const trainBotPolicyOneShot = async (
   const actions = new Int32Array(transitions.length);
   const returns = new Float32Array(transitions.length);
   for (let i = 0; i < transitions.length; i += 1) {
-    observations.set(transitions[i].observation, i * inputDim);
-    actions[i] = transitions[i].actionIndex;
-    returns[i] = transitions[i].reward ?? 0;
+    const rowOffset = i * inputDim;
+    const sourceObs = transitions[i].observation;
+    for (let j = 0; j < inputDim; j += 1) {
+      const value = sourceObs[j];
+      observations[rowOffset + j] = Number.isFinite(value) ? value : 0;
+    }
+    const actionIndex = transitions[i].actionIndex;
+    actions[i] =
+      Number.isFinite(actionIndex) &&
+      actionIndex >= 0 &&
+      actionIndex < actionSpace.length
+        ? actionIndex
+        : 0;
+    const reward = transitions[i].reward ?? 0;
+    returns[i] = Number.isFinite(reward) ? reward : 0;
   }
 
   const trained = await trainWithTfjs({
@@ -1153,6 +1222,36 @@ export const trainBotPolicyOneShot = async (
     valueWeight,
     epochs,
   });
+  if (
+    !isFiniteArray(trained.params.w1) ||
+    !isFiniteArray(trained.params.b1) ||
+    !isFiniteArray(trained.params.wp) ||
+    !isFiniteArray(trained.params.bp)
+  ) {
+    return {
+      ok: false,
+      message:
+        'Bot training produced non-finite weights. Try fewer episodes, lower piece cap, or train from scratch.',
+      episodes,
+      meanReturn: mean(episodeReturns),
+      finalLoss: trained.finalLoss,
+      policyArtifact: null,
+    };
+  }
+  if (
+    trained.finalLoss != null &&
+    Number.isFinite(trained.finalLoss) === false
+  ) {
+    return {
+      ok: false,
+      message:
+        'Bot training diverged (loss is non-finite). Try fewer episodes, lower piece cap, or train from scratch.',
+      episodes,
+      meanReturn: mean(episodeReturns),
+      finalLoss: trained.finalLoss,
+      policyArtifact: null,
+    };
+  }
   params = trained.params;
   const policyArtifact = toArtifact(config.modeId, params);
   policyArtifact.archId = config.modelAxes.arch;
@@ -1164,7 +1263,10 @@ export const trainBotPolicyOneShot = async (
     ok: true,
     message:
       `Bot policy training complete (episodes=${episodes}, transitions=${transitions.length}, ` +
-      `gamma=${gamma.toFixed(4)}, init=${initSource}, seed=${seed}).`,
+      `gamma=${gamma.toFixed(4)}, init=${initSource}, seed=${seed}` +
+      `${requestedEpisodes > episodes ? `, episodes_capped=${episodes}` : ''}` +
+      `${transitionCapHit ? `, transition_cap=${BOT_TRAIN_MAX_TRANSITIONS}` : ''}` +
+      ').',
     episodes,
     meanReturn: mean(episodeReturns),
     finalLoss: trained.finalLoss,

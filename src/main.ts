@@ -1812,6 +1812,7 @@ async function boot() {
     seed?: number;
     pieceSourceProfile?: BotPieceSourceProfile;
     pieces?: number;
+    greedy?: boolean;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1832,7 +1833,7 @@ async function boot() {
       policy,
       apmInput,
       seed,
-      greedy: true,
+      greedy: options?.greedy !== false,
     });
     botGuiInspectEnabled = true;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
@@ -1843,7 +1844,8 @@ async function boot() {
     requestStartGame();
     return (
       `GUI inspect started for ${policyId}. ` +
-      `APM=${apmInput}, piece_source=${pieceSourceProfile}.`
+      `APM=${apmInput}, piece_source=${pieceSourceProfile}, ` +
+      `policy_mode=${options?.greedy === false ? 'sampled' : 'greedy'}.`
     );
   };
 
