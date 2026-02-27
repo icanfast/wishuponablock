@@ -54,6 +54,10 @@ import {
   type TrajectoryRewardPolicyId,
   type TrajectoryRewardTerminalStats,
 } from './app/trajectoryRewardPolicy';
+import {
+  validateTrajectoryReplaySessions,
+  type ReplayValidationSummary,
+} from './app/trajectoryReplayValidator';
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import { runGlobalTrainingOneShot } from './app/globalTrainerTfjs';
 import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
@@ -3107,6 +3111,20 @@ async function boot() {
       samplesUsed: number;
       finalLoss: number | null;
     }>;
+    wubReplayValidateSessions?: (
+      sessions: TrajectorySessionV1[],
+      options?: {
+        maxNodes?: number;
+        allowSoftDrop?: boolean;
+        maxReportedIssues?: number;
+      },
+    ) => ReplayValidationSummary;
+    wubReplayValidateManifest?: (options?: {
+      maxNodes?: number;
+      allowSoftDrop?: boolean;
+      maxReportedIssues?: number;
+      loadIfEmpty?: boolean;
+    }) => Promise<ReplayValidationSummary>;
   };
   identityConsole.wubSetUserId = (value) => identityService.setUserId(value);
   identityConsole.wubSetSuperuser = () =>
@@ -3118,6 +3136,45 @@ async function boot() {
     trajectoryBuffer.listSamples(options);
   identityConsole.wubTrainingRun = async (options) =>
     await runLocalHeadTraining(options);
+  identityConsole.wubReplayValidateSessions = (sessions, options) =>
+    validateTrajectoryReplaySessions(sessions, options);
+  identityConsole.wubReplayValidateManifest = async (options) => {
+    let sessions = adminManifestSessions;
+    if (sessions.length === 0 && options?.loadIfEmpty !== false) {
+      sessions = await loadAdminManifestSessions();
+    }
+    if (sessions.length === 0) {
+      throw new Error(
+        'No manifest sessions loaded. Prepare manifest and load session objects first.',
+      );
+    }
+    const summary = validateTrajectoryReplaySessions(sessions, {
+      maxNodes: options?.maxNodes,
+      allowSoftDrop: options?.allowSoftDrop,
+      maxReportedIssues: options?.maxReportedIssues,
+    });
+    const passRatePct = (summary.successRate * 100).toFixed(2);
+    console.info(
+      `[replay] pass=${summary.passedSteps}/${summary.validatedSteps} (${passRatePct}%), ` +
+        `replay_steps=${summary.replaySteps}, sessions=${summary.totalSessions}.`,
+    );
+    if (summary.byModeBuild.length > 0) {
+      console.table(
+        summary.byModeBuild.map((entry) => ({
+          mode: entry.modeId,
+          build: entry.buildVersion,
+          sessions: entry.sessions,
+          validated: entry.validatedSteps,
+          passed: entry.passedSteps,
+          passRatePct: Number((entry.successRate * 100).toFixed(2)),
+        })),
+      );
+    }
+    if (summary.issues.length > 0) {
+      console.warn('[replay] issues', summary.issues);
+    }
+    return summary;
+  };
 }
 
 boot().catch((e) => console.error(e));
