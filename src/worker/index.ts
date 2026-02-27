@@ -212,6 +212,33 @@ const clampInt = (
   return Math.max(options.min, Math.min(options.max, Math.trunc(value)));
 };
 
+const isDevReleaseChannel = (env: Env): boolean => {
+  const channel = asString(env.RELEASE_CHANNEL)?.toLowerCase() ?? '';
+  return (
+    channel.includes('dev') ||
+    channel.includes('staging') ||
+    channel.includes('preview') ||
+    channel === 'test'
+  );
+};
+
+const errorDetailMessage = (error: unknown): string => {
+  if (error instanceof Error) {
+    const message = error.message?.trim();
+    return message.length > 0 ? message : 'Unknown Error';
+  }
+  if (typeof error === 'string') {
+    const message = error.trim();
+    return message.length > 0 ? message : 'Unknown Error';
+  }
+  try {
+    const serialized = JSON.stringify(error);
+    return serialized.length > 0 ? serialized : 'Unknown Error';
+  } catch {
+    return 'Unknown Error';
+  }
+};
+
 const isValidRecordingId = (value: string): boolean =>
   value.length >= 8 && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value);
 
@@ -3460,11 +3487,13 @@ const handlePostTrajectoryRecording = async (
     );
   } catch (error) {
     console.error('[recordings] trajectory upload failed', error);
-    return jsonResponse(
-      { error: 'Recording storage is currently unavailable.' },
-      503,
-      { 'cache-control': 'no-store' },
-    );
+    const body: Record<string, unknown> = {
+      error: 'Recording storage is currently unavailable.',
+    };
+    if (isDevReleaseChannel(env)) {
+      body.detail = errorDetailMessage(error);
+    }
+    return jsonResponse(body, 503, { 'cache-control': 'no-store' });
   }
 };
 
