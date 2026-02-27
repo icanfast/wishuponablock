@@ -4500,8 +4500,7 @@ input[type=number] {
     adminLoadSelectedButton.disabled =
       datasetBusy || !isAdmin || adminSelectedRecordingId == null;
     adminReplayApmInput.disabled = datasetBusy || !isAdmin;
-    adminReplayStartButton.disabled =
-      datasetBusy || !isAdmin || adminSelectedRecordingId == null;
+    adminReplayStartButton.disabled = datasetBusy || !isAdmin;
     adminReplayStopButton.disabled = datasetBusy || !isAdmin;
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
@@ -4529,9 +4528,7 @@ input[type=number] {
         ? '0.65'
         : '1';
     adminReplayStartButton.style.opacity =
-      !isAdmin || datasetBusy || adminSelectedRecordingId == null
-        ? '0.65'
-        : '1';
+      !isAdmin || datasetBusy ? '0.65' : '1';
     adminReplayStopButton.style.opacity =
       !isAdmin || datasetBusy ? '0.65' : '1';
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
@@ -4563,9 +4560,7 @@ input[type=number] {
         ? 'default'
         : 'pointer';
     adminReplayStartButton.style.cursor =
-      !isAdmin || datasetBusy || adminSelectedRecordingId == null
-        ? 'default'
-        : 'pointer';
+      !isAdmin || datasetBusy ? 'default' : 'pointer';
     adminReplayStopButton.style.cursor =
       !isAdmin || datasetBusy ? 'default' : 'pointer';
   };
@@ -5182,9 +5177,11 @@ input[type=number] {
   });
 
   adminReplayStartButton.addEventListener('click', async () => {
-    if (adminDatasetPending) return;
-    if (!adminSelectedRecordingId) {
-      setAdminActionStatus('Select and load a recording first.', 'error');
+    if (adminDatasetPending) {
+      setAdminActionStatus(
+        'Dataset action already running. Please wait.',
+        'error',
+      );
       return;
     }
     adminDatasetPending = true;
@@ -5207,7 +5204,13 @@ input[type=number] {
   });
 
   adminReplayStopButton.addEventListener('click', async () => {
-    if (adminDatasetPending) return;
+    if (adminDatasetPending) {
+      setAdminActionStatus(
+        'Dataset action already running. Please wait.',
+        'error',
+      );
+      return;
+    }
     adminDatasetPending = true;
     setAdminActionStatus('Stopping replay executor GUI...');
     updateAdminControls();
