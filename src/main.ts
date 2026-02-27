@@ -85,7 +85,12 @@ import {
 } from './app/snapshotService';
 import { createGameSessionFactory } from './app/gameFactory';
 import { PixiRenderer } from './render/pixiRenderer';
-import { PIECES, type Board, type PieceKind, type GameState } from './core/types';
+import {
+  PIECES,
+  type Board,
+  type PieceKind,
+  type GameState,
+} from './core/types';
 import {
   createMenuScreen,
   type MenuAuthState,
@@ -2675,9 +2680,7 @@ async function boot() {
       }
       updateSprintHud(state);
       updateClassicHud(state);
-      gameUi.setQueueOddsMode(
-        usesModelGenerator(generatorType),
-      );
+      gameUi.setQueueOddsMode(usesModelGenerator(generatorType));
       gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
       if (ended && !previousRunEnded) {
