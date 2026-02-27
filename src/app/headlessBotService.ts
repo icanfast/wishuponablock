@@ -443,6 +443,15 @@ const normalizePieceSourceProfile = (
 ): BotPieceSourceProfile =>
   value === 'active_generator' ? 'active_generator' : 'bag7';
 
+const nextRandomSeed = (): number => {
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    const buffer = new Uint32Array(1);
+    globalThis.crypto.getRandomValues(buffer);
+    return Math.max(1, buffer[0] >>> 0);
+  }
+  return Math.max(1, Math.trunc(Math.random() * 0x7fffffff));
+};
+
 const asInputFrame = (action: BotMacroAction): InputFrame => ({
   ...EMPTY_INPUT,
   moveX: action.moveX,
@@ -1040,7 +1049,10 @@ export const trainBotPolicyOneShot = async (
   const entropyBeta = clamp(config.entropyBeta ?? 0.01, 0, 1);
   const valueWeight = clamp(config.valueWeight ?? 0.5, 0, 10);
   const epochs = Math.max(1, Math.trunc(config.epochs ?? 6));
-  const seed = Math.max(1, Math.trunc(config.seed ?? Date.now()));
+  const seed =
+    config.seed != null && Number.isFinite(config.seed)
+      ? Math.max(1, Math.trunc(config.seed))
+      : nextRandomSeed();
   const pieceSourceProfile = normalizePieceSourceProfile(
     config.pieceSourceProfile,
   );
@@ -1152,7 +1164,7 @@ export const trainBotPolicyOneShot = async (
     ok: true,
     message:
       `Bot policy training complete (episodes=${episodes}, transitions=${transitions.length}, ` +
-      `gamma=${gamma.toFixed(4)}, init=${initSource}).`,
+      `gamma=${gamma.toFixed(4)}, init=${initSource}, seed=${seed}).`,
     episodes,
     meanReturn: mean(episodeReturns),
     finalLoss: trained.finalLoss,

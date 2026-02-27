@@ -3242,8 +3242,8 @@ input[type=number] {
   const botLabSeedInput = document.createElement('input');
   botLabSeedInput.type = 'number';
   botLabSeedInput.step = '1';
-  botLabSeedInput.placeholder = 'seed';
-  botLabSeedInput.value = '42030';
+  botLabSeedInput.placeholder = 'seed (optional)';
+  botLabSeedInput.value = '';
   const botLabTrainSourceSelect = document.createElement('select');
   for (const [value, label] of [
     ['bag7', 'train source: bag7'],
