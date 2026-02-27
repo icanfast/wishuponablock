@@ -283,6 +283,10 @@ export type MenuScreenOptions = {
   onAdminPrepareManifest: (query: MenuAdminManifestQuery) => Promise<string>;
   onAdminTrainGlobalOneShot: () => Promise<string>;
   onAdminPublishGlobalCandidate: () => Promise<string>;
+  onAdminStartReplayExecutorGui: (options?: {
+    apmInput?: number;
+  }) => Promise<string>;
+  onAdminStopReplayExecutorGui: () => Promise<string> | string;
   onAdminTrainBotPolicyOneShot: (options: {
     episodes?: number;
     maxPiecesPerEpisode?: number;
@@ -406,6 +410,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminPrepareManifest,
     onAdminTrainGlobalOneShot,
     onAdminPublishGlobalCandidate,
+    onAdminStartReplayExecutorGui,
+    onAdminStopReplayExecutorGui,
     onAdminApplyBenchmarkSuggestedArch,
     onBotLabFetchCurrentPolicy,
     onBotLabListPolicies,
@@ -3044,6 +3050,34 @@ input[type=number] {
     fontSize: '12px',
   });
   const adminLoadSelectedButton = makeMenuButton('LOAD SELECTED RECORDING');
+  const adminReplayApmInput = document.createElement('input');
+  adminReplayApmInput.type = 'number';
+  adminReplayApmInput.min = '20';
+  adminReplayApmInput.max = '1200';
+  adminReplayApmInput.step = '1';
+  adminReplayApmInput.value = '60';
+  adminReplayApmInput.placeholder = 'executor APM (default 60)';
+  Object.assign(adminReplayApmInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const adminReplayButtons = document.createElement('div');
+  Object.assign(adminReplayButtons.style, {
+    display: 'flex',
+    gap: '6px',
+  });
+  const adminReplayStartButton = makeMenuButton('RUN EXECUTOR GUI');
+  const adminReplayStopButton = makeMenuButton('STOP EXECUTOR');
+  Object.assign(adminReplayStartButton.style, { flex: '1' });
+  Object.assign(adminReplayStopButton.style, { flex: '1' });
+  adminReplayButtons.appendChild(adminReplayStartButton);
+  adminReplayButtons.appendChild(adminReplayStopButton);
   const adminLoadedSummary = document.createElement('div');
   Object.assign(adminLoadedSummary.style, {
     color: '#b6c2d4',
@@ -3062,6 +3096,8 @@ input[type=number] {
   adminDatasetControls.appendChild(adminDatasetSummary);
   adminDatasetControls.appendChild(adminRecordingsSelect);
   adminDatasetControls.appendChild(adminLoadSelectedButton);
+  adminDatasetControls.appendChild(adminReplayApmInput);
+  adminDatasetControls.appendChild(adminReplayButtons);
   adminDatasetControls.appendChild(adminLoadedSummary);
   const adminBackButton = makeMenuButton('BACK');
   Object.assign(adminBackButton.style, { marginTop: 'auto' });
@@ -4463,6 +4499,10 @@ input[type=number] {
       datasetBusy || !isAdmin || adminCurrentRecordings.length === 0;
     adminLoadSelectedButton.disabled =
       datasetBusy || !isAdmin || adminSelectedRecordingId == null;
+    adminReplayApmInput.disabled = datasetBusy || !isAdmin;
+    adminReplayStartButton.disabled =
+      datasetBusy || !isAdmin || adminSelectedRecordingId == null;
+    adminReplayStopButton.disabled = datasetBusy || !isAdmin;
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
     adminPublishBaselineButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
@@ -4488,6 +4528,12 @@ input[type=number] {
       !isAdmin || datasetBusy || adminSelectedRecordingId == null
         ? '0.65'
         : '1';
+    adminReplayStartButton.style.opacity =
+      !isAdmin || datasetBusy || adminSelectedRecordingId == null
+        ? '0.65'
+        : '1';
+    adminReplayStopButton.style.opacity =
+      !isAdmin || datasetBusy ? '0.65' : '1';
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
     adminPublishBaselineButton.style.cursor =
@@ -4516,6 +4562,12 @@ input[type=number] {
       !isAdmin || datasetBusy || adminSelectedRecordingId == null
         ? 'default'
         : 'pointer';
+    adminReplayStartButton.style.cursor =
+      !isAdmin || datasetBusy || adminSelectedRecordingId == null
+        ? 'default'
+        : 'pointer';
+    adminReplayStopButton.style.cursor =
+      !isAdmin || datasetBusy ? 'default' : 'pointer';
   };
 
   const updateAccountControls = () => {
@@ -5121,6 +5173,50 @@ input[type=number] {
     } catch (error) {
       setAdminActionStatus(
         toErrorMessage(error, 'Could not load selected recording.'),
+        'error',
+      );
+    } finally {
+      adminDatasetPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminReplayStartButton.addEventListener('click', async () => {
+    if (adminDatasetPending) return;
+    if (!adminSelectedRecordingId) {
+      setAdminActionStatus('Select and load a recording first.', 'error');
+      return;
+    }
+    adminDatasetPending = true;
+    setAdminActionStatus('Starting replay executor GUI...');
+    updateAdminControls();
+    try {
+      const message = await onAdminStartReplayExecutorGui({
+        apmInput: parsePositiveIntInput(adminReplayApmInput),
+      });
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not start replay executor GUI.'),
+        'error',
+      );
+    } finally {
+      adminDatasetPending = false;
+      updateAdminControls();
+    }
+  });
+
+  adminReplayStopButton.addEventListener('click', async () => {
+    if (adminDatasetPending) return;
+    adminDatasetPending = true;
+    setAdminActionStatus('Stopping replay executor GUI...');
+    updateAdminControls();
+    try {
+      const message = await onAdminStopReplayExecutorGui();
+      setAdminActionStatus(message, 'success');
+    } catch (error) {
+      setAdminActionStatus(
+        toErrorMessage(error, 'Could not stop replay executor GUI.'),
         'error',
       );
     } finally {

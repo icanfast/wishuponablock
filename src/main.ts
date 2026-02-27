@@ -61,6 +61,7 @@ import {
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import { runGlobalTrainingOneShot } from './app/globalTrainerTfjs';
 import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
+import { createTrajectoryReplayGuiInputSource } from './app/trajectoryReplayGuiInputSource';
 import {
   createGuiInspectBotInputSource,
   generateBotTrajectoryBatch,
@@ -132,6 +133,7 @@ import { createToolCanvas } from './ui/tools/toolCanvas';
 import { getPiecePalette, type PiecePalette } from './core/palette';
 import { createPerfOverlay } from './app/perfOverlay';
 import { setPerfMetricsSink } from './core/perfMetrics';
+import { dropDistance } from './core/piece';
 import pkg from '../package.json';
 
 function hasWebGL(): boolean {
@@ -577,8 +579,13 @@ async function boot() {
   let manualInputSource = inputService.getInputSource();
   let botGuiInputSource: InputSource | null = null;
   let botGuiInspectEnabled = false;
+  let replayGuiInputSource: InputSource | null = null;
+  let replayGuiInspectEnabled = false;
   const activeInputSource: InputSource = {
     sample: (state, dtMs) => {
+      if (replayGuiInspectEnabled && replayGuiInputSource) {
+        return replayGuiInputSource.sample(state, dtMs);
+      }
       if (botGuiInspectEnabled && botGuiInputSource) {
         return botGuiInputSource.sample(state, dtMs);
       }
@@ -587,6 +594,7 @@ async function boot() {
     reset: (seed) => {
       manualInputSource.reset?.(seed);
       botGuiInputSource?.reset?.(seed);
+      replayGuiInputSource?.reset?.(seed);
     },
   };
   let authState: MenuAuthState = {
@@ -985,6 +993,7 @@ async function boot() {
     id: string,
   ): Promise<MenuAdminRecordingPreview> => {
     const session = await adminRecordingsService.loadRecordingObject(id);
+    adminLoadedRecordingSession = session;
     const rewards = session.samples
       .map((sample) => sample.reward)
       .filter(
@@ -1260,6 +1269,7 @@ async function boot() {
 
   let adminManifestPage: AdminRecordingsManifestPage | null = null;
   let adminManifestSessions: TrajectorySessionV1[] = [];
+  let adminLoadedRecordingSession: TrajectorySessionV1 | null = null;
   let adminGlobalTrainingCandidate: {
     bytes: ArrayBuffer;
     pipelineId: string;
@@ -1921,6 +1931,8 @@ async function boot() {
     const seed = options?.seed ?? 42_030;
     const pieceSourceProfile =
       options?.pieceSourceProfile ?? policy.pieceSourceProfile ?? 'bag7';
+    replayGuiInspectEnabled = false;
+    replayGuiInputSource = null;
     botGuiInputSource = createGuiInspectBotInputSource({
       model: reference.model,
       policy,
@@ -1947,6 +1959,112 @@ async function boot() {
     botGuiInputSource = null;
     applyBotGuiPieceSourceProfile('active_generator');
     return 'GUI inspect stopped.';
+  };
+
+  const normalizeReplayRotation = (value: number): 0 | 1 | 2 | 3 => {
+    const normalized = Math.trunc(value) % 4;
+    if (normalized === 1) return 1;
+    if (normalized === 2) return 2;
+    if (normalized === 3 || normalized === -1) return 3;
+    return 0;
+  };
+
+  const toBoardFromOccupancy = (occupancy: number[][]): Board =>
+    occupancy.map((row) => row.map((cell) => (cell > 0 ? 'I' : null)));
+
+  const applyTrajectoryInitialStateToGame = (
+    sessionValue: TrajectorySessionV1,
+  ): void => {
+    const initialState = sessionValue.initialState;
+    if (!initialState) return;
+    const game = session.getGame();
+    const state = game.state;
+    state.board = toBoardFromOccupancy(initialState.boardOccupancy);
+    state.hold = initialState.hold;
+    state.active = {
+      k: initialState.active.k,
+      r: normalizeReplayRotation(initialState.active.r),
+      x: Math.trunc(initialState.active.x),
+      y: Math.trunc(initialState.active.y),
+    };
+    state.next = [...initialState.next];
+    state.canHold = Boolean(initialState.canHold);
+    state.timeMs = Math.max(0, Math.trunc(initialState.timeMs));
+    state.totalLinesCleared = Math.max(
+      0,
+      Math.trunc(initialState.totalLinesCleared),
+    );
+    state.score = Math.max(0, Math.trunc(initialState.score));
+    state.combo = 0;
+    state.gameOver = false;
+    state.gameWon = false;
+    state.mlQueueProbabilities = [];
+    state.ghostY = state.active.y + dropDistance(state.board, state.active);
+  };
+
+  const startAdminReplayExecutorGui = async (options?: {
+    apmInput?: number;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const loaded = adminLoadedRecordingSession;
+    if (!loaded) {
+      throw new Error('Load a recording first.');
+    }
+    if (!loaded.initialState) {
+      throw new Error(
+        'Recording has no initialState. Load a newer recording with replay bootstrap data.',
+      );
+    }
+    const replaySteps = loaded.samples.filter(
+      (sample) => sample.replay != null,
+    );
+    if (replaySteps.length === 0) {
+      throw new Error('Loaded recording has no replay steps.');
+    }
+    const apmInput = Math.max(
+      20,
+      Math.min(1200, Math.trunc(options?.apmInput ?? 60)),
+    );
+    stopAdminBotGuiInspect();
+    replayGuiInputSource = createTrajectoryReplayGuiInputSource({
+      session: loaded,
+      apmInput,
+      onLog: (line) => console.info(line),
+      onComplete: (stats) => {
+        replayGuiInspectEnabled = false;
+        replayGuiInputSource = null;
+        console.info(
+          `[replay-exec] run finished for ${loaded.sessionId}. ` +
+            `planned=${stats.plannedSteps}/${stats.totalReplaySteps}, ` +
+            `board_ok=${stats.passedBoardChecks}, board_failed=${stats.failedBoardChecks}, ` +
+            `plan_failed=${stats.failedPlans}.`,
+        );
+      },
+    });
+    replayGuiInspectEnabled = true;
+    modeController.startPractice();
+    sessionController.rebuildSession();
+    await startGameWithModelReady();
+    applyTrajectoryInitialStateToGame(loaded);
+    runtime?.setInputSource(activeInputSource);
+    runtime?.renderNow();
+    return (
+      `Replay executor GUI started for session ${loaded.sessionId}. ` +
+      `APM=${apmInput}, replay_steps=${replaySteps.length}. ` +
+      `Logs are prefixed with [replay-exec] in the browser console.`
+    );
+  };
+
+  const stopAdminReplayExecutorGui = (): string => {
+    replayGuiInspectEnabled = false;
+    replayGuiInputSource = null;
+    return 'Replay executor GUI stopped.';
   };
 
   const applyAdminBenchmarkSuggestedArch = async (): Promise<string> => {
@@ -2949,6 +3067,8 @@ async function boot() {
     onAdminPrepareManifest: prepareAdminManifest,
     onAdminTrainGlobalOneShot: runAdminGlobalTrainingOneShot,
     onAdminPublishGlobalCandidate: publishAdminGlobalTrainingCandidate,
+    onAdminStartReplayExecutorGui: startAdminReplayExecutorGui,
+    onAdminStopReplayExecutorGui: stopAdminReplayExecutorGui,
     onAdminTrainBotPolicyOneShot: runAdminTrainBotPolicyOneShot,
     onAdminGenerateBotRecordings: runAdminGenerateBotRecordings,
     onAdminRunCapabilityBenchmark: runAdminCapabilityBenchmark,
@@ -3078,6 +3198,9 @@ async function boot() {
     }
   };
   requestStartGame = () => {
+    if (replayGuiInspectEnabled) {
+      stopAdminReplayExecutorGui();
+    }
     void startGameWithModelReady();
   };
 
