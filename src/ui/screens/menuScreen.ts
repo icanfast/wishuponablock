@@ -283,6 +283,7 @@ export type MenuScreenOptions = {
   onAdminPrepareManifest: (query: MenuAdminManifestQuery) => Promise<string>;
   onAdminTrainGlobalOneShot: () => Promise<string>;
   onAdminPublishGlobalCandidate: () => Promise<string>;
+  onAdminGetReplayExecutorDebug: () => Record<string, unknown>;
   onAdminStartReplayExecutorGui: (options?: {
     apmInput?: number;
   }) => Promise<string>;
@@ -410,6 +411,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminPrepareManifest,
     onAdminTrainGlobalOneShot,
     onAdminPublishGlobalCandidate,
+    onAdminGetReplayExecutorDebug,
     onAdminStartReplayExecutorGui,
     onAdminStopReplayExecutorGui,
     onAdminApplyBenchmarkSuggestedArch,
@@ -5184,12 +5186,19 @@ input[type=number] {
       );
       return;
     }
+    const requestedApm = parsePositiveIntInput(adminReplayApmInput);
+    const debugPayload = onAdminGetReplayExecutorDebug();
+    console.info('[replay-exec] run button debug', {
+      selectedRecordingId: adminSelectedRecordingId,
+      requestedApm,
+      ...debugPayload,
+    });
     adminDatasetPending = true;
     setAdminActionStatus('Starting replay executor GUI...');
     updateAdminControls();
     try {
       const message = await onAdminStartReplayExecutorGui({
-        apmInput: parsePositiveIntInput(adminReplayApmInput),
+        apmInput: requestedApm,
       });
       setAdminActionStatus(message, 'success');
     } catch (error) {

@@ -6,6 +6,8 @@ import {
   PLAY_HEIGHT,
   PLAY_WIDTH,
   ROWS,
+  SPAWN_X,
+  SPAWN_Y,
 } from './core/constants';
 import {
   GENERATOR_TYPES,
@@ -133,7 +135,7 @@ import { createToolCanvas } from './ui/tools/toolCanvas';
 import { getPiecePalette, type PiecePalette } from './core/palette';
 import { createPerfOverlay } from './app/perfOverlay';
 import { setPerfMetricsSink } from './core/perfMetrics';
-import { dropDistance } from './core/piece';
+import { collides, dropDistance } from './core/piece';
 import pkg from '../package.json';
 
 function hasWebGL(): boolean {
@@ -1972,6 +1974,60 @@ async function boot() {
   const toBoardFromOccupancy = (occupancy: number[][]): Board =>
     occupancy.map((row) => row.map((cell) => (cell > 0 ? 'I' : null)));
 
+  const spawnReplayActiveForBoard = (board: Board, piece: PieceKind) => {
+    const active = {
+      k: piece,
+      r: 0 as const,
+      x: SPAWN_X,
+      y: SPAWN_Y,
+    };
+    for (let i = 0; i < 4; i += 1) {
+      if (!collides(board, active)) break;
+      active.y -= 1;
+    }
+    return active;
+  };
+
+  const buildReplayBootstrapSession = (
+    value: TrajectorySessionV1,
+  ): {
+    session: TrajectorySessionV1;
+    bootstrapNotice: string | null;
+  } => {
+    if (value.initialState) {
+      return { session: value, bootstrapNotice: null };
+    }
+    const first = value.samples[0];
+    if (!first) {
+      throw new Error('Recording has no samples.');
+    }
+    const board = toBoardFromOccupancy(first.boardOccupancy);
+    const replayTimeMs = first.replay?.gameTimeMs ?? 0;
+    const replayLines = first.replay?.totalLinesCleared ?? 0;
+    const replayScore = first.replay?.score ?? 0;
+    const synthesized: TrajectorySessionV1 = {
+      ...value,
+      initialState: {
+        boardOccupancy: first.boardOccupancy.map((row) => row.slice()),
+        hold: first.hold,
+        active: spawnReplayActiveForBoard(board, first.action),
+        next: first.pieces.slice(0, 3),
+        canHold: true,
+        timeMs: Math.max(0, Math.trunc(replayTimeMs)),
+        totalLinesCleared: Math.max(0, Math.trunc(replayLines)),
+        score: Math.max(0, Math.trunc(replayScore)),
+      },
+      samples: value.samples.map((sample, index) =>
+        index === 0 ? { ...sample, replay: undefined } : sample,
+      ),
+    };
+    return {
+      session: synthesized,
+      bootstrapNotice:
+        'Recording has no initialState; replay bootstrapped from sample #0 and that step was skipped.',
+    };
+  };
+
   const applyTrajectoryInitialStateToGame = (
     sessionValue: TrajectorySessionV1,
   ): void => {
@@ -2012,15 +2068,12 @@ async function boot() {
     ) {
       throw new Error('Admin account required.');
     }
-    const loaded = adminLoadedRecordingSession;
-    if (!loaded) {
+    const loadedRaw = adminLoadedRecordingSession;
+    if (!loadedRaw) {
       throw new Error('Load a recording first.');
     }
-    if (!loaded.initialState) {
-      throw new Error(
-        'Recording has no initialState. Load a newer recording with replay bootstrap data.',
-      );
-    }
+    const bootstrap = buildReplayBootstrapSession(loadedRaw);
+    const loaded = bootstrap.session;
     const replaySteps = loaded.samples.filter(
       (sample) => sample.replay != null,
     );
@@ -2054,10 +2107,14 @@ async function boot() {
     applyTrajectoryInitialStateToGame(loaded);
     runtime?.setInputSource(activeInputSource);
     runtime?.renderNow();
+    if (bootstrap.bootstrapNotice) {
+      console.info(`[replay-exec] ${bootstrap.bootstrapNotice}`);
+    }
     return (
       `Replay executor GUI started for session ${loaded.sessionId}. ` +
       `APM=${apmInput}, replay_steps=${replaySteps.length}. ` +
-      `Logs are prefixed with [replay-exec] in the browser console.`
+      `Logs are prefixed with [replay-exec] in the browser console.` +
+      (bootstrap.bootstrapNotice ? ` ${bootstrap.bootstrapNotice}` : '')
     );
   };
 
@@ -2065,6 +2122,52 @@ async function boot() {
     replayGuiInspectEnabled = false;
     replayGuiInputSource = null;
     return 'Replay executor GUI stopped.';
+  };
+
+  const getAdminReplayExecutorDebug = (): Record<string, unknown> => {
+    const loaded = adminLoadedRecordingSession;
+    const replaySamples =
+      loaded?.samples.filter((sample) => sample.replay != null) ?? [];
+    const firstReplaySample = replaySamples[0] ?? null;
+    const manifest = adminManifestPage;
+    return {
+      nowIso: new Date().toISOString(),
+      modeId: modeController.getState().mode.id,
+      generatorType: settingsStore.get().generator.type,
+      replayGuiInspectEnabled,
+      botGuiInspectEnabled,
+      loadedRecording: loaded
+        ? {
+            sessionId: loaded.sessionId,
+            modeId: loaded.modeId,
+            buildVersion: loaded.buildVersion,
+            samples: loaded.samples.length,
+            replaySamples: replaySamples.length,
+            hasInitialState: loaded.initialState != null,
+            firstSampleId: loaded.samples[0]?.id ?? null,
+            firstReplaySampleId: firstReplaySample?.id ?? null,
+          }
+        : null,
+      manifest: manifest
+        ? {
+            selector: manifest.selector,
+            page: {
+              limit: manifest.page.limit,
+              returned: manifest.page.returned,
+              hasNextCursor: Boolean(manifest.page.nextCursor),
+            },
+            firstRecordingIds: manifest.recordings
+              .slice(0, 5)
+              .map((recording) => recording.id),
+          }
+        : null,
+      loadedManifestSessions: {
+        count: adminManifestSessions.length,
+        firstSessionIds: adminManifestSessions
+          .slice(0, 5)
+          .map((sessionValue) => sessionValue.sessionId),
+      },
+    };
   };
 
   const applyAdminBenchmarkSuggestedArch = async (): Promise<string> => {
@@ -3067,6 +3170,7 @@ async function boot() {
     onAdminPrepareManifest: prepareAdminManifest,
     onAdminTrainGlobalOneShot: runAdminGlobalTrainingOneShot,
     onAdminPublishGlobalCandidate: publishAdminGlobalTrainingCandidate,
+    onAdminGetReplayExecutorDebug: getAdminReplayExecutorDebug,
     onAdminStartReplayExecutorGui: startAdminReplayExecutorGui,
     onAdminStopReplayExecutorGui: stopAdminReplayExecutorGui,
     onAdminTrainBotPolicyOneShot: runAdminTrainBotPolicyOneShot,
