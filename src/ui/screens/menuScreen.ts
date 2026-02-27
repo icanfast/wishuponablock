@@ -20,7 +20,8 @@ type MenuPanel =
   | 'account'
   | 'my_models'
   | 'admin'
-  | 'bot_lab';
+  | 'bot_lab'
+  | 'replay_lab';
 
 export type MenuAuthUser = {
   id: string;
@@ -284,10 +285,14 @@ export type MenuScreenOptions = {
   onAdminTrainGlobalOneShot: () => Promise<string>;
   onAdminPublishGlobalCandidate: () => Promise<string>;
   onAdminGetReplayExecutorDebug: () => Record<string, unknown>;
+  onAdminStartRecordingReplay: (options?: {
+    apmInput?: number;
+    clockMode?: 'fixed' | 'sample_time';
+  }) => Promise<string>;
   onAdminStartReplayExecutorGui: (options?: {
     apmInput?: number;
   }) => Promise<string>;
-  onAdminStopReplayExecutorGui: () => Promise<string> | string;
+  onAdminStopReplayMode: () => Promise<string> | string;
   onAdminTrainBotPolicyOneShot: (options: {
     episodes?: number;
     maxPiecesPerEpisode?: number;
@@ -412,8 +417,9 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAdminTrainGlobalOneShot,
     onAdminPublishGlobalCandidate,
     onAdminGetReplayExecutorDebug,
+    onAdminStartRecordingReplay,
     onAdminStartReplayExecutorGui,
-    onAdminStopReplayExecutorGui,
+    onAdminStopReplayMode,
     onAdminApplyBenchmarkSuggestedArch,
     onBotLabFetchCurrentPolicy,
     onBotLabListPolicies,
@@ -564,6 +570,7 @@ input[type=number] {
   const myModelsPanel = makeMenuPanel();
   const adminPanel = makeMenuPanel();
   const botLabPanel = makeMenuPanel();
+  const replayLabPanel = makeMenuPanel();
   const butterfingerPanel = makeMenuPanel();
   const playMenuRow = document.createElement('div');
 
@@ -614,6 +621,14 @@ input[type=number] {
     overflowY: 'auto',
   });
   Object.assign(botLabPanel.style, {
+    minHeight: '260px',
+    width: '360px',
+    display: 'none',
+    textAlign: 'left',
+    maxHeight: '520px',
+    overflowY: 'auto',
+  });
+  Object.assign(replayLabPanel.style, {
     minHeight: '260px',
     width: '360px',
     display: 'none',
@@ -3052,34 +3067,7 @@ input[type=number] {
     fontSize: '12px',
   });
   const adminLoadSelectedButton = makeMenuButton('LOAD SELECTED RECORDING');
-  const adminReplayApmInput = document.createElement('input');
-  adminReplayApmInput.type = 'number';
-  adminReplayApmInput.min = '20';
-  adminReplayApmInput.max = '1200';
-  adminReplayApmInput.step = '1';
-  adminReplayApmInput.value = '60';
-  adminReplayApmInput.placeholder = 'executor APM (default 60)';
-  Object.assign(adminReplayApmInput.style, {
-    color: '#e2e8f0',
-    background: '#0b0f14',
-    border: '1px solid #1f2a37',
-    borderRadius: '4px',
-    fontSize: '12px',
-    padding: '6px 8px',
-    width: '100%',
-    boxSizing: 'border-box',
-  });
-  const adminReplayButtons = document.createElement('div');
-  Object.assign(adminReplayButtons.style, {
-    display: 'flex',
-    gap: '6px',
-  });
-  const adminReplayStartButton = makeMenuButton('RUN EXECUTOR GUI');
-  const adminReplayStopButton = makeMenuButton('STOP EXECUTOR');
-  Object.assign(adminReplayStartButton.style, { flex: '1' });
-  Object.assign(adminReplayStopButton.style, { flex: '1' });
-  adminReplayButtons.appendChild(adminReplayStartButton);
-  adminReplayButtons.appendChild(adminReplayStopButton);
+  const adminOpenReplayLabButton = makeMenuButton('OPEN REPLAY LAB');
   const adminLoadedSummary = document.createElement('div');
   Object.assign(adminLoadedSummary.style, {
     color: '#b6c2d4',
@@ -3098,8 +3086,7 @@ input[type=number] {
   adminDatasetControls.appendChild(adminDatasetSummary);
   adminDatasetControls.appendChild(adminRecordingsSelect);
   adminDatasetControls.appendChild(adminLoadSelectedButton);
-  adminDatasetControls.appendChild(adminReplayApmInput);
-  adminDatasetControls.appendChild(adminReplayButtons);
+  adminDatasetControls.appendChild(adminOpenReplayLabButton);
   adminDatasetControls.appendChild(adminLoadedSummary);
   const adminBackButton = makeMenuButton('BACK');
   Object.assign(adminBackButton.style, { marginTop: 'auto' });
@@ -3114,6 +3101,100 @@ input[type=number] {
   adminPanel.appendChild(adminDatasetLabel);
   adminPanel.appendChild(adminDatasetControls);
   adminPanel.appendChild(adminBackButton);
+
+  const replayLabTitle = document.createElement('div');
+  replayLabTitle.textContent = 'REPLAY LAB';
+  Object.assign(replayLabTitle.style, {
+    color: '#8fa0b8',
+    fontSize: '12px',
+    letterSpacing: '0.5px',
+    marginBottom: '4px',
+  });
+  const replayLabSummary = document.createElement('div');
+  Object.assign(replayLabSummary.style, {
+    color: '#b6c2d4',
+    fontSize: '12px',
+    lineHeight: '1.35',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    padding: '8px',
+    whiteSpace: 'pre-wrap',
+  });
+  const replayLabStatus = document.createElement('div');
+  Object.assign(replayLabStatus.style, {
+    minHeight: '24px',
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.35',
+    marginTop: '2px',
+    whiteSpace: 'pre-wrap',
+  });
+  const replayLabControls = document.createElement('div');
+  Object.assign(replayLabControls.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  const replayLabApmInput = document.createElement('input');
+  replayLabApmInput.type = 'number';
+  replayLabApmInput.min = '20';
+  replayLabApmInput.max = '1200';
+  replayLabApmInput.step = '1';
+  replayLabApmInput.value = '60';
+  replayLabApmInput.placeholder = 'replay/executor APM';
+  Object.assign(replayLabApmInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const replayLabClockSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['fixed', 'clock: fixed ticker'],
+    ['sample_time', 'clock: sample time'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    replayLabClockSelect.appendChild(option);
+  }
+  Object.assign(replayLabClockSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const replayLabButtons = document.createElement('div');
+  Object.assign(replayLabButtons.style, {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  });
+  const replayLabRunRecordingButton = makeMenuButton('RUN RECORDING REPLAY');
+  const replayLabRunExecutorButton = makeMenuButton('RUN EXECUTOR GUI');
+  const replayLabStopButton = makeMenuButton('STOP REPLAY');
+  replayLabButtons.appendChild(replayLabRunRecordingButton);
+  replayLabButtons.appendChild(replayLabRunExecutorButton);
+  replayLabButtons.appendChild(replayLabStopButton);
+  const replayLabBackButton = makeMenuButton('BACK');
+  Object.assign(replayLabBackButton.style, { marginTop: 'auto' });
+  replayLabControls.appendChild(replayLabApmInput);
+  replayLabControls.appendChild(replayLabClockSelect);
+  replayLabControls.appendChild(replayLabButtons);
+  replayLabPanel.appendChild(replayLabTitle);
+  replayLabPanel.appendChild(replayLabSummary);
+  replayLabPanel.appendChild(replayLabStatus);
+  replayLabPanel.appendChild(replayLabControls);
+  replayLabPanel.appendChild(replayLabBackButton);
 
   const botLabTitle = document.createElement('div');
   botLabTitle.textContent = 'BOT LAB';
@@ -3554,6 +3635,7 @@ input[type=number] {
   let modelActionPending = false;
   let adminActionPending = false;
   let adminDatasetPending = false;
+  let replayLabPending = false;
   let adminCurrentCursor: string | null = null;
   let adminCurrentRecordings: MenuAdminRecordingSummary[] = [];
   let adminSelectedRecordingId: string | null = null;
@@ -3600,6 +3682,13 @@ input[type=number] {
   ) => {
     adminStatus.textContent = message;
     adminStatus.style.color = statusColor(tone);
+  };
+  const setReplayLabStatus = (
+    message: string,
+    tone: MenuAuthStatusTone = 'neutral',
+  ) => {
+    replayLabStatus.textContent = message;
+    replayLabStatus.style.color = statusColor(tone);
   };
   const setBotLabActionStatus = (
     message: string,
@@ -4121,6 +4210,72 @@ input[type=number] {
     return lines.join('\n');
   };
 
+  const formatReplayLabSummary = (isAdmin: boolean): string => {
+    if (!isAdmin) {
+      return 'Replay Lab locked.\nSign in with an admin account.';
+    }
+    const debug = onAdminGetReplayExecutorDebug();
+    const loadedRaw = (debug.loadedRecording ?? null) as {
+      sessionId?: unknown;
+      modeId?: unknown;
+      buildVersion?: unknown;
+      samples?: unknown;
+      replaySamples?: unknown;
+      hasInitialState?: unknown;
+    } | null;
+    if (!loadedRaw) {
+      return 'No recording loaded.\nLoad a recording in Admin first.';
+    }
+    const sessionId =
+      typeof loadedRaw.sessionId === 'string' ? loadedRaw.sessionId : 'unknown';
+    const modeId =
+      typeof loadedRaw.modeId === 'string' ? loadedRaw.modeId : '-';
+    const buildVersion =
+      typeof loadedRaw.buildVersion === 'string' ? loadedRaw.buildVersion : '-';
+    const samples =
+      typeof loadedRaw.samples === 'number'
+        ? Math.max(0, loadedRaw.samples)
+        : 0;
+    const replaySamples =
+      typeof loadedRaw.replaySamples === 'number'
+        ? Math.max(0, loadedRaw.replaySamples)
+        : 0;
+    const hasInitialState = loadedRaw.hasInitialState === true ? 'yes' : 'no';
+    return [
+      `Loaded session: ${sessionId}`,
+      `Mode: ${modeId} · Build: ${buildVersion}`,
+      `Samples: ${samples} · Replay steps: ${replaySamples}`,
+      `Initial state: ${hasInitialState}`,
+    ].join('\n');
+  };
+
+  const updateReplayLabControls = () => {
+    const isAdmin =
+      currentAuthState.authenticated &&
+      currentAuthState.user != null &&
+      currentAuthState.user.isAdmin;
+    const busy =
+      currentAuthState.loading ||
+      replayLabPending ||
+      adminActionPending ||
+      adminDatasetPending;
+    replayLabSummary.textContent = formatReplayLabSummary(isAdmin);
+    replayLabApmInput.disabled = !isAdmin || busy;
+    replayLabClockSelect.disabled = !isAdmin || busy;
+    replayLabRunRecordingButton.disabled = !isAdmin || busy;
+    replayLabRunExecutorButton.disabled = !isAdmin || busy;
+    replayLabStopButton.disabled = !isAdmin || busy;
+    for (const button of [
+      replayLabRunRecordingButton,
+      replayLabRunExecutorButton,
+      replayLabStopButton,
+    ]) {
+      const enabled = !button.disabled;
+      button.style.opacity = enabled ? '1' : '0.65';
+      button.style.cursor = enabled ? 'pointer' : 'default';
+    }
+  };
+
   const parseBotPieceSourceProfile = (
     value: string,
     fallback: 'bag7' | 'active_generator' = 'bag7',
@@ -4501,9 +4656,7 @@ input[type=number] {
       datasetBusy || !isAdmin || adminCurrentRecordings.length === 0;
     adminLoadSelectedButton.disabled =
       datasetBusy || !isAdmin || adminSelectedRecordingId == null;
-    adminReplayApmInput.disabled = datasetBusy || !isAdmin;
-    adminReplayStartButton.disabled = datasetBusy || !isAdmin;
-    adminReplayStopButton.disabled = datasetBusy || !isAdmin;
+    adminOpenReplayLabButton.disabled = datasetBusy || !isAdmin;
     adminWhoAmIButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
     adminOpenRouteButton.style.opacity = busy ? '0.65' : '1';
     adminPublishBaselineButton.style.opacity = !isAdmin || busy ? '0.65' : '1';
@@ -4529,9 +4682,7 @@ input[type=number] {
       !isAdmin || datasetBusy || adminSelectedRecordingId == null
         ? '0.65'
         : '1';
-    adminReplayStartButton.style.opacity =
-      !isAdmin || datasetBusy ? '0.65' : '1';
-    adminReplayStopButton.style.opacity =
+    adminOpenReplayLabButton.style.opacity =
       !isAdmin || datasetBusy ? '0.65' : '1';
     adminWhoAmIButton.style.cursor = !isAdmin || busy ? 'default' : 'pointer';
     adminOpenRouteButton.style.cursor = busy ? 'default' : 'pointer';
@@ -4561,10 +4712,9 @@ input[type=number] {
       !isAdmin || datasetBusy || adminSelectedRecordingId == null
         ? 'default'
         : 'pointer';
-    adminReplayStartButton.style.cursor =
+    adminOpenReplayLabButton.style.cursor =
       !isAdmin || datasetBusy ? 'default' : 'pointer';
-    adminReplayStopButton.style.cursor =
-      !isAdmin || datasetBusy ? 'default' : 'pointer';
+    updateReplayLabControls();
   };
 
   const updateAccountControls = () => {
@@ -5178,62 +5328,79 @@ input[type=number] {
     }
   });
 
-  adminReplayStartButton.addEventListener('click', async () => {
-    if (adminDatasetPending) {
-      setAdminActionStatus(
-        'Dataset action already running. Please wait.',
+  adminOpenReplayLabButton.addEventListener('click', () => {
+    setReplayLabStatus('');
+    show('replay_lab');
+  });
+
+  replayLabRunRecordingButton.addEventListener('click', async () => {
+    if (replayLabPending) return;
+    replayLabPending = true;
+    const requestedApm = parsePositiveIntInput(replayLabApmInput);
+    const clockMode = replayLabClockSelect.value.trim();
+    setReplayLabStatus('Starting recording replay...');
+    updateReplayLabControls();
+    try {
+      const message = await onAdminStartRecordingReplay({
+        apmInput: requestedApm,
+        clockMode: clockMode === 'sample_time' ? 'sample_time' : 'fixed',
+      });
+      setReplayLabStatus(message, 'success');
+    } catch (error) {
+      setReplayLabStatus(
+        toErrorMessage(error, 'Could not start recording replay.'),
         'error',
       );
-      return;
+    } finally {
+      replayLabPending = false;
+      updateReplayLabControls();
     }
-    const requestedApm = parsePositiveIntInput(adminReplayApmInput);
+  });
+
+  replayLabRunExecutorButton.addEventListener('click', async () => {
+    if (replayLabPending) return;
+    replayLabPending = true;
+    const requestedApm = parsePositiveIntInput(replayLabApmInput);
     const debugPayload = onAdminGetReplayExecutorDebug();
     console.info('[replay-exec] run button debug', {
       selectedRecordingId: adminSelectedRecordingId,
       requestedApm,
       ...debugPayload,
     });
-    adminDatasetPending = true;
-    setAdminActionStatus('Starting replay executor GUI...');
-    updateAdminControls();
+    setReplayLabStatus('Starting replay executor...');
+    updateReplayLabControls();
     try {
       const message = await onAdminStartReplayExecutorGui({
         apmInput: requestedApm,
       });
-      setAdminActionStatus(message, 'success');
+      setReplayLabStatus(message, 'success');
     } catch (error) {
-      setAdminActionStatus(
+      setReplayLabStatus(
         toErrorMessage(error, 'Could not start replay executor GUI.'),
         'error',
       );
     } finally {
-      adminDatasetPending = false;
-      updateAdminControls();
+      replayLabPending = false;
+      updateReplayLabControls();
     }
   });
 
-  adminReplayStopButton.addEventListener('click', async () => {
-    if (adminDatasetPending) {
-      setAdminActionStatus(
-        'Dataset action already running. Please wait.',
-        'error',
-      );
-      return;
-    }
-    adminDatasetPending = true;
-    setAdminActionStatus('Stopping replay executor GUI...');
-    updateAdminControls();
+  replayLabStopButton.addEventListener('click', async () => {
+    if (replayLabPending) return;
+    replayLabPending = true;
+    setReplayLabStatus('Stopping replay...');
+    updateReplayLabControls();
     try {
-      const message = await onAdminStopReplayExecutorGui();
-      setAdminActionStatus(message, 'success');
+      const message = await onAdminStopReplayMode();
+      setReplayLabStatus(message, 'success');
     } catch (error) {
-      setAdminActionStatus(
-        toErrorMessage(error, 'Could not stop replay executor GUI.'),
+      setReplayLabStatus(
+        toErrorMessage(error, 'Could not stop replay mode.'),
         'error',
       );
     } finally {
-      adminDatasetPending = false;
-      updateAdminControls();
+      replayLabPending = false;
+      updateReplayLabControls();
     }
   });
 
@@ -5770,6 +5937,7 @@ input[type=number] {
   syncModelAxesControls();
   setMyModelsActionStatus('');
   setAdminActionStatus('');
+  setReplayLabStatus('');
   adminBaselinesSummary.textContent = formatAdminBaselinesSummary(false);
   renderAdminBaselinesSelect();
   adminDatasetSummary.textContent = formatAdminDatasetSummary(adminLastPage);
@@ -5802,6 +5970,7 @@ input[type=number] {
   menuLayer.appendChild(accountPanel);
   menuLayer.appendChild(myModelsPanel);
   menuLayer.appendChild(adminPanel);
+  menuLayer.appendChild(replayLabPanel);
   menuLayer.appendChild(botLabPanel);
   root.appendChild(menuLayer);
 
@@ -5899,12 +6068,14 @@ input[type=number] {
     accountPanel.style.display = panel === 'account' ? 'flex' : 'none';
     myModelsPanel.style.display = panel === 'my_models' ? 'flex' : 'none';
     adminPanel.style.display = panel === 'admin' ? 'flex' : 'none';
+    replayLabPanel.style.display = panel === 'replay_lab' ? 'flex' : 'none';
     botLabPanel.style.display = panel === 'bot_lab' ? 'flex' : 'none';
     feedbackMenuButton.style.display = panel === 'main' ? 'block' : 'none';
     menuTitle.style.display =
       panel === 'options' ||
       panel === 'my_models' ||
       panel === 'admin' ||
+      panel === 'replay_lab' ||
       panel === 'bot_lab'
         ? 'none'
         : 'block';
@@ -5916,6 +6087,9 @@ input[type=number] {
     }
     if (panel === 'admin') {
       updateAdminControls();
+    }
+    if (panel === 'replay_lab') {
+      updateReplayLabControls();
     }
     if (panel === 'bot_lab') {
       updateBotLabControls();
@@ -5981,6 +6155,7 @@ input[type=number] {
   accountBackButton.addEventListener('click', showMain);
   myModelsBackButton.addEventListener('click', showMain);
   adminBackButton.addEventListener('click', showMain);
+  replayLabBackButton.addEventListener('click', () => show('admin'));
   botLabBackButton.addEventListener('click', showMain);
 
   window.addEventListener('keydown', (event) => {

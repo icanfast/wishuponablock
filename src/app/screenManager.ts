@@ -1,4 +1,4 @@
-export type ScreenId = 'menu' | 'game' | 'tool';
+export type ScreenId = 'menu' | 'game' | 'tool' | 'replay';
 
 export type ScreenHandle = {
   root: HTMLElement;

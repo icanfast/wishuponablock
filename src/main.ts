@@ -1,4 +1,4 @@
-import { Application, Graphics } from 'pixi.js';
+import { Application, Graphics, type Ticker } from 'pixi.js';
 import {
   COLS,
   ML_BACKEND_PREFERENCE_STORAGE_KEY,
@@ -123,12 +123,13 @@ import {
 } from './core/modelAxes';
 import { parseWubModelFromBytes, type LoadedModel } from './core/wubModel';
 import { createGameScreen, type GameScreen } from './ui/screens/gameScreen';
+import { createReplayScreen } from './ui/screens/replayScreen';
 import {
   createToolHost,
   type ToolController,
   type ToolHost,
 } from './ui/tools/toolHost';
-import type { InputSource } from './core/runner';
+import { NullInputSource, type InputSource } from './core/runner';
 import { createLabelingTool } from './ui/tools/labelingTool';
 import { createConstructorTool } from './ui/tools/constructorTool';
 import { createToolCanvas } from './ui/tools/toolCanvas';
@@ -191,6 +192,8 @@ type ActiveModelSource =
       mode: string;
       version: number | null;
     };
+
+type ReplayClockMode = 'fixed' | 'sample_time';
 
 async function boot() {
   const APP_VERSION = pkg.version;
@@ -258,10 +261,12 @@ async function boot() {
   };
 
   const gameScreen = makeScreenLayer();
+  const replayScreen = makeScreenLayer();
   const toolScreen = makeScreenLayer();
   const menuScreen = makeScreenLayer();
 
   uiLayer.appendChild(gameScreen);
+  uiLayer.appendChild(replayScreen);
   uiLayer.appendChild(toolScreen);
   uiLayer.appendChild(menuScreen);
 
@@ -415,7 +420,9 @@ async function boot() {
   let activeModelContextKey: string | null = null;
   let modelSyncRequestId = 0;
   const syncedModelShaByMode = new Map<string, string>();
-  let setScreen: (screen: 'menu' | 'game' | 'tool') => void = () => {};
+  let setScreen: (
+    screen: 'menu' | 'game' | 'tool' | 'replay',
+  ) => void = () => {};
   let requestStartGame: () => void = () => {};
   let runtime: GameRuntime | null = null;
   const modelService = createModelService({
@@ -564,6 +571,7 @@ async function boot() {
     );
   const personalTrainer = createPersonalTrainerTfjs();
   let menuUi: MenuScreen | null = null;
+  let replayUi: ReturnType<typeof createReplayScreen> | null = null;
   const charcuterieDefaultSimCount = 10000;
   const charcuterieScoreWeights: CharcuterieScoreWeights = {
     height: 10,
@@ -583,6 +591,8 @@ async function boot() {
   let botGuiInspectEnabled = false;
   let replayGuiInputSource: InputSource | null = null;
   let replayGuiInspectEnabled = false;
+  let replayDirectTicker: ((ticker: Ticker) => void) | null = null;
+  let replayDirectRunning = false;
   const activeInputSource: InputSource = {
     sample: (state, dtMs) => {
       if (replayGuiInspectEnabled && replayGuiInputSource) {
@@ -2058,6 +2068,171 @@ async function boot() {
     state.ghostY = state.active.y + dropDistance(state.board, state.active);
   };
 
+  const applyTrajectorySampleSnapshotToGame = (
+    sample: TrajectorySessionV1['samples'][number],
+  ): void => {
+    const game = session.getGame();
+    const state = game.state;
+    state.board = toBoardFromOccupancy(sample.boardOccupancy);
+    state.hold = sample.hold;
+    const nextPiece = sample.replay?.lockPiece ?? sample.action;
+    state.active = spawnReplayActiveForBoard(state.board, nextPiece);
+    state.next = sample.pieces.slice(0, 3);
+    state.canHold = true;
+    state.timeMs =
+      sample.replay?.gameTimeMs ?? Math.max(0, Math.trunc(state.timeMs));
+    state.totalLinesCleared =
+      sample.replay?.totalLinesCleared ??
+      Math.max(0, Math.trunc(state.totalLinesCleared));
+    state.score = sample.replay?.score ?? Math.max(0, Math.trunc(state.score));
+    state.combo = 0;
+    state.gameOver = false;
+    state.gameWon = false;
+    state.mlQueueProbabilities = [];
+    state.ghostY = state.active.y + dropDistance(state.board, state.active);
+  };
+
+  const clearReplayUiLog = (): void => {
+    replayUi?.clearLog();
+  };
+
+  const appendReplayUiLog = (line: string): void => {
+    replayUi?.appendLog(line);
+    console.info(line);
+  };
+
+  const stopReplayDirectPlayback = (): void => {
+    if (replayDirectTicker) {
+      app.ticker.remove(replayDirectTicker);
+      replayDirectTicker = null;
+    }
+    replayDirectRunning = false;
+  };
+
+  const stopAdminReplayMode = (): string => {
+    stopReplayDirectPlayback();
+    replayGuiInspectEnabled = false;
+    replayGuiInputSource = null;
+    runtime?.setInputSource(NullInputSource);
+    runtime?.setPausedByMenu(true);
+    replayUi?.setStatus('Replay stopped.');
+    return 'Replay stopped.';
+  };
+
+  const startAdminRecordingReplay = async (options?: {
+    apmInput?: number;
+    clockMode?: ReplayClockMode;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const loadedRaw = adminLoadedRecordingSession;
+    if (!loadedRaw) {
+      throw new Error('Load a recording first.');
+    }
+    if (loadedRaw.samples.length === 0) {
+      throw new Error('Loaded recording has no samples.');
+    }
+    const bootstrap = buildReplayBootstrapSession(loadedRaw);
+    const loaded = bootstrap.session;
+    const apmInput = Math.max(
+      20,
+      Math.min(1200, Math.trunc(options?.apmInput ?? 60)),
+    );
+    const clockMode: ReplayClockMode =
+      options?.clockMode === 'sample_time' ? 'sample_time' : 'fixed';
+    const fixedIntervalMs = Math.max(16, 60_000 / apmInput);
+    stopAdminBotGuiInspect();
+    stopAdminReplayMode();
+    modeController.startPractice();
+    sessionController.rebuildSession();
+    await screenManager.setActive('replay');
+    applyTrajectoryInitialStateToGame(loaded);
+    runtime?.renderNow();
+    clearReplayUiLog();
+    replayUi?.setDetails(
+      [
+        `Session: ${loaded.sessionId}`,
+        `Mode: ${loaded.modeId}`,
+        `Build: ${loaded.buildVersion}`,
+        `Steps: ${loaded.samples.length}`,
+        `Clock: ${clockMode === 'sample_time' ? 'sample_time' : `fixed @ ${apmInput} APM`}`,
+      ].join('\n'),
+    );
+    if (bootstrap.bootstrapNotice) {
+      appendReplayUiLog(`[replay] ${bootstrap.bootstrapNotice}`);
+    }
+    replayUi?.setStatus(`Replay running... 0/${loaded.samples.length}`);
+
+    let cursor = 0;
+    let elapsedMs = 0;
+    let previousGameTimeMs = loaded.initialState?.timeMs ?? 0;
+    const getStepIntervalMs = (
+      sample: TrajectorySessionV1['samples'][number],
+    ): number => {
+      if (clockMode !== 'sample_time') return fixedIntervalMs;
+      const sampleTime = sample.replay?.gameTimeMs;
+      if (sampleTime == null || !Number.isFinite(sampleTime)) {
+        return fixedIntervalMs;
+      }
+      const delta = Math.max(0, Math.trunc(sampleTime) - previousGameTimeMs);
+      previousGameTimeMs = Math.max(previousGameTimeMs, Math.trunc(sampleTime));
+      return Math.max(16, delta);
+    };
+    let currentIntervalMs = getStepIntervalMs(loaded.samples[0]);
+
+    const finish = (reason: string): void => {
+      stopReplayDirectPlayback();
+      runtime?.setInputSource(NullInputSource);
+      runtime?.setPausedByMenu(true);
+      replayUi?.setStatus(reason);
+      appendReplayUiLog(
+        `[replay] ${reason} (${cursor}/${loaded.samples.length}).`,
+      );
+    };
+
+    const step = (): void => {
+      if (cursor >= loaded.samples.length) {
+        finish('Replay finished');
+        return;
+      }
+      const sample = loaded.samples[cursor];
+      applyTrajectorySampleSnapshotToGame(sample);
+      runtime?.renderNow();
+      cursor += 1;
+      replayUi?.setStatus(
+        `Replay running... ${cursor}/${loaded.samples.length}`,
+      );
+      if (cursor >= loaded.samples.length) {
+        finish('Replay finished');
+        return;
+      }
+      currentIntervalMs = getStepIntervalMs(loaded.samples[cursor]);
+    };
+
+    replayDirectRunning = true;
+    replayDirectTicker = (ticker) => {
+      if (!replayDirectRunning) return;
+      elapsedMs += Math.max(0, ticker.elapsedMS);
+      while (elapsedMs >= currentIntervalMs) {
+        elapsedMs -= currentIntervalMs;
+        step();
+        if (!replayDirectRunning) {
+          return;
+        }
+      }
+    };
+    app.ticker.add(replayDirectTicker);
+    return (
+      `Replay started for ${loaded.sessionId}. ` +
+      `clock=${clockMode}, samples=${loaded.samples.length}.`
+    );
+  };
+
   const startAdminReplayExecutorGui = async (options?: {
     apmInput?: number;
   }): Promise<string> => {
@@ -2085,43 +2260,53 @@ async function boot() {
       Math.min(1200, Math.trunc(options?.apmInput ?? 60)),
     );
     stopAdminBotGuiInspect();
+    stopReplayDirectPlayback();
     replayGuiInputSource = createTrajectoryReplayGuiInputSource({
       session: loaded,
       apmInput,
-      onLog: (line) => console.info(line),
+      onLog: appendReplayUiLog,
       onComplete: (stats) => {
         replayGuiInspectEnabled = false;
         replayGuiInputSource = null;
-        console.info(
+        runtime?.setInputSource(NullInputSource);
+        runtime?.setPausedByMenu(true);
+        appendReplayUiLog(
           `[replay-exec] run finished for ${loaded.sessionId}. ` +
             `planned=${stats.plannedSteps}/${stats.totalReplaySteps}, ` +
             `board_ok=${stats.passedBoardChecks}, board_failed=${stats.failedBoardChecks}, ` +
             `plan_failed=${stats.failedPlans}.`,
         );
+        replayUi?.setStatus('Replay executor finished.');
       },
     });
     replayGuiInspectEnabled = true;
     modeController.startPractice();
     sessionController.rebuildSession();
-    await startGameWithModelReady();
+    await screenManager.setActive('replay');
     applyTrajectoryInitialStateToGame(loaded);
-    runtime?.setInputSource(activeInputSource);
+    runtime?.setInputSource(replayGuiInputSource ?? NullInputSource);
+    runtime?.setPausedByMenu(false);
     runtime?.renderNow();
+    clearReplayUiLog();
+    replayUi?.setDetails(
+      [
+        `Session: ${loaded.sessionId}`,
+        `Mode: ${loaded.modeId}`,
+        `Build: ${loaded.buildVersion}`,
+        `Replay steps: ${replaySteps.length}`,
+        `Executor APM: ${apmInput}`,
+      ].join('\n'),
+    );
+    replayUi?.setStatus('Replay executor running...');
     if (bootstrap.bootstrapNotice) {
-      console.info(`[replay-exec] ${bootstrap.bootstrapNotice}`);
+      appendReplayUiLog(`[replay-exec] ${bootstrap.bootstrapNotice}`);
     }
     return (
       `Replay executor GUI started for session ${loaded.sessionId}. ` +
       `APM=${apmInput}, replay_steps=${replaySteps.length}. ` +
-      `Logs are prefixed with [replay-exec] in the browser console.` +
+      `Logs are visible in Replay screen and console.` +
       (bootstrap.bootstrapNotice ? ` ${bootstrap.bootstrapNotice}` : '')
     );
-  };
-
-  const stopAdminReplayExecutorGui = (): string => {
-    replayGuiInspectEnabled = false;
-    replayGuiInputSource = null;
-    return 'Replay executor GUI stopped.';
   };
 
   const getAdminReplayExecutorDebug = (): Record<string, unknown> => {
@@ -2135,6 +2320,7 @@ async function boot() {
       modeId: modeController.getState().mode.id,
       generatorType: settingsStore.get().generator.type,
       replayGuiInspectEnabled,
+      replayDirectRunning,
       botGuiInspectEnabled,
       loadedRecording: loaded
         ? {
@@ -2858,6 +3044,9 @@ async function boot() {
     gameUi.manualButton.style.display = 'none';
   }
 
+  replayUi = createReplayScreen();
+  replayScreen.appendChild(replayUi.root);
+
   const formatSprintTime = (ms: number): string => {
     const totalMs = Math.max(0, Math.floor(ms));
     const minutes = Math.floor(totalMs / 60000);
@@ -3171,8 +3360,9 @@ async function boot() {
     onAdminTrainGlobalOneShot: runAdminGlobalTrainingOneShot,
     onAdminPublishGlobalCandidate: publishAdminGlobalTrainingCandidate,
     onAdminGetReplayExecutorDebug: getAdminReplayExecutorDebug,
+    onAdminStartRecordingReplay: startAdminRecordingReplay,
     onAdminStartReplayExecutorGui: startAdminReplayExecutorGui,
-    onAdminStopReplayExecutorGui: stopAdminReplayExecutorGui,
+    onAdminStopReplayMode: stopAdminReplayMode,
     onAdminTrainBotPolicyOneShot: runAdminTrainBotPolicyOneShot,
     onAdminGenerateBotRecordings: runAdminGenerateBotRecordings,
     onAdminRunCapabilityBenchmark: runAdminCapabilityBenchmark,
@@ -3254,13 +3444,34 @@ async function boot() {
     'tool',
     screenFlow.makeToolScreen(toolScreen, () => activeToolId),
   );
+  screenManager.register('replay', {
+    root: replayScreen,
+    enter: () => {
+      runtime?.setInputSource(NullInputSource);
+      runtime?.setPausedByMenu(true);
+      gameGfx.visible = true;
+      toolGfx.visible = false;
+      gameUi.gameOverLabel.style.display = 'none';
+      toolHost.deactivate();
+      if (ENABLE_LEGACY_DATA_TOOLS) {
+        void stopRecordingSession();
+      }
+      replayUi?.setStatus('Replay idle.');
+      runtime?.renderNow();
+    },
+    leave: () => {
+      stopAdminReplayMode();
+    },
+  });
 
-  setScreen = (screen: 'menu' | 'game' | 'tool') => {
+  setScreen = (screen: 'menu' | 'game' | 'tool' | 'replay') => {
     if (screen === 'menu') {
       void refreshMenuLabelingProgress();
     }
     void screenManager.setActive(screen);
   };
+
+  replayUi.backButton.addEventListener('click', () => setScreen('menu'));
 
   let startingGame = false;
   const startGameWithModelReady = async (): Promise<void> => {
@@ -3296,14 +3507,15 @@ async function boot() {
       previousRunEnded = false;
       lastRecordedActiveRef = null;
       scheduleTrajectoryRunStart(modeController.getState().mode.id);
+      runtime?.setInputSource(activeInputSource);
       await screenManager.setActive('game');
     } finally {
       startingGame = false;
     }
   };
   requestStartGame = () => {
-    if (replayGuiInspectEnabled) {
-      stopAdminReplayExecutorGui();
+    if (replayGuiInspectEnabled || replayDirectRunning) {
+      stopAdminReplayMode();
     }
     void startGameWithModelReady();
   };
