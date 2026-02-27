@@ -315,6 +315,7 @@ export type MenuScreenOptions = {
     maxPiecesPerEpisode?: number;
     seed?: number;
     pieceSourceProfile?: 'bag7' | 'active_generator';
+    warmStartFromLoaded?: boolean;
   }) => Promise<string>;
   onBotLabRunHeadlessValidate: (options?: {
     maxPieces?: number;
@@ -3290,6 +3291,16 @@ input[type=number] {
   botLabTrainControls.appendChild(
     makeBotLabField('Piece Source', botLabTrainSourceSelect),
   );
+  const botLabWarmStartToggle = document.createElement('input');
+  botLabWarmStartToggle.type = 'checkbox';
+  botLabWarmStartToggle.checked = true;
+  const botLabWarmStartRow = makeInlineToggle(
+    'Warm start from loaded policy',
+    botLabWarmStartToggle,
+  );
+  Object.assign(botLabWarmStartRow.style, {
+    marginTop: '2px',
+  });
   const botLabTrainButton = makeMenuButton('TRAIN POLICY (ONE-SHOT)');
   const botLabHeadlessValidateButton = makeMenuButton('HEADLESS VALIDATE 10K');
 
@@ -3448,6 +3459,7 @@ input[type=number] {
   botLabPanel.appendChild(botLabPublishPolicyButton);
   botLabPanel.appendChild(botLabTrainLabel);
   botLabPanel.appendChild(botLabTrainControls);
+  botLabPanel.appendChild(botLabWarmStartRow);
   botLabPanel.appendChild(botLabTrainButton);
   botLabPanel.appendChild(botLabHeadlessValidateButton);
   botLabPanel.appendChild(botLabGuiLabel);
@@ -4127,6 +4139,7 @@ input[type=number] {
     botLabPublishPolicyButton.style.display = isAdmin ? 'block' : 'none';
     botLabTrainLabel.style.display = isAdmin ? 'block' : 'none';
     botLabTrainControls.style.display = isAdmin ? 'grid' : 'none';
+    botLabWarmStartRow.style.display = isAdmin ? 'inline-flex' : 'none';
     botLabTrainButton.style.display = isAdmin ? 'block' : 'none';
     botLabHeadlessValidateButton.style.display = isAdmin ? 'block' : 'none';
     botLabGuiLabel.style.display = isAdmin ? 'block' : 'none';
@@ -4155,6 +4168,7 @@ input[type=number] {
     botLabMaxPiecesInput.disabled = !isAdmin || busy;
     botLabSeedInput.disabled = !isAdmin || busy;
     botLabTrainSourceSelect.disabled = !isAdmin || busy;
+    botLabWarmStartToggle.disabled = !isAdmin || busy;
     botLabTrainButton.disabled = !isAdmin || busy;
     botLabHeadlessValidateButton.disabled = !isAdmin || busy;
     botLabGuiApmInput.disabled = !isAdmin || busy;
@@ -5299,6 +5313,7 @@ input[type=number] {
           botLabTrainSourceSelect.value,
           'bag7',
         ),
+        warmStartFromLoaded: botLabWarmStartToggle.checked,
       });
       setBotLabActionStatus(message, 'success');
     } catch (error) {

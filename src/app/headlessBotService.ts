@@ -120,6 +120,7 @@ export type BotTrainOneShotConfig = {
   model: LoadedModel;
   modelRunner: ModelRunner;
   modelAxes: ModelAxes;
+  initialPolicy?: BotPolicyArtifact | null;
   episodes?: number;
   maxPiecesPerEpisode?: number;
   gamma?: number;
@@ -1056,12 +1057,32 @@ export const trainBotPolicyOneShot = async (
       onDecision: () => {},
     }).game.state,
   ).length;
-  let params = randomizeParams(
-    inputDim,
-    64,
-    actionSpace.length,
-    new XorShift32(seed),
-  );
+  let initSource: 'scratch' | 'warm' = 'scratch';
+  let params: PolicyParams | null = null;
+  if (config.initialPolicy) {
+    try {
+      const warmParams = fromArtifact(config.initialPolicy);
+      const sameMode = config.initialPolicy.modeId === config.modeId;
+      const compatible =
+        sameMode &&
+        warmParams.inputDim === inputDim &&
+        warmParams.actionDim === actionSpace.length;
+      if (compatible) {
+        params = warmParams;
+        initSource = 'warm';
+      }
+    } catch {
+      // Ignore malformed policy artifact and fall back to random init.
+    }
+  }
+  if (!params) {
+    params = randomizeParams(
+      inputDim,
+      64,
+      actionSpace.length,
+      new XorShift32(seed),
+    );
+  }
   const transitions: Transition[] = [];
   const episodeReturns: number[] = [];
 
@@ -1131,7 +1152,7 @@ export const trainBotPolicyOneShot = async (
     ok: true,
     message:
       `Bot policy training complete (episodes=${episodes}, transitions=${transitions.length}, ` +
-      `gamma=${gamma.toFixed(4)}).`,
+      `gamma=${gamma.toFixed(4)}, init=${initSource}).`,
     episodes,
     meanReturn: mean(episodeReturns),
     finalLoss: trained.finalLoss,

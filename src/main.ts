@@ -1527,6 +1527,7 @@ async function boot() {
     maxPiecesPerEpisode?: number;
     seed?: number;
     pieceSourceProfile?: BotPieceSourceProfile;
+    warmStartFromLoaded?: boolean;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -1540,12 +1541,15 @@ async function boot() {
       throw new Error('Model is not loaded.');
     }
     const modeId = modeController.getState().mode.id;
+    const initialPolicy =
+      options.warmStartFromLoaded === false ? null : adminBotPolicy;
     const result = await trainBotPolicyOneShot({
       modeId,
       settings: settingsStore.get(),
       model,
       modelRunner: modelService.getRunner(),
       modelAxes: getActiveModelAxes(),
+      initialPolicy,
       episodes: options.episodes,
       maxPiecesPerEpisode: options.maxPiecesPerEpisode,
       seed: options.seed,
