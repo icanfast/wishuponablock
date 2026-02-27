@@ -10,7 +10,10 @@ import type { Board, GameState, InputFrame, PieceKind } from '../core/types';
 import { PIECES } from '../core/types';
 import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
-import type { TrajectoryReplayStepV1 } from '../core/trajectoryProtocol';
+import type {
+  TrajectoryInitialStateV1,
+  TrajectoryReplayStepV1,
+} from '../core/trajectoryProtocol';
 import { applyModeSettings, runModeStart } from './modeService';
 
 const TFJS_CDN_URL = 'https://esm.sh/@tensorflow/tfjs@4.22.0';
@@ -173,6 +176,7 @@ export type BotTrajectoryDraft = {
   startedAtMs: number;
   endedAtMs: number;
   durationMs: number;
+  initialState: TrajectoryInitialStateV1;
   outcome: 'game_over' | 'game_won' | 'manual';
   terminal: {
     totalLinesCleared: number;
@@ -284,6 +288,7 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
 type RolloutResult = {
   transitions: Transition[];
   episodeReturn: number;
+  initialState: TrajectoryInitialStateV1;
   decisions: Array<{
     event: ModelGeneratorDecisionEvent;
     replay: TrajectoryReplayStepV1 | null;
@@ -326,6 +331,24 @@ const percentile = (values: number[], p: number): number => {
 
 const boardOccupancy = (board: Board): number[][] =>
   board.map((row) => row.map((cell) => (cell == null ? 0 : 1)));
+
+const toTrajectoryInitialState = (
+  state: GameState,
+): TrajectoryInitialStateV1 => ({
+  boardOccupancy: boardOccupancy(state.board),
+  hold: state.hold,
+  active: {
+    k: state.active.k,
+    r: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+    x: Math.trunc(state.active.x),
+    y: Math.trunc(state.active.y),
+  },
+  next: [...state.next],
+  canHold: Boolean(state.canHold),
+  timeMs: Math.max(0, Math.trunc(state.timeMs)),
+  totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+  score: Math.max(0, Math.trunc(state.score)),
+});
 
 const countBoardHoles = (board: Board): number => {
   if (board.length === 0 || board[0].length === 0) return 0;
@@ -808,6 +831,7 @@ const runRollout = (config: {
     },
   });
   const rng = new XorShift32(config.seed ^ 0x9e3779b9);
+  const initialState = toTrajectoryInitialState(game.state);
   const bot = new MacroPolicyBot((state) => {
     const observation = encodeObservation(config.model, state);
     const forward = forwardPolicy(config.policyParams, observation);
@@ -910,6 +934,7 @@ const runRollout = (config: {
   return {
     transitions,
     episodeReturn,
+    initialState,
     decisions,
     tickDurationsMs,
     steps,
@@ -1650,6 +1675,18 @@ export const generateBotTrajectoryBatch = async (
       startedAtMs: rollout.startedAtMs,
       endedAtMs: rollout.endedAtMs,
       durationMs: Math.max(0, rollout.endedAtMs - rollout.startedAtMs),
+      initialState: {
+        boardOccupancy: rollout.initialState.boardOccupancy.map((row) =>
+          row.slice(),
+        ),
+        hold: rollout.initialState.hold,
+        active: { ...rollout.initialState.active },
+        next: [...rollout.initialState.next],
+        canHold: rollout.initialState.canHold,
+        timeMs: rollout.initialState.timeMs,
+        totalLinesCleared: rollout.initialState.totalLinesCleared,
+        score: rollout.initialState.score,
+      },
       outcome: rollout.outcome,
       terminal: rollout.terminal,
       samples,

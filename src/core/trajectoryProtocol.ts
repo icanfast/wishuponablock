@@ -41,6 +41,22 @@ export type TrajectoryReplayStepV1 = {
   score: number;
 };
 
+export type TrajectoryInitialStateV1 = {
+  boardOccupancy: number[][];
+  hold: PieceKind | null;
+  active: {
+    k: PieceKind;
+    r: number;
+    x: number;
+    y: number;
+  };
+  next: PieceKind[];
+  canHold: boolean;
+  timeMs: number;
+  totalLinesCleared: number;
+  score: number;
+};
+
 export type TrajectorySessionSampleV1 = {
   id: string;
   createdAtMs: number;
@@ -67,6 +83,7 @@ export type TrajectorySessionV1 = {
   startedAtMs: number;
   endedAtMs: number;
   durationMs: number;
+  initialState?: TrajectoryInitialStateV1;
   samples: TrajectorySessionSampleV1[];
   meta: TrajectorySessionMetaV1 | null;
 };
@@ -302,6 +319,69 @@ const parseReplay = (
   };
 };
 
+const parseInitialState = (
+  value: unknown,
+  options: { maxRows: number; maxCols: number },
+): TrajectoryInitialStateV1 | null => {
+  const obj = asObject(value);
+  if (!obj) return null;
+  const boardOccupancy = parseBoardOccupancy(
+    obj.boardOccupancy,
+    options.maxRows,
+    options.maxCols,
+  );
+  const hold = obj.hold == null ? null : asPiece(obj.hold);
+  const activeObj = asObject(obj.active);
+  const activeK = activeObj ? asPiece(activeObj.k) : null;
+  const activeR = activeObj ? asInt(activeObj.r, { min: 0, max: 3 }) : null;
+  const activeX = activeObj
+    ? asInt(activeObj.x, { min: -8, max: options.maxCols + 8 })
+    : null;
+  const activeY = activeObj
+    ? asInt(activeObj.y, { min: -8, max: options.maxRows + 8 })
+    : null;
+  const next = parsePieceArray(obj.next, 0, 32);
+  const canHold = asBoolean(obj.canHold);
+  const timeMs = asInt(obj.timeMs, {
+    min: 0,
+    max: 7 * 24 * 60 * 60 * 1000,
+  });
+  const totalLinesCleared = asInt(obj.totalLinesCleared, {
+    min: 0,
+    max: 1_000_000,
+  });
+  const score = asInt(obj.score, { min: 0, max: 1_000_000_000 });
+  if (
+    !boardOccupancy ||
+    !activeK ||
+    activeR == null ||
+    activeX == null ||
+    activeY == null ||
+    !next ||
+    canHold == null ||
+    timeMs == null ||
+    totalLinesCleared == null ||
+    score == null
+  ) {
+    return null;
+  }
+  return {
+    boardOccupancy,
+    hold,
+    active: {
+      k: activeK,
+      r: activeR,
+      x: activeX,
+      y: activeY,
+    },
+    next,
+    canHold,
+    timeMs,
+    totalLinesCleared,
+    score,
+  };
+};
+
 const parseSample = (
   value: unknown,
   options: { maxRows: number; maxCols: number },
@@ -455,6 +535,13 @@ export const parseTrajectorySessionV1 = (
   if (obj.meta != null && !meta) {
     return { ok: false, error: 'Invalid trajectory metadata.' };
   }
+  const initialState =
+    obj.initialState == null
+      ? null
+      : parseInitialState(obj.initialState, { maxRows, maxCols });
+  if (obj.initialState != null && !initialState) {
+    return { ok: false, error: 'Invalid trajectory initial state.' };
+  }
 
   return {
     ok: true,
@@ -466,6 +553,7 @@ export const parseTrajectorySessionV1 = (
       startedAtMs,
       endedAtMs,
       durationMs,
+      ...(initialState ? { initialState } : {}),
       samples,
       meta,
     },

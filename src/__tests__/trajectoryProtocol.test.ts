@@ -118,4 +118,45 @@ describe('trajectory protocol parser', () => {
     if (parsed.ok) return;
     expect(parsed.error).toContain('Invalid trajectory sample');
   });
+
+  it('parses optional initial state payload', () => {
+    const payload = makePayload(8);
+    (payload as Record<string, unknown>).initialState = {
+      boardOccupancy: Array.from({ length: 20 }, () =>
+        Array.from({ length: 10 }, () => 0),
+      ),
+      hold: null,
+      active: { k: 'I', r: 0, x: 3, y: 0 },
+      next: ['O', 'T', 'S'],
+      canHold: true,
+      timeMs: 0,
+      totalLinesCleared: 0,
+      score: 0,
+    };
+    const parsed = parseTrajectorySessionV1(payload, { minSamples: 8 });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.initialState?.active.k).toBe('I');
+    expect(parsed.value.initialState?.next).toEqual(['O', 'T', 'S']);
+  });
+
+  it('rejects invalid initial state payload', () => {
+    const payload = makePayload(8);
+    (payload as Record<string, unknown>).initialState = {
+      boardOccupancy: Array.from({ length: 20 }, () =>
+        Array.from({ length: 10 }, () => 0),
+      ),
+      hold: null,
+      active: { k: 'I', r: 5, x: 3, y: 0 },
+      next: ['O', 'T'],
+      canHold: true,
+      timeMs: 0,
+      totalLinesCleared: 0,
+      score: 0,
+    };
+    const parsed = parseTrajectorySessionV1(payload, { minSamples: 8 });
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain('initial state');
+  });
 });

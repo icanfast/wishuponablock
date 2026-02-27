@@ -70,6 +70,7 @@ import {
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
+  type TrajectoryInitialStateV1,
   type TrajectoryReplayStepV1,
   type TrajectorySessionMetaV1,
   type TrajectorySessionV1,
@@ -1722,6 +1723,18 @@ async function boot() {
         startedAtMs: draft.startedAtMs,
         endedAtMs: draft.endedAtMs,
         durationMs: draft.durationMs,
+        initialState: {
+          boardOccupancy: draft.initialState.boardOccupancy.map((row) =>
+            row.slice(),
+          ),
+          hold: draft.initialState.hold,
+          active: { ...draft.initialState.active },
+          next: [...draft.initialState.next],
+          canHold: draft.initialState.canHold,
+          timeMs: draft.initialState.timeMs,
+          totalLinesCleared: draft.initialState.totalLinesCleared,
+          score: draft.initialState.score,
+        },
         samples: draft.samples.map((sample, index) => ({
           ...sample,
           boardOccupancy: sample.boardOccupancy.map((row) => row.slice()),
@@ -1993,6 +2006,7 @@ async function boot() {
     pipelineId: string;
     minSamplesForUpload: number;
     rewardPolicyId: TrajectoryRewardPolicyId;
+    initialState: TrajectoryInitialStateV1;
   };
   let activeTrajectoryRun: TrajectoryRunState | null = null;
   let pendingTrajectoryRunModeId: string | null = null;
@@ -2054,6 +2068,26 @@ async function boot() {
     return meta;
   };
 
+  const toTrajectoryInitialState = (
+    state: GameState,
+  ): TrajectoryInitialStateV1 => ({
+    boardOccupancy: state.board.map((row) =>
+      row.map((cell) => (cell == null ? 0 : 1)),
+    ),
+    hold: state.hold,
+    active: {
+      k: state.active.k,
+      r: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+      x: Math.trunc(state.active.x),
+      y: Math.trunc(state.active.y),
+    },
+    next: [...state.next],
+    canHold: Boolean(state.canHold),
+    timeMs: Math.max(0, Math.trunc(state.timeMs)),
+    totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+    score: Math.max(0, Math.trunc(state.score)),
+  });
+
   const toTrajectorySamples = (
     samples: TrajectoryDecisionSample[],
     rewards: number[],
@@ -2095,7 +2129,7 @@ async function boot() {
       };
     });
 
-  const beginTrajectoryRun = (modeId: string): void => {
+  const beginTrajectoryRun = (modeId: string, state: GameState): void => {
     const axes = getActiveModelAxes();
     const pipeline = getTrainingPipelineForContext(modeId, axes);
     activeTrajectoryRun = {
@@ -2109,6 +2143,7 @@ async function boot() {
         pipeline.minSamples,
       ),
       rewardPolicyId: getTrajectoryRewardPolicyId(modeId, axes),
+      initialState: toTrajectoryInitialState(state),
     };
   };
 
@@ -2154,6 +2189,18 @@ async function boot() {
       startedAtMs: run.startedAtMs,
       endedAtMs,
       durationMs: Math.max(0, endedAtMs - run.startedAtMs),
+      initialState: {
+        boardOccupancy: run.initialState.boardOccupancy.map((row) =>
+          row.slice(),
+        ),
+        hold: run.initialState.hold,
+        active: { ...run.initialState.active },
+        next: [...run.initialState.next],
+        canHold: run.initialState.canHold,
+        timeMs: run.initialState.timeMs,
+        totalLinesCleared: run.initialState.totalLinesCleared,
+        score: run.initialState.score,
+      },
       samples: toTrajectorySamples(runSamples, rewards.rewards),
       meta: toTrajectoryMeta(run, outcome, rewards),
     };
@@ -2642,7 +2689,7 @@ async function boot() {
     },
     onFrame: (state) => {
       if (pendingTrajectoryRunModeId && !activeTrajectoryRun) {
-        beginTrajectoryRun(pendingTrajectoryRunModeId);
+        beginTrajectoryRun(pendingTrajectoryRunModeId, state);
         pendingTrajectoryRunModeId = null;
       }
       const generatorType = settingsStore.get().generator.type;
