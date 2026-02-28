@@ -4,7 +4,10 @@ import {
   planTrajectoryLockExecution,
   trajectoryExecutorCommandToInputFrame,
 } from '../core/trajectoryExecutor';
-import type { TrajectorySessionV1 } from '../core/trajectoryProtocol';
+import type {
+  TrajectoryReplayStepV1,
+  TrajectorySessionV1,
+} from '../core/trajectoryProtocol';
 import type { InputSource } from '../core/runner';
 import type { GameState, InputFrame, PieceKind } from '../core/types';
 
@@ -60,6 +63,23 @@ const sameOccupancy = (left: number[][], right: number[][]): boolean => {
   return true;
 };
 
+const summarizeBoard = (board: GameState['board']): string => {
+  let occupied = 0;
+  const heights = new Array<number>(board[0]?.length ?? 0).fill(0);
+  for (let y = 0; y < board.length; y += 1) {
+    for (let x = 0; x < board[y].length; x += 1) {
+      if (!board[y][x]) continue;
+      occupied += 1;
+      if (heights[x] === 0) {
+        heights[x] = board.length - y;
+      }
+    }
+  }
+  const heightsSummary =
+    heights.length > 0 ? `h=[${heights.join(',')}]` : 'h=[]';
+  return `occupied=${occupied}, ${heightsSummary}`;
+};
+
 const normalizeRotation = (value: number): 0 | 1 | 2 | 3 => {
   const normalized = Math.trunc(value) % 4;
   if (normalized === 1) return 1;
@@ -88,15 +108,42 @@ const coerceActiveForTarget = (
   log(`forced active piece to ${lockPiece} for replay alignment.`);
 };
 
-const coerceHoldForTarget = (
-  state: GameState,
-  holdPiece: PieceKind,
-  log: (line: string) => void,
-): void => {
-  if (state.hold === holdPiece) return;
-  state.hold = holdPiece;
-  state.canHold = true;
-  log(`forced hold piece to ${holdPiece} for holdUsed replay step.`);
+type PlanVariant = {
+  label: string;
+  target: TrajectoryReplayStepV1;
+  maxNodesScale: number;
+};
+
+type PlanAttempt = {
+  label: string;
+  reason: string;
+  visitedNodes: number;
+};
+
+type SuccessfulPlan = {
+  label: string;
+  result: Extract<ReturnType<typeof planTrajectoryLockExecution>, { ok: true }>;
+};
+
+const buildPlanVariants = (replay: TrajectoryReplayStepV1): PlanVariant[] => {
+  if (replay.holdUsed) {
+    return [
+      { label: 'as_recorded', target: replay, maxNodesScale: 1 },
+      {
+        label: 'fallback_hold_used_false',
+        target: { ...replay, holdUsed: false },
+        maxNodesScale: 2,
+      },
+    ];
+  }
+  return [
+    { label: 'as_recorded', target: replay, maxNodesScale: 1 },
+    {
+      label: 'fallback_hold_used_true',
+      target: { ...replay, holdUsed: true },
+      maxNodesScale: 2,
+    },
+  ];
 };
 
 export const createTrajectoryReplayGuiInputSource = (
@@ -170,37 +217,61 @@ export const createTrajectoryReplayGuiInputSource = (
       pendingCheck = null;
     }
 
-    if (replay.holdUsed && state.hold !== replay.lockPiece) {
-      coerceHoldForTarget(state, replay.lockPiece, log);
-    } else if (!replay.holdUsed && state.active.k !== replay.lockPiece) {
+    if (!replay.holdUsed && state.active.k !== replay.lockPiece) {
       coerceActiveForTarget(state, replay.lockPiece, log);
     }
     state.active.r = normalizeRotation(state.active.r);
-
-    const plan = planTrajectoryLockExecution({
-      board: state.board,
-      active: state.active,
-      hold: state.hold,
-      canHold: state.canHold,
-      target: replay,
-      maxNodes,
-      allowSoftDrop,
-    });
+    const variants = buildPlanVariants(replay);
+    const attempts: PlanAttempt[] = [];
+    let planned: SuccessfulPlan | null = null;
+    for (const variant of variants) {
+      const result = planTrajectoryLockExecution({
+        board: state.board,
+        active: state.active,
+        hold: state.hold,
+        canHold: state.canHold,
+        target: variant.target,
+        maxNodes: Math.max(1, Math.trunc(maxNodes * variant.maxNodesScale)),
+        allowSoftDrop,
+      });
+      if (result.ok) {
+        planned = { label: variant.label, result };
+        break;
+      }
+      attempts.push({
+        label: variant.label,
+        reason: result.reason,
+        visitedNodes: result.visitedNodes,
+      });
+    }
     replayCursor += 1;
-    if (!plan.ok) {
+    if (!planned) {
       stats.failedPlans += 1;
-      log(`plan failed for sample #${entry.index}: ${plan.reason}`);
+      const attemptsSummary = attempts
+        .map(
+          (attempt) =>
+            `${attempt.label}=>${attempt.reason} (visited=${attempt.visitedNodes})`,
+        )
+        .join(' | ');
+      log(
+        `plan failed for sample #${entry.index}. ` +
+          `target={piece:${replay.lockPiece},rot:${replay.lockRotation},x:${replay.lockX},y:${replay.lockY},holdUsed:${replay.holdUsed}} ` +
+          `state={active:${state.active.k}@${state.active.x},${state.active.y},r${state.active.r};hold:${state.hold ?? 'null'};canHold:${state.canHold}} ` +
+          `board={${summarizeBoard(state.board)}} ` +
+          `attempts=${attemptsSummary}`,
+      );
       complete();
       return;
     }
     stats.plannedSteps += 1;
-    queue = plan.commands.map((command) =>
+    queue = planned.result.commands.map((command) =>
       trajectoryExecutorCommandToInputFrame(command),
     );
     pendingCheck = entry;
     log(
       `planned sample #${entry.index}: commands=${queue.length}, ` +
-        `depth=${plan.searchDepth}, visited=${plan.visitedNodes}.`,
+        `depth=${planned.result.searchDepth}, visited=${planned.result.visitedNodes}, ` +
+        `variant=${planned.label}.`,
     );
   };
 
