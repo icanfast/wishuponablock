@@ -1,3 +1,12 @@
+import {
+  BOARD_CELL_PX,
+  BOARD_Y,
+  COLS,
+  PANEL_GAP,
+  ROWS,
+} from '../../core/constants';
+import type { PieceKind } from '../../core/types';
+
 export type ReplayScreen = {
   root: HTMLDivElement;
   backButton: HTMLButtonElement;
@@ -5,6 +14,7 @@ export type ReplayScreen = {
   setDetails: (value: string) => void;
   appendLog: (line: string) => void;
   clearLog: () => void;
+  setHoldValue: (value: PieceKind | null) => void;
 };
 
 const makeButton = (labelText: string): HTMLButtonElement => {
@@ -22,6 +32,8 @@ const makeButton = (labelText: string): HTMLButtonElement => {
   return button;
 };
 
+const REPLAY_VIEW_Y_OFFSET = 20;
+
 export const createReplayScreen = (): ReplayScreen => {
   const root = document.createElement('div');
   Object.assign(root.style, {
@@ -33,12 +45,36 @@ export const createReplayScreen = (): ReplayScreen => {
   const backButton = makeButton('BACK TO MENU');
   Object.assign(backButton.style, {
     position: 'absolute',
-    right: '16px',
-    top: '16px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    top: `${BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP + REPLAY_VIEW_Y_OFFSET}px`,
+    width: `${COLS * BOARD_CELL_PX}px`,
     pointerEvents: 'auto',
     zIndex: '3',
   });
   root.appendChild(backButton);
+
+  const holdValue = document.createElement('div');
+  holdValue.textContent = 'HOLD: -';
+  Object.assign(holdValue.style, {
+    position: 'absolute',
+    left: '16px',
+    top: '16px',
+    padding: '8px 10px',
+    background: 'rgba(11, 15, 20, 0.92)',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '6px',
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '13px',
+    letterSpacing: '0.2px',
+    zIndex: '3',
+  });
+  root.appendChild(holdValue);
+
+  const setHoldValue = (value: PieceKind | null): void => {
+    holdValue.textContent = `HOLD: ${value ?? '-'}`;
+  };
 
   return {
     root,
@@ -47,5 +83,6 @@ export const createReplayScreen = (): ReplayScreen => {
     setDetails: () => {},
     appendLog: () => {},
     clearLog: () => {},
+    setHoldValue,
   };
 };

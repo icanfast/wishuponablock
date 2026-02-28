@@ -95,6 +95,7 @@ import { createGameSessionFactory } from './app/gameFactory';
 import { PixiRenderer } from './render/pixiRenderer';
 import {
   PIECES,
+  type ActivePiece,
   type Board,
   type PieceKind,
   type GameState,
@@ -593,6 +594,24 @@ async function boot() {
   let replayGuiInspectEnabled = false;
   let replayDirectTicker: ((ticker: Ticker) => void) | null = null;
   let replayDirectRunning = false;
+  let replayExecutorTargetGhost: ActivePiece | null = null;
+  let applyReplayExecutorGhostOverride:
+    | ((ghost: ActivePiece | null) => void)
+    | null = null;
+  const setReplayExecutorTargetGhost = (target: ActivePiece | null): void => {
+    if (!target) {
+      replayExecutorTargetGhost = null;
+      applyReplayExecutorGhostOverride?.(null);
+      return;
+    }
+    replayExecutorTargetGhost = {
+      k: target.k,
+      r: target.r,
+      x: Math.trunc(target.x),
+      y: Math.trunc(target.y),
+    };
+    applyReplayExecutorGhostOverride?.(replayExecutorTargetGhost);
+  };
   const activeInputSource: InputSource = {
     sample: (state, dtMs) => {
       if (replayGuiInspectEnabled && replayGuiInputSource) {
@@ -2113,6 +2132,7 @@ async function boot() {
     stopReplayDirectPlayback();
     replayGuiInspectEnabled = false;
     replayGuiInputSource = null;
+    setReplayExecutorTargetGhost(null);
     runtime?.setInputSource(NullInputSource);
     runtime?.setPausedByMenu(true);
     replayUi?.setStatus('Replay stopped.');
@@ -2148,6 +2168,7 @@ async function boot() {
     const fixedIntervalMs = Math.max(16, 60_000 / apmInput);
     stopAdminBotGuiInspect();
     stopAdminReplayMode();
+    setReplayExecutorTargetGhost(null);
     modeController.startPractice();
     sessionController.rebuildSession();
     await screenManager.setActive('replay');
@@ -2261,13 +2282,17 @@ async function boot() {
     );
     stopAdminBotGuiInspect();
     stopReplayDirectPlayback();
+    setReplayExecutorTargetGhost(null);
     replayGuiInputSource = createTrajectoryReplayGuiInputSource({
       session: loaded,
       apmInput,
       onLog: appendReplayUiLog,
+      onTargetGhostChange: (target) =>
+        setReplayExecutorTargetGhost(target?.ghost ?? null),
       onComplete: (stats) => {
         replayGuiInspectEnabled = false;
         replayGuiInputSource = null;
+        setReplayExecutorTargetGhost(null);
         runtime?.setInputSource(NullInputSource);
         runtime?.setPausedByMenu(true);
         appendReplayUiLog(
@@ -3016,6 +3041,10 @@ async function boot() {
 
   const gameRenderer = new PixiRenderer(gameGfx);
   const toolRenderer = new PixiRenderer(toolGfx);
+  applyReplayExecutorGhostOverride = (ghost) => {
+    gameRenderer.setGhostOverride(ghost);
+  };
+  setReplayExecutorTargetGhost(replayExecutorTargetGhost);
   gameRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
   gameRenderer.setGhostOpacity(settings.graphics.ghostOpacity);
   gameRenderer.setHighContrast(settings.graphics.highContrast);
@@ -3141,6 +3170,9 @@ async function boot() {
       }
       updateSprintHud(state);
       updateClassicHud(state);
+      if (screenManager.getActive() === 'replay') {
+        replayUi?.setHoldValue(state.hold);
+      }
       gameUi.setQueueOddsMode(usesModelGenerator(generatorType));
       gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
@@ -3457,6 +3489,7 @@ async function boot() {
         void stopRecordingSession();
       }
       replayUi?.setStatus('Replay idle.');
+      replayUi?.setHoldValue(session.getGame().state.hold);
       runtime?.renderNow();
     },
     leave: () => {
@@ -3471,7 +3504,13 @@ async function boot() {
     void screenManager.setActive(screen);
   };
 
-  replayUi.backButton.addEventListener('click', () => setScreen('menu'));
+  replayUi.backButton.addEventListener('click', () => {
+    void refreshMenuLabelingProgress();
+    void (async () => {
+      await screenManager.setActive('menu');
+      menuUi?.show('replay_lab');
+    })();
+  });
 
   let startingGame = false;
   const startGameWithModelReady = async (): Promise<void> => {

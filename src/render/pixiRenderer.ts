@@ -56,6 +56,7 @@ export class PixiRenderer {
 
   private gridlineOpacity = 0;
   private ghostOpacity = DEFAULT_GHOST_OPACITY;
+  private ghostOverride: ActivePiece | null = null;
   private highContrast = false;
   private colorblindMode = false;
 
@@ -65,6 +66,19 @@ export class PixiRenderer {
 
   setGhostOpacity(opacity: number): void {
     this.ghostOpacity = Math.max(0, Math.min(1, opacity));
+  }
+
+  setGhostOverride(ghost: ActivePiece | null): void {
+    if (!ghost) {
+      this.ghostOverride = null;
+      return;
+    }
+    this.ghostOverride = {
+      k: ghost.k,
+      r: ghost.r,
+      x: Math.trunc(ghost.x),
+      y: Math.trunc(ghost.y),
+    };
   }
 
   setHighContrast(enabled: boolean): void {
@@ -144,8 +158,11 @@ export class PixiRenderer {
     if (state.gameOver || state.gameWon) return;
 
     // ghost
-    const ghostColor = this.getPieceColor(state.active.k);
-    const ghostPiece = { ...state.active, y: state.ghostY };
+    const ghostPiece = this.ghostOverride ?? {
+      ...state.active,
+      y: state.ghostY,
+    };
+    const ghostColor = this.getPieceColor(ghostPiece.k);
     if (this.ghostOpacity > 0) {
       for (const [x, y] of cellsOf(ghostPiece)) {
         if (y < 0) continue;

@@ -11,6 +11,16 @@ import type {
 import type { InputSource } from '../core/runner';
 import type { GameState, InputFrame, PieceKind } from '../core/types';
 
+export type ReplayExecutorTargetGhost = {
+  sampleIndex: number;
+  ghost: {
+    k: PieceKind;
+    r: 0 | 1 | 2 | 3;
+    x: number;
+    y: number;
+  };
+};
+
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
   rotate: 0,
@@ -43,6 +53,7 @@ export type TrajectoryReplayGuiInputSourceConfig = {
   maxNodes?: number;
   stopOnParityMismatch?: boolean;
   onLog?: (line: string) => void;
+  onTargetGhostChange?: (target: ReplayExecutorTargetGhost | null) => void;
   onComplete?: (stats: TrajectoryReplayGuiRunStats) => void;
 };
 
@@ -203,6 +214,7 @@ export const createTrajectoryReplayGuiInputSource = (
   const complete = (): void => {
     if (finished) return;
     finished = true;
+    config.onTargetGhostChange?.(null);
     const summary =
       `complete: planned=${stats.plannedSteps}/${stats.totalReplaySteps}, ` +
       `board_checks_ok=${stats.passedBoardChecks}, board_checks_failed=${stats.failedBoardChecks}, ` +
@@ -310,6 +322,15 @@ export const createTrajectoryReplayGuiInputSource = (
     queue = planned.result.commands.map((command) =>
       trajectoryExecutorCommandToInputFrame(command),
     );
+    config.onTargetGhostChange?.({
+      sampleIndex: entry.index,
+      ghost: {
+        k: replay.lockPiece,
+        r: normalizeRotation(replay.lockRotation),
+        x: Math.trunc(replay.lockX),
+        y: Math.trunc(replay.lockY),
+      },
+    });
     pendingCheck = entry;
     log(
       `planned sample #${entry.index}: commands=${queue.length}, ` +
@@ -357,6 +378,7 @@ export const createTrajectoryReplayGuiInputSource = (
       replayCursor = 0;
       pendingCheck = null;
       finished = false;
+      config.onTargetGhostChange?.(null);
       stats.plannedSteps = 0;
       stats.passedBoardChecks = 0;
       stats.failedBoardChecks = 0;
