@@ -6,7 +6,13 @@ import { getMode } from '../core/modes';
 import { XorShift32 } from '../core/rng';
 import { GameRunner, type InputSource } from '../core/runner';
 import type { Settings } from '../core/settings';
-import type { Board, GameState, InputFrame, PieceKind } from '../core/types';
+import type {
+  ActivePiece,
+  Board,
+  GameState,
+  InputFrame,
+  PieceKind,
+} from '../core/types';
 import { PIECES } from '../core/types';
 import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
@@ -559,6 +565,7 @@ const buildPlacementChoices = (
 ): {
   commandsBySlot: InputFrame[][];
   actionMask: Float32Array;
+  placements: ReturnType<typeof enumerateTrajectoryExecutorPlacements>;
 } => {
   const placements = enumerateTrajectoryExecutorPlacements({
     board: state.board,
@@ -585,7 +592,7 @@ const buildPlacementChoices = (
     actionMask[0] = 1;
     commandsBySlot.push([trajectoryExecutorCommandToInputFrame('hard_drop')]);
   }
-  return { commandsBySlot, actionMask };
+  return { commandsBySlot, actionMask, placements };
 };
 
 const randomizeParams = (
@@ -2035,6 +2042,7 @@ export type BotGuiInputSourceConfig = {
   apmInput: number;
   seed?: number;
   greedy?: boolean;
+  onTargetGhostChange?: (ghost: ActivePiece | null) => void;
 };
 
 export const createGuiInspectBotInputSource = (
@@ -2161,9 +2169,25 @@ export const createGuiInspectBotInputSource = (
           actionIndex = sampleIndex(forward.probabilities, rng);
         }
         if (placementChoices) {
+          const targetPlacement =
+            placementChoices.placements[actionIndex] ??
+            placementChoices.placements[0] ??
+            null;
+          config.onTargetGhostChange?.(
+            targetPlacement
+              ? {
+                  k: targetPlacement.lockPiece,
+                  r: (((Math.trunc(targetPlacement.lockRotation) % 4) + 4) %
+                    4) as ActivePiece['r'],
+                  x: targetPlacement.lockX,
+                  y: targetPlacement.lockY,
+                }
+              : null,
+          );
           queue = placementChoices.commandsBySlot[actionIndex] ??
             placementChoices.commandsBySlot[0] ?? [EMPTY_INPUT];
         } else {
+          config.onTargetGhostChange?.(null);
           const macroActions =
             params.macroActions ?? actionSpace.map((action) => ({ ...action }));
           const action =
@@ -2182,6 +2206,7 @@ export const createGuiInspectBotInputSource = (
       activeRef = null;
       queue = [];
       cooldownMs = 0;
+      config.onTargetGhostChange?.(null);
     },
   };
 };

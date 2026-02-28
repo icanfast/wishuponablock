@@ -595,13 +595,26 @@ async function boot() {
   let replayDirectTicker: ((ticker: Ticker) => void) | null = null;
   let replayDirectRunning = false;
   let replayExecutorTargetGhost: ActivePiece | null = null;
-  let applyReplayExecutorGhostOverride:
-    | ((ghost: ActivePiece | null) => void)
-    | null = null;
+  let botInspectTargetGhost: ActivePiece | null = null;
+  let applyGameGhostOverride: ((ghost: ActivePiece | null) => void) | null =
+    null;
+  const refreshInspectTargetGhost = (): void => {
+    const target = replayExecutorTargetGhost ?? botInspectTargetGhost;
+    if (!target) {
+      applyGameGhostOverride?.(null);
+      return;
+    }
+    applyGameGhostOverride?.({
+      k: target.k,
+      r: target.r,
+      x: Math.trunc(target.x),
+      y: Math.trunc(target.y),
+    });
+  };
   const setReplayExecutorTargetGhost = (target: ActivePiece | null): void => {
     if (!target) {
       replayExecutorTargetGhost = null;
-      applyReplayExecutorGhostOverride?.(null);
+      refreshInspectTargetGhost();
       return;
     }
     replayExecutorTargetGhost = {
@@ -610,7 +623,21 @@ async function boot() {
       x: Math.trunc(target.x),
       y: Math.trunc(target.y),
     };
-    applyReplayExecutorGhostOverride?.(replayExecutorTargetGhost);
+    refreshInspectTargetGhost();
+  };
+  const setBotInspectTargetGhost = (target: ActivePiece | null): void => {
+    if (!target) {
+      botInspectTargetGhost = null;
+      refreshInspectTargetGhost();
+      return;
+    }
+    botInspectTargetGhost = {
+      k: target.k,
+      r: target.r,
+      x: Math.trunc(target.x),
+      y: Math.trunc(target.y),
+    };
+    refreshInspectTargetGhost();
   };
   const activeInputSource: InputSource = {
     sample: (state, dtMs) => {
@@ -1962,14 +1989,20 @@ async function boot() {
     const seed = options?.seed ?? 42_030;
     const pieceSourceProfile =
       options?.pieceSourceProfile ?? policy.pieceSourceProfile ?? 'bag7';
+    if (replayGuiInspectEnabled || replayDirectRunning) {
+      stopAdminReplayMode();
+    }
     replayGuiInspectEnabled = false;
     replayGuiInputSource = null;
+    setReplayExecutorTargetGhost(null);
+    setBotInspectTargetGhost(null);
     botGuiInputSource = createGuiInspectBotInputSource({
       model: reference.model,
       policy,
       apmInput,
       seed,
       greedy: options?.greedy !== false,
+      onTargetGhostChange: (ghost) => setBotInspectTargetGhost(ghost),
     });
     botGuiInspectEnabled = true;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
@@ -1977,7 +2010,15 @@ async function boot() {
       simCount: charcuterieDefaultSimCount,
       ...(Number.isFinite(seed) ? { seed: Math.trunc(seed) } : {}),
     });
-    requestStartGame();
+    await startGameWithModelReady();
+    session.getGame().setConfig({
+      gravityMs: Number.POSITIVE_INFINITY,
+      lockDelayMs: Number.POSITIVE_INFINITY,
+      hardLockDelayMs: Number.POSITIVE_INFINITY,
+    });
+    runtime?.setInputSource(botGuiInputSource ?? NullInputSource);
+    runtime?.setPausedByMenu(false);
+    runtime?.renderNow();
     return (
       `GUI inspect started for ${policyId}. ` +
       `APM=${apmInput}, piece_source=${pieceSourceProfile}, ` +
@@ -1988,7 +2029,14 @@ async function boot() {
   const stopAdminBotGuiInspect = (): string => {
     botGuiInspectEnabled = false;
     botGuiInputSource = null;
+    setBotInspectTargetGhost(null);
     applyBotGuiPieceSourceProfile('active_generator');
+    const gameCfg = settingsStore.get().game;
+    session.getGame().setConfig({
+      gravityMs: gameCfg.gravityMs,
+      lockDelayMs: gameCfg.lockDelayMs,
+      hardLockDelayMs: gameCfg.hardLockDelayMs,
+    });
     return 'GUI inspect stopped.';
   };
 
@@ -2764,6 +2812,35 @@ async function boot() {
     return lines.join('\n');
   };
 
+  const autoFinalizeTrajectoryOnInterruption = (
+    reason: 'screen_leave' | 'restart',
+  ): void => {
+    const run = activeTrajectoryRun;
+    if (!run) return;
+    const state = session.getGame().state;
+    const outcome = state.gameWon
+      ? 'game_won'
+      : state.gameOver
+        ? 'game_over'
+        : 'manual';
+    const terminal = toTrajectoryTerminalStats(state);
+    if (authState.authenticated) {
+      void finalizeAndUploadTrajectoryRun(outcome, terminal).catch((error) => {
+        console.warn(`[trajectory] auto upload failed (${reason})`, error);
+      });
+      return;
+    }
+    const finalized = finalizeTrajectoryRun(outcome, terminal);
+    if (finalized) {
+      lastTrajectoryUploadMessage =
+        'Run captured locally. Sign in and use "UPLOAD TRAJECTORY".';
+      lastTrajectoryUploadError = null;
+    } else if (activeTrajectoryRun == null) {
+      lastTrajectoryUploadMessage = `Run ignored (need >= ${lastTrajectoryMinSamplesRequired} samples).`;
+      lastTrajectoryUploadError = null;
+    }
+  };
+
   const runLocalHeadTraining = async (options?: {
     modeId?: string;
     sampleLimit?: number;
@@ -2935,10 +3012,9 @@ async function boot() {
     onHold: handleHoldSnapshot,
     onLineClear: handleLineClear,
     onBeforeRestart: () => {
+      autoFinalizeTrajectoryOnInterruption('restart');
       restartRecordingSession();
-      previousRunEnded = false;
       lastRecordedActiveRef = null;
-      activeTrajectoryRun = null;
       pendingTrajectoryReplayStep = null;
       holdUsedSinceLastLock = false;
       scheduleTrajectoryRunStart(modeController.getState().mode.id);
@@ -3045,10 +3121,10 @@ async function boot() {
 
   const gameRenderer = new PixiRenderer(gameGfx);
   const toolRenderer = new PixiRenderer(toolGfx);
-  applyReplayExecutorGhostOverride = (ghost) => {
+  applyGameGhostOverride = (ghost) => {
     gameRenderer.setGhostOverride(ghost);
   };
-  setReplayExecutorTargetGhost(replayExecutorTargetGhost);
+  refreshInspectTargetGhost();
   gameRenderer.setGridlineOpacity(settings.graphics.gridlineOpacity);
   gameRenderer.setGhostOpacity(settings.graphics.ghostOpacity);
   gameRenderer.setHighContrast(settings.graphics.highContrast);
@@ -3122,7 +3198,6 @@ async function boot() {
     gameUi.classicScoreValue.textContent = scoreFormatted;
   };
 
-  let previousRunEnded = false;
   let lastRecordedActiveRef: GameState['active'] | null = null;
   modelStatusLabel = gameUi.modelStatusLabel;
 
@@ -3180,7 +3255,9 @@ async function boot() {
       gameUi.setQueueOddsMode(usesModelGenerator(generatorType));
       gameUi.setMlQueueProbabilities(state.mlQueueProbabilities);
       const ended = state.gameOver || state.gameWon;
-      if (ended && !previousRunEnded) {
+      // Finalize/upload exactly once per run by checking run presence,
+      // not a frame-local ended flag that can desync across mode flows.
+      if (ended && activeTrajectoryRun) {
         void snapshotService?.flushRemoteUploads();
         const outcome = state.gameWon ? 'game_won' : 'game_over';
         const terminal = toTrajectoryTerminalStats(state);
@@ -3202,7 +3279,6 @@ async function boot() {
           }
         }
       }
-      previousRunEnded = ended;
     },
   });
   inputService.setOnInputSourceChange((source) => {
@@ -3502,6 +3578,9 @@ async function boot() {
   });
 
   setScreen = (screen: 'menu' | 'game' | 'tool' | 'replay') => {
+    if (screen !== 'game' && screenManager.getActive() === 'game') {
+      autoFinalizeTrajectoryOnInterruption('screen_leave');
+    }
     if (screen === 'menu') {
       void refreshMenuLabelingProgress();
     }
@@ -3547,7 +3626,6 @@ async function boot() {
         });
       }
       activeTrajectoryRun = null;
-      previousRunEnded = false;
       lastRecordedActiveRef = null;
       scheduleTrajectoryRunStart(modeController.getState().mode.id);
       runtime?.setInputSource(activeInputSource);
