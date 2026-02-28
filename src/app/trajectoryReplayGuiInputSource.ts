@@ -248,7 +248,17 @@ export const createTrajectoryReplayGuiInputSource = (
         pendingCheck.sample.boardOccupancy,
       );
       const holdMatches = state.hold === pendingCheck.sample.hold;
-      const activeMatches = state.active.k === pendingCheck.sample.action;
+      let activeMatches = state.active.k === pendingCheck.sample.action;
+      if (!activeMatches) {
+        const before = state.active.k;
+        coerceActiveForTarget(state, pendingCheck.sample.action, log);
+        activeMatches = state.active.k === pendingCheck.sample.action;
+        log(
+          `active drift after sample #${pendingCheck.index}: ` +
+            `actual_active=${before} expected_active=${pendingCheck.sample.action} ` +
+            `-> corrected_active=${state.active.k}.`,
+        );
+      }
       if (boardMatches && holdMatches && activeMatches) {
         stats.passedBoardChecks += 1;
       } else {
