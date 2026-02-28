@@ -140,7 +140,12 @@ const coerceActiveForTarget = (
     if (!collides(state.board, forced)) break;
     forced.y -= 1;
   }
-  state.active = forced;
+  // Mutate in-place so active object identity stays stable for the
+  // active-change detector; replacing the object here causes queue resets.
+  state.active.k = forced.k;
+  state.active.r = forced.r;
+  state.active.x = forced.x;
+  state.active.y = forced.y;
   log(`forced active piece to ${lockPiece} for replay alignment.`);
 };
 
