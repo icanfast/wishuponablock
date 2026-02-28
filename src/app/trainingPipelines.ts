@@ -124,6 +124,7 @@ const PERSONAL_TRAINING_PIPELINE_REGISTRY: Record<
         },
       },
       charcuterie: {
+        minSamples: 2,
         trainDefaults: {
           epochs: 6,
           learningRate: 0.0015,
@@ -167,6 +168,7 @@ const PERSONAL_TRAINING_PIPELINE_REGISTRY: Record<
         },
       },
       charcuterie: {
+        minSamples: 2,
         trainDefaults: {
           epochs: 8,
           learningRate: 0.0015,

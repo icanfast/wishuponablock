@@ -3357,8 +3357,15 @@ const handlePostTrajectoryRecording = async (
     });
   }
 
+  const hintedMode =
+    payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? normalizeGameMode((payload as Record<string, unknown>).modeId)
+      : null;
+  const minSamplesForMode =
+    hintedMode === 'charcuterie' ? 2 : MIN_TRAJECTORY_SAMPLES_PER_SESSION;
+
   const parsed = parseTrajectorySessionV1(payload, {
-    minSamples: MIN_TRAJECTORY_SAMPLES_PER_SESSION,
+    minSamples: minSamplesForMode,
     maxSamples: MAX_TRAJECTORY_SAMPLES_PER_SESSION,
   });
   if (!parsed.ok) {

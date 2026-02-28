@@ -2815,8 +2815,22 @@ async function boot() {
   const autoFinalizeTrajectoryOnInterruption = (
     reason: 'screen_leave' | 'restart',
   ): void => {
+    const tryUploadSession = (session: TrajectorySessionV1): void => {
+      void uploadTrajectorySession(session).catch((error) => {
+        const message = toErrorMessage(error, 'Trajectory upload failed.');
+        lastTrajectoryUploadError = message;
+        lastTrajectoryUploadMessage = `Upload failed: ${message}`;
+        console.warn(`[trajectory] auto upload failed (${reason})`, error);
+      });
+    };
+
     const run = activeTrajectoryRun;
-    if (!run) return;
+    if (!run) {
+      if (reason === 'restart' && pendingTrajectorySession) {
+        tryUploadSession(pendingTrajectorySession);
+      }
+      return;
+    }
     const state = session.getGame().state;
     const outcome = state.gameWon
       ? 'game_won'
@@ -2824,6 +2838,16 @@ async function boot() {
         ? 'game_over'
         : 'manual';
     const terminal = toTrajectoryTerminalStats(state);
+    if (reason === 'restart') {
+      const finalized = finalizeTrajectoryRun(outcome, terminal);
+      if (!finalized) {
+        lastTrajectoryUploadMessage = `Run ignored (need >= ${lastTrajectoryMinSamplesRequired} samples).`;
+        lastTrajectoryUploadError = null;
+        return;
+      }
+      tryUploadSession(finalized);
+      return;
+    }
     if (authState.authenticated) {
       void finalizeAndUploadTrajectoryRun(outcome, terminal).catch((error) => {
         console.warn(`[trajectory] auto upload failed (${reason})`, error);
