@@ -10,6 +10,10 @@ import type { Board, GameState, InputFrame, PieceKind } from '../core/types';
 import { PIECES } from '../core/types';
 import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
+import {
+  enumerateTrajectoryExecutorPlacements,
+  trajectoryExecutorCommandToInputFrame,
+} from '../core/trajectoryExecutor';
 import type {
   TrajectoryInitialStateV1,
   TrajectoryReplayStepV1,
@@ -34,6 +38,10 @@ const BOT_TRAIN_MAX_EPISODES = 4096;
 const BOT_TRAIN_MAX_PIECES_PER_EPISODE = 512;
 const BOT_TRAIN_MAX_TRANSITIONS = 200_000;
 const BOT_PPO_CLIP_EPSILON = 0.2;
+const BOT_PLACEMENT_ACTION_DIM = 192;
+const DEFAULT_BOT_ACTION_SPACE_KIND: BotActionSpaceKind = 'placement_v1';
+
+export type BotActionSpaceKind = 'macro_v1' | 'placement_v1';
 
 type TfTensor = {
   dataSync: () => Float32Array | Int32Array | Uint8Array;
@@ -116,7 +124,9 @@ export type BotPolicyArtifact = {
   inputDim: number;
   hiddenDim: number;
   actionDim: number;
-  actions: BotMacroAction[];
+  actionSpaceKind?: BotActionSpaceKind;
+  actions?: BotMacroAction[];
+  placementActionDim?: number;
   weights: {
     w1: number[];
     b1: number[];
@@ -263,6 +273,8 @@ type PolicyParams = {
   inputDim: number;
   hiddenDim: number;
   actionDim: number;
+  actionSpaceKind: BotActionSpaceKind;
+  macroActions: BotMacroAction[] | null;
   w1: Float32Array;
   b1: Float32Array;
   wp: Float32Array;
@@ -272,6 +284,7 @@ type PolicyParams = {
 type Transition = {
   observation: Float32Array;
   actionIndex: number;
+  actionMask: Float32Array | null;
   reward: number | null;
 };
 
@@ -279,6 +292,10 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   inputDim: params.inputDim,
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
+  actionSpaceKind: params.actionSpaceKind,
+  macroActions: params.macroActions
+    ? params.macroActions.map((action) => ({ ...action }))
+    : null,
   w1: new Float32Array(params.w1),
   b1: new Float32Array(params.b1),
   wp: new Float32Array(params.wp),
@@ -431,22 +448,40 @@ const scoreCharcuterieBoard = (
   );
 };
 
-const softmax = (logits: Float32Array): Float32Array => {
+const softmax = (
+  logits: Float32Array,
+  actionMask?: Float32Array | null,
+): Float32Array => {
   if (logits.length === 0) return new Float32Array();
-  let maxValue = logits[0];
-  for (let i = 1; i < logits.length; i += 1) {
-    if (logits[i] > maxValue) maxValue = logits[i];
+  let maxValue = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < logits.length; i += 1) {
+    if (actionMask && actionMask[i] <= 0) continue;
+    const value = logits[i];
+    if (value > maxValue) maxValue = value;
+  }
+  if (!Number.isFinite(maxValue)) {
+    maxValue = logits[0] ?? 0;
   }
   const out = new Float32Array(logits.length);
   let total = 0;
   for (let i = 0; i < logits.length; i += 1) {
+    if (actionMask && actionMask[i] <= 0) {
+      out[i] = 0;
+      continue;
+    }
     const value = Math.exp(logits[i] - maxValue);
     out[i] = value;
     total += value;
   }
   if (total <= 0 || !Number.isFinite(total)) {
-    const uniform = 1 / out.length;
-    for (let i = 0; i < out.length; i += 1) out[i] = uniform;
+    let active = 0;
+    for (let i = 0; i < out.length; i += 1) {
+      if (!actionMask || actionMask[i] > 0) active += 1;
+    }
+    const uniform = active > 0 ? 1 / active : 1 / out.length;
+    for (let i = 0; i < out.length; i += 1) {
+      out[i] = !actionMask || actionMask[i] > 0 ? uniform : 0;
+    }
     return out;
   }
   for (let i = 0; i < out.length; i += 1) out[i] /= total;
@@ -510,7 +545,7 @@ const nextRandomSeed = (): number => {
   return Math.max(1, Math.trunc(Math.random() * 0x7fffffff));
 };
 
-const asInputFrame = (action: BotMacroAction): InputFrame => ({
+const asMacroInputFrame = (action: BotMacroAction): InputFrame => ({
   ...EMPTY_INPUT,
   moveX: action.moveX,
   rotate: action.rotation === 'cw' ? 1 : action.rotation === 'ccw' ? -1 : 0,
@@ -518,10 +553,47 @@ const asInputFrame = (action: BotMacroAction): InputFrame => ({
   hardDrop: true,
 });
 
+const buildPlacementChoices = (
+  state: GameState,
+  actionDim: number,
+): {
+  commandsBySlot: InputFrame[][];
+  actionMask: Float32Array;
+} => {
+  const placements = enumerateTrajectoryExecutorPlacements({
+    board: state.board,
+    active: state.active,
+    hold: state.hold,
+    canHold: state.canHold,
+    nextPieceOnFirstHold: state.next[0] ?? null,
+    maxNodesPerBranch: 20_000,
+    allowSoftDrop: true,
+  });
+  const actionMask = new Float32Array(actionDim);
+  const commandsBySlot: InputFrame[][] = [];
+  const maxChoices = Math.min(actionDim, placements.length);
+  for (let i = 0; i < maxChoices; i += 1) {
+    const placement = placements[i];
+    actionMask[i] = 1;
+    commandsBySlot.push(
+      placement.commands.map((command) =>
+        trajectoryExecutorCommandToInputFrame(command),
+      ),
+    );
+  }
+  if (commandsBySlot.length === 0) {
+    actionMask[0] = 1;
+    commandsBySlot.push([trajectoryExecutorCommandToInputFrame('hard_drop')]);
+  }
+  return { commandsBySlot, actionMask };
+};
+
 const randomizeParams = (
   inputDim: number,
   hiddenDim: number,
   actionDim: number,
+  actionSpaceKind: BotActionSpaceKind,
+  macroActions: BotMacroAction[] | null,
   rng: XorShift32,
 ): PolicyParams => {
   const w1 = new Float32Array(inputDim * hiddenDim);
@@ -536,12 +608,23 @@ const randomizeParams = (
   for (let i = 0; i < wp.length; i += 1) {
     wp[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
   }
-  return { inputDim, hiddenDim, actionDim, w1, b1, wp, bp };
+  return {
+    inputDim,
+    hiddenDim,
+    actionDim,
+    actionSpaceKind,
+    macroActions,
+    w1,
+    b1,
+    wp,
+    bp,
+  };
 };
 
 const forwardPolicy = (
   params: PolicyParams,
   observation: Float32Array,
+  actionMask?: Float32Array | null,
 ): {
   logits: Float32Array;
   probabilities: Float32Array;
@@ -560,9 +643,10 @@ const forwardPolicy = (
     for (let h = 0; h < params.hiddenDim; h += 1) {
       sum += hidden[h] * params.wp[h * params.actionDim + a];
     }
-    logits[a] = sum;
+    logits[a] =
+      actionMask && actionMask[a] <= 0 ? Number.NEGATIVE_INFINITY : sum;
   }
-  return { logits, probabilities: softmax(logits) };
+  return { logits, probabilities: softmax(logits, actionMask) };
 };
 
 const encodeObservation = (
@@ -598,7 +682,7 @@ const encodeObservation = (
   return out;
 };
 
-class MacroPolicyBot implements InputSource {
+class PolicyActionBot implements InputSource {
   private activeRef: GameState['active'] | null = null;
   private queue: InputFrame[] = [];
   private transitions: Transition[] = [];
@@ -608,6 +692,8 @@ class MacroPolicyBot implements InputSource {
     private decide: (state: GameState) => {
       actionIndex: number;
       observation: Float32Array;
+      actionMask: Float32Array | null;
+      queue: InputFrame[];
     },
   ) {}
 
@@ -615,11 +701,13 @@ class MacroPolicyBot implements InputSource {
     if (state.active !== this.activeRef) {
       this.activeRef = state.active;
       const decision = this.decide(state);
-      const action = actionSpace[decision.actionIndex] ?? actionSpace[0];
-      this.queue = [asInputFrame(action)];
+      this.queue = decision.queue.length > 0 ? decision.queue : [EMPTY_INPUT];
       this.transitions.push({
         observation: decision.observation,
         actionIndex: decision.actionIndex,
+        actionMask: decision.actionMask
+          ? new Float32Array(decision.actionMask)
+          : null,
         reward: null,
       });
     }
@@ -643,6 +731,9 @@ class MacroPolicyBot implements InputSource {
     return this.transitions.map((transition) => ({
       observation: new Float32Array(transition.observation),
       actionIndex: transition.actionIndex,
+      actionMask: transition.actionMask
+        ? new Float32Array(transition.actionMask)
+        : null,
       reward: transition.reward,
     }));
   }
@@ -832,13 +923,19 @@ const runRollout = (config: {
   });
   const rng = new XorShift32(config.seed ^ 0x9e3779b9);
   const initialState = toTrajectoryInitialState(game.state);
-  const bot = new MacroPolicyBot((state) => {
+  const bot = new PolicyActionBot((state) => {
     const observation = encodeObservation(config.model, state);
-    const forward = forwardPolicy(config.policyParams, observation);
+    const placementChoices =
+      config.policyParams.actionSpaceKind === 'placement_v1'
+        ? buildPlacementChoices(state, config.policyParams.actionDim)
+        : null;
+    const actionMask = placementChoices?.actionMask ?? null;
+    const forward = forwardPolicy(config.policyParams, observation, actionMask);
     let actionIndex = 0;
     if (config.greedy) {
       let best = forward.logits[0] ?? Number.NEGATIVE_INFINITY;
       for (let i = 1; i < forward.logits.length; i += 1) {
+        if (actionMask && actionMask[i] <= 0) continue;
         if (forward.logits[i] > best) {
           best = forward.logits[i];
           actionIndex = i;
@@ -847,7 +944,22 @@ const runRollout = (config: {
     } else {
       actionIndex = sampleIndex(forward.probabilities, rng);
     }
-    return { actionIndex, observation };
+    if (placementChoices) {
+      const queue = placementChoices.commandsBySlot[actionIndex] ??
+        placementChoices.commandsBySlot[0] ?? [EMPTY_INPUT];
+      return { actionIndex, observation, actionMask, queue };
+    }
+    const macroActions =
+      config.policyParams.macroActions ??
+      actionSpace.map((action) => ({ ...action }));
+    const action =
+      macroActions[actionIndex] ?? macroActions[0] ?? actionSpace[0];
+    return {
+      actionIndex,
+      observation,
+      actionMask,
+      queue: [asMacroInputFrame(action)],
+    };
   });
 
   const maxPieces = Math.max(1, Math.trunc(config.maxPieces));
@@ -969,6 +1081,7 @@ const computeDiscountedReturns = (
 const trainWithTfjsReinforce = async (options: {
   params: PolicyParams;
   observations: Float32Array;
+  actionMasks: Float32Array | null;
   actions: Int32Array;
   returns: Float32Array;
   learningRate: number;
@@ -1005,6 +1118,9 @@ const trainWithTfjsReinforce = async (options: {
     count,
     options.params.inputDim,
   ]);
+  const actionMaskTensor = options.actionMasks
+    ? tf.tensor2d(options.actionMasks, [count, options.params.actionDim])
+    : null;
   const actionTensor = tf.tensor1d(options.actions, 'int32');
   const returnsTensor = tf.tensor1d(options.returns);
   const oneHot = tf.oneHot(actionTensor, options.params.actionDim);
@@ -1038,6 +1154,10 @@ const trainWithTfjsReinforce = async (options: {
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
+    actionSpaceKind: options.params.actionSpaceKind,
+    macroActions: options.params.macroActions
+      ? options.params.macroActions.map((action) => ({ ...action }))
+      : null,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
@@ -1047,7 +1167,13 @@ const trainWithTfjsReinforce = async (options: {
     const checkpointBeforeStep = snapshotCurrentParams();
     const lossTensor = optimizer.minimize(() => {
       const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
-      const logits = tf.add(tf.matMul(hidden, wp), bp);
+      const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
+      const logits = actionMaskTensor
+        ? tf.sub(
+            logitsRaw,
+            tf.mul(tf.sub(tf.scalar(1), actionMaskTensor), tf.scalar(1e9)),
+          )
+        : logitsRaw;
       const logProbs = tf.logSoftmax(logits, 1);
       const probs = tf.softmax(logits, 1);
       const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
@@ -1112,6 +1238,7 @@ const trainWithTfjsReinforce = async (options: {
 
   tf.dispose([
     inputTensor,
+    actionMaskTensor,
     actionTensor,
     returnsTensor,
     oneHot,
@@ -1128,6 +1255,7 @@ const trainWithTfjsReinforce = async (options: {
 const trainWithTfjsPpo = async (options: {
   params: PolicyParams;
   observations: Float32Array;
+  actionMasks: Float32Array | null;
   actions: Int32Array;
   returns: Float32Array;
   oldLogProbs: Float32Array;
@@ -1167,6 +1295,9 @@ const trainWithTfjsPpo = async (options: {
     count,
     options.params.inputDim,
   ]);
+  const actionMaskTensor = options.actionMasks
+    ? tf.tensor2d(options.actionMasks, [count, options.params.actionDim])
+    : null;
   const actionTensor = tf.tensor1d(options.actions, 'int32');
   const returnsTensor = tf.tensor1d(options.returns);
   const oldLogProbTensor = tf.tensor1d(options.oldLogProbs);
@@ -1202,6 +1333,10 @@ const trainWithTfjsPpo = async (options: {
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
+    actionSpaceKind: options.params.actionSpaceKind,
+    macroActions: options.params.macroActions
+      ? options.params.macroActions.map((action) => ({ ...action }))
+      : null,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
@@ -1213,7 +1348,13 @@ const trainWithTfjsPpo = async (options: {
     const checkpointBeforeStep = snapshotCurrentParams();
     const lossTensor = optimizer.minimize(() => {
       const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
-      const logits = tf.add(tf.matMul(hidden, wp), bp);
+      const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
+      const logits = actionMaskTensor
+        ? tf.sub(
+            logitsRaw,
+            tf.mul(tf.sub(tf.scalar(1), actionMaskTensor), tf.scalar(1e9)),
+          )
+        : logitsRaw;
       const logProbs = tf.logSoftmax(logits, 1);
       const probs = tf.softmax(logits, 1);
       const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
@@ -1272,6 +1413,7 @@ const trainWithTfjsPpo = async (options: {
 
   tf.dispose([
     inputTensor,
+    actionMaskTensor,
     actionTensor,
     returnsTensor,
     oldLogProbTensor,
@@ -1297,7 +1439,13 @@ const toArtifact = (
   inputDim: params.inputDim,
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
-  actions: actionSpace.map((action) => ({ ...action })),
+  actionSpaceKind: params.actionSpaceKind,
+  actions:
+    params.actionSpaceKind === 'macro_v1' && params.macroActions
+      ? params.macroActions.map((action) => ({ ...action }))
+      : undefined,
+  placementActionDim:
+    params.actionSpaceKind === 'placement_v1' ? params.actionDim : undefined,
   weights: {
     w1: Array.from(params.w1),
     b1: Array.from(params.b1),
@@ -1310,6 +1458,33 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   const inputDim = Math.max(1, Math.trunc(policy.inputDim));
   const hiddenDim = Math.max(1, Math.trunc(policy.hiddenDim));
   const actionDim = Math.max(1, Math.trunc(policy.actionDim));
+  const actionSpaceKind: BotActionSpaceKind =
+    policy.actionSpaceKind === 'placement_v1' ? 'placement_v1' : 'macro_v1';
+  const macroActionsRaw = Array.isArray(policy.actions) ? policy.actions : [];
+  const macroActions =
+    actionSpaceKind === 'macro_v1'
+      ? macroActionsRaw
+          .map((action): BotMacroAction | null => {
+            if (!action || typeof action !== 'object') return null;
+            const item = action as Partial<BotMacroAction>;
+            const rotation = item.rotation;
+            const moveX = item.moveX;
+            if (
+              (rotation !== 'none' &&
+                rotation !== 'cw' &&
+                rotation !== 'ccw' &&
+                rotation !== '180') ||
+              !Number.isFinite(moveX)
+            ) {
+              return null;
+            }
+            return {
+              rotation,
+              moveX: Math.trunc(Number(moveX)),
+            };
+          })
+          .filter((value): value is BotMacroAction => value != null)
+      : null;
   const w1 = new Float32Array(policy.weights.w1);
   const b1 = new Float32Array(policy.weights.b1);
   const wp = new Float32Array(policy.weights.wp);
@@ -1334,6 +1509,13 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     inputDim,
     hiddenDim,
     actionDim,
+    actionSpaceKind,
+    macroActions:
+      actionSpaceKind === 'macro_v1'
+        ? macroActions && macroActions.length > 0
+          ? macroActions
+          : actionSpace.map((action) => ({ ...action }))
+        : null,
     w1,
     b1,
     wp,
@@ -1441,7 +1623,8 @@ export const trainBotPolicyOneShot = async (
       const compatible =
         sameMode &&
         warmParams.inputDim === inputDim &&
-        warmParams.actionDim === actionSpace.length &&
+        warmParams.actionSpaceKind === DEFAULT_BOT_ACTION_SPACE_KIND &&
+        warmParams.actionDim === BOT_PLACEMENT_ACTION_DIM &&
         isFiniteArray(warmParams.w1) &&
         isFiniteArray(warmParams.b1) &&
         isFiniteArray(warmParams.wp) &&
@@ -1458,7 +1641,9 @@ export const trainBotPolicyOneShot = async (
     params = randomizeParams(
       inputDim,
       64,
-      actionSpace.length,
+      BOT_PLACEMENT_ACTION_DIM,
+      DEFAULT_BOT_ACTION_SPACE_KIND,
+      null,
       new XorShift32(seed),
     );
   }
@@ -1483,9 +1668,11 @@ export const trainBotPolicyOneShot = async (
     const rewards = rollout.transitions.map((entry) => entry.reward ?? 0);
     const discounted = computeDiscountedReturns(rewards, gamma);
     for (let i = 0; i < rollout.transitions.length; i += 1) {
+      const transitionMask = rollout.transitions[i].actionMask;
       transitions.push({
         observation: rollout.transitions[i].observation,
         actionIndex: rollout.transitions[i].actionIndex,
+        actionMask: transitionMask ? new Float32Array(transitionMask) : null,
         reward: discounted[i],
       });
       if (transitions.length >= BOT_TRAIN_MAX_TRANSITIONS) {
@@ -1510,6 +1697,7 @@ export const trainBotPolicyOneShot = async (
   }
 
   const observations = new Float32Array(transitions.length * inputDim);
+  const actionMasks = new Float32Array(transitions.length * params.actionDim);
   const actions = new Int32Array(transitions.length);
   const returns = new Float32Array(transitions.length);
   const oldLogProbs = new Float32Array(transitions.length);
@@ -1521,15 +1709,26 @@ export const trainBotPolicyOneShot = async (
       observations[rowOffset + j] = Number.isFinite(value) ? value : 0;
     }
     const actionIndex = transitions[i].actionIndex;
+    const maskOffset = i * params.actionDim;
+    const mask = transitions[i].actionMask;
+    if (mask && mask.length === params.actionDim) {
+      actionMasks.set(mask, maskOffset);
+    } else {
+      actionMasks.fill(1, maskOffset, maskOffset + params.actionDim);
+    }
     actions[i] =
       Number.isFinite(actionIndex) &&
       actionIndex >= 0 &&
-      actionIndex < actionSpace.length
+      actionIndex < params.actionDim
         ? actionIndex
         : 0;
     const reward = transitions[i].reward ?? 0;
     returns[i] = Number.isFinite(reward) ? reward : 0;
-    const forward = forwardPolicy(params, sourceObs);
+    const rowMask = actionMasks.subarray(
+      maskOffset,
+      maskOffset + params.actionDim,
+    );
+    const forward = forwardPolicy(params, sourceObs, rowMask);
     const probability = forward.probabilities[actions[i]] ?? 0;
     const safeProb =
       Number.isFinite(probability) && probability > 1e-8 ? probability : 1e-8;
@@ -1562,6 +1761,7 @@ export const trainBotPolicyOneShot = async (
       ? await trainWithTfjsPpo({
           params,
           observations,
+          actionMasks,
           actions,
           returns,
           oldLogProbs,
@@ -1575,6 +1775,7 @@ export const trainBotPolicyOneShot = async (
       : await trainWithTfjsReinforce({
           params,
           observations,
+          actionMasks,
           actions,
           returns,
           learningRate,
@@ -1940,11 +2141,17 @@ export const createGuiInspectBotInputSource = (
       if (state.active !== activeRef) {
         activeRef = state.active;
         const observation = encodeObservation(config.model, state);
-        const forward = forwardPolicy(params, observation);
+        const placementChoices =
+          params.actionSpaceKind === 'placement_v1'
+            ? buildPlacementChoices(state, params.actionDim)
+            : null;
+        const actionMask = placementChoices?.actionMask ?? null;
+        const forward = forwardPolicy(params, observation, actionMask);
         let actionIndex = 0;
         if (greedy) {
           let best = forward.logits[0] ?? Number.NEGATIVE_INFINITY;
           for (let i = 1; i < forward.logits.length; i += 1) {
+            if (actionMask && actionMask[i] <= 0) continue;
             if (forward.logits[i] > best) {
               best = forward.logits[i];
               actionIndex = i;
@@ -1953,8 +2160,16 @@ export const createGuiInspectBotInputSource = (
         } else {
           actionIndex = sampleIndex(forward.probabilities, rng);
         }
-        const action = actionSpace[actionIndex] ?? actionSpace[0];
-        queue = queueFromMacro(action);
+        if (placementChoices) {
+          queue = placementChoices.commandsBySlot[actionIndex] ??
+            placementChoices.commandsBySlot[0] ?? [EMPTY_INPUT];
+        } else {
+          const macroActions =
+            params.macroActions ?? actionSpace.map((action) => ({ ...action }));
+          const action =
+            macroActions[actionIndex] ?? macroActions[0] ?? actionSpace[0];
+          queue = queueFromMacro(action);
+        }
       }
       if (queue.length === 0) return EMPTY_INPUT;
       if (cooldownMs > 0) return EMPTY_INPUT;

@@ -5,7 +5,13 @@ import {
   tryRotate180PreferDirect,
   tryRotateSRS,
 } from './piece';
-import type { ActivePiece, Board, InputFrame, PieceKind } from './types';
+import {
+  PIECES,
+  type ActivePiece,
+  type Board,
+  type InputFrame,
+  type PieceKind,
+} from './types';
 import type { TrajectoryReplayStepV1 } from './trajectoryProtocol';
 
 const EMPTY_INPUT: InputFrame = {
@@ -56,6 +62,26 @@ export type TrajectoryExecutorPlanResult =
       holdsConsumed: boolean;
     };
 
+export type TrajectoryExecutorReachablePlacement = {
+  lockPiece: PieceKind;
+  lockRotation: number;
+  lockX: number;
+  lockY: number;
+  holdUsed: boolean;
+  commands: TrajectoryExecutorCommand[];
+  searchDepth: number;
+};
+
+export type TrajectoryExecutorEnumerateInput = {
+  board: Board;
+  active: ActivePiece;
+  hold: PieceKind | null;
+  canHold: boolean;
+  nextPieceOnFirstHold?: PieceKind | null;
+  maxNodesPerBranch?: number;
+  allowSoftDrop?: boolean;
+};
+
 export type TrajectoryExecutorSimulationResult = {
   ok: boolean;
   finalPiece: ActivePiece;
@@ -79,6 +105,8 @@ const rotateTo = (value: number): number => {
   const normalized = Math.trunc(value) % 4;
   return normalized < 0 ? normalized + 4 : normalized;
 };
+
+const PIECE_ORDER = new Map(PIECES.map((piece, index) => [piece, index]));
 
 const toInputFrame = (command: TrajectoryExecutorCommand): InputFrame => {
   switch (command) {
@@ -138,6 +166,22 @@ const applySearchAction = (
     default:
       return null;
   }
+};
+
+const spawnPieceForExecutor = (
+  board: Board,
+  piece: PieceKind,
+): ActivePiece | null => {
+  const spawned: ActivePiece = {
+    k: piece,
+    r: 0,
+    x: SPAWN_X,
+    y: SPAWN_Y,
+  };
+  if (collides(board, spawned, spawned.r, 0, 0)) {
+    return null;
+  }
+  return spawned;
 };
 
 const isTargetLockReachable = (
@@ -278,6 +322,127 @@ export const planTrajectoryLockExecution = (
     visitedNodes: visited.size,
     holdsConsumed: startResolved.holdsConsumed,
   };
+};
+
+const enumerateReachableLockPlacementsForStart = (input: {
+  board: Board;
+  startPiece: ActivePiece;
+  prefix: TrajectoryExecutorCommand[];
+  holdUsed: boolean;
+  maxNodes: number;
+  allowSoftDrop: boolean;
+}): TrajectoryExecutorReachablePlacement[] => {
+  const actionOrder = input.allowSoftDrop
+    ? SEARCH_ACTION_ORDER
+    : SEARCH_ACTION_ORDER.filter((action) => action !== 'soft_drop');
+  const queue: SearchNode[] = [
+    {
+      piece: clonePiece(input.startPiece),
+      commands: [],
+    },
+  ];
+  const visited = new Set<string>([stateKey(input.startPiece)]);
+  const byLockKey = new Map<string, TrajectoryExecutorReachablePlacement>();
+  let head = 0;
+
+  while (head < queue.length) {
+    const node = queue[head++];
+    const lockY = node.piece.y + dropDistance(input.board, node.piece);
+    const lockKey =
+      `${node.piece.k}:` +
+      `${rotateTo(node.piece.r)}:` +
+      `${node.piece.x}:` +
+      `${lockY}:` +
+      `${input.holdUsed ? 1 : 0}`;
+    if (!byLockKey.has(lockKey)) {
+      byLockKey.set(lockKey, {
+        lockPiece: node.piece.k,
+        lockRotation: rotateTo(node.piece.r),
+        lockX: node.piece.x,
+        lockY,
+        holdUsed: input.holdUsed,
+        commands: [...input.prefix, ...node.commands, 'hard_drop'],
+        searchDepth: node.commands.length,
+      });
+    }
+    if (visited.size >= input.maxNodes) {
+      break;
+    }
+    for (const action of actionOrder) {
+      const nextPiece = applySearchAction(input.board, node.piece, action);
+      if (!nextPiece) continue;
+      const key = stateKey(nextPiece);
+      if (visited.has(key)) continue;
+      visited.add(key);
+      queue.push({
+        piece: nextPiece,
+        commands: [...node.commands, action],
+      });
+    }
+  }
+
+  return Array.from(byLockKey.values());
+};
+
+export const enumerateTrajectoryExecutorPlacements = (
+  input: TrajectoryExecutorEnumerateInput,
+): TrajectoryExecutorReachablePlacement[] => {
+  const maxNodesPerBranch = Math.max(
+    256,
+    Math.trunc(input.maxNodesPerBranch ?? 12_000),
+  );
+  const allowSoftDrop = input.allowSoftDrop !== false;
+  const placements: TrajectoryExecutorReachablePlacement[] = [];
+
+  placements.push(
+    ...enumerateReachableLockPlacementsForStart({
+      board: input.board,
+      startPiece: input.active,
+      prefix: [],
+      holdUsed: false,
+      maxNodes: maxNodesPerBranch,
+      allowSoftDrop,
+    }),
+  );
+
+  if (input.canHold) {
+    const holdTarget = input.hold ?? input.nextPieceOnFirstHold ?? null;
+    if (holdTarget) {
+      const spawned = spawnPieceForExecutor(input.board, holdTarget);
+      if (spawned) {
+        placements.push(
+          ...enumerateReachableLockPlacementsForStart({
+            board: input.board,
+            startPiece: spawned,
+            prefix: ['hold'],
+            holdUsed: true,
+            maxNodes: maxNodesPerBranch,
+            allowSoftDrop,
+          }),
+        );
+      }
+    }
+  }
+
+  placements.sort((left, right) => {
+    if (left.holdUsed !== right.holdUsed) {
+      return left.holdUsed ? 1 : -1;
+    }
+    const pieceCompare =
+      (PIECE_ORDER.get(left.lockPiece) ?? 99) -
+      (PIECE_ORDER.get(right.lockPiece) ?? 99);
+    if (pieceCompare !== 0) return pieceCompare;
+    if (left.lockY !== right.lockY) return right.lockY - left.lockY;
+    if (left.lockX !== right.lockX) return left.lockX - right.lockX;
+    if (left.lockRotation !== right.lockRotation) {
+      return left.lockRotation - right.lockRotation;
+    }
+    if (left.searchDepth !== right.searchDepth) {
+      return left.searchDepth - right.searchDepth;
+    }
+    return left.commands.length - right.commands.length;
+  });
+  return placements;
 };
 
 export const simulateTrajectoryExecutorCommands = (input: {
