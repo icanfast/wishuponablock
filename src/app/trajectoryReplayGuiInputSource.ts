@@ -243,7 +243,8 @@ export const createTrajectoryReplayGuiInputSource = (
         pendingCheck.sample.boardOccupancy,
       );
       const holdMatches = state.hold === pendingCheck.sample.hold;
-      if (boardMatches && holdMatches) {
+      const activeMatches = state.active.k === pendingCheck.sample.action;
+      if (boardMatches && holdMatches && activeMatches) {
         stats.passedBoardChecks += 1;
       } else {
         stats.failedBoardChecks += 1;
@@ -254,10 +255,11 @@ export const createTrajectoryReplayGuiInputSource = (
         );
         log(
           `parity mismatch after sample #${pendingCheck.index}: ` +
-            `board=${boardMatches ? 'ok' : 'mismatch'} hold=${holdMatches ? 'ok' : 'mismatch'} ` +
+            `board=${boardMatches ? 'ok' : 'mismatch'} hold=${holdMatches ? 'ok' : 'mismatch'} active=${activeMatches ? 'ok' : 'mismatch'} ` +
             `diff_cells=${occupancyDiff.diffCount} ` +
             `first_diff=${JSON.stringify(occupancyDiff.firstDiffs)} ` +
-            `actual_hold=${state.hold ?? 'null'} expected_hold=${pendingCheck.sample.hold ?? 'null'}.`,
+            `actual_hold=${state.hold ?? 'null'} expected_hold=${pendingCheck.sample.hold ?? 'null'} ` +
+            `actual_active=${state.active.k} expected_active=${pendingCheck.sample.action}.`,
         );
         if (stopOnParityMismatch) {
           log(
