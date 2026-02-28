@@ -60,6 +60,9 @@ export type TrajectoryReplayGuiInputSourceConfig = {
 const boardToOccupancy = (board: GameState['board']): number[][] =>
   board.map((row) => row.map((cell) => (cell ? 1 : 0)));
 
+const occupancyToBoard = (occupancy: number[][]): GameState['board'] =>
+  occupancy.map((row) => row.map((cell) => (cell > 0 ? 'I' : null)));
+
 const sameOccupancy = (left: number[][], right: number[][]): boolean => {
   if (left.length !== right.length) return false;
   for (let y = 0; y < left.length; y += 1) {
@@ -190,9 +193,13 @@ const buildPlanVariants = (replay: TrajectoryReplayStepV1): PlanVariant[] => {
 export const createTrajectoryReplayGuiInputSource = (
   config: TrajectoryReplayGuiInputSourceConfig,
 ): InputSource => {
-  const replayEntries: ReplayEntry[] = config.session.samples
-    .map((sample, index) => ({ sample, index }))
-    .filter((entry) => Boolean(entry.sample.replay));
+  const allEntries: ReplayEntry[] = config.session.samples.map(
+    (sample, index) => ({ sample, index }),
+  );
+  const replayStepsTotal = allEntries.reduce(
+    (count, entry) => count + (entry.sample.replay ? 1 : 0),
+    0,
+  );
   const clampApm = Math.min(1200, Math.max(20, Math.trunc(config.apmInput)));
   const actionIntervalMs = 60_000 / clampApm;
   const log = (line: string) => config.onLog?.(`[replay-exec] ${line}`);
@@ -203,16 +210,16 @@ export const createTrajectoryReplayGuiInputSource = (
   let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
   let cooldownMs = 0;
-  let replayCursor = 0;
+  let sampleCursor = 0;
   let pendingCheck: ReplayEntry | null = null;
   let finished = false;
   const stats: TrajectoryReplayGuiRunStats = {
-    totalReplaySteps: replayEntries.length,
+    totalReplaySteps: replayStepsTotal,
     plannedSteps: 0,
     passedBoardChecks: 0,
     failedBoardChecks: 0,
     failedPlans: 0,
-    skippedSteps: config.session.samples.length - replayEntries.length,
+    skippedSteps: config.session.samples.length - replayStepsTotal,
     commandsEmitted: 0,
   };
 
@@ -230,18 +237,6 @@ export const createTrajectoryReplayGuiInputSource = (
   };
 
   const planNextForActive = (state: GameState): void => {
-    if (replayCursor >= replayEntries.length) {
-      complete();
-      return;
-    }
-    const entry = replayEntries[replayCursor];
-    const replay = entry.sample.replay;
-    if (!replay) {
-      replayCursor += 1;
-      planNextForActive(state);
-      return;
-    }
-
     if (pendingCheck) {
       const boardMatches = sameOccupancy(
         boardToOccupancy(state.board),
@@ -288,72 +283,94 @@ export const createTrajectoryReplayGuiInputSource = (
       pendingCheck = null;
     }
 
-    if (!replay.holdUsed && state.active.k !== replay.lockPiece) {
-      coerceActiveForTarget(state, replay.lockPiece, log);
-    }
-    state.active.r = normalizeRotation(state.active.r);
-    const variants = buildPlanVariants(replay);
-    const attempts: PlanAttempt[] = [];
-    let planned: SuccessfulPlan | null = null;
-    for (const variant of variants) {
-      const result = planTrajectoryLockExecution({
-        board: state.board,
-        active: state.active,
-        hold: state.hold,
-        canHold: state.canHold,
-        target: variant.target,
-        maxNodes: Math.max(1, Math.trunc(maxNodes * variant.maxNodesScale)),
-        allowSoftDrop,
-      });
-      if (result.ok) {
-        planned = { label: variant.label, result };
-        break;
+    while (sampleCursor < allEntries.length) {
+      const entry = allEntries[sampleCursor];
+      const replay = entry.sample.replay;
+      if (!replay) {
+        sampleCursor += 1;
+        state.board = occupancyToBoard(entry.sample.boardOccupancy);
+        if (entry.sample.hold !== state.hold) {
+          state.canHold = false;
+        }
+        state.hold = entry.sample.hold;
+        coerceActiveForTarget(state, entry.sample.action, log);
+        state.active.r = normalizeRotation(state.active.r);
+        log(
+          `applied non-replay checkpoint sample #${entry.index}: ` +
+            `active=${state.active.k}, hold=${state.hold ?? 'null'}, canHold=${state.canHold}.`,
+        );
+        continue;
       }
-      attempts.push({
-        label: variant.label,
-        reason: result.reason,
-        visitedNodes: result.visitedNodes,
-      });
-    }
-    replayCursor += 1;
-    if (!planned) {
-      stats.failedPlans += 1;
-      const attemptsSummary = attempts
-        .map(
-          (attempt) =>
-            `${attempt.label}=>${attempt.reason} (visited=${attempt.visitedNodes})`,
-        )
-        .join(' | ');
-      log(
-        `plan failed for sample #${entry.index}. ` +
-          `target={piece:${replay.lockPiece},rot:${replay.lockRotation},x:${replay.lockX},y:${replay.lockY},holdUsed:${replay.holdUsed}} ` +
-          `state={active:${state.active.k}@${state.active.x},${state.active.y},r${state.active.r};hold:${state.hold ?? 'null'};canHold:${state.canHold}} ` +
-          `board={${summarizeBoard(state.board)}} ` +
-          `note=if holdUsed=true and hold is empty, runtime first-hold semantics may differ from static plan assumptions. ` +
-          `attempts=${attemptsSummary}`,
+
+      if (!replay.holdUsed && state.active.k !== replay.lockPiece) {
+        coerceActiveForTarget(state, replay.lockPiece, log);
+      }
+      state.active.r = normalizeRotation(state.active.r);
+      const variants = buildPlanVariants(replay);
+      const attempts: PlanAttempt[] = [];
+      let planned: SuccessfulPlan | null = null;
+      for (const variant of variants) {
+        const result = planTrajectoryLockExecution({
+          board: state.board,
+          active: state.active,
+          hold: state.hold,
+          canHold: state.canHold,
+          target: variant.target,
+          maxNodes: Math.max(1, Math.trunc(maxNodes * variant.maxNodesScale)),
+          allowSoftDrop,
+        });
+        if (result.ok) {
+          planned = { label: variant.label, result };
+          break;
+        }
+        attempts.push({
+          label: variant.label,
+          reason: result.reason,
+          visitedNodes: result.visitedNodes,
+        });
+      }
+      sampleCursor += 1;
+      if (!planned) {
+        stats.failedPlans += 1;
+        const attemptsSummary = attempts
+          .map(
+            (attempt) =>
+              `${attempt.label}=>${attempt.reason} (visited=${attempt.visitedNodes})`,
+          )
+          .join(' | ');
+        log(
+          `plan failed for sample #${entry.index}. ` +
+            `target={piece:${replay.lockPiece},rot:${replay.lockRotation},x:${replay.lockX},y:${replay.lockY},holdUsed:${replay.holdUsed}} ` +
+            `state={active:${state.active.k}@${state.active.x},${state.active.y},r${state.active.r};hold:${state.hold ?? 'null'};canHold:${state.canHold}} ` +
+            `board={${summarizeBoard(state.board)}} ` +
+            `note=if holdUsed=true and hold is empty, runtime first-hold semantics may differ from static plan assumptions. ` +
+            `attempts=${attemptsSummary}`,
+        );
+        complete();
+        return;
+      }
+      stats.plannedSteps += 1;
+      queue = planned.result.commands.map((command) =>
+        trajectoryExecutorCommandToInputFrame(command),
       );
-      complete();
+      config.onTargetGhostChange?.({
+        sampleIndex: entry.index,
+        ghost: {
+          k: replay.lockPiece,
+          r: normalizeRotation(replay.lockRotation),
+          x: Math.trunc(replay.lockX),
+          y: Math.trunc(replay.lockY),
+        },
+      });
+      pendingCheck = entry;
+      log(
+        `planned sample #${entry.index}: commands=${queue.length}, ` +
+          `depth=${planned.result.searchDepth}, visited=${planned.result.visitedNodes}, ` +
+          `variant=${planned.label}.`,
+      );
       return;
     }
-    stats.plannedSteps += 1;
-    queue = planned.result.commands.map((command) =>
-      trajectoryExecutorCommandToInputFrame(command),
-    );
-    config.onTargetGhostChange?.({
-      sampleIndex: entry.index,
-      ghost: {
-        k: replay.lockPiece,
-        r: normalizeRotation(replay.lockRotation),
-        x: Math.trunc(replay.lockX),
-        y: Math.trunc(replay.lockY),
-      },
-    });
-    pendingCheck = entry;
-    log(
-      `planned sample #${entry.index}: commands=${queue.length}, ` +
-        `depth=${planned.result.searchDepth}, visited=${planned.result.visitedNodes}, ` +
-        `variant=${planned.label}.`,
-    );
+    complete();
   };
 
   return {
@@ -392,7 +409,7 @@ export const createTrajectoryReplayGuiInputSource = (
       activeRef = null;
       queue = [];
       cooldownMs = 0;
-      replayCursor = 0;
+      sampleCursor = 0;
       pendingCheck = null;
       finished = false;
       config.onTargetGhostChange?.(null);
