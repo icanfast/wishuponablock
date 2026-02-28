@@ -2308,7 +2308,11 @@ async function boot() {
     sessionController.rebuildSession();
     await screenManager.setActive('replay');
     applyTrajectoryInitialStateToGame(loaded);
-    session.getGame().setConfig({ gravityMs: Number.POSITIVE_INFINITY });
+    session.getGame().setConfig({
+      gravityMs: Number.POSITIVE_INFINITY,
+      lockDelayMs: Number.POSITIVE_INFINITY,
+      hardLockDelayMs: Number.POSITIVE_INFINITY,
+    });
     runtime?.setInputSource(replayGuiInputSource ?? NullInputSource);
     runtime?.setPausedByMenu(false);
     runtime?.renderNow();
