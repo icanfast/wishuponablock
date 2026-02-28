@@ -2094,8 +2094,7 @@ async function boot() {
     const state = game.state;
     state.board = toBoardFromOccupancy(sample.boardOccupancy);
     state.hold = sample.hold;
-    const nextPiece = sample.replay?.lockPiece ?? sample.action;
-    state.active = spawnReplayActiveForBoard(state.board, nextPiece);
+    state.active = spawnReplayActiveForBoard(state.board, sample.action);
     state.next = sample.pieces.slice(0, 3);
     state.canHold = true;
     state.timeMs =
