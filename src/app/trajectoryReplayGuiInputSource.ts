@@ -41,6 +41,7 @@ export type TrajectoryReplayGuiInputSourceConfig = {
   apmInput: number;
   allowSoftDrop?: boolean;
   maxNodes?: number;
+  stopOnParityMismatch?: boolean;
   onLog?: (line: string) => void;
   onComplete?: (stats: TrajectoryReplayGuiRunStats) => void;
 };
@@ -61,6 +62,30 @@ const sameOccupancy = (left: number[][], right: number[][]): boolean => {
     }
   }
   return true;
+};
+
+const summarizeOccupancyDiff = (
+  actual: number[][],
+  expected: number[][],
+): { diffCount: number; firstDiffs: Array<{ x: number; y: number }> } => {
+  const firstDiffs: Array<{ x: number; y: number }> = [];
+  let diffCount = 0;
+  const rows = Math.max(actual.length, expected.length);
+  for (let y = 0; y < rows; y += 1) {
+    const aRow = actual[y] ?? [];
+    const eRow = expected[y] ?? [];
+    const cols = Math.max(aRow.length, eRow.length);
+    for (let x = 0; x < cols; x += 1) {
+      const a = (aRow[x] ?? 0) > 0 ? 1 : 0;
+      const e = (eRow[x] ?? 0) > 0 ? 1 : 0;
+      if (a === e) continue;
+      diffCount += 1;
+      if (firstDiffs.length < 12) {
+        firstDiffs.push({ x, y });
+      }
+    }
+  }
+  return { diffCount, firstDiffs };
 };
 
 const summarizeBoard = (board: GameState['board']): string => {
@@ -157,6 +182,7 @@ export const createTrajectoryReplayGuiInputSource = (
   const log = (line: string) => config.onLog?.(`[replay-exec] ${line}`);
   const maxNodes = Math.max(1, Math.trunc(config.maxNodes ?? 30_000));
   const allowSoftDrop = config.allowSoftDrop !== false;
+  const stopOnParityMismatch = config.stopOnParityMismatch !== false;
 
   let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
@@ -209,10 +235,26 @@ export const createTrajectoryReplayGuiInputSource = (
         stats.passedBoardChecks += 1;
       } else {
         stats.failedBoardChecks += 1;
+        const occupancyNow = boardToOccupancy(state.board);
+        const occupancyDiff = summarizeOccupancyDiff(
+          occupancyNow,
+          pendingCheck.sample.boardOccupancy,
+        );
         log(
           `parity mismatch after sample #${pendingCheck.index}: ` +
-            `board=${boardMatches ? 'ok' : 'mismatch'} hold=${holdMatches ? 'ok' : 'mismatch'}.`,
+            `board=${boardMatches ? 'ok' : 'mismatch'} hold=${holdMatches ? 'ok' : 'mismatch'} ` +
+            `diff_cells=${occupancyDiff.diffCount} ` +
+            `first_diff=${JSON.stringify(occupancyDiff.firstDiffs)} ` +
+            `actual_hold=${state.hold ?? 'null'} expected_hold=${pendingCheck.sample.hold ?? 'null'}.`,
         );
+        if (stopOnParityMismatch) {
+          log(
+            `stopping on first parity mismatch (sample #${pendingCheck.index}) to avoid cascading divergence.`,
+          );
+          pendingCheck = null;
+          complete();
+          return;
+        }
       }
       pendingCheck = null;
     }
@@ -258,6 +300,7 @@ export const createTrajectoryReplayGuiInputSource = (
           `target={piece:${replay.lockPiece},rot:${replay.lockRotation},x:${replay.lockX},y:${replay.lockY},holdUsed:${replay.holdUsed}} ` +
           `state={active:${state.active.k}@${state.active.x},${state.active.y},r${state.active.r};hold:${state.hold ?? 'null'};canHold:${state.canHold}} ` +
           `board={${summarizeBoard(state.board)}} ` +
+          `note=if holdUsed=true and hold is empty, runtime first-hold semantics may differ from static plan assumptions. ` +
           `attempts=${attemptsSummary}`,
       );
       complete();
