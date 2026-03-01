@@ -2495,6 +2495,7 @@ async function boot() {
     minSamplesForUpload: number;
     rewardPolicyId: TrajectoryRewardPolicyId;
     initialState: TrajectoryInitialStateV1;
+    sampleIds: Set<string>;
   };
   let activeTrajectoryRun: TrajectoryRunState | null = null;
   let pendingTrajectoryRunModeId: string | null = null;
@@ -2642,12 +2643,10 @@ async function boot() {
       startedAtMs: Date.now(),
       axes,
       pipelineId: pipeline.id,
-      minSamplesForUpload: Math.max(
-        MIN_TRAJECTORY_SAMPLES_PER_SESSION,
-        pipeline.minSamples,
-      ),
+      minSamplesForUpload: Math.max(1, pipeline.minSamples),
       rewardPolicyId: getTrajectoryRewardPolicyId(modeId, axes),
       initialState: toTrajectoryInitialState(state),
+      sampleIds: new Set<string>(),
     };
     trajectoryDebug('run started', {
       modeId,
@@ -2674,7 +2673,50 @@ async function boot() {
         modeId: run.modeId,
         modelAxes: run.axes,
       })
-      .filter((sample) => sample.createdAtMs >= run.startedAtMs);
+      .filter((sample) => run.sampleIds.has(sample.id));
+
+  const trackSampleForActiveRun = (
+    sample: TrajectoryDecisionSample,
+    source: 'model' | 'surrogate',
+  ): void => {
+    const run = activeTrajectoryRun;
+    if (!run) {
+      trajectoryDebug('sample recorded without active run', {
+        source,
+        sampleId: sample.id,
+        modeId: sample.modeId,
+      });
+      return;
+    }
+    if (
+      sample.modeId !== run.modeId ||
+      sample.arch !== run.axes.arch ||
+      sample.rewardProfileId !== run.axes.rewardProfileId ||
+      sample.queuePolicyId !== run.axes.queuePolicyId
+    ) {
+      trajectoryDebug('sample not attached to run (axes mismatch)', {
+        source,
+        runSessionId: run.sessionId,
+        runModeId: run.modeId,
+        sampleId: sample.id,
+        sampleModeId: sample.modeId,
+        sampleAxes: {
+          arch: sample.arch,
+          rewardProfileId: sample.rewardProfileId,
+          queuePolicyId: sample.queuePolicyId,
+        },
+        runAxes: run.axes,
+      });
+      return;
+    }
+    run.sampleIds.add(sample.id);
+    trajectoryDebug('sample attached to run', {
+      source,
+      runSessionId: run.sessionId,
+      sampleId: sample.id,
+      totalSamplesInRun: run.sampleIds.size,
+    });
+  };
 
   const buildTrajectorySession = (
     run: TrajectoryRunState,
@@ -2683,6 +2725,13 @@ async function boot() {
   ): TrajectorySessionV1 | null => {
     const runSamples = listRunSamples(run);
     if (runSamples.length < run.minSamplesForUpload) {
+      trajectoryEvent('finalize skipped (below min samples)', {
+        modeId: run.modeId,
+        sessionId: run.sessionId,
+        outcome,
+        samples: runSamples.length,
+        minSamplesForUpload: run.minSamplesForUpload,
+      });
       trajectoryDebug('build session skipped: below min samples', {
         modeId: run.modeId,
         sessionId: run.sessionId,
@@ -2735,6 +2784,13 @@ async function boot() {
       samples: session.samples.length,
       durationMs: session.durationMs,
     });
+    trajectoryEvent('finalize built session', {
+      modeId: session.modeId,
+      sessionId: session.sessionId,
+      outcome,
+      samples: session.samples.length,
+      minSamplesForUpload: run.minSamplesForUpload,
+    });
     return session;
   };
 
@@ -2758,6 +2814,7 @@ async function boot() {
       outcome,
       samplesBeforeFinalize,
       minSamplesForUpload: run.minSamplesForUpload,
+      trackedSampleIds: run.sampleIds.size,
     });
     lastTrajectoryMinSamplesRequired = run.minSamplesForUpload;
     const session = buildTrajectorySession(run, outcome, terminal);
@@ -3197,12 +3254,13 @@ async function boot() {
       const modeId = modeController.getState().mode.id;
       const replay = pendingTrajectoryReplayStep;
       pendingTrajectoryReplayStep = null;
-      trajectoryBuffer.recordDecision({
+      const sample = trajectoryBuffer.recordDecision({
         modeId,
         modelAxes: getActiveModelAxes(),
         decision,
         replay,
       });
+      trackSampleForActiveRun(sample, 'model');
     },
     setLockEffectsSuppressed: (value) => {
       suppressLockEffects = value;
@@ -3401,7 +3459,7 @@ async function boot() {
             logits[actionIndex] = 1;
             probabilities[actionIndex] = 1;
           }
-          trajectoryBuffer.recordDecision({
+          const sample = trajectoryBuffer.recordDecision({
             modeId: modeController.getState().mode.id,
             modelAxes: getActiveModelAxes(),
             decision: {
@@ -3418,6 +3476,7 @@ async function boot() {
             },
             replay: pendingTrajectoryReplayStep,
           });
+          trackSampleForActiveRun(sample, 'surrogate');
           pendingTrajectoryReplayStep = null;
         }
       }
@@ -3435,6 +3494,7 @@ async function boot() {
         trajectoryEvent(state.gameWon ? 'game won' : 'game over', {
           modeId: activeTrajectoryRun.modeId,
           sessionId: activeTrajectoryRun.sessionId,
+          samplesTracked: activeTrajectoryRun.sampleIds.size,
         });
         trajectoryDebug('terminal state reached on frame', {
           modeId: activeTrajectoryRun.modeId,
