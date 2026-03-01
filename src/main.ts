@@ -2507,6 +2507,12 @@ async function boot() {
   let lastTrajectoryUploadAtMs: number | null = null;
   let lastTrajectoryUploadSamples = 0;
   let lastTrajectoryUploadError: string | null = null;
+  const TRAJECTORY_DEBUG_ENABLED =
+    import.meta.env.DEV || import.meta.env.VITE_TRAJECTORY_DEBUG === 'true';
+  const trajectoryDebug = (...args: unknown[]) => {
+    if (!TRAJECTORY_DEBUG_ENABLED) return;
+    console.log('[trajectory-debug]', ...args);
+  };
 
   const getTrajectoryModelArch = (): string => {
     const model = modelService.getModel();
@@ -2633,10 +2639,21 @@ async function boot() {
       rewardPolicyId: getTrajectoryRewardPolicyId(modeId, axes),
       initialState: toTrajectoryInitialState(state),
     };
+    trajectoryDebug('run started', {
+      modeId,
+      sessionId: activeTrajectoryRun.sessionId,
+      pipelineId: activeTrajectoryRun.pipelineId,
+      minSamplesForUpload: activeTrajectoryRun.minSamplesForUpload,
+      generatorType: settingsStore.get().generator.type,
+    });
   };
 
-  const scheduleTrajectoryRunStart = (modeId: string): void => {
+  const scheduleTrajectoryRunStart = (
+    modeId: string,
+    reason: 'start_game' | 'restart',
+  ): void => {
     pendingTrajectoryRunModeId = modeId;
+    trajectoryDebug('run start scheduled', { modeId, reason });
   };
 
   const listRunSamples = (
@@ -2655,7 +2672,16 @@ async function boot() {
     terminal: TrajectoryRewardTerminalStats | null = null,
   ): TrajectorySessionV1 | null => {
     const runSamples = listRunSamples(run);
-    if (runSamples.length < run.minSamplesForUpload) return null;
+    if (runSamples.length < run.minSamplesForUpload) {
+      trajectoryDebug('build session skipped: below min samples', {
+        modeId: run.modeId,
+        sessionId: run.sessionId,
+        outcome,
+        samples: runSamples.length,
+        minSamplesForUpload: run.minSamplesForUpload,
+      });
+      return null;
+    }
     const rewards = computeTrajectoryRewards(
       runSamples,
       {
@@ -2669,7 +2695,7 @@ async function boot() {
       Date.now(),
       runSamples[runSamples.length - 1].createdAtMs,
     );
-    return {
+    const session = {
       schema: TRAJECTORY_SESSION_SCHEMA_V1,
       sessionId: run.sessionId,
       modeId: run.modeId,
@@ -2692,6 +2718,14 @@ async function boot() {
       samples: toTrajectorySamples(runSamples, rewards.rewards),
       meta: toTrajectoryMeta(run, outcome, rewards),
     };
+    trajectoryDebug('build session ok', {
+      modeId: session.modeId,
+      sessionId: session.sessionId,
+      outcome,
+      samples: session.samples.length,
+      durationMs: session.durationMs,
+    });
+    return session;
   };
 
   const finalizeTrajectoryRun = (
@@ -2703,11 +2737,33 @@ async function boot() {
     pendingTrajectoryRunModeId = null;
     pendingTrajectoryReplayStep = null;
     holdUsedSinceLastLock = false;
-    if (!run) return null;
+    if (!run) {
+      trajectoryDebug('finalize skipped: no active run', { outcome });
+      return null;
+    }
+    const samplesBeforeFinalize = listRunSamples(run).length;
+    trajectoryDebug('finalize requested', {
+      modeId: run.modeId,
+      sessionId: run.sessionId,
+      outcome,
+      samplesBeforeFinalize,
+      minSamplesForUpload: run.minSamplesForUpload,
+    });
     lastTrajectoryMinSamplesRequired = run.minSamplesForUpload;
     const session = buildTrajectorySession(run, outcome, terminal);
     if (session) {
       pendingTrajectorySession = session;
+      trajectoryDebug('finalize produced pending session', {
+        modeId: session.modeId,
+        sessionId: session.sessionId,
+        samples: session.samples.length,
+      });
+    } else {
+      trajectoryDebug('finalize produced no session', {
+        modeId: run.modeId,
+        sessionId: run.sessionId,
+        outcome,
+      });
     }
     return session;
   };
@@ -2715,6 +2771,11 @@ async function boot() {
   const uploadTrajectorySession = async (
     session: TrajectorySessionV1,
   ): Promise<string> => {
+    trajectoryDebug('upload start', {
+      modeId: session.modeId,
+      sessionId: session.sessionId,
+      samples: session.samples.length,
+    });
     const uploaded = await trajectoryRecordingService.uploadSession(session);
     if (pendingTrajectorySession?.sessionId === session.sessionId) {
       pendingTrajectorySession = null;
@@ -2723,6 +2784,12 @@ async function boot() {
     lastTrajectoryUploadSamples = uploaded.samples;
     lastTrajectoryUploadError = null;
     lastTrajectoryUploadMessage = `Uploaded ${uploaded.samples} samples for mode "${uploaded.mode}".`;
+    trajectoryDebug('upload success', {
+      id: uploaded.id,
+      mode: uploaded.mode,
+      samples: uploaded.samples,
+      createdAtMs: uploaded.createdAtMs,
+    });
     return `${lastTrajectoryUploadMessage} (id: ${uploaded.id})`;
   };
 
@@ -2815,11 +2882,24 @@ async function boot() {
   const autoFinalizeTrajectoryOnInterruption = (
     reason: 'screen_leave' | 'restart',
   ): void => {
+    trajectoryDebug('auto finalize triggered', {
+      reason,
+      hasActiveRun: activeTrajectoryRun != null,
+      pendingSessionId: pendingTrajectorySession?.sessionId ?? null,
+      authenticated: authState.authenticated,
+    });
     const tryUploadSession = (session: TrajectorySessionV1): void => {
       void uploadTrajectorySession(session).catch((error) => {
         const message = toErrorMessage(error, 'Trajectory upload failed.');
         lastTrajectoryUploadError = message;
         lastTrajectoryUploadMessage = `Upload failed: ${message}`;
+        trajectoryDebug('upload failed', {
+          reason,
+          sessionId: session.sessionId,
+          modeId: session.modeId,
+          samples: session.samples.length,
+          error: message,
+        });
         console.warn(`[trajectory] auto upload failed (${reason})`, error);
       });
     };
@@ -2827,7 +2907,22 @@ async function boot() {
     const run = activeTrajectoryRun;
     if (!run) {
       if (reason === 'restart' && pendingTrajectorySession) {
+        trajectoryDebug(
+          'restart with no active run: uploading pending session',
+          {
+            sessionId: pendingTrajectorySession.sessionId,
+            modeId: pendingTrajectorySession.modeId,
+            samples: pendingTrajectorySession.samples.length,
+          },
+        );
         tryUploadSession(pendingTrajectorySession);
+      } else {
+        trajectoryDebug(
+          'auto finalize no-op: no active run and no pending session',
+          {
+            reason,
+          },
+        );
       }
       return;
     }
@@ -2843,6 +2938,14 @@ async function boot() {
       if (!finalized) {
         lastTrajectoryUploadMessage = `Run ignored (need >= ${lastTrajectoryMinSamplesRequired} samples).`;
         lastTrajectoryUploadError = null;
+        trajectoryDebug(
+          'restart finalize skipped upload: no finalized session',
+          {
+            modeId: run.modeId,
+            sessionId: run.sessionId,
+            outcome,
+          },
+        );
         return;
       }
       tryUploadSession(finalized);
@@ -2850,6 +2953,12 @@ async function boot() {
     }
     if (authState.authenticated) {
       void finalizeAndUploadTrajectoryRun(outcome, terminal).catch((error) => {
+        trajectoryDebug('screen_leave finalize/upload failed', {
+          modeId: run.modeId,
+          sessionId: run.sessionId,
+          outcome,
+          error: toErrorMessage(error, 'Unknown upload error.'),
+        });
         console.warn(`[trajectory] auto upload failed (${reason})`, error);
       });
       return;
@@ -3041,7 +3150,7 @@ async function boot() {
       lastRecordedActiveRef = null;
       pendingTrajectoryReplayStep = null;
       holdUsedSinceLastLock = false;
-      scheduleTrajectoryRunStart(modeController.getState().mode.id);
+      scheduleTrajectoryRunStart(modeController.getState().mode.id, 'restart');
     },
     onModelDecision: (decision) => {
       const modeId = modeController.getState().mode.id;
@@ -3282,12 +3391,24 @@ async function boot() {
       // Finalize/upload exactly once per run by checking run presence,
       // not a frame-local ended flag that can desync across mode flows.
       if (ended && activeTrajectoryRun) {
+        trajectoryDebug('terminal state reached on frame', {
+          modeId: activeTrajectoryRun.modeId,
+          sessionId: activeTrajectoryRun.sessionId,
+          gameWon: state.gameWon,
+          gameOver: state.gameOver,
+        });
         void snapshotService?.flushRemoteUploads();
         const outcome = state.gameWon ? 'game_won' : 'game_over';
         const terminal = toTrajectoryTerminalStats(state);
         if (authState.authenticated) {
           void finalizeAndUploadTrajectoryRun(outcome, terminal).catch(
             (error) => {
+              trajectoryDebug('terminal auto upload failed', {
+                modeId: activeTrajectoryRun?.modeId ?? null,
+                sessionId: activeTrajectoryRun?.sessionId ?? null,
+                outcome,
+                error: toErrorMessage(error, 'Unknown upload error.'),
+              });
               console.warn('[trajectory] auto upload failed', error);
             },
           );
@@ -3651,7 +3772,10 @@ async function boot() {
       }
       activeTrajectoryRun = null;
       lastRecordedActiveRef = null;
-      scheduleTrajectoryRunStart(modeController.getState().mode.id);
+      scheduleTrajectoryRunStart(
+        modeController.getState().mode.id,
+        'start_game',
+      );
       runtime?.setInputSource(activeInputSource);
       await screenManager.setActive('game');
     } finally {
