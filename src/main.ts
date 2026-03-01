@@ -2508,6 +2508,7 @@ async function boot() {
   let lastTrajectoryUploadAtMs: number | null = null;
   let lastTrajectoryUploadSamples = 0;
   let lastTrajectoryUploadError: string | null = null;
+  const inFlightTrajectoryUploads = new Map<string, Promise<string>>();
   const TRAJECTORY_DEBUG_ENABLED =
     import.meta.env.DEV || import.meta.env.VITE_TRAJECTORY_DEBUG === 'true';
   const trajectoryDebug = (...args: unknown[]) => {
@@ -2835,9 +2836,21 @@ async function boot() {
     return session;
   };
 
-  const uploadTrajectorySession = async (
+  const uploadTrajectorySession = (
     session: TrajectorySessionV1,
   ): Promise<string> => {
+    const existing = inFlightTrajectoryUploads.get(session.sessionId);
+    if (existing) {
+      trajectoryEvent('upload deduped (already in progress)', {
+        modeId: session.modeId,
+        sessionId: session.sessionId,
+      });
+      trajectoryDebug('upload deduped', {
+        modeId: session.modeId,
+        sessionId: session.sessionId,
+      });
+      return existing;
+    }
     trajectoryEvent('upload start', {
       modeId: session.modeId,
       sessionId: session.sessionId,
@@ -2848,26 +2861,36 @@ async function boot() {
       sessionId: session.sessionId,
       samples: session.samples.length,
     });
-    const uploaded = await trajectoryRecordingService.uploadSession(session);
-    if (pendingTrajectorySession?.sessionId === session.sessionId) {
-      pendingTrajectorySession = null;
-    }
-    lastTrajectoryUploadAtMs = uploaded.createdAtMs;
-    lastTrajectoryUploadSamples = uploaded.samples;
-    lastTrajectoryUploadError = null;
-    lastTrajectoryUploadMessage = `Uploaded ${uploaded.samples} samples for mode "${uploaded.mode}".`;
-    trajectoryEvent('upload success', {
-      id: uploaded.id,
-      mode: uploaded.mode,
-      samples: uploaded.samples,
+    const corePromise = (async (): Promise<string> => {
+      const uploaded = await trajectoryRecordingService.uploadSession(session);
+      if (pendingTrajectorySession?.sessionId === session.sessionId) {
+        pendingTrajectorySession = null;
+      }
+      lastTrajectoryUploadAtMs = uploaded.createdAtMs;
+      lastTrajectoryUploadSamples = uploaded.samples;
+      lastTrajectoryUploadError = null;
+      lastTrajectoryUploadMessage = `Uploaded ${uploaded.samples} samples for mode "${uploaded.mode}".`;
+      trajectoryEvent('upload success', {
+        id: uploaded.id,
+        mode: uploaded.mode,
+        samples: uploaded.samples,
+      });
+      trajectoryDebug('upload success', {
+        id: uploaded.id,
+        mode: uploaded.mode,
+        samples: uploaded.samples,
+        createdAtMs: uploaded.createdAtMs,
+      });
+      return `${lastTrajectoryUploadMessage} (id: ${uploaded.id})`;
+    })();
+    inFlightTrajectoryUploads.set(session.sessionId, corePromise);
+    void corePromise.finally(() => {
+      const current = inFlightTrajectoryUploads.get(session.sessionId);
+      if (current === corePromise) {
+        inFlightTrajectoryUploads.delete(session.sessionId);
+      }
     });
-    trajectoryDebug('upload success', {
-      id: uploaded.id,
-      mode: uploaded.mode,
-      samples: uploaded.samples,
-      createdAtMs: uploaded.createdAtMs,
-    });
-    return `${lastTrajectoryUploadMessage} (id: ${uploaded.id})`;
+    return corePromise;
   };
 
   const finalizeAndUploadTrajectoryRun = async (
