@@ -2513,6 +2513,16 @@ async function boot() {
     if (!TRAJECTORY_DEBUG_ENABLED) return;
     console.log('[trajectory-debug]', ...args);
   };
+  const trajectoryEvent = (
+    event: string,
+    details?: Record<string, unknown>,
+  ) => {
+    if (details) {
+      console.info('[trajectory]', event, details);
+      return;
+    }
+    console.info('[trajectory]', event);
+  };
 
   const getTrajectoryModelArch = (): string => {
     const model = modelService.getModel();
@@ -2771,6 +2781,11 @@ async function boot() {
   const uploadTrajectorySession = async (
     session: TrajectorySessionV1,
   ): Promise<string> => {
+    trajectoryEvent('upload start', {
+      modeId: session.modeId,
+      sessionId: session.sessionId,
+      samples: session.samples.length,
+    });
     trajectoryDebug('upload start', {
       modeId: session.modeId,
       sessionId: session.sessionId,
@@ -2784,6 +2799,11 @@ async function boot() {
     lastTrajectoryUploadSamples = uploaded.samples;
     lastTrajectoryUploadError = null;
     lastTrajectoryUploadMessage = `Uploaded ${uploaded.samples} samples for mode "${uploaded.mode}".`;
+    trajectoryEvent('upload success', {
+      id: uploaded.id,
+      mode: uploaded.mode,
+      samples: uploaded.samples,
+    });
     trajectoryDebug('upload success', {
       id: uploaded.id,
       mode: uploaded.mode,
@@ -2882,6 +2902,12 @@ async function boot() {
   const autoFinalizeTrajectoryOnInterruption = (
     reason: 'screen_leave' | 'restart',
   ): void => {
+    trajectoryEvent('auto finalize/upload check', {
+      reason,
+      hasActiveRun: activeTrajectoryRun != null,
+      hasPendingSession: pendingTrajectorySession != null,
+      authenticated: authState.authenticated,
+    });
     trajectoryDebug('auto finalize triggered', {
       reason,
       hasActiveRun: activeTrajectoryRun != null,
@@ -2893,6 +2919,13 @@ async function boot() {
         const message = toErrorMessage(error, 'Trajectory upload failed.');
         lastTrajectoryUploadError = message;
         lastTrajectoryUploadMessage = `Upload failed: ${message}`;
+        trajectoryEvent('upload failed', {
+          reason,
+          sessionId: session.sessionId,
+          modeId: session.modeId,
+          samples: session.samples.length,
+          error: message,
+        });
         trajectoryDebug('upload failed', {
           reason,
           sessionId: session.sessionId,
@@ -2938,6 +2971,11 @@ async function boot() {
       if (!finalized) {
         lastTrajectoryUploadMessage = `Run ignored (need >= ${lastTrajectoryMinSamplesRequired} samples).`;
         lastTrajectoryUploadError = null;
+        trajectoryEvent('restart finalize ignored (below min samples)', {
+          modeId: run.modeId,
+          sessionId: run.sessionId,
+          minSamplesRequired: lastTrajectoryMinSamplesRequired,
+        });
         trajectoryDebug(
           'restart finalize skipped upload: no finalized session',
           {
@@ -3145,6 +3183,9 @@ async function boot() {
     onHold: handleHoldSnapshot,
     onLineClear: handleLineClear,
     onBeforeRestart: () => {
+      trajectoryEvent('game restarted', {
+        modeId: modeController.getState().mode.id,
+      });
       autoFinalizeTrajectoryOnInterruption('restart');
       restartRecordingSession();
       lastRecordedActiveRef = null;
@@ -3391,6 +3432,10 @@ async function boot() {
       // Finalize/upload exactly once per run by checking run presence,
       // not a frame-local ended flag that can desync across mode flows.
       if (ended && activeTrajectoryRun) {
+        trajectoryEvent(state.gameWon ? 'game won' : 'game over', {
+          modeId: activeTrajectoryRun.modeId,
+          sessionId: activeTrajectoryRun.sessionId,
+        });
         trajectoryDebug('terminal state reached on frame', {
           modeId: activeTrajectoryRun.modeId,
           sessionId: activeTrajectoryRun.sessionId,
@@ -3724,6 +3769,7 @@ async function boot() {
 
   setScreen = (screen: 'menu' | 'game' | 'tool' | 'replay') => {
     if (screen !== 'game' && screenManager.getActive() === 'game') {
+      trajectoryEvent('exited game screen', { to: screen });
       autoFinalizeTrajectoryOnInterruption('screen_leave');
     }
     if (screen === 'menu') {
