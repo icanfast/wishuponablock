@@ -3443,8 +3443,17 @@ async function boot() {
     },
     onFrame: (state) => {
       if (pendingTrajectoryRunModeId && !activeTrajectoryRun) {
-        beginTrajectoryRun(pendingTrajectoryRunModeId, state);
-        pendingTrajectoryRunModeId = null;
+        if (state.gameOver || state.gameWon) {
+          trajectoryDebug('run start deferred: state is terminal', {
+            modeId: pendingTrajectoryRunModeId,
+            gameWon: state.gameWon,
+            gameOver: state.gameOver,
+            timeMs: state.timeMs,
+          });
+        } else {
+          beginTrajectoryRun(pendingTrajectoryRunModeId, state);
+          pendingTrajectoryRunModeId = null;
+        }
       }
       const generatorType = settingsStore.get().generator.type;
       if (state.active !== lastRecordedActiveRef) {
