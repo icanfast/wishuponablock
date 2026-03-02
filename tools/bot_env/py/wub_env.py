@@ -3,9 +3,22 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+
+def _resolve_default_server_cmd() -> list[str]:
+    if os.name == "nt":
+        candidates = ("npx.cmd", "npx.exe", "npx")
+    else:
+        candidates = ("npx",)
+    for candidate in candidates:
+        if shutil.which(candidate):
+            return [candidate, "--yes", "tsx", "tools/bot_env/ts/envServer.ts"]
+    # Keep a predictable fallback so caller gets a clear process launch error.
+    return [candidates[0], "--yes", "tsx", "tools/bot_env/ts/envServer.ts"]
 
 
 class WubEnvBridge:
@@ -18,7 +31,7 @@ class WubEnvBridge:
         self.server_cmd = (
             server_cmd
             if server_cmd is not None
-            else ["npx", "--yes", "tsx", "tools/bot_env/ts/envServer.ts"]
+            else _resolve_default_server_cmd()
         )
         self._proc: subprocess.Popen[str] | None = None
         self._next_id = 1

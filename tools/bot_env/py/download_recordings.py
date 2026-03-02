@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -15,6 +15,16 @@ from typing import Any
 
 DEFAULT_BASE_URL = "https://dev.wishuponablock.com"
 DEFAULT_OUT_DIR = "tools/bot_env/recordings"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+try:
+    import certifi  # type: ignore
+except Exception:
+    certifi = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     parser.add_argument("--cookie", default=None, help="Raw wub_session cookie value.")
     parser.add_argument("--email", default=None, help="Email login (optional).")
     parser.add_argument("--password", default=None, help="Email password (optional).")
@@ -56,6 +67,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write final manifest summary JSON in output directory.",
     )
+    parser.add_argument(
+        "--ca-file",
+        default=None,
+        help="Path to custom CA bundle PEM file for TLS verification.",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate verification (debug use only).",
+    )
     args = parser.parse_args()
     if not args.cookie and not (args.email and args.password):
         parser.error("Provide either --cookie or both --email and --password.")
@@ -76,6 +97,7 @@ def request_json(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[int, dict[str, Any], dict[str, str]]:
     req = urllib.request.Request(
         url=url,
@@ -84,7 +106,7 @@ def request_json(
         data=body,
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=ssl_context) as resp:
             status = int(resp.status)
             raw_headers = {k.lower(): v for k, v in resp.headers.items()}
             payload = json.loads(resp.read().decode("utf-8"))
@@ -106,10 +128,11 @@ def request_json(
 def request_bytes(
     url: str,
     headers: dict[str, str] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
     req = urllib.request.Request(url=url, method="GET", headers=headers or {})
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=ssl_context) as resp:
             return int(resp.status), resp.read(), {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as exc:
         body = exc.read()
@@ -138,8 +161,13 @@ def login_and_get_cookie(base_url: str, email: str, password: str) -> str:
         headers={
             "content-type": "application/json",
             "accept": "application/json",
+            "origin": base_url,
+            "referer": f"{base_url}/",
+            "user-agent": HTTP_USER_AGENT,
+            "accept-language": "en-US,en;q=0.9",
         },
         body=payload,
+        ssl_context=TLS_CONTEXT,
     )
     if status != 200:
         raise RuntimeError(f"Login failed ({status}): {body.get('error', 'unknown error')}")
@@ -147,6 +175,24 @@ def login_and_get_cookie(base_url: str, email: str, password: str) -> str:
     if not cookie:
         raise RuntimeError("Login succeeded but wub_session cookie was not returned.")
     return cookie
+
+
+def resolve_tls_context(args: argparse.Namespace) -> ssl.SSLContext:
+    if bool(args.insecure):
+        return ssl._create_unverified_context()
+    if isinstance(args.ca_file, str) and args.ca_file.strip():
+        return ssl.create_default_context(cafile=args.ca_file.strip())
+    # Prefer certifi bundle when available; fallback to system defaults.
+    if certifi is not None:
+        try:
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+    return ssl.create_default_context()
+
+
+TLS_CONTEXT = ssl.create_default_context()
+HTTP_USER_AGENT = DEFAULT_USER_AGENT
 
 
 def build_manifest_params(args: argparse.Namespace, cursor: str | None) -> dict[str, str]:
@@ -194,6 +240,10 @@ def safe_name(value: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    global TLS_CONTEXT
+    global HTTP_USER_AGENT
+    TLS_CONTEXT = resolve_tls_context(args)
+    HTTP_USER_AGENT = str(args.user_agent).strip() or DEFAULT_USER_AGENT
     base_url = trim_base_url(args.base_url)
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +255,10 @@ def main() -> None:
     headers = {
         "accept": "application/json",
         "cookie": f"wub_session={cookie_value}",
+        "origin": base_url,
+        "referer": f"{base_url}/",
+        "user-agent": HTTP_USER_AGENT,
+        "accept-language": "en-US,en;q=0.9",
     }
 
     manifest_endpoint = f"{base_url}/api/admin/recordings/export-manifest"
@@ -223,7 +277,7 @@ def main() -> None:
     while True:
         params = build_manifest_params(args, cursor)
         url = f"{manifest_endpoint}?{urllib.parse.urlencode(params)}"
-        status, payload, _ = request_json(url=url, headers=headers)
+        status, payload, _ = request_json(url=url, headers=headers, ssl_context=TLS_CONTEXT)
         if status != 200:
             raise RuntimeError(f"Manifest request failed ({status}): {payload.get('error', 'unknown error')}")
 
@@ -249,7 +303,9 @@ def main() -> None:
                 continue
 
             fetch_url = f"{object_endpoint}?{urllib.parse.urlencode({'id': recording_id})}"
-            status_obj, body_obj, _ = request_bytes(fetch_url, headers=headers)
+            status_obj, body_obj, _ = request_bytes(
+                fetch_url, headers=headers, ssl_context=TLS_CONTEXT
+            )
             if status_obj != 200:
                 failed += 1
                 continue

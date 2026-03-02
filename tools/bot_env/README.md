@@ -82,6 +82,11 @@ python3 tools/bot_env/py/download_recordings.py \
   --out-dir tools/bot_env/recordings
 ```
 
+If you hit TLS trust errors on local Python:
+
+- Use your own CA bundle: `--ca-file /path/to/cacert.pem`
+- Or bypass verification for local testing only: `--insecure`
+
 ### 1) Build behavior-cloning dataset (optional warm-start)
 
 ```bash
