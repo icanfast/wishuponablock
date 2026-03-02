@@ -2049,7 +2049,7 @@ async function boot() {
       lockDelayMs: Number.POSITIVE_INFINITY,
       hardLockDelayMs: Number.POSITIVE_INFINITY,
     });
-    runtime?.setInputSource(botGuiInputSource ?? NullInputSource);
+    runtime?.setInputSource(activeInputSource);
     runtime?.setPausedByMenu(false);
     runtime?.renderNow();
     return (
@@ -2070,6 +2070,7 @@ async function boot() {
       lockDelayMs: gameCfg.lockDelayMs,
       hardLockDelayMs: gameCfg.hardLockDelayMs,
     });
+    runtime?.setInputSource(activeInputSource);
     return 'GUI inspect stopped.';
   };
 
@@ -3897,6 +3898,9 @@ async function boot() {
     if (screen !== 'game' && screenManager.getActive() === 'game') {
       trajectoryEvent('exited game screen', { to: screen });
       autoFinalizeTrajectoryOnInterruption('screen_leave');
+      if (botGuiInspectEnabled) {
+        stopAdminBotGuiInspect();
+      }
     }
     if (screen === 'menu') {
       void refreshMenuLabelingProgress();
@@ -3957,6 +3961,9 @@ async function boot() {
   requestStartGame = () => {
     if (replayGuiInspectEnabled || replayDirectRunning) {
       stopAdminReplayMode();
+    }
+    if (botGuiInspectEnabled) {
+      stopAdminBotGuiInspect();
     }
     void startGameWithModelReady();
   };

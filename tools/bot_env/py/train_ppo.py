@@ -431,240 +431,323 @@ def train(cfg: PPOConfig) -> None:
         completed_lengths: list[int] = []
 
         training_start = time.time()
-        for update in range(start_update + 1, num_updates + 1):
-            update_start = time.time()
+        best_score = float("-inf")
+        best_update = 0
+        best_stats: dict[str, Any] | None = None
+        best_state_dict: dict[str, torch.Tensor] | None = None
+        did_interrupt = False
+        try:
+            for update in range(start_update + 1, num_updates + 1):
+                update_start = time.time()
 
-            obs_buf = torch.zeros((cfg.num_steps, cfg.num_envs, obs_dim), device=device)
-            mask_buf = torch.zeros((cfg.num_steps, cfg.num_envs, action_dim), device=device)
-            action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
-            logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-            reward_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-            done_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-            value_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+                obs_buf = torch.zeros((cfg.num_steps, cfg.num_envs, obs_dim), device=device)
+                mask_buf = torch.zeros((cfg.num_steps, cfg.num_envs, action_dim), device=device)
+                action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
+                logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+                reward_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+                done_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+                value_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
 
-            for step in range(cfg.num_steps):
-                obs_t = as_tensor(obs_np, device)
-                mask_t = as_tensor(mask_np, device)
-                obs_buf[step] = obs_t
-                mask_buf[step] = mask_t
-
-                with torch.no_grad():
-                    logits, values = model(obs_t)
-                    dist = masked_categorical(logits, mask_t)
-                    if cfg.deterministic_eval:
-                        actions_t = torch.argmax(dist.probs, dim=-1)
-                    else:
-                        actions_t = dist.sample()
-                    logprob_t = dist.log_prob(actions_t)
-
-                action_buf[step] = actions_t
-                logprob_buf[step] = logprob_t
-                value_buf[step] = values
-
-                actions_np = actions_t.detach().cpu().numpy().astype(np.int64).tolist()
-                step_result = env.step_many(env_ids=env_ids, actions=actions_np)
-                next_obs_np = np.asarray(step_result["obs"], dtype=np.float32)
-                next_mask_np = ensure_action_masks(
-                    np.asarray(step_result["action_masks"], dtype=np.float32)
-                )
-                rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
-                dones_np = np.asarray(step_result["dones"], dtype=np.float32)
-
-                reward_buf[step] = as_tensor(rewards_np, device)
-                done_buf[step] = as_tensor(dones_np, device)
-
-                ep_return += rewards_np.astype(np.float64)
-                ep_length += 1
-
-                done_indices = np.where(dones_np > 0.5)[0]
-                if done_indices.size > 0:
-                    completed_returns.extend(ep_return[done_indices].tolist())
-                    completed_lengths.extend(ep_length[done_indices].tolist())
-                    ep_return[done_indices] = 0.0
-                    ep_length[done_indices] = 0
-
-                    done_env_ids = [env_ids[int(i)] for i in done_indices.tolist()]
-                    done_seeds = [
-                        cfg.seed + global_step + int(i) * 991 + update * 131
-                        for i in done_indices.tolist()
-                    ]
-                    reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
-                    reset_obs = np.asarray(reset_done["obs"], dtype=np.float32)
-                    reset_masks = ensure_action_masks(
-                        np.asarray(reset_done["action_masks"], dtype=np.float32)
-                    )
-                    for local_pos, env_idx in enumerate(done_indices.tolist()):
-                        next_obs_np[env_idx] = reset_obs[local_pos]
-                        next_mask_np[env_idx] = reset_masks[local_pos]
-
-                obs_np = next_obs_np
-                mask_np = next_mask_np
-                global_step += cfg.num_envs
-
-            with torch.no_grad():
-                next_obs_t = as_tensor(obs_np, device)
-                _, next_value = model(next_obs_t)
-
-            advantages = torch.zeros_like(reward_buf, device=device)
-            lastgaelam = torch.zeros(cfg.num_envs, device=device)
-            for t in reversed(range(cfg.num_steps)):
-                if t == cfg.num_steps - 1:
-                    next_non_terminal = 1.0 - done_buf[t]
-                    next_values = next_value
-                else:
-                    # done_buf[t] marks whether transition t ended the episode.
-                    # Use done_t for both TD bootstrap and GAE recursion masks.
-                    next_non_terminal = 1.0 - done_buf[t]
-                    next_values = value_buf[t + 1]
-                delta = reward_buf[t] + cfg.gamma * next_values * next_non_terminal - value_buf[t]
-                lastgaelam = delta + cfg.gamma * cfg.gae_lambda * next_non_terminal * lastgaelam
-                advantages[t] = lastgaelam
-            returns = advantages + value_buf
-
-            b_obs = obs_buf.reshape((-1, obs_dim))
-            b_masks = mask_buf.reshape((-1, action_dim))
-            b_actions = action_buf.reshape(-1)
-            b_logprobs = logprob_buf.reshape(-1)
-            b_advantages = advantages.reshape(-1)
-            b_returns = returns.reshape(-1)
-            b_values = value_buf.reshape(-1)
-
-            adv_mean = b_advantages.mean()
-            adv_std = b_advantages.std(unbiased=False) + 1e-8
-            b_advantages = (b_advantages - adv_mean) / adv_std
-
-            batch_inds = np.arange(batch_size)
-            clipfracs: list[float] = []
-            approx_kl_value = 0.0
-            policy_loss_value = 0.0
-            value_loss_value = 0.0
-            entropy_value = 0.0
-            updates_done = 0
-            early_stopped = False
-
-            for _epoch in range(cfg.update_epochs):
-                np.random.shuffle(batch_inds)
-                for start in range(0, batch_size, cfg.minibatch_size):
-                    end = start + cfg.minibatch_size
-                    mb_inds_np = batch_inds[start:end]
-                    mb_inds = torch.as_tensor(mb_inds_np, device=device, dtype=torch.long)
-
-                    logits, new_values = model(b_obs[mb_inds])
-                    dist = masked_categorical(logits, b_masks[mb_inds])
-                    new_logprob = dist.log_prob(b_actions[mb_inds])
-                    entropy = dist.entropy().mean()
-
-                    logratio = new_logprob - b_logprobs[mb_inds]
-                    ratio = torch.exp(logratio)
+                for step in range(cfg.num_steps):
+                    obs_t = as_tensor(obs_np, device)
+                    mask_t = as_tensor(mask_np, device)
+                    obs_buf[step] = obs_t
+                    mask_buf[step] = mask_t
 
                     with torch.no_grad():
-                        approx_kl = (b_logprobs[mb_inds] - new_logprob).mean()
-                        clipfrac = ((ratio - 1.0).abs() > cfg.clip_coef).float().mean()
-                        approx_kl_value = float(approx_kl.detach().cpu().item())
-                        clipfracs.append(float(clipfrac.detach().cpu().item()))
+                        logits, values = model(obs_t)
+                        dist = masked_categorical(logits, mask_t)
+                        if cfg.deterministic_eval:
+                            actions_t = torch.argmax(dist.probs, dim=-1)
+                        else:
+                            actions_t = dist.sample()
+                        logprob_t = dist.log_prob(actions_t)
 
-                    mb_adv = b_advantages[mb_inds]
-                    pg_loss_1 = -mb_adv * ratio
-                    pg_loss_2 = -mb_adv * torch.clamp(
-                        ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef
+                    action_buf[step] = actions_t
+                    logprob_buf[step] = logprob_t
+                    value_buf[step] = values
+
+                    actions_np = actions_t.detach().cpu().numpy().astype(np.int64).tolist()
+                    step_result = env.step_many(env_ids=env_ids, actions=actions_np)
+                    next_obs_np = np.asarray(step_result["obs"], dtype=np.float32)
+                    next_mask_np = ensure_action_masks(
+                        np.asarray(step_result["action_masks"], dtype=np.float32)
                     )
-                    policy_loss = torch.max(pg_loss_1, pg_loss_2).mean()
+                    rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
+                    dones_np = np.asarray(step_result["dones"], dtype=np.float32)
 
-                    value_pred = new_values
-                    if cfg.clip_vloss:
-                        value_pred_clipped = b_values[mb_inds] + (
-                            value_pred - b_values[mb_inds]
-                        ).clamp(-cfg.clip_coef, cfg.clip_coef)
-                        value_losses = (value_pred - b_returns[mb_inds]) ** 2
-                        value_losses_clipped = (value_pred_clipped - b_returns[mb_inds]) ** 2
-                        value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                    reward_buf[step] = as_tensor(rewards_np, device)
+                    done_buf[step] = as_tensor(dones_np, device)
+
+                    ep_return += rewards_np.astype(np.float64)
+                    ep_length += 1
+
+                    done_indices = np.where(dones_np > 0.5)[0]
+                    if done_indices.size > 0:
+                        completed_returns.extend(ep_return[done_indices].tolist())
+                        completed_lengths.extend(ep_length[done_indices].tolist())
+                        ep_return[done_indices] = 0.0
+                        ep_length[done_indices] = 0
+
+                        done_env_ids = [env_ids[int(i)] for i in done_indices.tolist()]
+                        done_seeds = [
+                            cfg.seed + global_step + int(i) * 991 + update * 131
+                            for i in done_indices.tolist()
+                        ]
+                        reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
+                        reset_obs = np.asarray(reset_done["obs"], dtype=np.float32)
+                        reset_masks = ensure_action_masks(
+                            np.asarray(reset_done["action_masks"], dtype=np.float32)
+                        )
+                        for local_pos, env_idx in enumerate(done_indices.tolist()):
+                            next_obs_np[env_idx] = reset_obs[local_pos]
+                            next_mask_np[env_idx] = reset_masks[local_pos]
+
+                    obs_np = next_obs_np
+                    mask_np = next_mask_np
+                    global_step += cfg.num_envs
+
+                with torch.no_grad():
+                    next_obs_t = as_tensor(obs_np, device)
+                    _, next_value = model(next_obs_t)
+
+                advantages = torch.zeros_like(reward_buf, device=device)
+                lastgaelam = torch.zeros(cfg.num_envs, device=device)
+                for t in reversed(range(cfg.num_steps)):
+                    if t == cfg.num_steps - 1:
+                        next_non_terminal = 1.0 - done_buf[t]
+                        next_values = next_value
                     else:
-                        value_loss = 0.5 * ((value_pred - b_returns[mb_inds]) ** 2).mean()
+                        # done_buf[t] marks whether transition t ended the episode.
+                        # Use done_t for both TD bootstrap and GAE recursion masks.
+                        next_non_terminal = 1.0 - done_buf[t]
+                        next_values = value_buf[t + 1]
+                    delta = reward_buf[t] + cfg.gamma * next_values * next_non_terminal - value_buf[t]
+                    lastgaelam = delta + cfg.gamma * cfg.gae_lambda * next_non_terminal * lastgaelam
+                    advantages[t] = lastgaelam
+                returns = advantages + value_buf
 
-                    loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
+                b_obs = obs_buf.reshape((-1, obs_dim))
+                b_masks = mask_buf.reshape((-1, action_dim))
+                b_actions = action_buf.reshape(-1)
+                b_logprobs = logprob_buf.reshape(-1)
+                b_advantages = advantages.reshape(-1)
+                b_returns = returns.reshape(-1)
+                b_values = value_buf.reshape(-1)
 
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                    optimizer.step()
+                adv_mean = b_advantages.mean()
+                adv_std = b_advantages.std(unbiased=False) + 1e-8
+                b_advantages = (b_advantages - adv_mean) / adv_std
 
-                    policy_loss_value = float(policy_loss.detach().cpu().item())
-                    value_loss_value = float(value_loss.detach().cpu().item())
-                    entropy_value = float(entropy.detach().cpu().item())
-                    updates_done += 1
+                batch_inds = np.arange(batch_size)
+                clipfracs: list[float] = []
+                approx_kl_value = 0.0
+                policy_loss_value = 0.0
+                value_loss_value = 0.0
+                entropy_value = 0.0
+                updates_done = 0
+                early_stopped = False
 
-                if cfg.target_kl > 0 and approx_kl_value > cfg.target_kl:
-                    early_stopped = True
-                    break
+                for _epoch in range(cfg.update_epochs):
+                    np.random.shuffle(batch_inds)
+                    for start in range(0, batch_size, cfg.minibatch_size):
+                        end = start + cfg.minibatch_size
+                        mb_inds_np = batch_inds[start:end]
+                        mb_inds = torch.as_tensor(
+                            mb_inds_np, device=device, dtype=torch.long
+                        )
 
-            y_pred = b_values.detach().cpu().numpy()
-            y_true = b_returns.detach().cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = (
-                float("nan") if var_y <= 1e-12 else 1.0 - float(np.var(y_true - y_pred) / var_y)
-            )
+                        logits, new_values = model(b_obs[mb_inds])
+                        dist = masked_categorical(logits, b_masks[mb_inds])
+                        new_logprob = dist.log_prob(b_actions[mb_inds])
+                        entropy = dist.entropy().mean()
 
-            update_seconds = max(1e-6, time.time() - update_start)
-            total_seconds = max(1e-6, time.time() - training_start)
-            sps = int(global_step / total_seconds)
+                        logratio = new_logprob - b_logprobs[mb_inds]
+                        ratio = torch.exp(logratio)
 
-            stats = {
-                "update": update,
-                "global_step": global_step,
-                "policy_loss": policy_loss_value,
-                "value_loss": value_loss_value,
-                "entropy": entropy_value,
-                "approx_kl": approx_kl_value,
-                "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
-                "explained_variance": explained_var,
-                "updates_done": updates_done,
-                "early_stopped_kl": early_stopped,
-                "sps": sps,
-                "update_seconds": update_seconds,
-                "mean_episode_return_recent": (
-                    float(np.mean(completed_returns[-100:])) if completed_returns else float("nan")
-                ),
-                "mean_episode_length_recent": (
-                    float(np.mean(completed_lengths[-100:])) if completed_lengths else float("nan")
-                ),
-            }
+                        with torch.no_grad():
+                            approx_kl = (b_logprobs[mb_inds] - new_logprob).mean()
+                            clipfrac = (
+                                (ratio - 1.0).abs() > cfg.clip_coef
+                            ).float().mean()
+                            approx_kl_value = float(approx_kl.detach().cpu().item())
+                            clipfracs.append(float(clipfrac.detach().cpu().item()))
 
-            if update % cfg.log_every_updates == 0 or update == 1 or update == num_updates:
-                print(
-                    "[ppo] "
-                    f"update={update}/{num_updates} "
-                    f"step={global_step} "
-                    f"ploss={stats['policy_loss']:.4f} "
-                    f"vloss={stats['value_loss']:.4f} "
-                    f"ent={stats['entropy']:.4f} "
-                    f"kl={stats['approx_kl']:.5f} "
-                    f"clip={stats['clip_fraction']:.3f} "
-                    f"ev={stats['explained_variance']:.3f} "
-                    f"ret100={stats['mean_episode_return_recent']:.3f} "
-                    f"sps={stats['sps']}"
+                        mb_adv = b_advantages[mb_inds]
+                        pg_loss_1 = -mb_adv * ratio
+                        pg_loss_2 = -mb_adv * torch.clamp(
+                            ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef
+                        )
+                        policy_loss = torch.max(pg_loss_1, pg_loss_2).mean()
+
+                        value_pred = new_values
+                        if cfg.clip_vloss:
+                            value_pred_clipped = b_values[mb_inds] + (
+                                value_pred - b_values[mb_inds]
+                            ).clamp(-cfg.clip_coef, cfg.clip_coef)
+                            value_losses = (value_pred - b_returns[mb_inds]) ** 2
+                            value_losses_clipped = (
+                                value_pred_clipped - b_returns[mb_inds]
+                            ) ** 2
+                            value_loss = (
+                                0.5
+                                * torch.max(value_losses, value_losses_clipped).mean()
+                            )
+                        else:
+                            value_loss = (
+                                0.5 * ((value_pred - b_returns[mb_inds]) ** 2).mean()
+                            )
+
+                        loss = (
+                            policy_loss
+                            + cfg.vf_coef * value_loss
+                            - cfg.ent_coef * entropy
+                        )
+
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                        optimizer.step()
+
+                        policy_loss_value = float(policy_loss.detach().cpu().item())
+                        value_loss_value = float(value_loss.detach().cpu().item())
+                        entropy_value = float(entropy.detach().cpu().item())
+                        updates_done += 1
+
+                    if cfg.target_kl > 0 and approx_kl_value > cfg.target_kl:
+                        early_stopped = True
+                        break
+
+                y_pred = b_values.detach().cpu().numpy()
+                y_true = b_returns.detach().cpu().numpy()
+                var_y = np.var(y_true)
+                explained_var = (
+                    float("nan")
+                    if var_y <= 1e-12
+                    else 1.0 - float(np.var(y_true - y_pred) / var_y)
                 )
 
-            if update % cfg.save_every_updates == 0 or update == num_updates:
-                ckpt_path = checkpoints_dir / f"ppo_update_{update:06d}.pt"
-                save_checkpoint(
-                    checkpoint_path=ckpt_path,
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                    obs_dim=obs_dim,
-                    action_dim=action_dim,
-                    global_step=global_step,
-                    update=update,
-                    stats=stats,
+                update_seconds = max(1e-6, time.time() - update_start)
+                total_seconds = max(1e-6, time.time() - training_start)
+                sps = int(global_step / total_seconds)
+
+                stats = {
+                    "update": update,
+                    "global_step": global_step,
+                    "policy_loss": policy_loss_value,
+                    "value_loss": value_loss_value,
+                    "entropy": entropy_value,
+                    "approx_kl": approx_kl_value,
+                    "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
+                    "explained_variance": explained_var,
+                    "updates_done": updates_done,
+                    "early_stopped_kl": early_stopped,
+                    "sps": sps,
+                    "update_seconds": update_seconds,
+                    "mean_episode_return_recent": (
+                        float(np.mean(completed_returns[-100:]))
+                        if completed_returns
+                        else float("nan")
+                    ),
+                    "mean_episode_length_recent": (
+                        float(np.mean(completed_lengths[-100:]))
+                        if completed_lengths
+                        else float("nan")
+                    ),
+                }
+
+                score_raw = stats["mean_episode_return_recent"]
+                score = (
+                    float(score_raw)
+                    if isinstance(score_raw, (float, int))
+                    and math.isfinite(float(score_raw))
+                    else float("-inf")
                 )
-                artifact = export_bot_policy_artifact(model, cfg, obs_dim, action_dim)
-                artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
-                write_json(artifact_path, artifact)
-                write_json(out_dir / "last_stats.json", stats)
+                if best_state_dict is None or score > best_score:
+                    best_score = score
+                    best_update = update
+                    best_stats = dict(stats)
+                    best_state_dict = {
+                        key: tensor.detach().cpu().clone()
+                        for key, tensor in model.state_dict().items()
+                    }
+                    best_ckpt_path = checkpoints_dir / "ppo_best.pt"
+                    save_checkpoint(
+                        checkpoint_path=best_ckpt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        obs_dim=obs_dim,
+                        action_dim=action_dim,
+                        global_step=global_step,
+                        update=update,
+                        stats=stats,
+                    )
+                    best_artifact = export_bot_policy_artifact(
+                        model, cfg, obs_dim, action_dim
+                    )
+                    write_json(out_dir / "bot_policy_best.json", best_artifact)
+                    write_json(out_dir / "best_stats.json", best_stats)
+                    print("[ppo] " f"new_best update={update} ret100={best_score:.3f}")
+
+                if update % cfg.log_every_updates == 0 or update == 1 or update == num_updates:
+                    print(
+                        "[ppo] "
+                        f"update={update}/{num_updates} "
+                        f"step={global_step} "
+                        f"ploss={stats['policy_loss']:.4f} "
+                        f"vloss={stats['value_loss']:.4f} "
+                        f"ent={stats['entropy']:.4f} "
+                        f"kl={stats['approx_kl']:.5f} "
+                        f"clip={stats['clip_fraction']:.3f} "
+                        f"ev={stats['explained_variance']:.3f} "
+                        f"ret100={stats['mean_episode_return_recent']:.3f} "
+                        f"sps={stats['sps']}"
+                    )
+
+                if update % cfg.save_every_updates == 0 or update == num_updates:
+                    ckpt_path = checkpoints_dir / f"ppo_update_{update:06d}.pt"
+                    save_checkpoint(
+                        checkpoint_path=ckpt_path,
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                        obs_dim=obs_dim,
+                        action_dim=action_dim,
+                        global_step=global_step,
+                        update=update,
+                        stats=stats,
+                    )
+                    artifact = export_bot_policy_artifact(model, cfg, obs_dim, action_dim)
+                    artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
+                    write_json(artifact_path, artifact)
+                    write_json(out_dir / "last_stats.json", stats)
+        except KeyboardInterrupt:
+            did_interrupt = True
+            print("[ppo] keyboard interrupt received; finishing with best available policy...")
+
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            if best_stats is not None:
+                write_json(out_dir / "best_stats.json", best_stats)
 
         artifact_final = export_bot_policy_artifact(model, cfg, obs_dim, action_dim)
         write_json(out_dir / "bot_policy_final.json", artifact_final)
-        print(f"[ppo] training complete. output={out_dir}")
+        if did_interrupt:
+            if best_update > 0 and math.isfinite(best_score):
+                print(
+                    f"[ppo] training interrupted. output={out_dir} "
+                    f"(final=best update={best_update}, ret100={best_score:.3f})"
+                )
+            else:
+                print(f"[ppo] training interrupted. output={out_dir} (final=latest)")
+        elif best_update > 0 and math.isfinite(best_score):
+            print(
+                f"[ppo] training complete. output={out_dir} "
+                f"(final=best update={best_update}, ret100={best_score:.3f})"
+            )
+        else:
+            print(f"[ppo] training complete. output={out_dir} (final=latest)")
 
 
 def main() -> None:
