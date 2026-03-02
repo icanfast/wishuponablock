@@ -10,7 +10,7 @@ This folder provides a minimal local bridge so Python (PyTorch) can drive the TS
 - `tools/bot_env/ts/envCore.ts`
   - Vectorized env pool.
   - One RL step = one piece-placement decision.
-  - Action space: placement slots (executor-backed).
+  - Action space: canonical full placement space (`placement_full_v1`) with reachability masking (executor-backed).
 - `tools/bot_env/py/wub_env.py`
   - Python client wrapper around the stdio protocol.
 - `tools/bot_env/py/smoke_test.py`
@@ -93,6 +93,7 @@ If you hit TLS trust errors on local Python:
 npx --yes tsx tools/bot_env/ts/buildBcDataset.ts \
   --input tools/bot_env/recordings \
   --output tools/bot_env/output/bc_dataset_charcuterie.json \
+  --observation-space raw_v1 \
   --mode charcuterie \
   --model-path public/models/model_v4.json \
   --return-gamma 0.995
@@ -108,6 +109,7 @@ Minimal run:
 python3 tools/bot_env/py/train_ppo.py \
   --mode-id charcuterie \
   --model-path public/models/model_v4.json \
+  --observation-space raw_v1 \
   --num-envs 16 \
   --num-steps 256 \
   --total-timesteps 2000000 \
@@ -120,6 +122,7 @@ With BC warm-start:
 python3 tools/bot_env/py/train_ppo.py \
   --mode-id charcuterie \
   --model-path public/models/model_v4.json \
+  --observation-space raw_v1 \
   --num-envs 16 \
   --num-steps 256 \
   --total-timesteps 2000000 \
@@ -138,6 +141,11 @@ Outputs:
 - `tools/bot_env/output/<run_name>/bot_policy_final.json` (final artifact)
 - `tools/bot_env/output/<run_name>/bot_policy_best.json` (best-by-ret100 artifact)
 - `tools/bot_env/output/<run_name>/bc_stats.json` (if BC was enabled)
+
+Notes:
+
+- When `--observation-space raw_v1` is used, training now applies a frozen WUB conv/pool/feature-norm encoder (loaded from `--model-path`) inside PyTorch, then trains PPO heads on top of those encoded features.
+- Exported artifacts from this path are tagged with `observationSpace: "model_head_v1"` to stay runtime-compatible.
 
 Resume from checkpoint:
 

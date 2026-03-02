@@ -9,16 +9,23 @@ import { createGeneratorFactory } from '../../../src/core/generators.ts';
 import { Game } from '../../../src/core/game.ts';
 import { getMode } from '../../../src/core/modes.ts';
 import { createModelRunner } from '../../../src/core/modelRunner.ts';
+import {
+  PLACEMENT_ACTION_DIM,
+  placementActionIndexFromPlacement,
+} from '../../../src/core/placementActionSpace.ts';
 import { GameRunner, type InputSource } from '../../../src/core/runner.ts';
 import { DEFAULT_SETTINGS } from '../../../src/core/settings.ts';
 import type { Board, GameState, InputFrame } from '../../../src/core/types.ts';
-import { PIECES } from '../../../src/core/types.ts';
 import {
   enumerateTrajectoryExecutorPlacements,
   trajectoryExecutorCommandToInputFrame,
 } from '../../../src/core/trajectoryExecutor.ts';
 import {
-  buildModelHeadInput,
+  encodeBotObservation,
+  normalizeBotObservationSpace,
+  type BotObservationSpace,
+} from '../../../src/core/botObservation.ts';
+import {
   parseWubModelFromJsonText,
   type LoadedModel,
 } from '../../../src/core/wubModel.ts';
@@ -30,10 +37,9 @@ import type {
 } from './protocol.ts';
 
 const FIXED_STEP_MS = 1000 / 120;
-const DEFAULT_ACTION_DIM = 192;
+const DEFAULT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
-const PIECE_INDEX = new Map(PIECES.map((piece, idx) => [piece, idx]));
 
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
@@ -57,6 +63,9 @@ const clampInt = (
 
 const normalizePieceSource = (value: unknown): PieceSourceProfile =>
   value === 'active_generator' ? 'active_generator' : 'bag7';
+
+const normalizeObservationSpace = (value: unknown): BotObservationSpace =>
+  normalizeBotObservationSpace(typeof value === 'string' ? value : null);
 
 const normalizeModeId = (value: unknown): string => {
   if (typeof value !== 'string') return 'charcuterie';
@@ -217,41 +226,23 @@ const computePieceReward = (options: {
   );
 };
 
-const encodeObservation = (model: LoadedModel, state: GameState): number[] => {
-  const headInput = buildModelHeadInput(model, state.board, state.hold);
-  const contextDim = PIECES.length + PIECES.length + 5;
-  const out = new Float32Array(headInput.length + contextDim);
-  out.set(headInput, 0);
-
-  let offset = headInput.length;
-  const activeIdx = PIECE_INDEX.get(state.active.k);
-  if (activeIdx != null) out[offset + activeIdx] = 1;
-  offset += PIECES.length;
-
-  const nextPiece = state.next[0] ?? null;
-  const nextIdx = nextPiece == null ? null : PIECE_INDEX.get(nextPiece);
-  if (nextIdx != null) out[offset + nextIdx] = 1;
-  offset += PIECES.length;
-
-  const lineGoal =
-    state.lineGoal != null && state.lineGoal > 0 ? state.lineGoal : null;
-  const progress =
-    lineGoal != null
-      ? clamp(state.totalLinesCleared / lineGoal, 0, 2)
-      : clamp(state.totalLinesCleared / 80, 0, 2);
-  out[offset++] = progress;
-  out[offset++] = clamp(state.timeMs / 180_000, 0, 2);
-  out[offset++] = clamp(state.level / 20, 0, 2);
-  out[offset++] = clamp(state.score / 200_000, 0, 2);
-  out[offset++] = state.canHold ? 1 : 0;
-
-  return Array.from(out);
-};
+const encodeObservation = (
+  observationSpace: BotObservationSpace,
+  model: LoadedModel,
+  state: GameState,
+): number[] =>
+  Array.from(
+    encodeBotObservation({
+      observationSpace,
+      model,
+      state,
+    }),
+  );
 
 const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
-): { commandsBySlot: InputFrame[][]; actionMask: number[] } => {
+): { commandsBySlot: Array<InputFrame[] | null>; actionMask: number[] } => {
   const placements = enumerateTrajectoryExecutorPlacements({
     board: state.board,
     active: state.active,
@@ -262,19 +253,25 @@ const buildPlacementChoices = (
     allowSoftDrop: true,
   });
   const actionMask = new Array<number>(actionDim).fill(0);
-  const commandsBySlot: InputFrame[][] = [];
-  const maxChoices = Math.min(actionDim, placements.length);
-  for (let i = 0; i < maxChoices; i += 1) {
-    actionMask[i] = 1;
-    commandsBySlot.push(
-      placements[i].commands.map((command) =>
-        trajectoryExecutorCommandToInputFrame(command),
-      ),
+  const commandsBySlot: Array<InputFrame[] | null> = new Array(actionDim).fill(
+    null,
+  );
+  for (const placement of placements) {
+    const actionIndex = placementActionIndexFromPlacement(placement);
+    if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
+      continue;
+    }
+    if (actionMask[actionIndex] > 0 && commandsBySlot[actionIndex]) {
+      continue;
+    }
+    actionMask[actionIndex] = 1;
+    commandsBySlot[actionIndex] = placement.commands.map((command) =>
+      trajectoryExecutorCommandToInputFrame(command),
     );
   }
-  if (commandsBySlot.length === 0) {
+  if (actionMask.every((value) => value <= 0)) {
     actionMask[0] = 1;
-    commandsBySlot.push([trajectoryExecutorCommandToInputFrame('hard_drop')]);
+    commandsBySlot[0] = [trajectoryExecutorCommandToInputFrame('hard_drop')];
   }
   return { commandsBySlot, actionMask };
 };
@@ -310,13 +307,14 @@ class BotEnv {
   private piecesPlaced = 0;
   private lockCount = 0;
   private cachedChoices: {
-    commandsBySlot: InputFrame[][];
+    commandsBySlot: Array<InputFrame[] | null>;
     actionMask: number[];
   } | null = null;
 
   constructor(
     private readonly modeId: string,
     private readonly model: LoadedModel,
+    private readonly observationSpace: BotObservationSpace,
     private readonly pieceSource: PieceSourceProfile,
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
@@ -353,7 +351,11 @@ class BotEnv {
     const choicesElapsedS = (performance.now() - choicesStart) / 1000;
     this.syncPrevMetrics();
     const obsStart = performance.now();
-    const obs = encodeObservation(this.model, this.game.state);
+    const obs = encodeObservation(
+      this.observationSpace,
+      this.model,
+      this.game.state,
+    );
     const obsElapsedS = (performance.now() - obsStart) / 1000;
     const choices = this.cachedChoices;
     const totalElapsedS = (performance.now() - resetStart) / 1000;
@@ -383,7 +385,11 @@ class BotEnv {
     const stepStart = performance.now();
     if (this.done) {
       const doneChoicesStart = performance.now();
-      const obs = encodeObservation(this.model, this.game.state);
+      const obs = encodeObservation(
+        this.observationSpace,
+        this.model,
+        this.game.state,
+      );
       const choices =
         this.cachedChoices ??
         buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
@@ -485,7 +491,11 @@ class BotEnv {
     }
 
     const obsStart = performance.now();
-    const obs = encodeObservation(this.model, this.game.state);
+    const obs = encodeObservation(
+      this.observationSpace,
+      this.model,
+      this.game.state,
+    );
     const obsElapsedS = (performance.now() - obsStart) / 1000;
     const choicesNextStart = performance.now();
     const nextChoices = buildPlacementChoices(
@@ -603,6 +613,9 @@ export class BotEnvPool {
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
     const numEnvs = clampInt(payload.numEnvs, 1, 1, 4096);
+    const observationSpace = normalizeObservationSpace(
+      payload.observationSpace,
+    );
     const pieceSourceProfile = normalizePieceSource(payload.pieceSourceProfile);
     const queuePolicyId =
       typeof payload.queuePolicyId === 'string' && payload.queuePolicyId.trim()
@@ -631,6 +644,7 @@ export class BotEnvPool {
         new BotEnv(
           modeId,
           model,
+          observationSpace,
           pieceSourceProfile,
           queuePolicyId,
           maxPiecesPerEpisode,

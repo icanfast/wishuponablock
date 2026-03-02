@@ -14,15 +14,22 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from wub_env import WubEnvBridge
+
+RAW_PIECES_ORDER = ("I", "O", "T", "S", "Z", "J", "L")
+RAW_CONTEXT_DIM = len(RAW_PIECES_ORDER) + (len(RAW_PIECES_ORDER) + 1) + len(RAW_PIECES_ORDER) + 5
+DEFAULT_BOARD_ROWS = 20
+DEFAULT_BOARD_COLS = 10
 
 
 @dataclass(frozen=True)
 class PPOConfig:
     mode_id: str
     model_path: str
+    observation_space: str
     queue_policy_id: str
     piece_source_profile: str
     max_pieces_per_episode: int
@@ -80,12 +87,283 @@ class PolicyValueNet(nn.Module):
         return logits, value
 
 
+class ObservationAdapter(nn.Module):
+    def __init__(self, raw_obs_dim: int, policy_obs_dim: int, policy_observation_space: str) -> None:
+        super().__init__()
+        self.raw_obs_dim = int(raw_obs_dim)
+        self.policy_obs_dim = int(policy_obs_dim)
+        self.policy_observation_space = policy_observation_space
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class IdentityObservationAdapter(ObservationAdapter):
+    def __init__(self, raw_obs_dim: int, policy_observation_space: str) -> None:
+        super().__init__(
+            raw_obs_dim=raw_obs_dim,
+            policy_obs_dim=raw_obs_dim,
+            policy_observation_space=policy_observation_space,
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return obs
+
+
+class WubHeadFromRawObservationAdapter(ObservationAdapter):
+    def __init__(self, raw_obs_dim: int, model_path: str) -> None:
+        model_json = json.loads(Path(model_path).read_text(encoding="utf-8"))
+        model_cfg = model_json.get("model", {})
+        params = model_json.get("params", {})
+
+        input_channels = int(model_cfg.get("input_channels", 0))
+        conv_channels = [int(v) for v in model_cfg.get("conv_channels", [])]
+        extra_features = int(model_cfg.get("extra_features", 0))
+        pool_shape_raw = model_cfg.get("pool_shape")
+        if isinstance(pool_shape_raw, list) and len(pool_shape_raw) == 2:
+            pool_h = max(1, int(pool_shape_raw[0]))
+            pool_w = max(1, int(pool_shape_raw[1]))
+        else:
+            pool_h, pool_w = 1, 1
+
+        board_channels = model_json.get("board_channels", ["occupancy", "holes", "row_fill"])
+        if not isinstance(board_channels, list) or len(board_channels) == 0:
+            board_channels = ["occupancy", "holes", "row_fill"]
+        board_channels_norm = [str(x) for x in board_channels]
+
+        board_size = int(raw_obs_dim) - RAW_CONTEXT_DIM
+        if board_size <= 0:
+            raise ValueError(
+                f"raw observation dim is too small for raw_v1 layout: obs_dim={raw_obs_dim}"
+            )
+        rows, cols = DEFAULT_BOARD_ROWS, DEFAULT_BOARD_COLS
+        if rows * cols != board_size:
+            raise ValueError(
+                "raw observation layout mismatch. "
+                f"expected board_size={DEFAULT_BOARD_ROWS * DEFAULT_BOARD_COLS}, got={board_size}"
+            )
+
+        model_pieces_raw = model_json.get("pieces")
+        if isinstance(model_pieces_raw, list) and len(model_pieces_raw) == len(RAW_PIECES_ORDER):
+            model_pieces = [str(x) for x in model_pieces_raw]
+        else:
+            model_pieces = list(RAW_PIECES_ORDER)
+        model_piece_index = {piece: i for i, piece in enumerate(model_pieces)}
+        hold_map = [0]
+        for piece in RAW_PIECES_ORDER:
+            mapped = model_piece_index.get(piece, -1)
+            hold_map.append(mapped + 1 if mapped >= 0 else 0)
+        hold_index_map = torch.tensor(hold_map, dtype=torch.long)
+
+        coord_x = torch.zeros((rows, cols), dtype=torch.float32)
+        coord_y = torch.zeros((rows, cols), dtype=torch.float32)
+        denom_x = max(1.0, float(cols - 1))
+        denom_y = max(1.0, float(rows - 1))
+        for y in range(rows):
+            for x in range(cols):
+                coord_x[y, x] = float(x) / denom_x
+                coord_y[y, x] = float(y) / denom_y
+
+        layers: list[nn.Conv2d] = []
+        in_ch = input_channels
+        for i, out_ch in enumerate(conv_channels):
+            conv = nn.Conv2d(
+                in_channels=in_ch,
+                out_channels=out_ch,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            )
+            layer_index = i * 2
+            weight_key = f"conv.{layer_index}.weight"
+            bias_key = f"conv.{layer_index}.bias"
+            weight_payload = params.get(weight_key)
+            bias_payload = params.get(bias_key)
+            if not isinstance(weight_payload, dict) or not isinstance(bias_payload, dict):
+                raise ValueError(f"Missing conv params for layer {i}: {weight_key}/{bias_key}")
+            weight_shape = weight_payload.get("shape")
+            bias_shape = bias_payload.get("shape")
+            if not isinstance(weight_shape, list) or not isinstance(bias_shape, list):
+                raise ValueError(f"Invalid conv param shapes for layer {i}.")
+            weight_data = np.asarray(weight_payload.get("data", []), dtype=np.float32)
+            bias_data = np.asarray(bias_payload.get("data", []), dtype=np.float32)
+            weight_tensor = torch.from_numpy(weight_data).view(*[int(v) for v in weight_shape])
+            bias_tensor = torch.from_numpy(bias_data).view(*[int(v) for v in bias_shape])
+            with torch.no_grad():
+                conv.weight.copy_(weight_tensor)
+                conv.bias.copy_(bias_tensor)
+            layers.append(conv)
+            in_ch = out_ch
+        extra_features_norm = max(0, extra_features)
+        feature_norm = (
+            str(model_cfg.get("feature_norm")).lower()
+            if model_cfg.get("feature_norm") is not None
+            else None
+        )
+        feature_norm_eps = float(model_cfg.get("feature_norm_eps", 1e-5))
+
+        pooled_dim = in_ch * pool_h * pool_w
+        policy_obs_dim = pooled_dim + extra_features_norm
+        super().__init__(
+            raw_obs_dim=raw_obs_dim,
+            policy_obs_dim=policy_obs_dim,
+            policy_observation_space="model_head_v1",
+        )
+        self.board_channels = board_channels_norm
+        self.rows = rows
+        self.cols = cols
+        self.board_size = board_size
+        self.active_offset = board_size
+        self.hold_offset = self.active_offset + len(RAW_PIECES_ORDER)
+        self.next_offset = self.hold_offset + len(RAW_PIECES_ORDER) + 1
+        self.register_buffer("hold_index_map", hold_index_map, persistent=False)
+        self.register_buffer("coord_x", coord_x, persistent=False)
+        self.register_buffer("coord_y", coord_y, persistent=False)
+        self.conv_layers = nn.ModuleList(layers)
+        self.pool_shape = (pool_h, pool_w)
+        self.extra_features = extra_features_norm
+        self.feature_norm = feature_norm
+        self.feature_norm_eps = feature_norm_eps
+        self.input_channels = input_channels
+
+    def _compute_reachable_empty(self, empty: torch.Tensor) -> torch.Tensor:
+        # empty: [B, R, C] bool
+        reachable = torch.zeros_like(empty)
+        reachable[:, 0, :] = empty[:, 0, :]
+        max_iters = self.rows * self.cols
+        for _ in range(max_iters):
+            up = torch.zeros_like(reachable)
+            up[:, 1:, :] = reachable[:, :-1, :]
+            down = torch.zeros_like(reachable)
+            down[:, :-1, :] = reachable[:, 1:, :]
+            left = torch.zeros_like(reachable)
+            left[:, :, 1:] = reachable[:, :, :-1]
+            right = torch.zeros_like(reachable)
+            right[:, :, :-1] = reachable[:, :, 1:]
+            expanded = reachable | up | down | left | right
+            next_reachable = expanded & empty
+            if not torch.any(next_reachable != reachable):
+                break
+            reachable = next_reachable
+        return reachable.to(dtype=torch.float32)
+
+    def _build_model_input_channels(self, occupancy: torch.Tensor) -> torch.Tensor:
+        # occupancy: [B, R, C] in {0,1}
+        bsz = occupancy.shape[0]
+        rows = self.rows
+        cols = self.cols
+        device = occupancy.device
+        dtype = occupancy.dtype
+
+        filled = occupancy > 0.5
+        seen = torch.cumsum(filled.to(dtype=torch.int32), dim=1) > 0
+        holes = ((~filled) & seen).to(dtype=dtype)
+        row_fill = occupancy.mean(dim=2, keepdim=True).expand(-1, -1, cols)
+
+        coord_x = self.coord_x.to(device=device, dtype=dtype).unsqueeze(0).expand(bsz, -1, -1)
+        coord_y = self.coord_y.to(device=device, dtype=dtype).unsqueeze(0).expand(bsz, -1, -1)
+
+        has_filled_col = filled.any(dim=1)  # [B, C]
+        first_filled = torch.argmax(filled.to(dtype=torch.int64), dim=1)  # [B, C]
+        col_height_base = torch.where(
+            has_filled_col,
+            (rows - first_filled).to(dtype=dtype) / max(1.0, float(rows)),
+            torch.zeros_like(first_filled, dtype=dtype),
+        )
+        col_height = col_height_base.unsqueeze(1).expand(-1, rows, -1)
+
+        well_depth = torch.zeros_like(occupancy)
+        depth = torch.zeros((bsz, cols), dtype=torch.int32, device=device)
+        for y in range(rows):
+            occ_row = filled[:, y, :]
+            left_blocked = torch.ones((bsz, cols), dtype=torch.bool, device=device)
+            right_blocked = torch.ones((bsz, cols), dtype=torch.bool, device=device)
+            left_blocked[:, 1:] = occ_row[:, :-1]
+            right_blocked[:, :-1] = occ_row[:, 1:]
+            in_well = (~occ_row) & left_blocked & right_blocked
+            depth = torch.where(occ_row, torch.zeros_like(depth), torch.where(in_well, depth + 1, torch.zeros_like(depth)))
+            well_depth[:, y, :] = depth.to(dtype=dtype) / max(1.0, float(rows))
+
+        empty = ~filled
+        reachable_empty = self._compute_reachable_empty(empty)
+
+        coarse_occ_v2 = occupancy.clone()
+        for y0 in range(0, rows, 2):
+            y1 = min(rows, y0 + 2)
+            max_band = occupancy[:, y0:y1, :].amax(dim=1, keepdim=True)
+            coarse_occ_v2[:, y0:y1, :] = max_band
+
+        source = {
+            "occupancy": occupancy,
+            "holes": holes,
+            "row_fill": row_fill,
+            "coord_x": coord_x,
+            "coord_y": coord_y,
+            "col_height": col_height,
+            "well_depth": well_depth,
+            "reachable_empty": reachable_empty,
+            "coarse_occ_v2": coarse_occ_v2,
+        }
+        channels: list[torch.Tensor] = []
+        zero = torch.zeros_like(occupancy)
+        for name in self.board_channels:
+            channels.append(source.get(name, zero))
+        if len(channels) < self.input_channels:
+            channels.extend([zero] * (self.input_channels - len(channels)))
+        elif len(channels) > self.input_channels:
+            channels = channels[: self.input_channels]
+        return torch.stack(channels, dim=1)
+
+    def _build_extra_features(self, obs: torch.Tensor) -> torch.Tensor:
+        bsz = obs.shape[0]
+        if self.extra_features <= 0:
+            return torch.zeros((bsz, 0), dtype=obs.dtype, device=obs.device)
+        hold_block = obs[:, self.hold_offset : self.hold_offset + len(RAW_PIECES_ORDER) + 1]
+        hold_idx = torch.argmax(hold_block, dim=1).to(dtype=torch.long)
+        mapped = self.hold_index_map.to(device=obs.device)[hold_idx]
+        extra = torch.zeros((bsz, self.extra_features), dtype=obs.dtype, device=obs.device)
+        valid = (mapped >= 0) & (mapped < self.extra_features)
+        if torch.any(valid):
+            rows = torch.arange(bsz, device=obs.device)[valid]
+            cols = mapped[valid]
+            extra[rows, cols] = 1.0
+        return extra
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        occupancy = obs[:, : self.board_size].view(-1, self.rows, self.cols)
+        occupancy = torch.where(
+            occupancy > 0.5,
+            torch.ones_like(occupancy),
+            torch.zeros_like(occupancy),
+        )
+        model_input = self._build_model_input_channels(occupancy)
+        current = model_input
+        for conv in self.conv_layers:
+            current = torch.relu(conv(current))
+        pooled = F.adaptive_avg_pool2d(current, self.pool_shape)
+        flat = pooled.flatten(start_dim=1)
+        extra = self._build_extra_features(obs)
+        features = torch.cat([flat, extra], dim=1)
+        if self.feature_norm == "layernorm":
+            features = F.layer_norm(
+                features,
+                normalized_shape=(features.shape[1],),
+                eps=self.feature_norm_eps,
+            )
+        return features
+
+
 def parse_args() -> PPOConfig:
     parser = argparse.ArgumentParser(
         description="Train WUB headless bot with full PPO in local PyTorch."
     )
     parser.add_argument("--mode-id", default="charcuterie")
     parser.add_argument("--model-path", default="public/models/model_v4.json")
+    parser.add_argument(
+        "--observation-space",
+        default="raw_v1",
+        choices=["model_head_v1", "raw_v1"],
+    )
     parser.add_argument("--queue-policy-id", default="next_piece_v1")
     parser.add_argument("--piece-source-profile", default="bag7")
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
@@ -142,6 +420,9 @@ def parse_args() -> PPOConfig:
     return PPOConfig(
         mode_id=args.mode_id.strip().lower(),
         model_path=args.model_path,
+        observation_space=(
+            "raw_v1" if args.observation_space == "raw_v1" else "model_head_v1"
+        ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
         piece_source_profile=(
             "active_generator"
@@ -243,11 +524,20 @@ def as_tensor(np_array: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(np_array).to(device)
 
 
+def trainable_parameters(
+    model: PolicyValueNet, obs_adapter: ObservationAdapter
+) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = [p for p in model.parameters() if p.requires_grad]
+    params.extend([p for p in obs_adapter.parameters() if p.requires_grad])
+    return params
+
+
 def export_bot_policy_artifact(
     model: PolicyValueNet,
     cfg: PPOConfig,
     obs_dim: int,
     action_dim: int,
+    policy_observation_space: str,
     pipeline_id: str = "bot_ppo_offline_v1",
 ) -> dict[str, Any]:
     with torch.no_grad():
@@ -268,11 +558,12 @@ def export_bot_policy_artifact(
         "queuePolicyId": cfg.queue_policy_id,
         "pipelineId": pipeline_id,
         "pieceSourceProfile": cfg.piece_source_profile,
+        "observationSpace": policy_observation_space,
         "createdAtMs": now_ms,
         "inputDim": int(obs_dim),
         "hiddenDim": int(cfg.hidden_dim),
         "actionDim": int(action_dim),
-        "actionSpaceKind": "placement_v1",
+        "actionSpaceKind": "placement_full_v1",
         "placementActionDim": int(action_dim),
         "weights": {
             "w1": w1.T.reshape(-1).tolist(),  # [I, H]
@@ -286,8 +577,12 @@ def export_bot_policy_artifact(
     return artifact
 
 
-def load_from_artifact(model: PolicyValueNet, artifact_path: Path) -> None:
+def load_from_artifact(model: PolicyValueNet, artifact_path: Path) -> str:
     raw = json.loads(artifact_path.read_text(encoding="utf-8"))
+    observation_space_raw = raw.get("observationSpace")
+    observation_space = (
+        "raw_v1" if observation_space_raw == "raw_v1" else "model_head_v1"
+    )
     weights = raw.get("weights", {})
     input_dim = int(raw.get("inputDim", 0))
     hidden_dim = int(raw.get("hiddenDim", 0))
@@ -323,11 +618,13 @@ def load_from_artifact(model: PolicyValueNet, artifact_path: Path) -> None:
         model.policy_head.bias.copy_(torch.from_numpy(bp))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
         model.value_head.bias.copy_(torch.from_numpy(bv))
+    return observation_space
 
 
 def save_checkpoint(
     checkpoint_path: Path,
     model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
     optimizer: torch.optim.Optimizer,
     cfg: PPOConfig,
     obs_dim: int,
@@ -338,6 +635,7 @@ def save_checkpoint(
 ) -> None:
     checkpoint = {
         "model_state_dict": model.state_dict(),
+        "obs_adapter_state_dict": obs_adapter.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "global_step": int(global_step),
         "update": int(update),
@@ -352,11 +650,15 @@ def save_checkpoint(
 def load_checkpoint(
     checkpoint_path: Path,
     model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
     optimizer: torch.optim.Optimizer,
     map_device: torch.device,
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
+    adapter_state = checkpoint.get("obs_adapter_state_dict")
+    if isinstance(adapter_state, dict):
+        obs_adapter.load_state_dict(adapter_state, strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     global_step = int(checkpoint.get("global_step", 0))
     update = int(checkpoint.get("update", 0))
@@ -473,6 +775,7 @@ def load_bc_dataset(
 
 def run_bc_pretrain(
     model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
     cfg: PPOConfig,
     device: torch.device,
     obs_dim: int,
@@ -498,11 +801,12 @@ def run_bc_pretrain(
     sample_count = int(obs_t.shape[0])
     batch_size = min(cfg.bc_batch_size, sample_count)
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg.bc_learning_rate, eps=1e-5
+        trainable_parameters(model, obs_adapter), lr=cfg.bc_learning_rate, eps=1e-5
     )
 
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
+    best_adapter_state: dict[str, torch.Tensor] | None = None
     epoch_logs: list[dict[str, float]] = []
 
     for epoch in range(1, cfg.bc_epochs + 1):
@@ -514,7 +818,8 @@ def run_bc_pretrain(
 
         for start in range(0, sample_count, batch_size):
             idx = perm[start : start + batch_size]
-            logits, values = model(obs_t[idx])
+            obs_features = obs_adapter(obs_t[idx])
+            logits, values = model(obs_features)
             dist = masked_categorical(logits, masks_t[idx])
             actor_loss = -dist.log_prob(actions_t[idx]).mean()
 
@@ -529,7 +834,9 @@ def run_bc_pretrain(
             total_loss = actor_loss + cfg.bc_value_weight * value_loss
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            nn.utils.clip_grad_norm_(
+                trainable_parameters(model, obs_adapter), cfg.max_grad_norm
+            )
             optimizer.step()
 
             actor_loss_sum += float(actor_loss.detach().cpu().item())
@@ -563,9 +870,15 @@ def run_bc_pretrain(
                 key: tensor.detach().cpu().clone()
                 for key, tensor in model.state_dict().items()
             }
+            best_adapter_state = {
+                key: tensor.detach().cpu().clone()
+                for key, tensor in obs_adapter.state_dict().items()
+            }
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    if best_adapter_state is not None:
+        obs_adapter.load_state_dict(best_adapter_state, strict=False)
 
     return {
         "enabled": True,
@@ -605,6 +918,7 @@ def train(cfg: PPOConfig) -> None:
             mode_id=cfg.mode_id,
             num_envs=cfg.num_envs,
             model_path=cfg.model_path,
+            observation_space=cfg.observation_space,
             piece_source_profile=cfg.piece_source_profile,
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
@@ -622,8 +936,22 @@ def train(cfg: PPOConfig) -> None:
         reset_result = env.reset_many(env_ids=env_ids, seeds=reset_seeds)
         obs_np = np.asarray(reset_result["obs"], dtype=np.float32)
         mask_np = ensure_action_masks(np.asarray(reset_result["action_masks"], dtype=np.float32))
-        obs_dim = infer_obs_dim(reset_result["obs"])
+        raw_obs_dim = infer_obs_dim(reset_result["obs"])
         action_dim = infer_action_dim(reset_result["action_masks"])
+
+        if cfg.observation_space == "raw_v1":
+            obs_adapter: ObservationAdapter = WubHeadFromRawObservationAdapter(
+                raw_obs_dim=raw_obs_dim,
+                model_path=cfg.model_path,
+            ).to(device)
+        else:
+            obs_adapter = IdentityObservationAdapter(
+                raw_obs_dim=raw_obs_dim,
+                policy_observation_space=cfg.observation_space,
+            ).to(device)
+        obs_adapter.train()
+        obs_dim = int(obs_adapter.policy_obs_dim)
+        policy_observation_space = obs_adapter.policy_observation_space
 
         model = PolicyValueNet(obs_dim, cfg.hidden_dim, action_dim).to(device)
         optimizer: torch.optim.Optimizer
@@ -631,10 +959,14 @@ def train(cfg: PPOConfig) -> None:
         global_step = 0
         start_update = 0
         if cfg.resume_checkpoint:
-            optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+            optimizer = torch.optim.Adam(
+                trainable_parameters(model, obs_adapter),
+                lr=cfg.learning_rate,
+                eps=1e-5,
+            )
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
             global_step, start_update = load_checkpoint(
-                checkpoint_path, model, optimizer, device
+                checkpoint_path, model, obs_adapter, optimizer, device
             )
             print(
                 f"[ppo] resumed checkpoint: {checkpoint_path} "
@@ -642,20 +974,30 @@ def train(cfg: PPOConfig) -> None:
             )
         elif cfg.init_artifact:
             artifact_path = Path(cfg.init_artifact).resolve()
-            load_from_artifact(model, artifact_path)
+            artifact_observation_space = load_from_artifact(model, artifact_path)
+            if artifact_observation_space != policy_observation_space:
+                raise ValueError(
+                    "Init artifact observationSpace mismatch. "
+                    f"artifact={artifact_observation_space} policy={policy_observation_space}"
+                )
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
 
         if not cfg.resume_checkpoint:
             bc_stats = run_bc_pretrain(
                 model=model,
+                obs_adapter=obs_adapter,
                 cfg=cfg,
                 device=device,
-                obs_dim=obs_dim,
+                obs_dim=raw_obs_dim,
                 action_dim=action_dim,
             )
             if bc_stats.get("enabled"):
                 write_json(out_dir / "bc_stats.json", bc_stats)
-            optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+            optimizer = torch.optim.Adam(
+                trainable_parameters(model, obs_adapter),
+                lr=cfg.learning_rate,
+                eps=1e-5,
+            )
 
         batch_size = cfg.num_envs * cfg.num_steps
         if cfg.minibatch_size > batch_size:
@@ -666,7 +1008,9 @@ def train(cfg: PPOConfig) -> None:
 
         print(
             "[ppo] starting training "
-            f"(device={device.type}, obs_dim={obs_dim}, action_dim={action_dim}, "
+            f"(device={device.type}, env_obs_space={cfg.observation_space}, "
+            f"policy_obs_space={policy_observation_space}, "
+            f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"batch_size={batch_size}, updates={num_updates})"
         )
         write_json(
@@ -674,7 +1018,10 @@ def train(cfg: PPOConfig) -> None:
             {
                 **cfg.__dict__,
                 "device_resolved": device.type,
-                "obs_dim": obs_dim,
+                "raw_obs_dim": raw_obs_dim,
+                "policy_obs_dim": obs_dim,
+                "policy_observation_space": policy_observation_space,
+                "observation_adapter": obs_adapter.__class__.__name__,
                 "action_dim": action_dim,
                 "batch_size": batch_size,
                 "num_updates": num_updates,
@@ -692,6 +1039,7 @@ def train(cfg: PPOConfig) -> None:
         best_update = 0
         best_stats: dict[str, Any] | None = None
         best_state_dict: dict[str, torch.Tensor] | None = None
+        best_adapter_state_dict: dict[str, torch.Tensor] | None = None
         did_interrupt = False
         try:
             for update in range(start_update + 1, num_updates + 1):
@@ -716,7 +1064,9 @@ def train(cfg: PPOConfig) -> None:
                 profile_io_s = 0.0
 
                 rollout_start_perf = time.perf_counter()
-                obs_buf = torch.zeros((cfg.num_steps, cfg.num_envs, obs_dim), device=device)
+                raw_obs_buf = torch.zeros(
+                    (cfg.num_steps, cfg.num_envs, raw_obs_dim), device=device
+                )
                 mask_buf = torch.zeros((cfg.num_steps, cfg.num_envs, action_dim), device=device)
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
                 logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
@@ -725,13 +1075,14 @@ def train(cfg: PPOConfig) -> None:
                 value_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
 
                 for step in range(cfg.num_steps):
-                    obs_t = as_tensor(obs_np, device)
+                    raw_obs_t = as_tensor(obs_np, device)
                     mask_t = as_tensor(mask_np, device)
-                    obs_buf[step] = obs_t
+                    raw_obs_buf[step] = raw_obs_t
                     mask_buf[step] = mask_t
 
                     policy_forward_start = time.perf_counter()
                     with torch.no_grad():
+                        obs_t = obs_adapter(raw_obs_t)
                         logits, values = model(obs_t)
                         dist = masked_categorical(logits, mask_t)
                         if cfg.deterministic_eval:
@@ -818,7 +1169,8 @@ def train(cfg: PPOConfig) -> None:
 
                 gae_start = time.perf_counter()
                 with torch.no_grad():
-                    next_obs_t = as_tensor(obs_np, device)
+                    next_raw_obs_t = as_tensor(obs_np, device)
+                    next_obs_t = obs_adapter(next_raw_obs_t)
                     _, next_value = model(next_obs_t)
 
                 advantages = torch.zeros_like(reward_buf, device=device)
@@ -837,7 +1189,7 @@ def train(cfg: PPOConfig) -> None:
                     advantages[t] = lastgaelam
                 returns = advantages + value_buf
 
-                b_obs = obs_buf.reshape((-1, obs_dim))
+                b_raw_obs = raw_obs_buf.reshape((-1, raw_obs_dim))
                 b_masks = mask_buf.reshape((-1, action_dim))
                 b_actions = action_buf.reshape(-1)
                 b_logprobs = logprob_buf.reshape(-1)
@@ -869,7 +1221,8 @@ def train(cfg: PPOConfig) -> None:
                             mb_inds_np, device=device, dtype=torch.long
                         )
 
-                        logits, new_values = model(b_obs[mb_inds])
+                        mb_features = obs_adapter(b_raw_obs[mb_inds])
+                        logits, new_values = model(mb_features)
                         dist = masked_categorical(logits, b_masks[mb_inds])
                         new_logprob = dist.log_prob(b_actions[mb_inds])
                         entropy = dist.entropy().mean()
@@ -918,7 +1271,9 @@ def train(cfg: PPOConfig) -> None:
 
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
-                        nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                        nn.utils.clip_grad_norm_(
+                            trainable_parameters(model, obs_adapter), cfg.max_grad_norm
+                        )
                         optimizer.step()
 
                         policy_loss_value = float(policy_loss.detach().cpu().item())
@@ -1008,10 +1363,15 @@ def train(cfg: PPOConfig) -> None:
                         key: tensor.detach().cpu().clone()
                         for key, tensor in model.state_dict().items()
                     }
+                    best_adapter_state_dict = {
+                        key: tensor.detach().cpu().clone()
+                        for key, tensor in obs_adapter.state_dict().items()
+                    }
                     best_ckpt_path = checkpoints_dir / "ppo_best.pt"
                     save_checkpoint(
                         checkpoint_path=best_ckpt_path,
                         model=model,
+                        obs_adapter=obs_adapter,
                         optimizer=optimizer,
                         cfg=cfg,
                         obs_dim=obs_dim,
@@ -1021,7 +1381,7 @@ def train(cfg: PPOConfig) -> None:
                         stats=stats,
                     )
                     best_artifact = export_bot_policy_artifact(
-                        model, cfg, obs_dim, action_dim
+                        model, cfg, obs_dim, action_dim, policy_observation_space
                     )
                     write_json(out_dir / "bot_policy_best.json", best_artifact)
                     write_json(out_dir / "best_stats.json", best_stats)
@@ -1081,6 +1441,7 @@ def train(cfg: PPOConfig) -> None:
                     save_checkpoint(
                         checkpoint_path=ckpt_path,
                         model=model,
+                        obs_adapter=obs_adapter,
                         optimizer=optimizer,
                         cfg=cfg,
                         obs_dim=obs_dim,
@@ -1089,7 +1450,9 @@ def train(cfg: PPOConfig) -> None:
                         update=update,
                         stats=stats,
                     )
-                    artifact = export_bot_policy_artifact(model, cfg, obs_dim, action_dim)
+                    artifact = export_bot_policy_artifact(
+                        model, cfg, obs_dim, action_dim, policy_observation_space
+                    )
                     artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
                     write_json(artifact_path, artifact)
                     write_json(out_dir / "last_stats.json", stats)
@@ -1101,10 +1464,14 @@ def train(cfg: PPOConfig) -> None:
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-            if best_stats is not None:
-                write_json(out_dir / "best_stats.json", best_stats)
+        if best_adapter_state_dict is not None:
+            obs_adapter.load_state_dict(best_adapter_state_dict, strict=False)
+        if best_stats is not None:
+            write_json(out_dir / "best_stats.json", best_stats)
 
-        artifact_final = export_bot_policy_artifact(model, cfg, obs_dim, action_dim)
+        artifact_final = export_bot_policy_artifact(
+            model, cfg, obs_dim, action_dim, policy_observation_space
+        )
         write_json(out_dir / "bot_policy_final.json", artifact_final)
         if did_interrupt:
             if best_update > 0 and math.isfinite(best_score):

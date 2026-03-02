@@ -1,4 +1,5 @@
 export type PieceSourceProfile = 'bag7' | 'active_generator';
+export type BotObservationSpace = 'model_head_v1' | 'raw_v1';
 
 export type JsonValue =
   | null
@@ -27,6 +28,7 @@ export type InitPayload = {
   modeId?: string;
   numEnvs?: number;
   modelPath?: string;
+  observationSpace?: BotObservationSpace;
   pieceSourceProfile?: PieceSourceProfile;
   queuePolicyId?: string;
   maxPiecesPerEpisode?: number;

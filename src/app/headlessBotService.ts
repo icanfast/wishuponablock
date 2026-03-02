@@ -13,9 +13,17 @@ import type {
   InputFrame,
   PieceKind,
 } from '../core/types';
-import { PIECES } from '../core/types';
-import { buildModelHeadInput, type LoadedModel } from '../core/wubModel';
+import type { LoadedModel } from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
+import {
+  encodeBotObservation,
+  normalizeBotObservationSpace,
+  type BotObservationSpace,
+} from '../core/botObservation';
+import {
+  PLACEMENT_ACTION_DIM,
+  placementActionIndexFromPlacement,
+} from '../core/placementActionSpace';
 import {
   enumerateTrajectoryExecutorPlacements,
   trajectoryExecutorCommandToInputFrame,
@@ -39,15 +47,18 @@ const EMPTY_INPUT: InputFrame = {
 };
 const ACTION_ROTATIONS = ['none', 'cw', 'ccw', '180'] as const;
 const ACTION_MOVE_X = [-3, -2, -1, 0, 1, 2, 3, 4] as const;
-const PIECE_INDEX = new Map(PIECES.map((piece, idx) => [piece, idx]));
 const BOT_TRAIN_MAX_EPISODES = 4096;
 const BOT_TRAIN_MAX_PIECES_PER_EPISODE = 512;
 const BOT_TRAIN_MAX_TRANSITIONS = 200_000;
 const BOT_PPO_CLIP_EPSILON = 0.2;
-const BOT_PLACEMENT_ACTION_DIM = 192;
-const DEFAULT_BOT_ACTION_SPACE_KIND: BotActionSpaceKind = 'placement_v1';
+const BOT_PLACEMENT_ACTION_DIM = PLACEMENT_ACTION_DIM;
+const DEFAULT_BOT_ACTION_SPACE_KIND: BotActionSpaceKind = 'placement_full_v1';
+const DEFAULT_BOT_OBSERVATION_SPACE: BotObservationSpace = 'raw_v1';
 
-export type BotActionSpaceKind = 'macro_v1' | 'placement_v1';
+export type BotActionSpaceKind =
+  | 'macro_v1'
+  | 'placement_v1'
+  | 'placement_full_v1';
 
 type TfTensor = {
   dataSync: () => Float32Array | Int32Array | Uint8Array;
@@ -130,6 +141,7 @@ export type BotPolicyArtifact = {
   inputDim: number;
   hiddenDim: number;
   actionDim: number;
+  observationSpace?: BotObservationSpace;
   actionSpaceKind?: BotActionSpaceKind;
   actions?: BotMacroAction[];
   placementActionDim?: number;
@@ -288,6 +300,7 @@ type PolicyParams = {
   inputDim: number;
   hiddenDim: number;
   actionDim: number;
+  observationSpace: BotObservationSpace;
   actionSpaceKind: BotActionSpaceKind;
   macroActions: BotMacroAction[] | null;
   w1: Float32Array;
@@ -310,6 +323,7 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   inputDim: params.inputDim,
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
+  observationSpace: params.observationSpace,
   actionSpaceKind: params.actionSpaceKind,
   macroActions: params.macroActions
     ? params.macroActions.map((action) => ({ ...action }))
@@ -576,9 +590,13 @@ const asMacroInputFrame = (action: BotMacroAction): InputFrame => ({
 const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
+  actionSpaceKind: BotActionSpaceKind,
 ): {
-  commandsBySlot: InputFrame[][];
+  commandsBySlot: Array<InputFrame[] | null>;
   actionMask: Float32Array;
+  placementsByActionIndex: Array<
+    ReturnType<typeof enumerateTrajectoryExecutorPlacements>[number] | null
+  >;
   placements: ReturnType<typeof enumerateTrajectoryExecutorPlacements>;
 } => {
   const placements = enumerateTrajectoryExecutorPlacements({
@@ -591,28 +609,54 @@ const buildPlacementChoices = (
     allowSoftDrop: true,
   });
   const actionMask = new Float32Array(actionDim);
-  const commandsBySlot: InputFrame[][] = [];
-  const maxChoices = Math.min(actionDim, placements.length);
-  for (let i = 0; i < maxChoices; i += 1) {
-    const placement = placements[i];
-    actionMask[i] = 1;
-    commandsBySlot.push(
-      placement.commands.map((command) =>
+  const commandsBySlot: Array<InputFrame[] | null> = new Array(actionDim).fill(
+    null,
+  );
+  const placementsByActionIndex: Array<
+    ReturnType<typeof enumerateTrajectoryExecutorPlacements>[number] | null
+  > = new Array(actionDim).fill(null);
+
+  if (actionSpaceKind === 'placement_v1') {
+    const maxChoices = Math.min(actionDim, placements.length);
+    for (let i = 0; i < maxChoices; i += 1) {
+      const placement = placements[i];
+      actionMask[i] = 1;
+      placementsByActionIndex[i] = placement;
+      commandsBySlot[i] = placement.commands.map((command) =>
         trajectoryExecutorCommandToInputFrame(command),
-      ),
-    );
+      );
+    }
+  } else {
+    for (const placement of placements) {
+      const actionIndex = placementActionIndexFromPlacement(placement);
+      if (
+        actionIndex == null ||
+        actionIndex < 0 ||
+        actionIndex >= actionDim ||
+        actionMask[actionIndex] > 0
+      ) {
+        continue;
+      }
+      actionMask[actionIndex] = 1;
+      placementsByActionIndex[actionIndex] = placement;
+      commandsBySlot[actionIndex] = placement.commands.map((command) =>
+        trajectoryExecutorCommandToInputFrame(command),
+      );
+    }
   }
-  if (commandsBySlot.length === 0) {
+
+  if (!actionMask.some((value) => value > 0)) {
     actionMask[0] = 1;
-    commandsBySlot.push([trajectoryExecutorCommandToInputFrame('hard_drop')]);
+    commandsBySlot[0] = [trajectoryExecutorCommandToInputFrame('hard_drop')];
   }
-  return { commandsBySlot, actionMask, placements };
+  return { commandsBySlot, actionMask, placementsByActionIndex, placements };
 };
 
 const randomizeParams = (
   inputDim: number,
   hiddenDim: number,
   actionDim: number,
+  observationSpace: BotObservationSpace,
   actionSpaceKind: BotActionSpaceKind,
   macroActions: BotMacroAction[] | null,
   rng: XorShift32,
@@ -638,6 +682,7 @@ const randomizeParams = (
     inputDim,
     hiddenDim,
     actionDim,
+    observationSpace,
     actionSpaceKind,
     macroActions,
     w1,
@@ -760,37 +805,15 @@ const forwardPolicy = (
 };
 
 const encodeObservation = (
+  observationSpace: BotObservationSpace,
   model: LoadedModel,
   state: GameState,
-): Float32Array => {
-  const headInput = buildModelHeadInput(model, state.board, state.hold);
-  const contextDim = PIECES.length + PIECES.length + 5;
-  const out = new Float32Array(headInput.length + contextDim);
-  out.set(headInput, 0);
-
-  let offset = headInput.length;
-  const activeIdx = PIECE_INDEX.get(state.active.k);
-  if (activeIdx != null) out[offset + activeIdx] = 1;
-  offset += PIECES.length;
-
-  const nextPiece = state.next[0] ?? null;
-  const nextIdx = nextPiece == null ? null : PIECE_INDEX.get(nextPiece);
-  if (nextIdx != null) out[offset + nextIdx] = 1;
-  offset += PIECES.length;
-
-  const lineGoal =
-    state.lineGoal != null && state.lineGoal > 0 ? state.lineGoal : null;
-  const progress =
-    lineGoal != null
-      ? clamp(state.totalLinesCleared / lineGoal, 0, 2)
-      : clamp(state.totalLinesCleared / 80, 0, 2);
-  out[offset++] = progress;
-  out[offset++] = clamp(state.timeMs / 180_000, 0, 2);
-  out[offset++] = clamp(state.level / 20, 0, 2);
-  out[offset++] = clamp(state.score / 200_000, 0, 2);
-  out[offset++] = state.canHold ? 1 : 0;
-  return out;
-};
+): Float32Array =>
+  encodeBotObservation({
+    observationSpace,
+    model,
+    state,
+  });
 
 class PolicyActionBot implements InputSource {
   private activeRef: GameState['active'] | null = null;
@@ -1036,10 +1059,19 @@ const runRollout = (config: {
   const rng = new XorShift32(config.seed ^ 0x9e3779b9);
   const initialState = toTrajectoryInitialState(game.state);
   const bot = new PolicyActionBot((state) => {
-    const observation = encodeObservation(config.model, state);
+    const observation = encodeObservation(
+      config.policyParams.observationSpace,
+      config.model,
+      state,
+    );
     const placementChoices =
-      config.policyParams.actionSpaceKind === 'placement_v1'
-        ? buildPlacementChoices(state, config.policyParams.actionDim)
+      config.policyParams.actionSpaceKind === 'placement_v1' ||
+      config.policyParams.actionSpaceKind === 'placement_full_v1'
+        ? buildPlacementChoices(
+            state,
+            config.policyParams.actionDim,
+            config.policyParams.actionSpaceKind,
+          )
         : null;
     const actionMask = placementChoices?.actionMask ?? null;
     const forward = forwardPolicy(config.policyParams, observation, actionMask);
@@ -1057,8 +1089,12 @@ const runRollout = (config: {
       actionIndex = sampleIndex(forward.probabilities, rng);
     }
     if (placementChoices) {
+      const fallbackActionIndex = Math.max(
+        0,
+        placementChoices.actionMask.findIndex((value) => value > 0),
+      );
       const queue = placementChoices.commandsBySlot[actionIndex] ??
-        placementChoices.commandsBySlot[0] ?? [EMPTY_INPUT];
+        placementChoices.commandsBySlot[fallbackActionIndex] ?? [EMPTY_INPUT];
       return { actionIndex, observation, actionMask, queue };
     }
     const macroActions =
@@ -1259,6 +1295,7 @@ const trainWithTfjsReinforce = async (options: {
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
+    observationSpace: options.params.observationSpace,
     actionSpaceKind: options.params.actionSpaceKind,
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
@@ -1451,6 +1488,7 @@ const trainWithTfjsPpo = async (options: {
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
+    observationSpace: options.params.observationSpace,
     actionSpaceKind: options.params.actionSpaceKind,
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
@@ -1697,13 +1735,17 @@ const toArtifact = (
   inputDim: params.inputDim,
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
+  observationSpace: params.observationSpace,
   actionSpaceKind: params.actionSpaceKind,
   actions:
     params.actionSpaceKind === 'macro_v1' && params.macroActions
       ? params.macroActions.map((action) => ({ ...action }))
       : undefined,
   placementActionDim:
-    params.actionSpaceKind === 'placement_v1' ? params.actionDim : undefined,
+    params.actionSpaceKind === 'placement_v1' ||
+    params.actionSpaceKind === 'placement_full_v1'
+      ? params.actionDim
+      : undefined,
   weights: {
     w1: Array.from(params.w1),
     b1: Array.from(params.b1),
@@ -1718,8 +1760,15 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   const inputDim = Math.max(1, Math.trunc(policy.inputDim));
   const hiddenDim = Math.max(1, Math.trunc(policy.hiddenDim));
   const actionDim = Math.max(1, Math.trunc(policy.actionDim));
+  const observationSpace = normalizeBotObservationSpace(
+    policy.observationSpace,
+  );
   const actionSpaceKind: BotActionSpaceKind =
-    policy.actionSpaceKind === 'placement_v1' ? 'placement_v1' : 'macro_v1';
+    policy.actionSpaceKind === 'placement_full_v1'
+      ? 'placement_full_v1'
+      : policy.actionSpaceKind === 'placement_v1'
+        ? 'placement_v1'
+        : 'macro_v1';
   const macroActionsRaw = Array.isArray(policy.actions) ? policy.actions : [];
   const macroActions =
     actionSpaceKind === 'macro_v1'
@@ -1780,6 +1829,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     inputDim,
     hiddenDim,
     actionDim,
+    observationSpace,
     actionSpaceKind,
     macroActions:
       actionSpaceKind === 'macro_v1'
@@ -1848,8 +1898,17 @@ export const parseBotPolicyArtifactFromUnknown = (
     inputDim,
     hiddenDim,
     actionDim,
+    observationSpace: normalizeBotObservationSpace(
+      typeof value.observationSpace === 'string'
+        ? value.observationSpace
+        : null,
+    ),
     actionSpaceKind:
-      value.actionSpaceKind === 'placement_v1' ? 'placement_v1' : 'macro_v1',
+      value.actionSpaceKind === 'placement_full_v1'
+        ? 'placement_full_v1'
+        : value.actionSpaceKind === 'placement_v1'
+          ? 'placement_v1'
+          : 'macro_v1',
     actions: Array.isArray(value.actions)
       ? (value.actions as BotMacroAction[])
       : undefined,
@@ -1974,6 +2033,7 @@ export const trainBotPolicyOneShot = async (
   );
 
   const inputDim = encodeObservation(
+    DEFAULT_BOT_OBSERVATION_SPACE,
     config.model,
     buildHeadlessGame({
       modeId: config.modeId,
@@ -1991,6 +2051,7 @@ export const trainBotPolicyOneShot = async (
     inputDim,
     64,
     BOT_PLACEMENT_ACTION_DIM,
+    DEFAULT_BOT_OBSERVATION_SPACE,
     DEFAULT_BOT_ACTION_SPACE_KIND,
     null,
     new XorShift32(seed),
@@ -2002,6 +2063,7 @@ export const trainBotPolicyOneShot = async (
       const compatible =
         sameMode &&
         warmParams.inputDim === inputDim &&
+        warmParams.observationSpace === DEFAULT_BOT_OBSERVATION_SPACE &&
         warmParams.actionSpaceKind === DEFAULT_BOT_ACTION_SPACE_KIND &&
         warmParams.actionDim === BOT_PLACEMENT_ACTION_DIM &&
         isFiniteArray(warmParams.w1) &&
@@ -2596,10 +2658,19 @@ export const createGuiInspectBotInputSource = (
       cooldownMs = Math.max(0, cooldownMs - Math.max(0, dtMs));
       if (state.active !== activeRef) {
         activeRef = state.active;
-        const observation = encodeObservation(config.model, state);
+        const observation = encodeObservation(
+          params.observationSpace,
+          config.model,
+          state,
+        );
         const placementChoices =
-          params.actionSpaceKind === 'placement_v1'
-            ? buildPlacementChoices(state, params.actionDim)
+          params.actionSpaceKind === 'placement_v1' ||
+          params.actionSpaceKind === 'placement_full_v1'
+            ? buildPlacementChoices(
+                state,
+                params.actionDim,
+                params.actionSpaceKind,
+              )
             : null;
         const actionMask = placementChoices?.actionMask ?? null;
         const forward = forwardPolicy(params, observation, actionMask);
@@ -2617,9 +2688,13 @@ export const createGuiInspectBotInputSource = (
           actionIndex = sampleIndex(forward.probabilities, rng);
         }
         if (placementChoices) {
+          const fallbackActionIndex = Math.max(
+            0,
+            placementChoices.actionMask.findIndex((value) => value > 0),
+          );
           const targetPlacement =
-            placementChoices.placements[actionIndex] ??
-            placementChoices.placements[0] ??
+            placementChoices.placementsByActionIndex[actionIndex] ??
+            placementChoices.placementsByActionIndex[fallbackActionIndex] ??
             null;
           config.onTargetGhostChange?.(
             targetPlacement
@@ -2633,7 +2708,9 @@ export const createGuiInspectBotInputSource = (
               : null,
           );
           queue = placementChoices.commandsBySlot[actionIndex] ??
-            placementChoices.commandsBySlot[0] ?? [EMPTY_INPUT];
+            placementChoices.commandsBySlot[fallbackActionIndex] ?? [
+              EMPTY_INPUT,
+            ];
         } else {
           config.onTargetGhostChange?.(null);
           const macroActions =

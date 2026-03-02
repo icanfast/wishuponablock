@@ -5,31 +5,35 @@ import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 import {
-  buildModelHeadInput,
+  encodeBotObservationFromParts,
+  normalizeBotObservationSpace,
+  type BotObservationSpace,
+} from '../../../src/core/botObservation.ts';
+import {
+  PLACEMENT_ACTION_DIM,
+  placementActionIndexFromFields,
+} from '../../../src/core/placementActionSpace.ts';
+import {
   parseWubModelFromJsonText,
+  type LoadedModel,
 } from '../../../src/core/wubModel.ts';
 import { collides } from '../../../src/core/piece.ts';
 import {
-  PIECES,
   type ActivePiece,
   type Board,
   type PieceKind,
 } from '../../../src/core/types.ts';
-import {
-  enumerateTrajectoryExecutorPlacements,
-  type TrajectoryExecutorReachablePlacement,
-} from '../../../src/core/trajectoryExecutor.ts';
+import { enumerateTrajectoryExecutorPlacements } from '../../../src/core/trajectoryExecutor.ts';
 import {
   parseTrajectorySessionV1,
   type TrajectorySessionV1,
 } from '../../../src/core/trajectoryProtocol.ts';
 
-const DEFAULT_ACTION_DIM = 192;
+const DEFAULT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_MAX_NODES = 20_000;
 const DEFAULT_OUTPUT_PATH = 'tools/bot_env/output/bc_dataset.json';
 const DEFAULT_MODEL_PATH = 'public/models/model_v4.json';
 const DEFAULT_MODE_FILTER = 'charcuterie';
-const PIECE_INDEX = new Map(PIECES.map((piece, idx) => [piece, idx]));
 const SPAWN_X = 3;
 const SPAWN_Y = -1;
 
@@ -37,6 +41,7 @@ type CliOptions = {
   inputs: string[];
   outputPath: string;
   modelPath: string;
+  observationSpace: BotObservationSpace;
   modeFilter: string | null;
   actionDim: number;
   maxNodesPerBranch: number;
@@ -63,6 +68,7 @@ type BcDataset = {
   schema: 'wishuponablock.bot_bc_dataset.v1';
   createdAtMs: number;
   modelPath: string;
+  observationSpace: BotObservationSpace;
   modeFilter: string | null;
   obsDim: number;
   actionDim: number;
@@ -104,6 +110,7 @@ const printUsage = (): void => {
     --input <file-or-dir> [--input <file-or-dir> ...] \\
     [--output ${DEFAULT_OUTPUT_PATH}] \\
     [--model-path ${DEFAULT_MODEL_PATH}] \\
+    [--observation-space raw_v1] \\
     [--mode ${DEFAULT_MODE_FILTER}] \\
     [--action-dim ${DEFAULT_ACTION_DIM}] \\
     [--max-nodes ${DEFAULT_MAX_NODES}] \\
@@ -116,6 +123,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
   const inputs: string[] = [];
   let outputPath = DEFAULT_OUTPUT_PATH;
   let modelPath = DEFAULT_MODEL_PATH;
+  let observationSpace: BotObservationSpace = 'raw_v1';
   let modeFilter: string | null = DEFAULT_MODE_FILTER;
   let actionDim = DEFAULT_ACTION_DIM;
   let maxNodesPerBranch = DEFAULT_MAX_NODES;
@@ -155,6 +163,13 @@ const parseArgs = (argv: string[]): CliOptions | null => {
       if (!value) throw new Error('--mode requires a value.');
       const normalized = value.trim().toLowerCase();
       modeFilter = normalized.length > 0 ? normalized : null;
+      i += 1;
+      continue;
+    }
+    if (arg === '--observation-space') {
+      const value = argv[i + 1];
+      if (!value) throw new Error('--observation-space requires a value.');
+      observationSpace = normalizeBotObservationSpace(value.trim());
       i += 1;
       continue;
     }
@@ -199,6 +214,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
     inputs,
     outputPath,
     modelPath,
+    observationSpace,
     modeFilter,
     actionDim,
     maxNodesPerBranch,
@@ -270,7 +286,8 @@ const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
 
 const buildObservation = (input: {
-  model: ReturnType<typeof parseWubModelFromJsonText>;
+  model: LoadedModel | null;
+  observationSpace: BotObservationSpace;
   board: Board;
   hold: PieceKind | null;
   active: PieceKind;
@@ -282,32 +299,24 @@ const buildObservation = (input: {
   score: number;
   lineGoal: number | null;
 }): number[] => {
-  const headInput = buildModelHeadInput(input.model, input.board, input.hold);
-  const contextDim = PIECES.length + PIECES.length + 5;
-  const out = new Float32Array(headInput.length + contextDim);
-  out.set(headInput, 0);
-  let offset = headInput.length;
-
-  const activeIdx = PIECE_INDEX.get(input.active);
-  if (activeIdx != null) out[offset + activeIdx] = 1;
-  offset += PIECES.length;
-
-  const nextIdx = input.next == null ? null : PIECE_INDEX.get(input.next);
-  if (nextIdx != null) out[offset + nextIdx] = 1;
-  offset += PIECES.length;
-
-  const lineGoal =
-    input.lineGoal != null && input.lineGoal > 0 ? input.lineGoal : null;
-  const progress =
-    lineGoal != null
-      ? clamp(input.totalLinesCleared / lineGoal, 0, 2)
-      : clamp(input.totalLinesCleared / 80, 0, 2);
-  out[offset++] = progress;
-  out[offset++] = clamp(input.timeMs / 180_000, 0, 2);
-  out[offset++] = clamp(input.level / 20, 0, 2);
-  out[offset++] = clamp(input.score / 200_000, 0, 2);
-  out[offset++] = input.canHold ? 1 : 0;
-  return Array.from(out);
+  return Array.from(
+    encodeBotObservationFromParts({
+      observationSpace: input.observationSpace,
+      model: input.model,
+      parts: {
+        board: input.board,
+        hold: input.hold,
+        active: input.active,
+        next: input.next,
+        canHold: input.canHold,
+        totalLinesCleared: input.totalLinesCleared,
+        timeMs: input.timeMs,
+        level: input.level,
+        score: input.score,
+        lineGoal: input.lineGoal,
+      },
+    }),
+  );
 };
 
 const buildReturnToGo = (
@@ -334,27 +343,19 @@ const normalizeRotation = (value: number): number => {
 };
 
 const findPlacementIndex = (
-  placements: TrajectoryExecutorReachablePlacement[],
   actionDim: number,
   sample: TrajectorySessionV1['samples'][number],
 ): number => {
   const replay = sample.replay;
   if (!replay) return -1;
-  const max = Math.min(actionDim, placements.length);
-  const targetR = normalizeRotation(replay.lockRotation);
-  for (let i = 0; i < max; i += 1) {
-    const placement = placements[i];
-    if (
-      placement.lockPiece === replay.lockPiece &&
-      normalizeRotation(placement.lockRotation) === targetR &&
-      placement.lockX === replay.lockX &&
-      placement.lockY === replay.lockY &&
-      placement.holdUsed === replay.holdUsed
-    ) {
-      return i;
-    }
-  }
-  return -1;
+  const index = placementActionIndexFromFields({
+    holdUsed: replay.holdUsed,
+    lockRotation: normalizeRotation(replay.lockRotation),
+    lockX: replay.lockX,
+    lockY: replay.lockY,
+  });
+  if (index == null || index < 0 || index >= actionDim) return -1;
+  return index;
 };
 
 const pushIfRecord = (
@@ -379,8 +380,11 @@ const main = async (): Promise<void> => {
   const options = parseArgs(process.argv);
   if (!options) return;
 
-  const modelText = await readFile(path.resolve(options.modelPath), 'utf8');
-  const model = parseWubModelFromJsonText(modelText);
+  let model: LoadedModel | null = null;
+  if (options.observationSpace === 'model_head_v1') {
+    const modelText = await readFile(path.resolve(options.modelPath), 'utf8');
+    model = parseWubModelFromJsonText(modelText);
+  }
 
   const discovered = new Set<string>();
   for (const input of options.inputs) {
@@ -500,13 +504,18 @@ const main = async (): Promise<void> => {
           continue;
         }
         const actionMask = new Array<number>(options.actionDim).fill(0);
-        const maxChoices = Math.min(options.actionDim, placements.length);
-        for (let j = 0; j < maxChoices; j += 1) actionMask[j] = 1;
-        const actionIndex = findPlacementIndex(
-          placements,
-          options.actionDim,
-          sample,
-        );
+        for (const placement of placements) {
+          const index = placementActionIndexFromFields({
+            holdUsed: placement.holdUsed,
+            lockRotation: placement.lockRotation,
+            lockX: placement.lockX,
+            lockY: placement.lockY,
+          });
+          if (index == null || index < 0 || index >= options.actionDim)
+            continue;
+          actionMask[index] = 1;
+        }
+        const actionIndex = findPlacementIndex(options.actionDim, sample);
         if (actionIndex < 0 || actionIndex >= options.actionDim) {
           skipped.targetNotInActionSpace += 1;
           continue;
@@ -529,6 +538,7 @@ const main = async (): Promise<void> => {
 
         const obs = buildObservation({
           model,
+          observationSpace: options.observationSpace,
           board: boardBefore,
           hold: holdBefore,
           active: activeBefore,
@@ -586,6 +596,7 @@ const main = async (): Promise<void> => {
     schema: 'wishuponablock.bot_bc_dataset.v1',
     createdAtMs: Date.now(),
     modelPath: options.modelPath,
+    observationSpace: options.observationSpace,
     modeFilter: options.modeFilter,
     obsDim: records[0].obs.length,
     actionDim: options.actionDim,
