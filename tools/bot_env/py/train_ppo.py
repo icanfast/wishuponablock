@@ -51,6 +51,12 @@ class PPOConfig:
     resume_checkpoint: str | None
     init_artifact: str | None
     deterministic_eval: bool
+    bc_dataset: str | None
+    bc_epochs: int
+    bc_batch_size: int
+    bc_learning_rate: float
+    bc_value_weight: float
+    bc_max_records: int | None
 
 
 class PolicyValueNet(nn.Module):
@@ -115,6 +121,21 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--init-artifact", default=None)
     parser.add_argument("--deterministic-eval", action="store_true")
+    parser.add_argument(
+        "--bc-dataset",
+        default=None,
+        help="Path to BC dataset JSON produced by tools/bot_env/ts/buildBcDataset.ts",
+    )
+    parser.add_argument("--bc-epochs", type=int, default=5)
+    parser.add_argument("--bc-batch-size", type=int, default=4096)
+    parser.add_argument("--bc-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--bc-value-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--bc-max-records",
+        type=int,
+        default=0,
+        help="Optional cap for BC records (0 means no cap).",
+    )
 
     args = parser.parse_args()
     run_name = args.run_name.strip() or f"ppo_{args.mode_id}_{int(time.time())}"
@@ -153,6 +174,16 @@ def parse_args() -> PPOConfig:
         resume_checkpoint=args.resume_checkpoint,
         init_artifact=args.init_artifact,
         deterministic_eval=bool(args.deterministic_eval),
+        bc_dataset=(
+            args.bc_dataset.strip() if isinstance(args.bc_dataset, str) and args.bc_dataset.strip() else None
+        ),
+        bc_epochs=max(0, int(args.bc_epochs)),
+        bc_batch_size=max(1, int(args.bc_batch_size)),
+        bc_learning_rate=float(args.bc_learning_rate),
+        bc_value_weight=max(0.0, float(args.bc_value_weight)),
+        bc_max_records=(
+            max(1, int(args.bc_max_records)) if int(args.bc_max_records) > 0 else None
+        ),
     )
 
 
@@ -336,6 +367,210 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def load_bc_dataset(
+    dataset_path: Path,
+    obs_dim: int,
+    action_dim: int,
+    max_records: int | None,
+) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    raw = json.loads(dataset_path.read_text(encoding="utf-8"))
+    records = raw.get("records")
+    if not isinstance(records, list):
+        raise ValueError("BC dataset missing records array.")
+
+    obs_rows: list[list[float]] = []
+    mask_rows: list[list[float]] = []
+    action_rows: list[int] = []
+    return_rows: list[float] = []
+    return_mask_rows: list[float] = []
+
+    skipped = {
+        "invalid_record": 0,
+        "invalid_obs": 0,
+        "invalid_mask": 0,
+        "invalid_action": 0,
+    }
+
+    for rec in records:
+        if max_records is not None and len(obs_rows) >= max_records:
+            break
+        if not isinstance(rec, dict):
+            skipped["invalid_record"] += 1
+            continue
+
+        obs = rec.get("obs")
+        action_mask = rec.get("actionMask")
+        action_index = rec.get("actionIndex")
+        return_to_go = rec.get("returnToGo")
+
+        if (
+            not isinstance(obs, list)
+            or len(obs) != obs_dim
+            or any(not _is_finite_number(v) for v in obs)
+        ):
+            skipped["invalid_obs"] += 1
+            continue
+        if (
+            not isinstance(action_mask, list)
+            or len(action_mask) != action_dim
+            or any(not _is_finite_number(v) for v in action_mask)
+        ):
+            skipped["invalid_mask"] += 1
+            continue
+        if not isinstance(action_index, int):
+            skipped["invalid_action"] += 1
+            continue
+        if action_index < 0 or action_index >= action_dim:
+            skipped["invalid_action"] += 1
+            continue
+
+        mask = [1.0 if float(v) > 0 else 0.0 for v in action_mask]
+        if sum(mask) <= 0 or mask[action_index] <= 0:
+            skipped["invalid_action"] += 1
+            continue
+
+        obs_rows.append([float(v) for v in obs])
+        mask_rows.append(mask)
+        action_rows.append(action_index)
+        if _is_finite_number(return_to_go):
+            return_rows.append(float(return_to_go))
+            return_mask_rows.append(1.0)
+        else:
+            return_rows.append(0.0)
+            return_mask_rows.append(0.0)
+
+    if len(obs_rows) == 0:
+        raise ValueError("BC dataset produced zero compatible records.")
+
+    payload = {
+        "obs": np.asarray(obs_rows, dtype=np.float32),
+        "masks": np.asarray(mask_rows, dtype=np.float32),
+        "actions": np.asarray(action_rows, dtype=np.int64),
+        "returns": np.asarray(return_rows, dtype=np.float32),
+        "returns_mask": np.asarray(return_mask_rows, dtype=np.float32),
+    }
+    stats = {
+        "total_records": len(records),
+        "used_records": int(payload["obs"].shape[0]),
+        "with_returns": int(np.sum(payload["returns_mask"])),
+        **skipped,
+    }
+    return payload, stats
+
+
+def run_bc_pretrain(
+    model: PolicyValueNet,
+    cfg: PPOConfig,
+    device: torch.device,
+    obs_dim: int,
+    action_dim: int,
+) -> dict[str, Any]:
+    if not cfg.bc_dataset or cfg.bc_epochs <= 0:
+        return {"enabled": False}
+
+    dataset_path = Path(cfg.bc_dataset).resolve()
+    batch, dataset_stats = load_bc_dataset(
+        dataset_path=dataset_path,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        max_records=cfg.bc_max_records,
+    )
+
+    obs_t = as_tensor(batch["obs"], device)
+    masks_t = as_tensor(batch["masks"], device)
+    actions_t = torch.from_numpy(batch["actions"]).to(device)
+    returns_t = as_tensor(batch["returns"], device)
+    returns_mask_t = as_tensor(batch["returns_mask"], device)
+
+    sample_count = int(obs_t.shape[0])
+    batch_size = min(cfg.bc_batch_size, sample_count)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=cfg.bc_learning_rate, eps=1e-5
+    )
+
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    epoch_logs: list[dict[str, float]] = []
+
+    for epoch in range(1, cfg.bc_epochs + 1):
+        perm = torch.randperm(sample_count, device=device)
+        actor_loss_sum = 0.0
+        value_loss_sum = 0.0
+        total_loss_sum = 0.0
+        batch_count = 0
+
+        for start in range(0, sample_count, batch_size):
+            idx = perm[start : start + batch_size]
+            logits, values = model(obs_t[idx])
+            dist = masked_categorical(logits, masks_t[idx])
+            actor_loss = -dist.log_prob(actions_t[idx]).mean()
+
+            value_loss = torch.zeros((), device=device)
+            if cfg.bc_value_weight > 0:
+                mb_return_mask = returns_mask_t[idx]
+                valid_returns = torch.sum(mb_return_mask)
+                if float(valid_returns.detach().cpu().item()) > 0:
+                    sq_err = (values - returns_t[idx]) ** 2
+                    value_loss = 0.5 * torch.sum(sq_err * mb_return_mask) / valid_returns
+
+            total_loss = actor_loss + cfg.bc_value_weight * value_loss
+            optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            optimizer.step()
+
+            actor_loss_sum += float(actor_loss.detach().cpu().item())
+            value_loss_sum += float(value_loss.detach().cpu().item())
+            total_loss_sum += float(total_loss.detach().cpu().item())
+            batch_count += 1
+
+        denom = max(1, batch_count)
+        mean_actor_loss = actor_loss_sum / denom
+        mean_value_loss = value_loss_sum / denom
+        mean_total_loss = total_loss_sum / denom
+
+        epoch_log = {
+            "epoch": float(epoch),
+            "actor_loss": mean_actor_loss,
+            "value_loss": mean_value_loss,
+            "total_loss": mean_total_loss,
+        }
+        epoch_logs.append(epoch_log)
+        print(
+            "[bc] "
+            f"epoch={epoch}/{cfg.bc_epochs} "
+            f"actor={mean_actor_loss:.4f} "
+            f"value={mean_value_loss:.4f} "
+            f"total={mean_total_loss:.4f}"
+        )
+
+        if math.isfinite(mean_total_loss) and mean_total_loss < best_loss:
+            best_loss = mean_total_loss
+            best_state = {
+                key: tensor.detach().cpu().clone()
+                for key, tensor in model.state_dict().items()
+            }
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return {
+        "enabled": True,
+        "dataset_path": str(dataset_path),
+        "epochs": cfg.bc_epochs,
+        "batch_size": batch_size,
+        "learning_rate": cfg.bc_learning_rate,
+        "value_weight": cfg.bc_value_weight,
+        "dataset_stats": dataset_stats,
+        "best_total_loss": best_loss,
+        "epoch_logs": epoch_logs,
+    }
+
+
 def train(cfg: PPOConfig) -> None:
     set_global_seed(cfg.seed)
     device = choose_device(cfg.device)
@@ -382,11 +617,12 @@ def train(cfg: PPOConfig) -> None:
         action_dim = infer_action_dim(reset_result["action_masks"])
 
         model = PolicyValueNet(obs_dim, cfg.hidden_dim, action_dim).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+        optimizer: torch.optim.Optimizer
 
         global_step = 0
         start_update = 0
         if cfg.resume_checkpoint:
+            optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
             global_step, start_update = load_checkpoint(
                 checkpoint_path, model, optimizer, device
@@ -399,6 +635,18 @@ def train(cfg: PPOConfig) -> None:
             artifact_path = Path(cfg.init_artifact).resolve()
             load_from_artifact(model, artifact_path)
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
+
+        if not cfg.resume_checkpoint:
+            bc_stats = run_bc_pretrain(
+                model=model,
+                cfg=cfg,
+                device=device,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+            )
+            if bc_stats.get("enabled"):
+                write_json(out_dir / "bc_stats.json", bc_stats)
+            optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
 
         batch_size = cfg.num_envs * cfg.num_steps
         if cfg.minibatch_size > batch_size:
