@@ -49,4 +49,17 @@ export type StepBatchResult = {
   rewards: number[];
   dones: boolean[];
   infos: JsonObject[];
+  profile?: {
+    batch_total_s: number;
+    env_count: number;
+    step_env_total_s?: number;
+    step_choices_current_s?: number;
+    step_runner_s?: number;
+    step_reward_s?: number;
+    step_obs_s?: number;
+    step_choices_next_s?: number;
+    reset_env_total_s?: number;
+    reset_obs_s?: number;
+    reset_choices_s?: number;
+  };
 };

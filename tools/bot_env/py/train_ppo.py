@@ -371,6 +371,15 @@ def _is_finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
+def _profile_num(profile: Any, key: str) -> float:
+    if not isinstance(profile, dict):
+        return 0.0
+    value = profile.get(key)
+    if not _is_finite_number(value):
+        return 0.0
+    return float(value)
+
+
 def load_bc_dataset(
     dataset_path: Path,
     obs_dim: int,
@@ -691,6 +700,17 @@ def train(cfg: PPOConfig) -> None:
                 profile_policy_forward_s = 0.0
                 profile_env_step_s = 0.0
                 profile_env_reset_s = 0.0
+                profile_env_step_batch_s = 0.0
+                profile_env_step_core_s = 0.0
+                profile_env_step_choices_current_s = 0.0
+                profile_env_step_choices_next_s = 0.0
+                profile_env_step_runner_s = 0.0
+                profile_env_step_reward_s = 0.0
+                profile_env_step_obs_s = 0.0
+                profile_env_reset_batch_s = 0.0
+                profile_env_reset_core_s = 0.0
+                profile_env_reset_obs_s = 0.0
+                profile_env_reset_choices_s = 0.0
                 profile_gae_s = 0.0
                 profile_opt_s = 0.0
                 profile_io_s = 0.0
@@ -729,6 +749,18 @@ def train(cfg: PPOConfig) -> None:
                     env_step_start = time.perf_counter()
                     step_result = env.step_many(env_ids=env_ids, actions=actions_np)
                     profile_env_step_s += time.perf_counter() - env_step_start
+                    step_profile = step_result.get("profile", {})
+                    profile_env_step_batch_s += _profile_num(step_profile, "batch_total_s")
+                    profile_env_step_core_s += _profile_num(step_profile, "step_env_total_s")
+                    profile_env_step_choices_current_s += _profile_num(
+                        step_profile, "step_choices_current_s"
+                    )
+                    profile_env_step_choices_next_s += _profile_num(
+                        step_profile, "step_choices_next_s"
+                    )
+                    profile_env_step_runner_s += _profile_num(step_profile, "step_runner_s")
+                    profile_env_step_reward_s += _profile_num(step_profile, "step_reward_s")
+                    profile_env_step_obs_s += _profile_num(step_profile, "step_obs_s")
                     next_obs_np = np.asarray(step_result["obs"], dtype=np.float32)
                     next_mask_np = ensure_action_masks(
                         np.asarray(step_result["action_masks"], dtype=np.float32)
@@ -757,6 +789,19 @@ def train(cfg: PPOConfig) -> None:
                         env_reset_start = time.perf_counter()
                         reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
                         profile_env_reset_s += time.perf_counter() - env_reset_start
+                        reset_profile = reset_done.get("profile", {})
+                        profile_env_reset_batch_s += _profile_num(
+                            reset_profile, "batch_total_s"
+                        )
+                        profile_env_reset_core_s += _profile_num(
+                            reset_profile, "reset_env_total_s"
+                        )
+                        profile_env_reset_obs_s += _profile_num(
+                            reset_profile, "reset_obs_s"
+                        )
+                        profile_env_reset_choices_s += _profile_num(
+                            reset_profile, "reset_choices_s"
+                        )
                         reset_obs = np.asarray(reset_done["obs"], dtype=np.float32)
                         reset_masks = ensure_action_masks(
                             np.asarray(reset_done["action_masks"], dtype=np.float32)
@@ -926,6 +971,19 @@ def train(cfg: PPOConfig) -> None:
                 stats["profile_rollout_s"] = profile_rollout_s
                 stats["profile_env_step_s"] = profile_env_step_s
                 stats["profile_env_reset_s"] = profile_env_reset_s
+                stats["profile_env_step_batch_s"] = profile_env_step_batch_s
+                stats["profile_env_step_core_s"] = profile_env_step_core_s
+                stats["profile_env_step_choices_current_s"] = (
+                    profile_env_step_choices_current_s
+                )
+                stats["profile_env_step_choices_next_s"] = profile_env_step_choices_next_s
+                stats["profile_env_step_runner_s"] = profile_env_step_runner_s
+                stats["profile_env_step_reward_s"] = profile_env_step_reward_s
+                stats["profile_env_step_obs_s"] = profile_env_step_obs_s
+                stats["profile_env_reset_batch_s"] = profile_env_reset_batch_s
+                stats["profile_env_reset_core_s"] = profile_env_reset_core_s
+                stats["profile_env_reset_obs_s"] = profile_env_reset_obs_s
+                stats["profile_env_reset_choices_s"] = profile_env_reset_choices_s
                 stats["profile_policy_forward_s"] = profile_policy_forward_s
                 stats["profile_gae_s"] = profile_gae_s
                 stats["profile_opt_s"] = profile_opt_s
@@ -972,6 +1030,15 @@ def train(cfg: PPOConfig) -> None:
 
                 if update % cfg.log_every_updates == 0 or update == 1 or update == num_updates:
                     profile_env_total_s = profile_env_step_s + profile_env_reset_s
+                    profile_env_batch_s = profile_env_step_batch_s + profile_env_reset_batch_s
+                    profile_env_core_s = profile_env_step_core_s + profile_env_reset_core_s
+                    profile_env_choices_s = (
+                        profile_env_step_choices_current_s
+                        + profile_env_step_choices_next_s
+                        + profile_env_reset_choices_s
+                    )
+                    profile_env_obs_s = profile_env_step_obs_s + profile_env_reset_obs_s
+                    profile_env_ipc_s = max(0.0, profile_env_total_s - profile_env_batch_s)
                     profile_accounted_s = (
                         profile_rollout_s
                         + profile_gae_s
@@ -994,6 +1061,13 @@ def train(cfg: PPOConfig) -> None:
                         f"t_upd={update_seconds:.2f}s "
                         f"t_roll={profile_rollout_s:.2f}s "
                         f"t_env={profile_env_total_s:.2f}s "
+                        f"t_env_batch={profile_env_batch_s:.2f}s "
+                        f"t_env_core={profile_env_core_s:.2f}s "
+                        f"t_env_ipc={profile_env_ipc_s:.2f}s "
+                        f"t_env_runner={profile_env_step_runner_s:.2f}s "
+                        f"t_env_choices={profile_env_choices_s:.2f}s "
+                        f"t_env_obs={profile_env_obs_s:.2f}s "
+                        f"t_env_reward={profile_env_step_reward_s:.2f}s "
                         f"t_fwd={profile_policy_forward_s:.2f}s "
                         f"t_gae={profile_gae_s:.2f}s "
                         f"t_opt={profile_opt_s:.2f}s "

@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 
 import {
   applyModeSettings,
@@ -287,6 +288,21 @@ class OneFrameInputSource implements InputSource {
   }
 }
 
+type BotEnvResetProfile = {
+  total_s: number;
+  obs_s: number;
+  choices_s: number;
+};
+
+type BotEnvStepProfile = {
+  total_s: number;
+  choices_current_s: number;
+  runner_s: number;
+  reward_s: number;
+  obs_s: number;
+  choices_next_s: number;
+};
+
 class BotEnv {
   private game: Game;
   private runner: GameRunner;
@@ -320,26 +336,38 @@ class BotEnv {
     obs: number[];
     actionMask: number[];
     info: JsonObject;
+    profile: BotEnvResetProfile;
   } {
+    const resetStart = performance.now();
     const built = this.buildGame(seed);
     this.game = built.game;
     this.runner = built.runner;
     this.done = false;
     this.piecesPlaced = 0;
     this.lockCount = 0;
+    const choicesStart = performance.now();
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
     );
+    const choicesElapsedS = (performance.now() - choicesStart) / 1000;
     this.syncPrevMetrics();
+    const obsStart = performance.now();
     const obs = encodeObservation(this.model, this.game.state);
+    const obsElapsedS = (performance.now() - obsStart) / 1000;
     const choices = this.cachedChoices;
+    const totalElapsedS = (performance.now() - resetStart) / 1000;
     return {
       obs,
       actionMask: choices?.actionMask ?? [],
       info: {
         modeId: this.modeId,
         seed,
+      },
+      profile: {
+        total_s: totalElapsedS,
+        obs_s: obsElapsedS,
+        choices_s: choicesElapsedS,
       },
     };
   }
@@ -350,28 +378,44 @@ class BotEnv {
     reward: number;
     done: boolean;
     info: JsonObject;
+    profile: BotEnvStepProfile;
   } {
+    const stepStart = performance.now();
     if (this.done) {
+      const doneChoicesStart = performance.now();
       const obs = encodeObservation(this.model, this.game.state);
       const choices =
         this.cachedChoices ??
         buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
       this.cachedChoices = choices;
+      const doneChoicesElapsedS = (performance.now() - doneChoicesStart) / 1000;
+      const totalElapsedS = (performance.now() - stepStart) / 1000;
       return {
         obs,
         actionMask: choices.actionMask,
         reward: 0,
         done: true,
         info: { alreadyDone: true, piecesPlaced: this.piecesPlaced },
+        profile: {
+          total_s: totalElapsedS,
+          choices_current_s: doneChoicesElapsedS,
+          runner_s: 0,
+          reward_s: 0,
+          obs_s: 0,
+          choices_next_s: 0,
+        },
       };
     }
 
     const beforeLockCount = this.lockCount;
     const before = this.snapshotMetrics();
+    const choicesCurrentStart = performance.now();
     const choices =
       this.cachedChoices ??
       buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
     this.cachedChoices = choices;
+    const choicesCurrentElapsedS =
+      (performance.now() - choicesCurrentStart) / 1000;
     const actionIndex = clampInt(actionIndexRaw, 0, 0, DEFAULT_ACTION_DIM - 1);
     const hasAction = choices.actionMask[actionIndex] > 0;
     const resolvedActionIndex = hasAction
@@ -386,6 +430,7 @@ class BotEnv {
 
     let ticks = 0;
     const stepFrames = [...commands];
+    const runnerStart = performance.now();
     while (
       !this.isTerminal() &&
       this.lockCount === beforeLockCount &&
@@ -409,11 +454,13 @@ class BotEnv {
       );
       ticks += 1;
     }
+    const runnerElapsedS = (performance.now() - runnerStart) / 1000;
 
     if (this.lockCount > beforeLockCount) {
       this.piecesPlaced += 1;
     }
 
+    const rewardStart = performance.now();
     const after = this.snapshotMetrics();
     const blocks = countBoardBlocks(this.game.state.board);
     const warmupProgress = clamp(
@@ -430,18 +477,24 @@ class BotEnv {
       boardScoreDelta: before.boardScore - after.boardScore,
       charcuterieWarmupProgress: warmupProgress,
     });
+    const rewardElapsedS = (performance.now() - rewardStart) / 1000;
 
     this.syncPrevMetrics();
     if (this.isTerminal() || this.piecesPlaced >= this.maxPiecesPerEpisode) {
       this.done = true;
     }
 
+    const obsStart = performance.now();
     const obs = encodeObservation(this.model, this.game.state);
+    const obsElapsedS = (performance.now() - obsStart) / 1000;
+    const choicesNextStart = performance.now();
     const nextChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
     );
+    const choicesNextElapsedS = (performance.now() - choicesNextStart) / 1000;
     this.cachedChoices = nextChoices;
+    const totalElapsedS = (performance.now() - stepStart) / 1000;
     return {
       obs,
       actionMask: nextChoices.actionMask,
@@ -454,6 +507,14 @@ class BotEnv {
         ticks,
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
+      },
+      profile: {
+        total_s: totalElapsedS,
+        choices_current_s: choicesCurrentElapsedS,
+        runner_s: runnerElapsedS,
+        reward_s: rewardElapsedS,
+        obs_s: obsElapsedS,
+        choices_next_s: choicesNextElapsedS,
       },
     };
   }
@@ -581,11 +642,15 @@ export class BotEnvPool {
   }
 
   resetMany(envIds: number[], seeds: number[]): StepBatchResult {
+    const batchStart = performance.now();
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
+    let resetEnvTotalS = 0;
+    let resetObsS = 0;
+    let resetChoicesS = 0;
     for (let i = 0; i < envIds.length; i += 1) {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
@@ -596,16 +661,39 @@ export class BotEnvPool {
       rewards.push(0);
       dones.push(false);
       infos.push(out.info);
+      resetEnvTotalS += out.profile.total_s;
+      resetObsS += out.profile.obs_s;
+      resetChoicesS += out.profile.choices_s;
     }
-    return { obs, action_masks: actionMasks, rewards, dones, infos };
+    return {
+      obs,
+      action_masks: actionMasks,
+      rewards,
+      dones,
+      infos,
+      profile: {
+        batch_total_s: (performance.now() - batchStart) / 1000,
+        env_count: envIds.length,
+        reset_env_total_s: resetEnvTotalS,
+        reset_obs_s: resetObsS,
+        reset_choices_s: resetChoicesS,
+      },
+    };
   }
 
   stepMany(envIds: number[], actions: number[]): StepBatchResult {
+    const batchStart = performance.now();
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
+    let stepEnvTotalS = 0;
+    let stepChoicesCurrentS = 0;
+    let stepRunnerS = 0;
+    let stepRewardS = 0;
+    let stepObsS = 0;
+    let stepChoicesNextS = 0;
     for (let i = 0; i < envIds.length; i += 1) {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
@@ -616,8 +704,30 @@ export class BotEnvPool {
       rewards.push(out.reward);
       dones.push(out.done);
       infos.push(out.info);
+      stepEnvTotalS += out.profile.total_s;
+      stepChoicesCurrentS += out.profile.choices_current_s;
+      stepRunnerS += out.profile.runner_s;
+      stepRewardS += out.profile.reward_s;
+      stepObsS += out.profile.obs_s;
+      stepChoicesNextS += out.profile.choices_next_s;
     }
-    return { obs, action_masks: actionMasks, rewards, dones, infos };
+    return {
+      obs,
+      action_masks: actionMasks,
+      rewards,
+      dones,
+      infos,
+      profile: {
+        batch_total_s: (performance.now() - batchStart) / 1000,
+        env_count: envIds.length,
+        step_env_total_s: stepEnvTotalS,
+        step_choices_current_s: stepChoicesCurrentS,
+        step_runner_s: stepRunnerS,
+        step_reward_s: stepRewardS,
+        step_obs_s: stepObsS,
+        step_choices_next_s: stepChoicesNextS,
+      },
+    };
   }
 
   listEnvIds(): number[] {
