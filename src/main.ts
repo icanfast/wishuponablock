@@ -3720,6 +3720,12 @@ async function boot() {
     });
     sessionController.setMode(mode, options);
     void (async () => {
+      if (botGuiInspectEnabled) {
+        // Bot GUI inspect applies its own timing config. A background
+        // mode-change sync can rebuild the session and silently restore
+        // normal gravity/lock delays, so we skip sync while inspect is active.
+        return;
+      }
       await autoSavePersonalModelIfDirty(previousMode, 'mode_change');
       await syncActiveModelForContext({
         mode: mode.id,
