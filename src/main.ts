@@ -63,7 +63,10 @@ import {
 import { createPersonalTrainerTfjs } from './app/personalTrainerTfjs';
 import { runGlobalTrainingOneShot } from './app/globalTrainerTfjs';
 import { resolvePersonalTrainingPipelineForContext } from './app/trainingPipelines';
-import { createTrajectoryReplayGuiInputSource } from './app/trajectoryReplayGuiInputSource';
+import {
+  createTrajectoryReplayGuiInputSource,
+  type TrajectoryReplayGuiInputSource,
+} from './app/trajectoryReplayGuiInputSource';
 import {
   createGuiInspectBotInputSource,
   generateBotTrajectoryBatch,
@@ -591,8 +594,9 @@ async function boot() {
   let manualInputSource = inputService.getInputSource();
   let botGuiInputSource: InputSource | null = null;
   let botGuiInspectEnabled = false;
-  let replayGuiInputSource: InputSource | null = null;
+  let replayGuiInputSource: TrajectoryReplayGuiInputSource | null = null;
   let replayGuiInspectEnabled = false;
+  let replayExecutorStepMode = false;
   let replayDirectTicker: ((ticker: Ticker) => void) | null = null;
   let replayDirectRunning = false;
   let replayExecutorTargetGhost: ActivePiece | null = null;
@@ -2213,7 +2217,9 @@ async function boot() {
     stopReplayDirectPlayback();
     replayGuiInspectEnabled = false;
     replayGuiInputSource = null;
+    replayExecutorStepMode = false;
     setReplayExecutorTargetGhost(null);
+    replayUi?.setStepButtonVisible(false);
     runtime?.setInputSource(NullInputSource);
     runtime?.setPausedByMenu(true);
     replayUi?.setStatus('Replay stopped.');
@@ -2249,6 +2255,8 @@ async function boot() {
     const fixedIntervalMs = Math.max(16, 60_000 / apmInput);
     stopAdminBotGuiInspect();
     stopAdminReplayMode();
+    replayExecutorStepMode = false;
+    replayUi?.setStepButtonVisible(false);
     setReplayExecutorTargetGhost(null);
     modeController.startPractice();
     sessionController.rebuildSession();
@@ -2337,6 +2345,7 @@ async function boot() {
 
   const startAdminReplayExecutorGui = async (options?: {
     apmInput?: number;
+    stepMode?: boolean;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -2361,19 +2370,23 @@ async function boot() {
       20,
       Math.min(1200, Math.trunc(options?.apmInput ?? 60)),
     );
+    const stepMode = options?.stepMode === true;
     stopAdminBotGuiInspect();
     stopReplayDirectPlayback();
     setReplayExecutorTargetGhost(null);
     replayGuiInputSource = createTrajectoryReplayGuiInputSource({
       session: loaded,
       apmInput,
+      executionMode: stepMode ? 'step' : 'apm',
       onLog: appendReplayUiLog,
       onTargetGhostChange: (target) =>
         setReplayExecutorTargetGhost(target?.ghost ?? null),
       onComplete: (stats) => {
         replayGuiInspectEnabled = false;
         replayGuiInputSource = null;
+        replayExecutorStepMode = false;
         setReplayExecutorTargetGhost(null);
+        replayUi?.setStepButtonVisible(false);
         runtime?.setInputSource(NullInputSource);
         runtime?.setPausedByMenu(true);
         appendReplayUiLog(
@@ -2386,6 +2399,7 @@ async function boot() {
       },
     });
     replayGuiInspectEnabled = true;
+    replayExecutorStepMode = stepMode;
     modeController.startPractice();
     sessionController.rebuildSession();
     await screenManager.setActive('replay');
@@ -2398,6 +2412,7 @@ async function boot() {
     runtime?.setInputSource(replayGuiInputSource ?? NullInputSource);
     runtime?.setPausedByMenu(false);
     runtime?.renderNow();
+    replayUi?.setStepButtonVisible(stepMode);
     clearReplayUiLog();
     replayUi?.setDetails(
       [
@@ -2405,16 +2420,20 @@ async function boot() {
         `Mode: ${loaded.modeId}`,
         `Build: ${loaded.buildVersion}`,
         `Replay steps: ${replaySteps.length}`,
-        `Executor APM: ${apmInput}`,
+        `Executor mode: ${stepMode ? 'step-by-step' : `fixed @ ${apmInput} APM`}`,
       ].join('\n'),
     );
-    replayUi?.setStatus('Replay executor running...');
+    replayUi?.setStatus(
+      stepMode
+        ? 'Replay executor waiting for NEXT INPUT...'
+        : 'Replay executor running...',
+    );
     if (bootstrap.bootstrapNotice) {
       appendReplayUiLog(`[replay-exec] ${bootstrap.bootstrapNotice}`);
     }
     return (
       `Replay executor GUI started for session ${loaded.sessionId}. ` +
-      `APM=${apmInput}, replay_steps=${replaySteps.length}. ` +
+      `mode=${stepMode ? 'step' : `apm:${apmInput}`}, replay_steps=${replaySteps.length}. ` +
       `Logs are visible in Replay screen and console.` +
       (bootstrap.bootstrapNotice ? ` ${bootstrap.bootstrapNotice}` : '')
     );
@@ -3914,6 +3933,19 @@ async function boot() {
       await screenManager.setActive('menu');
       menuUi?.show('replay_lab');
     })();
+  });
+
+  replayUi.stepButton.addEventListener('click', () => {
+    if (
+      !replayGuiInspectEnabled ||
+      !replayExecutorStepMode ||
+      !replayGuiInputSource?.isStepMode
+    ) {
+      return;
+    }
+    replayGuiInputSource.requestStep();
+    replayUi?.setStatus('Replay executor stepping...');
+    runtime?.renderNow();
   });
 
   let startingGame = false;

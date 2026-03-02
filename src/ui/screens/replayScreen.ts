@@ -10,11 +10,13 @@ import type { PieceKind } from '../../core/types';
 export type ReplayScreen = {
   root: HTMLDivElement;
   backButton: HTMLButtonElement;
+  stepButton: HTMLButtonElement;
   setStatus: (value: string) => void;
   setDetails: (value: string) => void;
   appendLog: (line: string) => void;
   clearLog: () => void;
   setHoldValue: (value: PieceKind | null) => void;
+  setStepButtonVisible: (visible: boolean) => void;
 };
 
 const makeButton = (labelText: string): HTMLButtonElement => {
@@ -54,6 +56,19 @@ export const createReplayScreen = (): ReplayScreen => {
   });
   root.appendChild(backButton);
 
+  const stepButton = makeButton('NEXT INPUT');
+  Object.assign(stepButton.style, {
+    position: 'absolute',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    top: `${BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP + REPLAY_VIEW_Y_OFFSET - 48}px`,
+    width: `${COLS * BOARD_CELL_PX}px`,
+    pointerEvents: 'auto',
+    zIndex: '3',
+    display: 'none',
+  });
+  root.appendChild(stepButton);
+
   const holdValue = document.createElement('div');
   holdValue.textContent = 'HOLD: -';
   Object.assign(holdValue.style, {
@@ -76,13 +91,19 @@ export const createReplayScreen = (): ReplayScreen => {
     holdValue.textContent = `HOLD: ${value ?? '-'}`;
   };
 
+  const setStepButtonVisible = (visible: boolean): void => {
+    stepButton.style.display = visible ? 'block' : 'none';
+  };
+
   return {
     root,
     backButton,
+    stepButton,
     setStatus: () => {},
     setDetails: () => {},
     appendLog: () => {},
     clearLog: () => {},
     setHoldValue,
+    setStepButtonVisible,
   };
 };

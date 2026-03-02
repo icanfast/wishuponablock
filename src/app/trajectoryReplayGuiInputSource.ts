@@ -4,6 +4,7 @@ import {
   planTrajectoryLockExecution,
   trajectoryExecutorCommandToInputFrame,
 } from '../core/trajectoryExecutor';
+import type { TrajectoryExecutorCommand } from '../core/trajectoryExecutor';
 import type {
   TrajectoryReplayStepV1,
   TrajectorySessionV1,
@@ -49,12 +50,19 @@ export type TrajectoryReplayGuiRunStats = {
 export type TrajectoryReplayGuiInputSourceConfig = {
   session: TrajectorySessionV1;
   apmInput: number;
+  executionMode?: 'apm' | 'step';
   allowSoftDrop?: boolean;
   maxNodes?: number;
   stopOnParityMismatch?: boolean;
+  debugTrace?: boolean;
   onLog?: (line: string) => void;
   onTargetGhostChange?: (target: ReplayExecutorTargetGhost | null) => void;
   onComplete?: (stats: TrajectoryReplayGuiRunStats) => void;
+};
+
+export type TrajectoryReplayGuiInputSource = InputSource & {
+  isStepMode: boolean;
+  requestStep: () => void;
 };
 
 const boardToOccupancy = (board: GameState['board']): number[][] =>
@@ -127,6 +135,29 @@ const normalizeRotation = (value: number): 0 | 1 | 2 | 3 => {
   return 0;
 };
 
+const commandToDebugString = (command: TrajectoryExecutorCommand): string => {
+  switch (command) {
+    case 'left':
+      return 'L';
+    case 'right':
+      return 'R';
+    case 'rotate_cw':
+      return 'CW';
+    case 'rotate_ccw':
+      return 'CCW';
+    case 'rotate_180':
+      return 'R180';
+    case 'soft_drop':
+      return 'SD';
+    case 'hard_drop':
+      return 'HD';
+    case 'hold':
+      return 'HOLD';
+    default:
+      return String(command);
+  }
+};
+
 const coerceActiveForTarget = (
   state: GameState,
   lockPiece: PieceKind,
@@ -192,7 +223,7 @@ const buildPlanVariants = (replay: TrajectoryReplayStepV1): PlanVariant[] => {
 
 export const createTrajectoryReplayGuiInputSource = (
   config: TrajectoryReplayGuiInputSourceConfig,
-): InputSource => {
+): TrajectoryReplayGuiInputSource => {
   const allEntries: ReplayEntry[] = config.session.samples.map(
     (sample, index) => ({ sample, index }),
   );
@@ -202,14 +233,18 @@ export const createTrajectoryReplayGuiInputSource = (
   );
   const clampApm = Math.min(1200, Math.max(20, Math.trunc(config.apmInput)));
   const actionIntervalMs = 60_000 / clampApm;
+  const stepMode = config.executionMode === 'step';
   const log = (line: string) => config.onLog?.(`[replay-exec] ${line}`);
   const maxNodes = Math.max(1, Math.trunc(config.maxNodes ?? 30_000));
   const allowSoftDrop = config.allowSoftDrop !== false;
   const stopOnParityMismatch = config.stopOnParityMismatch !== false;
+  const debugTrace = config.debugTrace !== false;
 
   let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
+  let commandQueue: TrajectoryExecutorCommand[] = [];
   let cooldownMs = 0;
+  let manualStepBudget = 0;
   let sampleCursor = 0;
   let pendingCheck: ReplayEntry | null = null;
   let finished = false;
@@ -353,6 +388,7 @@ export const createTrajectoryReplayGuiInputSource = (
       queue = planned.result.commands.map((command) =>
         trajectoryExecutorCommandToInputFrame(command),
       );
+      commandQueue = [...planned.result.commands];
       config.onTargetGhostChange?.({
         sampleIndex: entry.index,
         ghost: {
@@ -368,6 +404,15 @@ export const createTrajectoryReplayGuiInputSource = (
           `depth=${planned.result.searchDepth}, visited=${planned.result.visitedNodes}, ` +
           `variant=${planned.label}.`,
       );
+      if (debugTrace) {
+        const commandTrace =
+          planned.result.commands.map(commandToDebugString).join(' -> ') ||
+          '(none)';
+        log(
+          `debug sample #${entry.index}: target={piece:${replay.lockPiece},rot:${replay.lockRotation},x:${replay.lockX},y:${replay.lockY},holdUsed:${replay.holdUsed}} ` +
+            `plan=[${commandTrace}]`,
+        );
+      }
       return;
     }
     complete();
@@ -380,6 +425,7 @@ export const createTrajectoryReplayGuiInputSource = (
       if (state.active !== activeRef) {
         activeRef = state.active;
         queue = [];
+        commandQueue = [];
         planNextForActive(state);
       }
       if (finished || queue.length === 0) {
@@ -399,16 +445,30 @@ export const createTrajectoryReplayGuiInputSource = (
         }
         return EMPTY_INPUT;
       }
-      if (cooldownMs > 0) return EMPTY_INPUT;
-      cooldownMs = actionIntervalMs;
+      if (stepMode) {
+        if (manualStepBudget <= 0) return EMPTY_INPUT;
+        manualStepBudget -= 1;
+      } else {
+        if (cooldownMs > 0) return EMPTY_INPUT;
+        cooldownMs = actionIntervalMs;
+      }
       const frame = queue.shift() ?? EMPTY_INPUT;
+      const command = commandQueue.shift() ?? null;
+      if (debugTrace && command) {
+        const targetSampleIndex = pendingCheck?.index ?? null;
+        log(
+          `debug emit sample #${targetSampleIndex ?? 'n/a'}: command=${commandToDebugString(command)} frame={moveX:${frame.moveX},rotate:${frame.rotate},rotate180:${frame.rotate180 ? 1 : 0},softDrop:${frame.softDrop ? 1 : 0},hardDrop:${frame.hardDrop ? 1 : 0},hold:${frame.hold ? 1 : 0}} remaining=${commandQueue.length}.`,
+        );
+      }
       stats.commandsEmitted += 1;
       return frame;
     },
     reset: () => {
       activeRef = null;
       queue = [];
+      commandQueue = [];
       cooldownMs = 0;
+      manualStepBudget = 0;
       sampleCursor = 0;
       pendingCheck = null;
       finished = false;
@@ -418,6 +478,16 @@ export const createTrajectoryReplayGuiInputSource = (
       stats.failedBoardChecks = 0;
       stats.failedPlans = 0;
       stats.commandsEmitted = 0;
+    },
+    isStepMode: stepMode,
+    requestStep: () => {
+      if (!stepMode || finished) return;
+      manualStepBudget += 1;
+      if (debugTrace) {
+        log(
+          `debug manual step granted: budget=${manualStepBudget}, pending_commands=${commandQueue.length}.`,
+        );
+      }
     },
   };
 };

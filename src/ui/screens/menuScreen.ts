@@ -291,6 +291,7 @@ export type MenuScreenOptions = {
   }) => Promise<string>;
   onAdminStartReplayExecutorGui: (options?: {
     apmInput?: number;
+    stepMode?: boolean;
   }) => Promise<string>;
   onAdminStopReplayMode: () => Promise<string> | string;
   onAdminTrainBotPolicyOneShot: (options: {
@@ -3178,6 +3179,21 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
+  const replayLabExecutorStepModeLabel = document.createElement('label');
+  Object.assign(replayLabExecutorStepModeLabel.style, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    color: '#b6c2d4',
+    fontSize: '12px',
+  });
+  const replayLabExecutorStepModeToggle = document.createElement('input');
+  replayLabExecutorStepModeToggle.type = 'checkbox';
+  replayLabExecutorStepModeToggle.checked = false;
+  replayLabExecutorStepModeLabel.appendChild(replayLabExecutorStepModeToggle);
+  replayLabExecutorStepModeLabel.appendChild(
+    document.createTextNode('executor step mode (manual NEXT INPUT)'),
+  );
   const replayLabButtons = document.createElement('div');
   Object.assign(replayLabButtons.style, {
     display: 'flex',
@@ -3194,6 +3210,7 @@ input[type=number] {
   Object.assign(replayLabBackButton.style, { marginTop: 'auto' });
   replayLabControls.appendChild(replayLabApmInput);
   replayLabControls.appendChild(replayLabClockSelect);
+  replayLabControls.appendChild(replayLabExecutorStepModeLabel);
   replayLabControls.appendChild(replayLabButtons);
   replayLabPanel.appendChild(replayLabTitle);
   replayLabPanel.appendChild(replayLabSummary);
@@ -4276,6 +4293,7 @@ input[type=number] {
     replayLabSummary.textContent = formatReplayLabSummary(isAdmin);
     replayLabApmInput.disabled = !isAdmin || busy;
     replayLabClockSelect.disabled = !isAdmin || busy;
+    replayLabExecutorStepModeToggle.disabled = !isAdmin || busy;
     replayLabRunRecordingButton.disabled = !isAdmin || busy;
     replayLabRunExecutorButton.disabled = !isAdmin || busy;
     replayLabStopButton.disabled = !isAdmin || busy;
@@ -5377,10 +5395,12 @@ input[type=number] {
     if (replayLabPending) return;
     replayLabPending = true;
     const requestedApm = parsePositiveIntInput(replayLabApmInput);
+    const requestedStepMode = replayLabExecutorStepModeToggle.checked;
     const debugPayload = onAdminGetReplayExecutorDebug();
     console.info('[replay-exec] run button debug', {
       selectedRecordingId: adminSelectedRecordingId,
       requestedApm,
+      requestedStepMode,
       ...debugPayload,
     });
     setReplayLabStatus('Starting replay executor...');
@@ -5388,6 +5408,7 @@ input[type=number] {
     try {
       const message = await onAdminStartReplayExecutorGui({
         apmInput: requestedApm,
+        stepMode: requestedStepMode,
       });
       setReplayLabStatus(message, 'success');
     } catch (error) {
