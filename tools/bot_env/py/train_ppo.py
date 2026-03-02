@@ -49,6 +49,9 @@ class PPOConfig:
     update_epochs: int
     minibatch_size: int
     target_kl: float
+    warmup_updates: int
+    warmup_ent_coef: float
+    warmup_target_kl: float
     device: str
     save_every_updates: int
     log_every_updates: int
@@ -113,6 +116,7 @@ class IdentityObservationAdapter(ObservationAdapter):
 class WubHeadFromRawObservationAdapter(ObservationAdapter):
     def __init__(self, raw_obs_dim: int, model_path: str) -> None:
         model_json = json.loads(Path(model_path).read_text(encoding="utf-8"))
+        self.model_schema = str(model_json.get("schema", "wishuponablock.model.v1"))
         model_cfg = model_json.get("model", {})
         params = model_json.get("params", {})
 
@@ -148,6 +152,7 @@ class WubHeadFromRawObservationAdapter(ObservationAdapter):
             model_pieces = [str(x) for x in model_pieces_raw]
         else:
             model_pieces = list(RAW_PIECES_ORDER)
+        self.model_pieces = list(model_pieces)
         model_piece_index = {piece: i for i, piece in enumerate(model_pieces)}
         hold_map = [0]
         for piece in RAW_PIECES_ORDER:
@@ -220,11 +225,14 @@ class WubHeadFromRawObservationAdapter(ObservationAdapter):
         self.register_buffer("coord_x", coord_x, persistent=False)
         self.register_buffer("coord_y", coord_y, persistent=False)
         self.conv_layers = nn.ModuleList(layers)
+        self.conv_channels = [int(v) for v in conv_channels]
         self.pool_shape = (pool_h, pool_w)
         self.extra_features = extra_features_norm
         self.feature_norm = feature_norm
         self.feature_norm_eps = feature_norm_eps
         self.input_channels = input_channels
+        self.num_outputs = int(model_cfg.get("num_outputs", len(RAW_PIECES_ORDER)))
+        self.mlp_hidden = int(model_cfg.get("mlp_hidden", 0))
 
     def _compute_reachable_empty(self, empty: torch.Tensor) -> torch.Tensor:
         # empty: [B, R, C] bool
@@ -352,6 +360,82 @@ class WubHeadFromRawObservationAdapter(ObservationAdapter):
             )
         return features
 
+    def to_exported_encoder_model(self) -> dict[str, Any]:
+        params: dict[str, dict[str, Any]] = {}
+        for i, conv in enumerate(self.conv_layers):
+            layer_index = i * 2
+            weight = conv.weight.detach().cpu().numpy().astype(np.float32)
+            bias = conv.bias.detach().cpu().numpy().astype(np.float32)
+            params[f"conv.{layer_index}.weight"] = {
+                "shape": [int(v) for v in weight.shape],
+                "data": weight.reshape(-1).tolist(),
+            }
+            params[f"conv.{layer_index}.bias"] = {
+                "shape": [int(v) for v in bias.shape],
+                "data": bias.reshape(-1).tolist(),
+            }
+        return {
+            "schema": self.model_schema,
+            "model": {
+                "input_channels": int(self.input_channels),
+                "conv_channels": [int(v) for v in self.conv_channels],
+                "mlp_hidden": int(self.mlp_hidden),
+                "extra_features": int(self.extra_features),
+                "num_outputs": int(self.num_outputs),
+                "pool_shape": [int(self.pool_shape[0]), int(self.pool_shape[1])],
+                "feature_norm": self.feature_norm,
+                "feature_norm_eps": float(self.feature_norm_eps),
+            },
+            "params": params,
+            "pieces": [str(v) for v in self.model_pieces],
+            "board_channels": [str(v) for v in self.board_channels],
+        }
+
+    def load_from_exported_encoder_model(self, payload: dict[str, Any]) -> None:
+        model = payload.get("model", {})
+        params = payload.get("params", {})
+        if not isinstance(model, dict) or not isinstance(params, dict):
+            raise ValueError("Invalid encoderModel payload structure.")
+        conv_channels = [int(v) for v in model.get("conv_channels", [])]
+        if conv_channels != self.conv_channels:
+            raise ValueError(
+                "encoderModel conv_channels mismatch. "
+                f"artifact={conv_channels} runtime={self.conv_channels}"
+            )
+        input_channels = int(model.get("input_channels", 0))
+        if input_channels != self.input_channels:
+            raise ValueError(
+                "encoderModel input_channels mismatch. "
+                f"artifact={input_channels} runtime={self.input_channels}"
+            )
+        for i, conv in enumerate(self.conv_layers):
+            layer_index = i * 2
+            weight_payload = params.get(f"conv.{layer_index}.weight")
+            bias_payload = params.get(f"conv.{layer_index}.bias")
+            if not isinstance(weight_payload, dict) or not isinstance(bias_payload, dict):
+                raise ValueError(f"encoderModel missing conv layer params at index={i}.")
+            weight_shape = weight_payload.get("shape")
+            bias_shape = bias_payload.get("shape")
+            weight_data = np.asarray(weight_payload.get("data", []), dtype=np.float32)
+            bias_data = np.asarray(bias_payload.get("data", []), dtype=np.float32)
+            if not isinstance(weight_shape, list) or not isinstance(bias_shape, list):
+                raise ValueError(f"encoderModel invalid tensor shape for layer={i}.")
+            weight_tensor = torch.from_numpy(weight_data).view(*[int(v) for v in weight_shape])
+            bias_tensor = torch.from_numpy(bias_data).view(*[int(v) for v in bias_shape])
+            if tuple(weight_tensor.shape) != tuple(conv.weight.shape):
+                raise ValueError(
+                    "encoderModel weight shape mismatch. "
+                    f"artifact={tuple(weight_tensor.shape)} runtime={tuple(conv.weight.shape)}"
+                )
+            if tuple(bias_tensor.shape) != tuple(conv.bias.shape):
+                raise ValueError(
+                    "encoderModel bias shape mismatch. "
+                    f"artifact={tuple(bias_tensor.shape)} runtime={tuple(conv.bias.shape)}"
+                )
+            with torch.no_grad():
+                conv.weight.copy_(weight_tensor)
+                conv.bias.copy_(bias_tensor)
+
 
 def parse_args() -> PPOConfig:
     parser = argparse.ArgumentParser(
@@ -378,13 +462,20 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
-    parser.add_argument("--clip-vloss", action="store_true")
+    parser.add_argument(
+        "--clip-vloss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--update-epochs", type=int, default=8)
     parser.add_argument("--minibatch-size", type=int, default=1024)
     parser.add_argument("--target-kl", type=float, default=0.02)
+    parser.add_argument("--warmup-updates", type=int, default=50)
+    parser.add_argument("--warmup-ent-coef", type=float, default=0.001)
+    parser.add_argument("--warmup-target-kl", type=float, default=0.01)
 
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-every-updates", type=int, default=10)
@@ -446,6 +537,9 @@ def parse_args() -> PPOConfig:
         update_epochs=max(1, int(args.update_epochs)),
         minibatch_size=max(1, int(args.minibatch_size)),
         target_kl=max(0.0, float(args.target_kl)),
+        warmup_updates=max(0, int(args.warmup_updates)),
+        warmup_ent_coef=max(0.0, float(args.warmup_ent_coef)),
+        warmup_target_kl=max(0.0, float(args.warmup_target_kl)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
         log_every_updates=max(1, int(args.log_every_updates)),
@@ -484,7 +578,10 @@ def choose_device(device_name: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def ensure_action_masks(mask_np: np.ndarray) -> np.ndarray:
+def ensure_action_masks(
+    mask_np: np.ndarray,
+    repair_stats: dict[str, int] | None = None,
+) -> np.ndarray:
     # Guarantee at least one valid action per env row.
     mask = np.asarray(mask_np, dtype=np.float32)
     if mask.ndim != 2:
@@ -492,7 +589,12 @@ def ensure_action_masks(mask_np: np.ndarray) -> np.ndarray:
     valid_counts = mask.sum(axis=1)
     invalid_rows = np.where(valid_counts <= 0)[0]
     if invalid_rows.size > 0:
-        mask[invalid_rows, :] = 1.0
+        if repair_stats is not None:
+            repair_stats["rows"] = repair_stats.get("rows", 0) + int(invalid_rows.size)
+            repair_stats["batches"] = repair_stats.get("batches", 0) + 1
+        # Safe fallback: force a single deterministic action slot (0).
+        mask[invalid_rows, :] = 0.0
+        mask[invalid_rows, 0] = 1.0
     return mask
 
 
@@ -534,6 +636,7 @@ def trainable_parameters(
 
 def export_bot_policy_artifact(
     model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
     cfg: PPOConfig,
     obs_dim: int,
     action_dim: int,
@@ -574,10 +677,16 @@ def export_bot_policy_artifact(
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
     }
+    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+        artifact["encoderModel"] = obs_adapter.to_exported_encoder_model()
     return artifact
 
 
-def load_from_artifact(model: PolicyValueNet, artifact_path: Path) -> str:
+def load_from_artifact(
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    artifact_path: Path,
+) -> str:
     raw = json.loads(artifact_path.read_text(encoding="utf-8"))
     observation_space_raw = raw.get("observationSpace")
     observation_space = (
@@ -618,6 +727,11 @@ def load_from_artifact(model: PolicyValueNet, artifact_path: Path) -> str:
         model.policy_head.bias.copy_(torch.from_numpy(bp))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
         model.value_head.bias.copy_(torch.from_numpy(bv))
+    encoder_payload = raw.get("encoderModel")
+    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter) and isinstance(
+        encoder_payload, dict
+    ):
+        obs_adapter.load_from_exported_encoder_model(encoder_payload)
     return observation_space
 
 
@@ -935,7 +1049,11 @@ def train(cfg: PPOConfig) -> None:
         reset_seeds = [cfg.seed + i * 101 for i in range(cfg.num_envs)]
         reset_result = env.reset_many(env_ids=env_ids, seeds=reset_seeds)
         obs_np = np.asarray(reset_result["obs"], dtype=np.float32)
-        mask_np = ensure_action_masks(np.asarray(reset_result["action_masks"], dtype=np.float32))
+        mask_repair_total = {"rows": 0, "batches": 0}
+        mask_np = ensure_action_masks(
+            np.asarray(reset_result["action_masks"], dtype=np.float32),
+            repair_stats=mask_repair_total,
+        )
         raw_obs_dim = infer_obs_dim(reset_result["obs"])
         action_dim = infer_action_dim(reset_result["action_masks"])
 
@@ -974,7 +1092,9 @@ def train(cfg: PPOConfig) -> None:
             )
         elif cfg.init_artifact:
             artifact_path = Path(cfg.init_artifact).resolve()
-            artifact_observation_space = load_from_artifact(model, artifact_path)
+            artifact_observation_space = load_from_artifact(
+                model, obs_adapter, artifact_path
+            )
             if artifact_observation_space != policy_observation_space:
                 raise ValueError(
                     "Init artifact observationSpace mismatch. "
@@ -1043,6 +1163,13 @@ def train(cfg: PPOConfig) -> None:
         did_interrupt = False
         try:
             for update in range(start_update + 1, num_updates + 1):
+                warmup_active = cfg.warmup_updates > 0 and update <= cfg.warmup_updates
+                ent_coef_now = (
+                    cfg.warmup_ent_coef if warmup_active else cfg.ent_coef
+                )
+                target_kl_now = (
+                    cfg.warmup_target_kl if warmup_active else cfg.target_kl
+                )
                 update_start_wall = time.time()
                 update_start_perf = time.perf_counter()
                 profile_policy_forward_s = 0.0
@@ -1062,6 +1189,7 @@ def train(cfg: PPOConfig) -> None:
                 profile_gae_s = 0.0
                 profile_opt_s = 0.0
                 profile_io_s = 0.0
+                mask_repair_update = {"rows": 0, "batches": 0}
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -1114,7 +1242,8 @@ def train(cfg: PPOConfig) -> None:
                     profile_env_step_obs_s += _profile_num(step_profile, "step_obs_s")
                     next_obs_np = np.asarray(step_result["obs"], dtype=np.float32)
                     next_mask_np = ensure_action_masks(
-                        np.asarray(step_result["action_masks"], dtype=np.float32)
+                        np.asarray(step_result["action_masks"], dtype=np.float32),
+                        repair_stats=mask_repair_update,
                     )
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
                     dones_np = np.asarray(step_result["dones"], dtype=np.float32)
@@ -1155,7 +1284,8 @@ def train(cfg: PPOConfig) -> None:
                         )
                         reset_obs = np.asarray(reset_done["obs"], dtype=np.float32)
                         reset_masks = ensure_action_masks(
-                            np.asarray(reset_done["action_masks"], dtype=np.float32)
+                            np.asarray(reset_done["action_masks"], dtype=np.float32),
+                            repair_stats=mask_repair_update,
                         )
                         for local_pos, env_idx in enumerate(done_indices.tolist()):
                             next_obs_np[env_idx] = reset_obs[local_pos]
@@ -1210,9 +1340,11 @@ def train(cfg: PPOConfig) -> None:
                 entropy_value = 0.0
                 updates_done = 0
                 early_stopped = False
+                approx_kl_values: list[float] = []
 
                 optimize_start = time.perf_counter()
                 for _epoch in range(cfg.update_epochs):
+                    epoch_approx_kl_values: list[float] = []
                     np.random.shuffle(batch_inds)
                     for start in range(0, batch_size, cfg.minibatch_size):
                         end = start + cfg.minibatch_size
@@ -1231,11 +1363,13 @@ def train(cfg: PPOConfig) -> None:
                         ratio = torch.exp(logratio)
 
                         with torch.no_grad():
-                            approx_kl = (b_logprobs[mb_inds] - new_logprob).mean()
+                            approx_kl = ((ratio - 1.0) - logratio).mean()
                             clipfrac = (
                                 (ratio - 1.0).abs() > cfg.clip_coef
                             ).float().mean()
                             approx_kl_value = float(approx_kl.detach().cpu().item())
+                            approx_kl_values.append(approx_kl_value)
+                            epoch_approx_kl_values.append(approx_kl_value)
                             clipfracs.append(float(clipfrac.detach().cpu().item()))
 
                         mb_adv = b_advantages[mb_inds]
@@ -1266,7 +1400,7 @@ def train(cfg: PPOConfig) -> None:
                         loss = (
                             policy_loss
                             + cfg.vf_coef * value_loss
-                            - cfg.ent_coef * entropy
+                            - ent_coef_now * entropy
                         )
 
                         optimizer.zero_grad(set_to_none=True)
@@ -1281,7 +1415,12 @@ def train(cfg: PPOConfig) -> None:
                         entropy_value = float(entropy.detach().cpu().item())
                         updates_done += 1
 
-                    if cfg.target_kl > 0 and approx_kl_value > cfg.target_kl:
+                    epoch_approx_kl_mean = (
+                        float(np.mean(epoch_approx_kl_values))
+                        if epoch_approx_kl_values
+                        else 0.0
+                    )
+                    if target_kl_now > 0 and epoch_approx_kl_mean > target_kl_now:
                         early_stopped = True
                         break
                 profile_opt_s = time.perf_counter() - optimize_start
@@ -1299,17 +1438,23 @@ def train(cfg: PPOConfig) -> None:
                 total_seconds = max(1e-6, time.time() - training_start)
                 sps = int(global_step / total_seconds)
 
+                approx_kl_mean = (
+                    float(np.mean(approx_kl_values)) if approx_kl_values else 0.0
+                )
                 stats = {
                     "update": update,
                     "global_step": global_step,
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
-                    "approx_kl": approx_kl_value,
+                    "approx_kl": approx_kl_mean,
                     "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
                     "explained_variance": explained_var,
                     "updates_done": updates_done,
                     "early_stopped_kl": early_stopped,
+                    "warmup_active": warmup_active,
+                    "ent_coef_used": ent_coef_now,
+                    "target_kl_used": target_kl_now,
                     "sps": sps,
                     "update_seconds": update_seconds,
                     "mean_episode_return_recent": (
@@ -1343,6 +1488,12 @@ def train(cfg: PPOConfig) -> None:
                 stats["profile_gae_s"] = profile_gae_s
                 stats["profile_opt_s"] = profile_opt_s
                 stats["profile_io_s"] = profile_io_s
+                stats["mask_repair_rows_update"] = mask_repair_update["rows"]
+                stats["mask_repair_batches_update"] = mask_repair_update["batches"]
+                mask_repair_total["rows"] += mask_repair_update["rows"]
+                mask_repair_total["batches"] += mask_repair_update["batches"]
+                stats["mask_repair_rows_total"] = mask_repair_total["rows"]
+                stats["mask_repair_batches_total"] = mask_repair_total["batches"]
                 stats["profile_update_s"] = max(
                     1e-6, time.perf_counter() - update_start_perf
                 )
@@ -1381,7 +1532,12 @@ def train(cfg: PPOConfig) -> None:
                         stats=stats,
                     )
                     best_artifact = export_bot_policy_artifact(
-                        model, cfg, obs_dim, action_dim, policy_observation_space
+                        model,
+                        obs_adapter,
+                        cfg,
+                        obs_dim,
+                        action_dim,
+                        policy_observation_space,
                     )
                     write_json(out_dir / "bot_policy_best.json", best_artifact)
                     write_json(out_dir / "best_stats.json", best_stats)
@@ -1415,6 +1571,9 @@ def train(cfg: PPOConfig) -> None:
                         f"ent={stats['entropy']:.4f} "
                         f"kl={stats['approx_kl']:.5f} "
                         f"clip={stats['clip_fraction']:.3f} "
+                        f"ent_coef={ent_coef_now:.5f} "
+                        f"target_kl={target_kl_now:.5f} "
+                        f"warmup={'y' if warmup_active else 'n'} "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "
                         f"sps={stats['sps']} "
@@ -1432,7 +1591,9 @@ def train(cfg: PPOConfig) -> None:
                         f"t_gae={profile_gae_s:.2f}s "
                         f"t_opt={profile_opt_s:.2f}s "
                         f"t_io={profile_io_s:.2f}s "
-                        f"t_ovh={profile_overhead_s:.2f}s"
+                        f"t_ovh={profile_overhead_s:.2f}s "
+                        f"mask_fix_rows={mask_repair_update['rows']} "
+                        f"mask_fix_rows_total={mask_repair_total['rows']}"
                     )
 
                 if update % cfg.save_every_updates == 0 or update == num_updates:
@@ -1451,7 +1612,12 @@ def train(cfg: PPOConfig) -> None:
                         stats=stats,
                     )
                     artifact = export_bot_policy_artifact(
-                        model, cfg, obs_dim, action_dim, policy_observation_space
+                        model,
+                        obs_adapter,
+                        cfg,
+                        obs_dim,
+                        action_dim,
+                        policy_observation_space,
                     )
                     artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
                     write_json(artifact_path, artifact)
@@ -1470,7 +1636,12 @@ def train(cfg: PPOConfig) -> None:
             write_json(out_dir / "best_stats.json", best_stats)
 
         artifact_final = export_bot_policy_artifact(
-            model, cfg, obs_dim, action_dim, policy_observation_space
+            model,
+            obs_adapter,
+            cfg,
+            obs_dim,
+            action_dim,
+            policy_observation_space,
         )
         write_json(out_dir / "bot_policy_final.json", artifact_final)
         if did_interrupt:

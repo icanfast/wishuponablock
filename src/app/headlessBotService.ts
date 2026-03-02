@@ -13,7 +13,14 @@ import type {
   InputFrame,
   PieceKind,
 } from '../core/types';
-import type { LoadedModel } from '../core/wubModel';
+import {
+  buildModelHeadInput,
+  getModelPoolShape,
+  parseWubModel,
+  serializeWubModel,
+  type ExportedModel,
+  type LoadedModel,
+} from '../core/wubModel';
 import type { ModelAxes } from '../core/modelAxes';
 import {
   encodeBotObservation,
@@ -145,6 +152,7 @@ export type BotPolicyArtifact = {
   actionSpaceKind?: BotActionSpaceKind;
   actions?: BotMacroAction[];
   placementActionDim?: number;
+  encoderModel?: ExportedModel;
   weights: {
     w1: number[];
     b1: number[];
@@ -303,6 +311,7 @@ type PolicyParams = {
   observationSpace: BotObservationSpace;
   actionSpaceKind: BotActionSpaceKind;
   macroActions: BotMacroAction[] | null;
+  encoderModel: LoadedModel | null;
   w1: Float32Array;
   b1: Float32Array;
   wp: Float32Array;
@@ -328,6 +337,7 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   macroActions: params.macroActions
     ? params.macroActions.map((action) => ({ ...action }))
     : null,
+  encoderModel: params.encoderModel,
   w1: new Float32Array(params.w1),
   b1: new Float32Array(params.b1),
   wp: new Float32Array(params.wp),
@@ -335,6 +345,20 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   wv: new Float32Array(params.wv),
   bv: new Float32Array(params.bv),
 });
+
+const encoderOutputDim = (model: LoadedModel): number => {
+  const convChannels = model.config.conv_channels;
+  const finalChannels =
+    convChannels.length > 0
+      ? Math.max(1, Math.trunc(convChannels[convChannels.length - 1] ?? 1))
+      : Math.max(1, Math.trunc(model.config.input_channels ?? 1));
+  const [poolH, poolW] = getModelPoolShape(model.config.pool_shape);
+  const extraFeatures = Math.max(
+    0,
+    Math.trunc(Number(model.config.extra_features ?? 0)),
+  );
+  return finalChannels * poolH * poolW + extraFeatures;
+};
 
 type RolloutResult = {
   transitions: Transition[];
@@ -685,6 +709,7 @@ const randomizeParams = (
     observationSpace,
     actionSpaceKind,
     macroActions,
+    encoderModel: null,
     w1,
     b1,
     wp,
@@ -808,12 +833,17 @@ const encodeObservation = (
   observationSpace: BotObservationSpace,
   model: LoadedModel,
   state: GameState,
-): Float32Array =>
-  encodeBotObservation({
+  params?: PolicyParams,
+): Float32Array => {
+  if (params?.encoderModel) {
+    return buildModelHeadInput(params.encoderModel, state.board, state.hold);
+  }
+  return encodeBotObservation({
     observationSpace,
     model,
     state,
   });
+};
 
 class PolicyActionBot implements InputSource {
   private activeRef: GameState['active'] | null = null;
@@ -1063,6 +1093,7 @@ const runRollout = (config: {
       config.policyParams.observationSpace,
       config.model,
       state,
+      config.policyParams,
     );
     const placementChoices =
       config.policyParams.actionSpaceKind === 'placement_v1' ||
@@ -1300,6 +1331,7 @@ const trainWithTfjsReinforce = async (options: {
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
       : null,
+    encoderModel: options.params.encoderModel,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
@@ -1493,6 +1525,7 @@ const trainWithTfjsPpo = async (options: {
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
       : null,
+    encoderModel: options.params.encoderModel,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
@@ -1746,6 +1779,9 @@ const toArtifact = (
     params.actionSpaceKind === 'placement_full_v1'
       ? params.actionDim
       : undefined,
+  encoderModel: params.encoderModel
+    ? serializeWubModel(params.encoderModel)
+    : undefined,
   weights: {
     w1: Array.from(params.w1),
     b1: Array.from(params.b1),
@@ -1770,6 +1806,14 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
         ? 'placement_v1'
         : 'macro_v1';
   const macroActionsRaw = Array.isArray(policy.actions) ? policy.actions : [];
+  let encoderModel: LoadedModel | null = null;
+  if (policy.encoderModel != null) {
+    try {
+      encoderModel = parseWubModel(policy.encoderModel);
+    } catch {
+      throw new Error('Invalid bot policy encoder model payload.');
+    }
+  }
   const macroActions =
     actionSpaceKind === 'macro_v1'
       ? macroActionsRaw
@@ -1815,6 +1859,19 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   ) {
     throw new Error('Invalid bot policy artifact dimensions.');
   }
+  if (encoderModel) {
+    if (observationSpace !== 'model_head_v1') {
+      throw new Error(
+        'Bot policy artifact encoder model requires observationSpace=model_head_v1.',
+      );
+    }
+    const encoderDim = encoderOutputDim(encoderModel);
+    if (encoderDim !== inputDim) {
+      throw new Error(
+        `Bot policy artifact encoder output mismatch. encoder=${encoderDim}, inputDim=${inputDim}.`,
+      );
+    }
+  }
   if (
     !isFiniteArray(w1) ||
     !isFiniteArray(b1) ||
@@ -1837,6 +1894,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
           ? macroActions
           : actionSpace.map((action) => ({ ...action }))
         : null,
+    encoderModel,
     w1,
     b1,
     wp,
@@ -1914,6 +1972,9 @@ export const parseBotPolicyArtifactFromUnknown = (
       : undefined,
     placementActionDim: Number.isFinite(Number(value.placementActionDim))
       ? Math.max(1, Math.trunc(Number(value.placementActionDim)))
+      : undefined,
+    encoderModel: isRecord(value.encoderModel)
+      ? (value.encoderModel as ExportedModel)
       : undefined,
     weights: {
       w1: asArray('w1'),
@@ -2662,6 +2723,7 @@ export const createGuiInspectBotInputSource = (
           params.observationSpace,
           config.model,
           state,
+          params,
         );
         const placementChoices =
           params.actionSpaceKind === 'placement_v1' ||

@@ -144,8 +144,10 @@ Outputs:
 
 Notes:
 
-- When `--observation-space raw_v1` is used, training now applies a frozen WUB conv/pool/feature-norm encoder (loaded from `--model-path`) inside PyTorch, then trains PPO heads on top of those encoded features.
-- Exported artifacts from this path are tagged with `observationSpace: "model_head_v1"` to stay runtime-compatible.
+- When `--observation-space raw_v1` is used, training applies a WUB conv/pool/feature-norm encoder (loaded from `--model-path`) inside PyTorch and trains both encoder + PPO heads together.
+- Exported artifacts from this path are tagged with `observationSpace: "model_head_v1"` and include `encoderModel` so runtime can reproduce the trained encoder exactly.
+- PPO now uses a warmup phase by default (`--warmup-updates 50`) with conservative settings (`--warmup-ent-coef 0.001`, `--warmup-target-kl 0.01`) before switching to your regular `--ent-coef` / `--target-kl`.
+- Value loss clipping is enabled by default; disable only if needed with `--no-clip-vloss`.
 
 Resume from checkpoint:
 
