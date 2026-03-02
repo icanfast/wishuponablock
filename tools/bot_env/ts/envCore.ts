@@ -293,6 +293,10 @@ class BotEnv {
   private done = false;
   private piecesPlaced = 0;
   private lockCount = 0;
+  private cachedChoices: {
+    commandsBySlot: InputFrame[][];
+    actionMask: number[];
+  } | null = null;
 
   constructor(
     private readonly modeId: string,
@@ -305,6 +309,10 @@ class BotEnv {
     const built = this.buildGame(seed);
     this.game = built.game;
     this.runner = built.runner;
+    this.cachedChoices = buildPlacementChoices(
+      this.game.state,
+      DEFAULT_ACTION_DIM,
+    );
     this.syncPrevMetrics();
   }
 
@@ -319,12 +327,16 @@ class BotEnv {
     this.done = false;
     this.piecesPlaced = 0;
     this.lockCount = 0;
+    this.cachedChoices = buildPlacementChoices(
+      this.game.state,
+      DEFAULT_ACTION_DIM,
+    );
     this.syncPrevMetrics();
     const obs = encodeObservation(this.model, this.game.state);
-    const choices = buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+    const choices = this.cachedChoices;
     return {
       obs,
-      actionMask: choices.actionMask,
+      actionMask: choices?.actionMask ?? [],
       info: {
         modeId: this.modeId,
         seed,
@@ -341,10 +353,10 @@ class BotEnv {
   } {
     if (this.done) {
       const obs = encodeObservation(this.model, this.game.state);
-      const choices = buildPlacementChoices(
-        this.game.state,
-        DEFAULT_ACTION_DIM,
-      );
+      const choices =
+        this.cachedChoices ??
+        buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+      this.cachedChoices = choices;
       return {
         obs,
         actionMask: choices.actionMask,
@@ -356,7 +368,10 @@ class BotEnv {
 
     const beforeLockCount = this.lockCount;
     const before = this.snapshotMetrics();
-    const choices = buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+    const choices =
+      this.cachedChoices ??
+      buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+    this.cachedChoices = choices;
     const actionIndex = clampInt(actionIndexRaw, 0, 0, DEFAULT_ACTION_DIM - 1);
     const hasAction = choices.actionMask[actionIndex] > 0;
     const resolvedActionIndex = hasAction
@@ -426,6 +441,7 @@ class BotEnv {
       this.game.state,
       DEFAULT_ACTION_DIM,
     );
+    this.cachedChoices = nextChoices;
     return {
       obs,
       actionMask: nextChoices.actionMask,
