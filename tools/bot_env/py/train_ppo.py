@@ -686,8 +686,16 @@ def train(cfg: PPOConfig) -> None:
         did_interrupt = False
         try:
             for update in range(start_update + 1, num_updates + 1):
-                update_start = time.time()
+                update_start_wall = time.time()
+                update_start_perf = time.perf_counter()
+                profile_policy_forward_s = 0.0
+                profile_env_step_s = 0.0
+                profile_env_reset_s = 0.0
+                profile_gae_s = 0.0
+                profile_opt_s = 0.0
+                profile_io_s = 0.0
 
+                rollout_start_perf = time.perf_counter()
                 obs_buf = torch.zeros((cfg.num_steps, cfg.num_envs, obs_dim), device=device)
                 mask_buf = torch.zeros((cfg.num_steps, cfg.num_envs, action_dim), device=device)
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
@@ -702,6 +710,7 @@ def train(cfg: PPOConfig) -> None:
                     obs_buf[step] = obs_t
                     mask_buf[step] = mask_t
 
+                    policy_forward_start = time.perf_counter()
                     with torch.no_grad():
                         logits, values = model(obs_t)
                         dist = masked_categorical(logits, mask_t)
@@ -710,13 +719,16 @@ def train(cfg: PPOConfig) -> None:
                         else:
                             actions_t = dist.sample()
                         logprob_t = dist.log_prob(actions_t)
+                    profile_policy_forward_s += time.perf_counter() - policy_forward_start
 
                     action_buf[step] = actions_t
                     logprob_buf[step] = logprob_t
                     value_buf[step] = values
 
                     actions_np = actions_t.detach().cpu().numpy().astype(np.int64).tolist()
+                    env_step_start = time.perf_counter()
                     step_result = env.step_many(env_ids=env_ids, actions=actions_np)
+                    profile_env_step_s += time.perf_counter() - env_step_start
                     next_obs_np = np.asarray(step_result["obs"], dtype=np.float32)
                     next_mask_np = ensure_action_masks(
                         np.asarray(step_result["action_masks"], dtype=np.float32)
@@ -742,7 +754,9 @@ def train(cfg: PPOConfig) -> None:
                             cfg.seed + global_step + int(i) * 991 + update * 131
                             for i in done_indices.tolist()
                         ]
+                        env_reset_start = time.perf_counter()
                         reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
+                        profile_env_reset_s += time.perf_counter() - env_reset_start
                         reset_obs = np.asarray(reset_done["obs"], dtype=np.float32)
                         reset_masks = ensure_action_masks(
                             np.asarray(reset_done["action_masks"], dtype=np.float32)
@@ -755,6 +769,9 @@ def train(cfg: PPOConfig) -> None:
                     mask_np = next_mask_np
                     global_step += cfg.num_envs
 
+                profile_rollout_s = time.perf_counter() - rollout_start_perf
+
+                gae_start = time.perf_counter()
                 with torch.no_grad():
                     next_obs_t = as_tensor(obs_np, device)
                     _, next_value = model(next_obs_t)
@@ -786,6 +803,7 @@ def train(cfg: PPOConfig) -> None:
                 adv_mean = b_advantages.mean()
                 adv_std = b_advantages.std(unbiased=False) + 1e-8
                 b_advantages = (b_advantages - adv_mean) / adv_std
+                profile_gae_s = time.perf_counter() - gae_start
 
                 batch_inds = np.arange(batch_size)
                 clipfracs: list[float] = []
@@ -796,6 +814,7 @@ def train(cfg: PPOConfig) -> None:
                 updates_done = 0
                 early_stopped = False
 
+                optimize_start = time.perf_counter()
                 for _epoch in range(cfg.update_epochs):
                     np.random.shuffle(batch_inds)
                     for start in range(0, batch_size, cfg.minibatch_size):
@@ -865,6 +884,7 @@ def train(cfg: PPOConfig) -> None:
                     if cfg.target_kl > 0 and approx_kl_value > cfg.target_kl:
                         early_stopped = True
                         break
+                profile_opt_s = time.perf_counter() - optimize_start
 
                 y_pred = b_values.detach().cpu().numpy()
                 y_true = b_returns.detach().cpu().numpy()
@@ -875,7 +895,7 @@ def train(cfg: PPOConfig) -> None:
                     else 1.0 - float(np.var(y_true - y_pred) / var_y)
                 )
 
-                update_seconds = max(1e-6, time.time() - update_start)
+                update_seconds = max(1e-6, time.time() - update_start_wall)
                 total_seconds = max(1e-6, time.time() - training_start)
                 sps = int(global_step / total_seconds)
 
@@ -903,6 +923,16 @@ def train(cfg: PPOConfig) -> None:
                         else float("nan")
                     ),
                 }
+                stats["profile_rollout_s"] = profile_rollout_s
+                stats["profile_env_step_s"] = profile_env_step_s
+                stats["profile_env_reset_s"] = profile_env_reset_s
+                stats["profile_policy_forward_s"] = profile_policy_forward_s
+                stats["profile_gae_s"] = profile_gae_s
+                stats["profile_opt_s"] = profile_opt_s
+                stats["profile_io_s"] = profile_io_s
+                stats["profile_update_s"] = max(
+                    1e-6, time.perf_counter() - update_start_perf
+                )
 
                 score_raw = stats["mean_episode_return_recent"]
                 score = (
@@ -912,6 +942,7 @@ def train(cfg: PPOConfig) -> None:
                     else float("-inf")
                 )
                 if best_state_dict is None or score > best_score:
+                    io_start = time.perf_counter()
                     best_score = score
                     best_update = update
                     best_stats = dict(stats)
@@ -936,9 +967,18 @@ def train(cfg: PPOConfig) -> None:
                     )
                     write_json(out_dir / "bot_policy_best.json", best_artifact)
                     write_json(out_dir / "best_stats.json", best_stats)
+                    profile_io_s += time.perf_counter() - io_start
                     print("[ppo] " f"new_best update={update} ret100={best_score:.3f}")
 
                 if update % cfg.log_every_updates == 0 or update == 1 or update == num_updates:
+                    profile_env_total_s = profile_env_step_s + profile_env_reset_s
+                    profile_accounted_s = (
+                        profile_rollout_s
+                        + profile_gae_s
+                        + profile_opt_s
+                        + profile_io_s
+                    )
+                    profile_overhead_s = max(0.0, update_seconds - profile_accounted_s)
                     print(
                         "[ppo] "
                         f"update={update}/{num_updates} "
@@ -950,10 +990,19 @@ def train(cfg: PPOConfig) -> None:
                         f"clip={stats['clip_fraction']:.3f} "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "
-                        f"sps={stats['sps']}"
+                        f"sps={stats['sps']} "
+                        f"t_upd={update_seconds:.2f}s "
+                        f"t_roll={profile_rollout_s:.2f}s "
+                        f"t_env={profile_env_total_s:.2f}s "
+                        f"t_fwd={profile_policy_forward_s:.2f}s "
+                        f"t_gae={profile_gae_s:.2f}s "
+                        f"t_opt={profile_opt_s:.2f}s "
+                        f"t_io={profile_io_s:.2f}s "
+                        f"t_ovh={profile_overhead_s:.2f}s"
                     )
 
                 if update % cfg.save_every_updates == 0 or update == num_updates:
+                    io_start = time.perf_counter()
                     ckpt_path = checkpoints_dir / f"ppo_update_{update:06d}.pt"
                     save_checkpoint(
                         checkpoint_path=ckpt_path,
@@ -970,6 +1019,8 @@ def train(cfg: PPOConfig) -> None:
                     artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
                     write_json(artifact_path, artifact)
                     write_json(out_dir / "last_stats.json", stats)
+                    profile_io_s += time.perf_counter() - io_start
+
         except KeyboardInterrupt:
             did_interrupt = True
             print("[ppo] keyboard interrupt received; finishing with best available policy...")
