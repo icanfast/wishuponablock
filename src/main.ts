@@ -74,6 +74,7 @@ import {
   runHeadlessBotValidation,
   runCapabilityBenchmark,
   trainBotPolicyOneShot,
+  type BotGuiInspectInputSource,
   type BotPieceSourceProfile,
   type BotTrainingAlgorithm,
   type BotPolicyArtifact,
@@ -592,8 +593,9 @@ async function boot() {
   const inputService = createInputService({ settings });
   const identityService = createIdentityService();
   let manualInputSource = inputService.getInputSource();
-  let botGuiInputSource: InputSource | null = null;
+  let botGuiInputSource: BotGuiInspectInputSource | null = null;
   let botGuiInspectEnabled = false;
+  let botGuiStepMode = false;
   let replayGuiInputSource: TrajectoryReplayGuiInputSource | null = null;
   let replayGuiInspectEnabled = false;
   let replayExecutorStepMode = false;
@@ -2008,6 +2010,7 @@ async function boot() {
     pieceSourceProfile?: BotPieceSourceProfile;
     pieces?: number;
     greedy?: boolean;
+    stepMode?: boolean;
   }): Promise<string> => {
     if (
       !authState.authenticated ||
@@ -2024,6 +2027,7 @@ async function boot() {
       Math.min(1200, Math.trunc(options?.apmInput ?? 240)),
     );
     const seed = options?.seed ?? 42_030;
+    const stepMode = options?.stepMode === true;
     const pieceSourceProfile =
       options?.pieceSourceProfile ?? policy.pieceSourceProfile ?? 'bag7';
     if (replayGuiInspectEnabled || replayDirectRunning) {
@@ -2037,11 +2041,13 @@ async function boot() {
       model: reference.model,
       policy,
       apmInput,
+      executionMode: stepMode ? 'step' : 'apm',
       seed,
       greedy: options?.greedy !== false,
       onTargetGhostChange: (ghost) => setBotInspectTargetGhost(ghost),
     });
     botGuiInspectEnabled = true;
+    botGuiStepMode = stepMode;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
     modeController.startCharcuterie(Math.max(1, options?.pieces ?? 20), {
       simCount: charcuterieDefaultSimCount,
@@ -2055,16 +2061,18 @@ async function boot() {
     });
     runtime?.setInputSource(activeInputSource);
     runtime?.setPausedByMenu(false);
+    gameUi.setStepButtonVisible(stepMode);
     runtime?.renderNow();
     return (
       `GUI inspect started for ${policyId}. ` +
-      `APM=${apmInput}, piece_source=${pieceSourceProfile}, ` +
+      `mode=${stepMode ? 'step' : `apm:${apmInput}`}, piece_source=${pieceSourceProfile}, ` +
       `policy_mode=${options?.greedy === false ? 'sampled' : 'greedy'}.`
     );
   };
 
   const stopAdminBotGuiInspect = (): string => {
     botGuiInspectEnabled = false;
+    botGuiStepMode = false;
     botGuiInputSource = null;
     setBotInspectTargetGhost(null);
     applyBotGuiPieceSourceProfile('active_generator');
@@ -2075,6 +2083,7 @@ async function boot() {
       hardLockDelayMs: gameCfg.hardLockDelayMs,
     });
     runtime?.setInputSource(activeInputSource);
+    gameUi.setStepButtonVisible(false);
     return 'GUI inspect stopped.';
   };
 
@@ -3460,6 +3469,7 @@ async function boot() {
     gameUi.recordStatus.style.display = 'none';
     gameUi.manualButton.style.display = 'none';
   }
+  gameUi.setStepButtonVisible(false);
 
   replayUi = createReplayScreen();
   replayScreen.appendChild(replayUi.root);
@@ -3945,6 +3955,18 @@ async function boot() {
     }
     replayGuiInputSource.requestStep();
     replayUi?.setStatus('Replay executor stepping...');
+    runtime?.renderNow();
+  });
+
+  gameUi.stepButton.addEventListener('click', () => {
+    if (
+      !botGuiInspectEnabled ||
+      !botGuiStepMode ||
+      !botGuiInputSource?.isStepMode
+    ) {
+      return;
+    }
+    botGuiInputSource.requestStep();
     runtime?.renderNow();
   });
 

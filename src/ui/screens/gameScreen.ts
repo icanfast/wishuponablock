@@ -44,8 +44,10 @@ export type GameScreen = {
   recordStatus: HTMLDivElement;
   manualButton: HTMLButtonElement;
   menuButton: HTMLButtonElement;
+  stepButton: HTMLButtonElement;
   setQueueOddsMode: (enabled: boolean) => void;
   setMlQueueProbabilities: (values: PieceProbability[]) => void;
+  setStepButtonVisible: (visible: boolean) => void;
 };
 
 type GameScreenOptions = {
@@ -424,6 +426,19 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
   });
   root.appendChild(menuButton);
 
+  const stepButton = makeOverlayButton('NEXT INPUT');
+  Object.assign(stepButton.style, {
+    position: 'absolute',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    top: `${BOARD_Y + ROWS * BOARD_CELL_PX + PANEL_GAP + 44}px`,
+    width: `${COLS * BOARD_CELL_PX}px`,
+    pointerEvents: 'auto',
+    zIndex: '2',
+    display: 'none',
+  });
+  root.appendChild(stepButton);
+
   const formatProbabilityPercent = (probability: number): string => {
     const value = Number.isFinite(probability) ? Math.max(0, probability) : 0;
     const percent = value * 100;
@@ -490,7 +505,11 @@ export function createGameScreen(options: GameScreenOptions): GameScreen {
     recordStatus,
     manualButton,
     menuButton,
+    stepButton,
     setQueueOddsMode,
     setMlQueueProbabilities,
+    setStepButtonVisible: (visible: boolean) => {
+      stepButton.style.display = visible ? 'block' : 'none';
+    },
   };
 }

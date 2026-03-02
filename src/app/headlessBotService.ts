@@ -2611,23 +2611,31 @@ export type BotGuiInputSourceConfig = {
   model: LoadedModel;
   policy: BotPolicyArtifact;
   apmInput: number;
+  executionMode?: 'apm' | 'step';
   seed?: number;
   greedy?: boolean;
   onTargetGhostChange?: (ghost: ActivePiece | null) => void;
 };
 
+export type BotGuiInspectInputSource = InputSource & {
+  isStepMode: boolean;
+  requestStep: () => void;
+};
+
 export const createGuiInspectBotInputSource = (
   config: BotGuiInputSourceConfig,
-): InputSource => {
+): BotGuiInspectInputSource => {
   const params = fromArtifact(config.policy);
   const seed = Math.max(1, Math.trunc(config.seed ?? Date.now()));
   const greedy = config.greedy !== false;
   const clampedApm = clamp(config.apmInput, 20, 1200);
   const actionIntervalMs = 60_000 / clampedApm;
+  const stepMode = config.executionMode === 'step';
   let rng = new XorShift32(seed ^ 0x517cc1b7);
   let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
   let cooldownMs = 0;
+  let manualStepBudget = 0;
 
   const nextFrame = (frame: InputFrame): InputFrame => ({
     ...EMPTY_INPUT,
@@ -2783,8 +2791,13 @@ export const createGuiInspectBotInputSource = (
         }
       }
       if (queue.length === 0) return EMPTY_INPUT;
-      if (cooldownMs > 0) return EMPTY_INPUT;
-      cooldownMs = actionIntervalMs;
+      if (stepMode) {
+        if (manualStepBudget <= 0) return EMPTY_INPUT;
+        manualStepBudget -= 1;
+      } else {
+        if (cooldownMs > 0) return EMPTY_INPUT;
+        cooldownMs = actionIntervalMs;
+      }
       return queue.shift() ?? EMPTY_INPUT;
     },
     reset: (nextSeed) => {
@@ -2793,7 +2806,13 @@ export const createGuiInspectBotInputSource = (
       activeRef = null;
       queue = [];
       cooldownMs = 0;
+      manualStepBudget = 0;
       config.onTargetGhostChange?.(null);
+    },
+    isStepMode: stepMode,
+    requestStep: () => {
+      if (!stepMode) return;
+      manualStepBudget += 1;
     },
   };
 };

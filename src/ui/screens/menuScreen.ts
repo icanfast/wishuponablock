@@ -344,6 +344,7 @@ export type MenuScreenOptions = {
     pieceSourceProfile?: 'bag7' | 'active_generator';
     pieces?: number;
     greedy?: boolean;
+    stepMode?: boolean;
   }) => Promise<string>;
   onBotLabStopGuiInspect: () => Promise<string> | string;
   onBotLabGenerateRecordings: (options: {
@@ -3562,6 +3563,16 @@ input[type=number] {
   Object.assign(botLabGuiGreedyRow.style, {
     marginTop: '2px',
   });
+  const botLabGuiStepModeToggle = document.createElement('input');
+  botLabGuiStepModeToggle.type = 'checkbox';
+  botLabGuiStepModeToggle.checked = false;
+  const botLabGuiStepModeRow = makeInlineToggle(
+    'Step mode (manual NEXT INPUT)',
+    botLabGuiStepModeToggle,
+  );
+  Object.assign(botLabGuiStepModeRow.style, {
+    marginTop: '2px',
+  });
   const botLabGuiButtons = document.createElement('div');
   Object.assign(botLabGuiButtons.style, {
     display: 'flex',
@@ -3651,6 +3662,7 @@ input[type=number] {
   botLabPanel.appendChild(botLabGuiLabel);
   botLabPanel.appendChild(botLabGuiControls);
   botLabPanel.appendChild(botLabGuiGreedyRow);
+  botLabPanel.appendChild(botLabGuiStepModeRow);
   botLabPanel.appendChild(botLabGuiButtons);
   botLabPanel.appendChild(botLabDataLabel);
   botLabPanel.appendChild(botLabDataControls);
@@ -4407,6 +4419,7 @@ input[type=number] {
     botLabGuiLabel.style.display = isAdmin ? 'block' : 'none';
     botLabGuiControls.style.display = isAdmin ? 'grid' : 'none';
     botLabGuiGreedyRow.style.display = isAdmin ? 'inline-flex' : 'none';
+    botLabGuiStepModeRow.style.display = isAdmin ? 'inline-flex' : 'none';
     botLabGuiButtons.style.display = isAdmin ? 'flex' : 'none';
     botLabDataLabel.style.display = isAdmin ? 'block' : 'none';
     botLabDataControls.style.display = isAdmin ? 'grid' : 'none';
@@ -4441,6 +4454,7 @@ input[type=number] {
     botLabGuiPiecesInput.disabled = !isAdmin || busy;
     botLabGuiSourceSelect.disabled = !isAdmin || busy;
     botLabGuiGreedyToggle.disabled = !isAdmin || busy;
+    botLabGuiStepModeToggle.disabled = !isAdmin || busy;
     botLabStartGuiButton.disabled = !isAdmin || busy;
     botLabStopGuiButton.disabled = !isAdmin || busy || !botLabGuiInspectRunning;
     botLabGenerateSessionsInput.disabled = !isAdmin || busy;
@@ -5757,6 +5771,7 @@ input[type=number] {
           'bag7',
         ),
         greedy: botLabGuiGreedyToggle.checked,
+        stepMode: botLabGuiStepModeToggle.checked,
       });
       botLabGuiInspectRunning = true;
       setBotLabActionStatus(message, 'success');
