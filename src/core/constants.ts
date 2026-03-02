@@ -101,7 +101,14 @@ export const ML_BACKEND_PREFERENCE_STORAGE_KEY =
 
 export const GAME_PROTOCOL_VERSION = 2;
 
-const BASE_URL = import.meta.env.BASE_URL ?? '/';
+const BASE_URL =
+  (
+    import.meta as {
+      env?: {
+        BASE_URL?: string;
+      };
+    }
+  ).env?.BASE_URL ?? '/';
 export const ML_MODEL_URL = `${BASE_URL}models/model_v4.json`;
 
 export const SPAWN_X = 3;

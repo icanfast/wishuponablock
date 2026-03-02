@@ -18,7 +18,14 @@ export function createSoundService(options: SoundServiceOptions): SoundService {
   lockSound.preload = 'auto';
   lockSound.volume = options.settings.audio.masterVolume;
 
-  const baseUrl = import.meta.env.BASE_URL ?? '/';
+  const baseUrl =
+    (
+      import.meta as {
+        env?: {
+          BASE_URL?: string;
+        };
+      }
+    ).env?.BASE_URL ?? '/';
   const comboNotes = ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C2'] as const;
   const comboSounds = comboNotes.map((note) => {
     const audio = new Audio(`${baseUrl}sfx/${note}.ogg`);

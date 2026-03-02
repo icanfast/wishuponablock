@@ -138,8 +138,13 @@ export type BotPolicyArtifact = {
     b1: number[];
     wp: number[];
     bp: number[];
+    wv?: number[];
+    bv?: number[];
   };
 };
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 export type BotTrainOneShotConfig = {
   modeId: string;
@@ -156,6 +161,10 @@ export type BotTrainOneShotConfig = {
   entropyBeta?: number;
   valueWeight?: number;
   epochs?: number;
+  gaeLambda?: number;
+  ppoMinibatchSize?: number;
+  ppoTargetKl?: number;
+  ppoIterations?: number;
   seed?: number;
   pieceSourceProfile?: BotPieceSourceProfile;
 };
@@ -285,6 +294,8 @@ type PolicyParams = {
   b1: Float32Array;
   wp: Float32Array;
   bp: Float32Array;
+  wv: Float32Array;
+  bv: Float32Array;
 };
 
 type Transition = {
@@ -292,6 +303,7 @@ type Transition = {
   actionIndex: number;
   actionMask: Float32Array | null;
   reward: number | null;
+  done: number;
 };
 
 const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
@@ -306,6 +318,8 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   b1: new Float32Array(params.b1),
   wp: new Float32Array(params.wp),
   bp: new Float32Array(params.bp),
+  wv: new Float32Array(params.wv),
+  bv: new Float32Array(params.bv),
 });
 
 type RolloutResult = {
@@ -607,6 +621,8 @@ const randomizeParams = (
   const b1 = new Float32Array(hiddenDim);
   const wp = new Float32Array(hiddenDim * actionDim);
   const bp = new Float32Array(actionDim);
+  const wv = new Float32Array(hiddenDim);
+  const bv = new Float32Array(1);
   const scaleIn = Math.sqrt(2 / Math.max(1, inputDim));
   const scaleHidden = Math.sqrt(2 / Math.max(1, hiddenDim));
   for (let i = 0; i < w1.length; i += 1) {
@@ -614,6 +630,9 @@ const randomizeParams = (
   }
   for (let i = 0; i < wp.length; i += 1) {
     wp[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
+  }
+  for (let i = 0; i < wv.length; i += 1) {
+    wv[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
   }
   return {
     inputDim,
@@ -625,7 +644,91 @@ const randomizeParams = (
     b1,
     wp,
     bp,
+    wv,
+    bv,
   };
+};
+
+const defaultValueHead = (
+  hiddenDim: number,
+): {
+  wv: Float32Array;
+  bv: Float32Array;
+} => ({
+  wv: new Float32Array(hiddenDim),
+  bv: new Float32Array(1),
+});
+
+const forwardValue = (
+  params: PolicyParams,
+  observation: Float32Array,
+): number => {
+  let value = params.bv[0] ?? 0;
+  for (let h = 0; h < params.hiddenDim; h += 1) {
+    let sum = params.b1[h];
+    for (let i = 0; i < params.inputDim; i += 1) {
+      sum += observation[i] * params.w1[i * params.hiddenDim + h];
+    }
+    const hidden = sum > 0 ? sum : 0;
+    value += hidden * params.wv[h];
+  }
+  return Number.isFinite(value) ? value : 0;
+};
+
+const normalizeAdvantagesInPlace = (advantages: Float32Array): void => {
+  if (advantages.length === 0) return;
+  let meanValue = 0;
+  for (let i = 0; i < advantages.length; i += 1) {
+    meanValue += advantages[i];
+  }
+  meanValue /= Math.max(1, advantages.length);
+  let variance = 0;
+  for (let i = 0; i < advantages.length; i += 1) {
+    const centered = advantages[i] - meanValue;
+    advantages[i] = centered;
+    variance += centered * centered;
+  }
+  const std = Math.sqrt(variance / Math.max(1, advantages.length) + 1e-8);
+  for (let i = 0; i < advantages.length; i += 1) {
+    advantages[i] /= std;
+  }
+};
+
+const computeGae = (options: {
+  rewards: Float32Array;
+  values: Float32Array;
+  dones: Uint8Array;
+  gamma: number;
+  lambda: number;
+}): { advantages: Float32Array; returns: Float32Array } => {
+  const { rewards, values, dones, gamma, lambda } = options;
+  const count = rewards.length;
+  const advantages = new Float32Array(count);
+  const returns = new Float32Array(count);
+  let gae = 0;
+  for (let i = count - 1; i >= 0; i -= 1) {
+    const done = i === count - 1 ? 1 : dones[i];
+    const notDone = done > 0 ? 0 : 1;
+    const nextValue = i + 1 < count && notDone > 0 ? values[i + 1] : 0;
+    const delta = rewards[i] + gamma * nextValue - values[i];
+    gae = delta + gamma * lambda * notDone * gae;
+    advantages[i] = Number.isFinite(gae) ? gae : 0;
+    const ret = advantages[i] + values[i];
+    returns[i] = Number.isFinite(ret) ? ret : values[i];
+  }
+  return { advantages, returns };
+};
+
+const createShuffledIndices = (size: number, rng: XorShift32): Int32Array => {
+  const out = new Int32Array(size);
+  for (let i = 0; i < size; i += 1) out[i] = i;
+  for (let i = size - 1; i > 0; i -= 1) {
+    const j = Math.floor(nextFloat(rng) * (i + 1));
+    const tmp = out[i];
+    out[i] = out[j];
+    out[j] = tmp;
+  }
+  return out;
 };
 
 const forwardPolicy = (
@@ -716,6 +819,7 @@ class PolicyActionBot implements InputSource {
           ? new Float32Array(decision.actionMask)
           : null,
         reward: null,
+        done: 0,
       });
     }
     return this.queue.shift() ?? EMPTY_INPUT;
@@ -742,6 +846,7 @@ class PolicyActionBot implements InputSource {
         ? new Float32Array(transition.actionMask)
         : null,
       reward: transition.reward,
+      done: transition.done,
     }));
   }
 }
@@ -1072,19 +1177,6 @@ const runRollout = (config: {
   };
 };
 
-const computeDiscountedReturns = (
-  rewards: number[],
-  gamma: number,
-): Float32Array => {
-  const out = new Float32Array(rewards.length);
-  let running = 0;
-  for (let i = rewards.length - 1; i >= 0; i -= 1) {
-    running = rewards[i] + gamma * running;
-    out[i] = running;
-  }
-  return out;
-};
-
 const trainWithTfjsReinforce = async (options: {
   params: PolicyParams;
   observations: Float32Array;
@@ -1100,6 +1192,9 @@ const trainWithTfjsReinforce = async (options: {
   finalLoss: number | null;
   bestLoss: number | null;
   usedBestCheckpoint: boolean;
+  approxKl: number | null;
+  clipFraction: number | null;
+  stoppedEarlyByKl: boolean;
 }> => {
   const tf = await loadTf();
   await tf.ready();
@@ -1118,6 +1213,9 @@ const trainWithTfjsReinforce = async (options: {
       finalLoss: null,
       bestLoss: null,
       usedBestCheckpoint: false,
+      approxKl: null,
+      clipFraction: null,
+      stoppedEarlyByKl: false,
     };
   }
 
@@ -1147,9 +1245,9 @@ const trainWithTfjsReinforce = async (options: {
   );
   const bp = tf.variable(tf.tensor1d(options.params.bp));
   const wv = tf.variable(
-    tf.randomNormal([options.params.hiddenDim, 1], 0, 0.02),
+    tf.tensor2d(options.params.wv, [options.params.hiddenDim, 1]),
   );
-  const bv = tf.variable(tf.scalar(0));
+  const bv = tf.variable(tf.tensor1d(options.params.bv));
 
   const optimizer = tf.train.adam(options.learningRate);
   let finalLoss: number | null = null;
@@ -1169,6 +1267,8 @@ const trainWithTfjsReinforce = async (options: {
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
     bp: new Float32Array(bp.dataSync() as Float32Array),
+    wv: new Float32Array(wv.dataSync() as Float32Array),
+    bv: new Float32Array(bv.dataSync() as Float32Array),
   });
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
     const checkpointBeforeStep = snapshotCurrentParams();
@@ -1223,6 +1323,8 @@ const trainWithTfjsReinforce = async (options: {
         isFiniteArray(checkpointBeforeStep.b1) &&
         isFiniteArray(checkpointBeforeStep.wp) &&
         isFiniteArray(checkpointBeforeStep.bp) &&
+        isFiniteArray(checkpointBeforeStep.wv) &&
+        isFiniteArray(checkpointBeforeStep.bv) &&
         (!hasBestFiniteLoss || bestLoss == null || finalLoss < bestLoss)
       ) {
         bestParams = checkpointBeforeStep;
@@ -1256,7 +1358,15 @@ const trainWithTfjsReinforce = async (options: {
     wv,
     bv,
   ]);
-  return { params: trained, finalLoss, bestLoss, usedBestCheckpoint };
+  return {
+    params: trained,
+    finalLoss,
+    bestLoss,
+    usedBestCheckpoint,
+    approxKl: null,
+    clipFraction: null,
+    stoppedEarlyByKl: false,
+  };
 };
 
 const trainWithTfjsPpo = async (options: {
@@ -1266,17 +1376,25 @@ const trainWithTfjsPpo = async (options: {
   actions: Int32Array;
   returns: Float32Array;
   oldLogProbs: Float32Array;
+  oldValues: Float32Array;
   advantages: Float32Array;
   learningRate: number;
   entropyBeta: number;
   valueWeight: number;
   epochs: number;
+  minibatchSize: number;
+  targetKl: number;
   clipEpsilon: number;
+  valueClipEpsilon: number;
+  seed: number;
 }): Promise<{
   params: PolicyParams;
   finalLoss: number | null;
   bestLoss: number | null;
   usedBestCheckpoint: boolean;
+  approxKl: number | null;
+  clipFraction: number | null;
+  stoppedEarlyByKl: boolean;
 }> => {
   const tf = await loadTf();
   await tf.ready();
@@ -1295,21 +1413,11 @@ const trainWithTfjsPpo = async (options: {
       finalLoss: null,
       bestLoss: null,
       usedBestCheckpoint: false,
+      approxKl: null,
+      clipFraction: null,
+      stoppedEarlyByKl: false,
     };
   }
-
-  const inputTensor = tf.tensor2d(options.observations, [
-    count,
-    options.params.inputDim,
-  ]);
-  const actionMaskTensor = options.actionMasks
-    ? tf.tensor2d(options.actionMasks, [count, options.params.actionDim])
-    : null;
-  const actionTensor = tf.tensor1d(options.actions, 'int32');
-  const returnsTensor = tf.tensor1d(options.returns);
-  const oldLogProbTensor = tf.tensor1d(options.oldLogProbs);
-  const advantageTensor = tf.tensor1d(options.advantages);
-  const oneHot = tf.oneHot(actionTensor, options.params.actionDim);
 
   const w1 = tf.variable(
     tf.tensor2d(options.params.w1, [
@@ -1326,16 +1434,19 @@ const trainWithTfjsPpo = async (options: {
   );
   const bp = tf.variable(tf.tensor1d(options.params.bp));
   const wv = tf.variable(
-    tf.randomNormal([options.params.hiddenDim, 1], 0, 0.02),
+    tf.tensor2d(options.params.wv, [options.params.hiddenDim, 1]),
   );
-  const bv = tf.variable(tf.scalar(0));
+  const bv = tf.variable(tf.tensor1d(options.params.bv));
 
   const optimizer = tf.train.adam(options.learningRate);
   let finalLoss: number | null = null;
   let bestLoss: number | null = null;
   let bestParams: PolicyParams = clonePolicyParams(options.params);
+  let approxKl: number | null = null;
+  let clipFraction: number | null = null;
   let hasBestFiniteLoss = false;
   let divergenceDetected = false;
+  let stoppedEarlyByKl = false;
   const snapshotCurrentParams = (): PolicyParams => ({
     inputDim: options.params.inputDim,
     hiddenDim: options.params.hiddenDim,
@@ -1348,62 +1459,208 @@ const trainWithTfjsPpo = async (options: {
     b1: new Float32Array(b1.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
     bp: new Float32Array(bp.dataSync() as Float32Array),
+    wv: new Float32Array(wv.dataSync() as Float32Array),
+    bv: new Float32Array(bv.dataSync() as Float32Array),
   });
   const clipLo = 1 - options.clipEpsilon;
   const clipHi = 1 + options.clipEpsilon;
+  const minibatchSize = Math.max(
+    1,
+    Math.min(count, Math.trunc(options.minibatchSize)),
+  );
+  const shuffleRng = new XorShift32(options.seed ^ 0x6c8e9cf5);
+
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
-    const checkpointBeforeStep = snapshotCurrentParams();
-    const lossTensor = optimizer.minimize(() => {
-      const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
-      const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
-      const logits = actionMaskTensor
-        ? tf.sub(
-            logitsRaw,
-            tf.mul(tf.sub(tf.scalar(1), actionMaskTensor), tf.scalar(1e9)),
-          )
-        : logitsRaw;
-      const logProbs = tf.logSoftmax(logits, 1);
-      const probs = tf.softmax(logits, 1);
-      const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
+    const shuffledIndices = createShuffledIndices(count, shuffleRng);
+    let epochLossSum = 0;
+    let epochBatches = 0;
+    for (let start = 0; start < count; start += minibatchSize) {
+      const size = Math.min(minibatchSize, count - start);
+      const obsBatch = new Float32Array(size * options.params.inputDim);
+      const maskBatch = new Float32Array(size * options.params.actionDim);
+      const actionsBatch = new Int32Array(size);
+      const returnsBatch = new Float32Array(size);
+      const oldLogBatch = new Float32Array(size);
+      const oldValueBatch = new Float32Array(size);
+      const advBatch = new Float32Array(size);
 
-      const ratio = tf.exp(tf.sub(selectedLogProb, oldLogProbTensor));
-      const clippedRatio = tf.clipByValue(ratio, clipLo, clipHi);
-      const surrogateA = tf.mul(ratio, advantageTensor);
-      const surrogateB = tf.mul(clippedRatio, advantageTensor);
-      const policyLoss = tf.neg(tf.mean(tf.minimum(surrogateA, surrogateB)));
+      for (let bi = 0; bi < size; bi += 1) {
+        const index = shuffledIndices[start + bi];
+        const obsOffset = index * options.params.inputDim;
+        const obsWriteOffset = bi * options.params.inputDim;
+        for (let j = 0; j < options.params.inputDim; j += 1) {
+          obsBatch[obsWriteOffset + j] = options.observations[obsOffset + j];
+        }
 
-      const values = tf.squeeze(tf.add(tf.matMul(hidden, wv), bv), [1]);
-      const valueResidual = tf.sub(values, returnsTensor);
-      const valueLoss = tf.mean(
-        tf.square(tf.clipByValue(valueResidual, -20, 20)),
-      );
+        const maskOffset = index * options.params.actionDim;
+        const maskWriteOffset = bi * options.params.actionDim;
+        if (options.actionMasks) {
+          for (let j = 0; j < options.params.actionDim; j += 1) {
+            maskBatch[maskWriteOffset + j] =
+              options.actionMasks[maskOffset + j];
+          }
+        } else {
+          maskBatch.fill(
+            1,
+            maskWriteOffset,
+            maskWriteOffset + options.params.actionDim,
+          );
+        }
 
-      const entropy = tf.neg(tf.mean(tf.sum(tf.mul(probs, logProbs), 1)));
-      return tf.add(
-        tf.add(policyLoss, tf.mul(valueLoss, tf.scalar(options.valueWeight))),
-        tf.neg(tf.mul(entropy, tf.scalar(options.entropyBeta))),
-      );
-    }, true);
-    if (lossTensor) {
-      const data = lossTensor.dataSync() as Float32Array;
-      const value = Number(data[0]);
-      finalLoss = Number.isFinite(value) ? value : Number.NaN;
-      lossTensor.dispose();
-      if (!Number.isFinite(finalLoss)) {
+        actionsBatch[bi] = options.actions[index] ?? 0;
+        returnsBatch[bi] = options.returns[index] ?? 0;
+        oldLogBatch[bi] = options.oldLogProbs[index] ?? 0;
+        oldValueBatch[bi] = options.oldValues[index] ?? 0;
+        advBatch[bi] = options.advantages[index] ?? 0;
+      }
+
+      const inputTensor = tf.tensor2d(obsBatch, [
+        size,
+        options.params.inputDim,
+      ]);
+      const actionMaskTensor = tf.tensor2d(maskBatch, [
+        size,
+        options.params.actionDim,
+      ]);
+      const actionTensor = tf.tensor1d(actionsBatch, 'int32');
+      const returnsTensor = tf.tensor1d(returnsBatch);
+      const oldLogProbTensor = tf.tensor1d(oldLogBatch);
+      const oldValueTensor = tf.tensor1d(oldValueBatch);
+      const advantageTensor = tf.tensor1d(advBatch);
+      const oneHot = tf.oneHot(actionTensor, options.params.actionDim);
+
+      const lossTensor = optimizer.minimize(() => {
+        const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
+        const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
+        const logits = tf.sub(
+          logitsRaw,
+          tf.mul(tf.sub(tf.scalar(1), actionMaskTensor), tf.scalar(1e9)),
+        );
+        const logProbs = tf.logSoftmax(logits, 1);
+        const probs = tf.softmax(logits, 1);
+        const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
+
+        const ratio = tf.exp(tf.sub(selectedLogProb, oldLogProbTensor));
+        const clippedRatio = tf.clipByValue(ratio, clipLo, clipHi);
+        const surrogateA = tf.mul(ratio, advantageTensor);
+        const surrogateB = tf.mul(clippedRatio, advantageTensor);
+        const policyLoss = tf.neg(tf.mean(tf.minimum(surrogateA, surrogateB)));
+
+        const values = tf.squeeze(tf.add(tf.matMul(hidden, wv), bv), [1]);
+        const valueDelta = tf.sub(values, oldValueTensor);
+        const valueClipped = tf.add(
+          oldValueTensor,
+          tf.clipByValue(
+            valueDelta,
+            -options.valueClipEpsilon,
+            options.valueClipEpsilon,
+          ),
+        );
+        const valueLossUnclipped = tf.square(tf.sub(values, returnsTensor));
+        const valueLossClipped = tf.square(tf.sub(valueClipped, returnsTensor));
+        const valueLossMax = tf.neg(
+          tf.minimum(tf.neg(valueLossUnclipped), tf.neg(valueLossClipped)),
+        );
+        const valueLoss = tf.mul(tf.scalar(0.5), tf.mean(valueLossMax));
+
+        const entropy = tf.neg(tf.mean(tf.sum(tf.mul(probs, logProbs), 1)));
+        return tf.add(
+          tf.add(policyLoss, tf.mul(valueLoss, tf.scalar(options.valueWeight))),
+          tf.neg(tf.mul(entropy, tf.scalar(options.entropyBeta))),
+        );
+      }, true);
+
+      let batchLoss = Number.NaN;
+      if (lossTensor) {
+        const data = lossTensor.dataSync() as Float32Array;
+        batchLoss = Number(data[0]);
+        lossTensor.dispose();
+      }
+
+      tf.dispose([
+        inputTensor,
+        actionMaskTensor,
+        actionTensor,
+        returnsTensor,
+        oldLogProbTensor,
+        oldValueTensor,
+        advantageTensor,
+        oneHot,
+      ]);
+
+      if (!Number.isFinite(batchLoss)) {
         divergenceDetected = true;
         break;
       }
-      if (
-        isFiniteArray(checkpointBeforeStep.w1) &&
-        isFiniteArray(checkpointBeforeStep.b1) &&
-        isFiniteArray(checkpointBeforeStep.wp) &&
-        isFiniteArray(checkpointBeforeStep.bp) &&
-        (!hasBestFiniteLoss || bestLoss == null || finalLoss < bestLoss)
-      ) {
-        bestParams = checkpointBeforeStep;
-        bestLoss = finalLoss;
-        hasBestFiniteLoss = true;
+      epochLossSum += batchLoss;
+      epochBatches += 1;
+    }
+
+    if (divergenceDetected) {
+      finalLoss = Number.NaN;
+      break;
+    }
+    finalLoss = epochBatches > 0 ? epochLossSum / epochBatches : Number.NaN;
+    if (!Number.isFinite(finalLoss)) {
+      divergenceDetected = true;
+      break;
+    }
+
+    const checkpoint = snapshotCurrentParams();
+    if (
+      isFiniteArray(checkpoint.w1) &&
+      isFiniteArray(checkpoint.b1) &&
+      isFiniteArray(checkpoint.wp) &&
+      isFiniteArray(checkpoint.bp) &&
+      isFiniteArray(checkpoint.wv) &&
+      isFiniteArray(checkpoint.bv) &&
+      (!hasBestFiniteLoss || bestLoss == null || finalLoss < bestLoss)
+    ) {
+      bestParams = checkpoint;
+      bestLoss = finalLoss;
+      hasBestFiniteLoss = true;
+    }
+
+    let klSum = 0;
+    let clipCount = 0;
+    let metricCount = 0;
+    for (let i = 0; i < count; i += 1) {
+      const obsOffset = i * options.params.inputDim;
+      const observation = options.observations.subarray(
+        obsOffset,
+        obsOffset + options.params.inputDim,
+      );
+      const maskOffset = i * options.params.actionDim;
+      const actionMask = options.actionMasks
+        ? options.actionMasks.subarray(
+            maskOffset,
+            maskOffset + options.params.actionDim,
+          )
+        : null;
+      const forward = forwardPolicy(checkpoint, observation, actionMask);
+      const actionIndex = options.actions[i] ?? 0;
+      const probability = forward.probabilities[actionIndex] ?? 0;
+      const safeProb =
+        Number.isFinite(probability) && probability > 1e-8 ? probability : 1e-8;
+      const newLogProb = Math.log(safeProb);
+      const oldLogProb = options.oldLogProbs[i] ?? 0;
+      const ratio = Math.exp(newLogProb - oldLogProb);
+      klSum += oldLogProb - newLogProb;
+      if (Math.abs(ratio - 1) > options.clipEpsilon) {
+        clipCount += 1;
       }
+      metricCount += 1;
+    }
+    approxKl = metricCount > 0 ? klSum / metricCount : 0;
+    clipFraction = metricCount > 0 ? clipCount / metricCount : 0;
+    if (
+      options.targetKl > 0 &&
+      approxKl != null &&
+      Number.isFinite(approxKl) &&
+      approxKl > options.targetKl
+    ) {
+      stoppedEarlyByKl = true;
+      break;
     }
   }
 
@@ -1418,22 +1675,16 @@ const trainWithTfjsPpo = async (options: {
       (bestLoss != null && bestLoss < finalLoss));
   finalLoss = hasBestFiniteLoss ? bestLoss : null;
 
-  tf.dispose([
-    inputTensor,
-    actionMaskTensor,
-    actionTensor,
-    returnsTensor,
-    oldLogProbTensor,
-    advantageTensor,
-    oneHot,
-    w1,
-    b1,
-    wp,
-    bp,
-    wv,
-    bv,
-  ]);
-  return { params: trained, finalLoss, bestLoss, usedBestCheckpoint };
+  tf.dispose([w1, b1, wp, bp, wv, bv]);
+  return {
+    params: trained,
+    finalLoss,
+    bestLoss,
+    usedBestCheckpoint,
+    approxKl,
+    clipFraction,
+    stoppedEarlyByKl,
+  };
 };
 
 const toArtifact = (
@@ -1458,6 +1709,8 @@ const toArtifact = (
     b1: Array.from(params.b1),
     wp: Array.from(params.wp),
     bp: Array.from(params.bp),
+    wv: Array.from(params.wv),
+    bv: Array.from(params.bv),
   },
 });
 
@@ -1496,11 +1749,20 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   const b1 = new Float32Array(policy.weights.b1);
   const wp = new Float32Array(policy.weights.wp);
   const bp = new Float32Array(policy.weights.bp);
+  const valueHead = defaultValueHead(hiddenDim);
+  const wv = Array.isArray(policy.weights.wv)
+    ? new Float32Array(policy.weights.wv)
+    : valueHead.wv;
+  const bv = Array.isArray(policy.weights.bv)
+    ? new Float32Array(policy.weights.bv)
+    : valueHead.bv;
   if (
     w1.length !== inputDim * hiddenDim ||
     b1.length !== hiddenDim ||
     wp.length !== hiddenDim * actionDim ||
-    bp.length !== actionDim
+    bp.length !== actionDim ||
+    wv.length !== hiddenDim ||
+    bv.length !== 1
   ) {
     throw new Error('Invalid bot policy artifact dimensions.');
   }
@@ -1508,7 +1770,9 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     !isFiniteArray(w1) ||
     !isFiniteArray(b1) ||
     !isFiniteArray(wp) ||
-    !isFiniteArray(bp)
+    !isFiniteArray(bp) ||
+    !isFiniteArray(wv) ||
+    !isFiniteArray(bv)
   ) {
     throw new Error('Bot policy artifact contains non-finite values.');
   }
@@ -1527,7 +1791,101 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     b1,
     wp,
     bp,
+    wv,
+    bv,
   };
+};
+
+export const parseBotPolicyArtifactFromUnknown = (
+  value: unknown,
+): BotPolicyArtifact => {
+  if (!isRecord(value)) {
+    throw new Error('Invalid bot policy artifact payload.');
+  }
+  const weightsRaw = value.weights;
+  if (!isRecord(weightsRaw)) {
+    throw new Error('Bot policy artifact is missing weights.');
+  }
+  const asArray = (key: string): number[] => {
+    const raw = weightsRaw[key];
+    if (!Array.isArray(raw)) return [];
+    return raw.map((item) => Number(item));
+  };
+  const modeIdRaw = typeof value.modeId === 'string' ? value.modeId.trim() : '';
+  const modeId = modeIdRaw.length > 0 ? modeIdRaw.toLowerCase() : 'charcuterie';
+  const createdAtRaw = Number(value.createdAtMs);
+  const createdAtMs =
+    Number.isFinite(createdAtRaw) && createdAtRaw > 0
+      ? Math.trunc(createdAtRaw)
+      : Date.now();
+  const inputDim = Math.max(1, Math.trunc(Number(value.inputDim)));
+  const hiddenDim = Math.max(1, Math.trunc(Number(value.hiddenDim)));
+  const actionDim = Math.max(1, Math.trunc(Number(value.actionDim)));
+  const candidate: BotPolicyArtifact = {
+    id:
+      typeof value.id === 'string' && value.id.trim().length > 0
+        ? value.id.trim()
+        : `bot_policy_${modeId}_${createdAtMs}`,
+    modeId,
+    archId:
+      typeof value.archId === 'string' && value.archId.trim().length > 0
+        ? value.archId.trim().toLowerCase()
+        : undefined,
+    queuePolicyId:
+      typeof value.queuePolicyId === 'string' &&
+      value.queuePolicyId.trim().length > 0
+        ? value.queuePolicyId.trim().toLowerCase()
+        : undefined,
+    pipelineId:
+      typeof value.pipelineId === 'string' && value.pipelineId.trim().length > 0
+        ? value.pipelineId.trim()
+        : undefined,
+    pieceSourceProfile:
+      value.pieceSourceProfile === 'active_generator'
+        ? 'active_generator'
+        : 'bag7',
+    createdAtMs,
+    inputDim,
+    hiddenDim,
+    actionDim,
+    actionSpaceKind:
+      value.actionSpaceKind === 'placement_v1' ? 'placement_v1' : 'macro_v1',
+    actions: Array.isArray(value.actions)
+      ? (value.actions as BotMacroAction[])
+      : undefined,
+    placementActionDim: Number.isFinite(Number(value.placementActionDim))
+      ? Math.max(1, Math.trunc(Number(value.placementActionDim)))
+      : undefined,
+    weights: {
+      w1: asArray('w1'),
+      b1: asArray('b1'),
+      wp: asArray('wp'),
+      bp: asArray('bp'),
+      wv: asArray('wv'),
+      bv: asArray('bv'),
+    },
+  };
+  const params = fromArtifact(candidate);
+  const normalized = toArtifact(modeId, params);
+  normalized.id = candidate.id;
+  normalized.createdAtMs = createdAtMs;
+  normalized.archId = candidate.archId;
+  normalized.queuePolicyId = candidate.queuePolicyId;
+  normalized.pipelineId = candidate.pipelineId;
+  normalized.pieceSourceProfile = candidate.pieceSourceProfile;
+  return normalized;
+};
+
+export const parseBotPolicyArtifactFromJson = (
+  jsonText: string,
+): BotPolicyArtifact => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    throw new Error('Invalid JSON. Could not parse bot policy file.');
+  }
+  return parseBotPolicyArtifactFromUnknown(parsed);
 };
 
 const toDraftSamples = (
@@ -1600,6 +1958,13 @@ export const trainBotPolicyOneShot = async (
   const entropyBeta = clamp(config.entropyBeta ?? 0.01, 0, 1);
   const valueWeight = clamp(config.valueWeight ?? 0.5, 0, 10);
   const epochs = Math.max(1, Math.trunc(config.epochs ?? 6));
+  const gaeLambda = clamp(config.gaeLambda ?? 0.95, 0.7, 1);
+  const ppoMinibatchSize = Math.max(
+    16,
+    Math.trunc(config.ppoMinibatchSize ?? 512),
+  );
+  const ppoTargetKl = clamp(config.ppoTargetKl ?? 0.02, 0, 1);
+  const ppoIterations = Math.max(1, Math.trunc(config.ppoIterations ?? 1));
   const seed =
     config.seed != null && Number.isFinite(config.seed)
       ? Math.max(1, Math.trunc(config.seed))
@@ -1622,7 +1987,14 @@ export const trainBotPolicyOneShot = async (
     }).game.state,
   ).length;
   let initSource: 'scratch' | 'warm' = 'scratch';
-  let params: PolicyParams | null = null;
+  let params: PolicyParams = randomizeParams(
+    inputDim,
+    64,
+    BOT_PLACEMENT_ACTION_DIM,
+    DEFAULT_BOT_ACTION_SPACE_KIND,
+    null,
+    new XorShift32(seed),
+  );
   if (config.initialPolicy) {
     try {
       const warmParams = fromArtifact(config.initialPolicy);
@@ -1635,7 +2007,9 @@ export const trainBotPolicyOneShot = async (
         isFiniteArray(warmParams.w1) &&
         isFiniteArray(warmParams.b1) &&
         isFiniteArray(warmParams.wp) &&
-        isFiniteArray(warmParams.bp);
+        isFiniteArray(warmParams.bp) &&
+        isFiniteArray(warmParams.wv) &&
+        isFiniteArray(warmParams.bv);
       if (compatible) {
         params = warmParams;
         initSource = 'warm';
@@ -1644,202 +2018,276 @@ export const trainBotPolicyOneShot = async (
       // Ignore malformed policy artifact and fall back to random init.
     }
   }
-  if (!params) {
-    params = randomizeParams(
-      inputDim,
-      64,
-      BOT_PLACEMENT_ACTION_DIM,
-      DEFAULT_BOT_ACTION_SPACE_KIND,
-      null,
-      new XorShift32(seed),
-    );
-  }
   const transitions: Transition[] = [];
   const episodeReturns: number[] = [];
   let transitionCapHit = false;
+  let episodeCursor = 0;
+  let finalLoss: number | null = null;
+  let usedBestCheckpoint = false;
+  let latestApproxKl: number | null = null;
+  let latestClipFraction: number | null = null;
+  let stoppedEarlyByKl = false;
+  const transitionsPerIteration: number[] = [];
 
-  for (let episode = 0; episode < episodes; episode += 1) {
-    const rollout = runRollout({
-      modeId: config.modeId,
-      settings: config.settings,
-      model: config.model,
-      modelRunner: config.modelRunner,
-      modelAxes: config.modelAxes,
-      pieceSourceProfile,
-      policyParams: params,
-      seed: seed + episode * 997,
-      maxPieces: maxPiecesPerEpisode,
-      greedy: false,
-    });
-    episodeReturns.push(rollout.episodeReturn);
-    const rewards = rollout.transitions.map((entry) => entry.reward ?? 0);
-    const discounted = computeDiscountedReturns(rewards, gamma);
-    for (let i = 0; i < rollout.transitions.length; i += 1) {
-      const transitionMask = rollout.transitions[i].actionMask;
-      transitions.push({
-        observation: rollout.transitions[i].observation,
-        actionIndex: rollout.transitions[i].actionIndex,
-        actionMask: transitionMask ? new Float32Array(transitionMask) : null,
-        reward: discounted[i],
+  const collectTransitions = (episodeCount: number): void => {
+    for (let episode = 0; episode < episodeCount; episode += 1) {
+      const rollout = runRollout({
+        modeId: config.modeId,
+        settings: config.settings,
+        model: config.model,
+        modelRunner: config.modelRunner,
+        modelAxes: config.modelAxes,
+        pieceSourceProfile,
+        policyParams: params,
+        seed: seed + episodeCursor * 997,
+        maxPieces: maxPiecesPerEpisode,
+        greedy: false,
       });
-      if (transitions.length >= BOT_TRAIN_MAX_TRANSITIONS) {
-        transitionCapHit = true;
+      episodeCursor += 1;
+      episodeReturns.push(rollout.episodeReturn);
+      const transitionCount = rollout.transitions.length;
+      if (transitionCount <= 0) continue;
+      for (let i = 0; i < transitionCount; i += 1) {
+        const transitionMask = rollout.transitions[i].actionMask;
+        transitions.push({
+          observation: rollout.transitions[i].observation,
+          actionIndex: rollout.transitions[i].actionIndex,
+          actionMask: transitionMask ? new Float32Array(transitionMask) : null,
+          reward: rollout.transitions[i].reward,
+          done: i === transitionCount - 1 ? 1 : 0,
+        });
+        if (transitions.length >= BOT_TRAIN_MAX_TRANSITIONS) {
+          transitionCapHit = true;
+          break;
+        }
+      }
+      if (transitionCapHit) {
         break;
       }
     }
-    if (transitionCapHit) {
-      break;
+  };
+
+  const runOneTrainingUpdate = async (): Promise<boolean> => {
+    if (transitions.length === 0) return false;
+    const transitionCount = transitions.length;
+    const observations = new Float32Array(transitionCount * inputDim);
+    const actionMasks = new Float32Array(transitionCount * params.actionDim);
+    const actions = new Int32Array(transitionCount);
+    const rewards = new Float32Array(transitionCount);
+    const dones = new Uint8Array(transitionCount);
+    const oldLogProbs = new Float32Array(transitionCount);
+    const oldValues = new Float32Array(transitionCount);
+
+    for (let i = 0; i < transitionCount; i += 1) {
+      const rowOffset = i * inputDim;
+      const sourceObs = transitions[i].observation;
+      for (let j = 0; j < inputDim; j += 1) {
+        const value = sourceObs[j];
+        observations[rowOffset + j] = Number.isFinite(value) ? value : 0;
+      }
+      const actionIndex = transitions[i].actionIndex;
+      const maskOffset = i * params.actionDim;
+      const mask = transitions[i].actionMask;
+      if (mask && mask.length === params.actionDim) {
+        actionMasks.set(mask, maskOffset);
+      } else {
+        actionMasks.fill(1, maskOffset, maskOffset + params.actionDim);
+      }
+      actions[i] =
+        Number.isFinite(actionIndex) &&
+        actionIndex >= 0 &&
+        actionIndex < params.actionDim
+          ? actionIndex
+          : 0;
+      const reward = transitions[i].reward ?? 0;
+      rewards[i] = Number.isFinite(reward) ? reward : 0;
+      dones[i] = transitions[i].done > 0 ? 1 : 0;
+
+      const rowMask = actionMasks.subarray(
+        maskOffset,
+        maskOffset + params.actionDim,
+      );
+      const forward = forwardPolicy(params, sourceObs, rowMask);
+      const probability = forward.probabilities[actions[i]] ?? 0;
+      const safeProb =
+        Number.isFinite(probability) && probability > 1e-8 ? probability : 1e-8;
+      oldLogProbs[i] = Math.log(safeProb);
+      oldValues[i] = forwardValue(params, sourceObs);
+    }
+
+    const returns = new Float32Array(transitionCount);
+    const advantages = new Float32Array(transitionCount);
+    if (algorithm === 'ppo') {
+      const gae = computeGae({
+        rewards,
+        values: oldValues,
+        dones,
+        gamma,
+        lambda: gaeLambda,
+      });
+      returns.set(gae.returns);
+      advantages.set(gae.advantages);
+    } else {
+      let running = 0;
+      for (let i = transitionCount - 1; i >= 0; i -= 1) {
+        if (dones[i] > 0) running = 0;
+        running = rewards[i] + gamma * running;
+        returns[i] = running;
+        advantages[i] = running;
+      }
+    }
+    normalizeAdvantagesInPlace(advantages);
+
+    const trained =
+      algorithm === 'ppo'
+        ? await trainWithTfjsPpo({
+            params,
+            observations,
+            actionMasks,
+            actions,
+            returns,
+            oldLogProbs,
+            oldValues,
+            advantages,
+            learningRate,
+            entropyBeta,
+            valueWeight,
+            epochs,
+            minibatchSize: ppoMinibatchSize,
+            targetKl: ppoTargetKl,
+            clipEpsilon: BOT_PPO_CLIP_EPSILON,
+            valueClipEpsilon: BOT_PPO_CLIP_EPSILON,
+            seed: seed + episodeCursor * 131,
+          })
+        : await trainWithTfjsReinforce({
+            params,
+            observations,
+            actionMasks,
+            actions,
+            returns,
+            learningRate,
+            entropyBeta,
+            valueWeight,
+            epochs,
+          });
+
+    if (
+      !isFiniteArray(trained.params.w1) ||
+      !isFiniteArray(trained.params.b1) ||
+      !isFiniteArray(trained.params.wp) ||
+      !isFiniteArray(trained.params.bp) ||
+      !isFiniteArray(trained.params.wv) ||
+      !isFiniteArray(trained.params.bv)
+    ) {
+      return false;
+    }
+    if (
+      trained.finalLoss != null &&
+      Number.isFinite(trained.finalLoss) === false
+    ) {
+      return false;
+    }
+    finalLoss = trained.finalLoss;
+    usedBestCheckpoint = trained.usedBestCheckpoint;
+    latestApproxKl = trained.approxKl;
+    latestClipFraction = trained.clipFraction;
+    stoppedEarlyByKl = trained.stoppedEarlyByKl;
+    params = trained.params;
+    transitionsPerIteration.push(transitionCount);
+    return true;
+  };
+
+  if (algorithm === 'ppo' && ppoIterations > 1) {
+    const baseEpisodesPerIter = Math.floor(episodes / ppoIterations);
+    let remainder = episodes % ppoIterations;
+    for (let iter = 0; iter < ppoIterations; iter += 1) {
+      const episodesForIter = baseEpisodesPerIter + (remainder > 0 ? 1 : 0);
+      remainder = Math.max(0, remainder - 1);
+      if (episodesForIter <= 0) continue;
+      transitions.length = 0;
+      collectTransitions(episodesForIter);
+      if (transitions.length === 0) continue;
+      const ok = await runOneTrainingUpdate();
+      if (!ok) {
+        return {
+          ok: false,
+          message:
+            'Bot training produced non-finite weights/loss. Try fewer episodes, lower piece cap, or train from scratch.',
+          episodes: episodeCursor,
+          meanReturn: mean(episodeReturns),
+          finalLoss,
+          policyArtifact: null,
+        };
+      }
+      if (stoppedEarlyByKl) break;
+      if (transitionCapHit) break;
+    }
+  } else {
+    collectTransitions(episodes);
+    if (transitions.length > 0) {
+      const ok = await runOneTrainingUpdate();
+      if (!ok) {
+        return {
+          ok: false,
+          message:
+            'Bot training produced non-finite weights/loss. Try fewer episodes, lower piece cap, or train from scratch.',
+          episodes: episodeCursor,
+          meanReturn: mean(episodeReturns),
+          finalLoss,
+          policyArtifact: null,
+        };
+      }
     }
   }
 
-  if (transitions.length === 0) {
+  const transitionsUsed = transitionsPerIteration.reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  if (transitionsUsed <= 0) {
     return {
       ok: false,
       message: 'Bot training failed: no transitions collected.',
-      episodes,
+      episodes: episodeCursor,
       meanReturn: 0,
       finalLoss: null,
       policyArtifact: null,
     };
   }
 
-  const observations = new Float32Array(transitions.length * inputDim);
-  const actionMasks = new Float32Array(transitions.length * params.actionDim);
-  const actions = new Int32Array(transitions.length);
-  const returns = new Float32Array(transitions.length);
-  const oldLogProbs = new Float32Array(transitions.length);
-  for (let i = 0; i < transitions.length; i += 1) {
-    const rowOffset = i * inputDim;
-    const sourceObs = transitions[i].observation;
-    for (let j = 0; j < inputDim; j += 1) {
-      const value = sourceObs[j];
-      observations[rowOffset + j] = Number.isFinite(value) ? value : 0;
-    }
-    const actionIndex = transitions[i].actionIndex;
-    const maskOffset = i * params.actionDim;
-    const mask = transitions[i].actionMask;
-    if (mask && mask.length === params.actionDim) {
-      actionMasks.set(mask, maskOffset);
-    } else {
-      actionMasks.fill(1, maskOffset, maskOffset + params.actionDim);
-    }
-    actions[i] =
-      Number.isFinite(actionIndex) &&
-      actionIndex >= 0 &&
-      actionIndex < params.actionDim
-        ? actionIndex
-        : 0;
-    const reward = transitions[i].reward ?? 0;
-    returns[i] = Number.isFinite(reward) ? reward : 0;
-    const rowMask = actionMasks.subarray(
-      maskOffset,
-      maskOffset + params.actionDim,
-    );
-    const forward = forwardPolicy(params, sourceObs, rowMask);
-    const probability = forward.probabilities[actions[i]] ?? 0;
-    const safeProb =
-      Number.isFinite(probability) && probability > 1e-8 ? probability : 1e-8;
-    oldLogProbs[i] = Math.log(safeProb);
-  }
-
-  const advantages = new Float32Array(returns.length);
-  let advantageMean = 0;
-  for (let i = 0; i < returns.length; i += 1) {
-    const value = returns[i];
-    advantages[i] = value;
-    advantageMean += value;
-  }
-  advantageMean /= Math.max(1, advantages.length);
-  let advantageVar = 0;
-  for (let i = 0; i < advantages.length; i += 1) {
-    const centered = advantages[i] - advantageMean;
-    advantages[i] = centered;
-    advantageVar += centered * centered;
-  }
-  const advantageStd = Math.sqrt(
-    advantageVar / Math.max(1, advantages.length) + 1e-8,
-  );
-  for (let i = 0; i < advantages.length; i += 1) {
-    advantages[i] /= advantageStd;
-  }
-
-  const trained =
-    algorithm === 'ppo'
-      ? await trainWithTfjsPpo({
-          params,
-          observations,
-          actionMasks,
-          actions,
-          returns,
-          oldLogProbs,
-          advantages,
-          learningRate,
-          entropyBeta,
-          valueWeight,
-          epochs,
-          clipEpsilon: BOT_PPO_CLIP_EPSILON,
-        })
-      : await trainWithTfjsReinforce({
-          params,
-          observations,
-          actionMasks,
-          actions,
-          returns,
-          learningRate,
-          entropyBeta,
-          valueWeight,
-          epochs,
-        });
-  if (
-    !isFiniteArray(trained.params.w1) ||
-    !isFiniteArray(trained.params.b1) ||
-    !isFiniteArray(trained.params.wp) ||
-    !isFiniteArray(trained.params.bp)
-  ) {
-    return {
-      ok: false,
-      message:
-        'Bot training produced non-finite weights. Try fewer episodes, lower piece cap, or train from scratch.',
-      episodes,
-      meanReturn: mean(episodeReturns),
-      finalLoss: trained.finalLoss,
-      policyArtifact: null,
-    };
-  }
-  if (
-    trained.finalLoss != null &&
-    Number.isFinite(trained.finalLoss) === false
-  ) {
-    return {
-      ok: false,
-      message:
-        'Bot training diverged (loss is non-finite). Try fewer episodes, lower piece cap, or train from scratch.',
-      episodes,
-      meanReturn: mean(episodeReturns),
-      finalLoss: trained.finalLoss,
-      policyArtifact: null,
-    };
-  }
-  params = trained.params;
   const policyArtifact = toArtifact(config.modeId, params);
   policyArtifact.archId = config.modelAxes.arch;
   policyArtifact.queuePolicyId = config.modelAxes.queuePolicyId;
   policyArtifact.pipelineId =
-    algorithm === 'ppo' ? 'bot_ppo_v2' : 'bot_reinforce_v2';
+    algorithm === 'ppo' ? 'bot_ppo_v3' : 'bot_reinforce_v2';
   policyArtifact.pieceSourceProfile = pieceSourceProfile;
+  const approxKlText =
+    typeof latestApproxKl === 'number'
+      ? `, approx_kl=${Number(latestApproxKl).toExponential(2)}`
+      : '';
+  const clipFractionText =
+    typeof latestClipFraction === 'number'
+      ? `, clip_frac=${Number(latestClipFraction).toFixed(3)}`
+      : '';
 
   return {
     ok: true,
     message:
-      `Bot policy training complete (${algorithm}, episodes=${episodes}, transitions=${transitions.length}, ` +
+      `Bot policy training complete (${algorithm}, episodes=${episodeCursor}, transitions=${transitionsUsed}, ` +
       `gamma=${gamma.toFixed(4)}, init=${initSource}, seed=${seed}` +
       `${requestedEpisodes > episodes ? `, episodes_capped=${episodes}` : ''}` +
       `${transitionCapHit ? `, transition_cap=${BOT_TRAIN_MAX_TRANSITIONS}` : ''}` +
-      `${trained.usedBestCheckpoint ? ', checkpoint=best_loss' : ''}` +
+      `${algorithm === 'ppo' ? `, lambda=${gaeLambda.toFixed(3)}` : ''}` +
+      `${algorithm === 'ppo' ? `, minibatch=${ppoMinibatchSize}` : ''}` +
+      `${algorithm === 'ppo' ? `, target_kl=${ppoTargetKl.toFixed(4)}` : ''}` +
+      `${approxKlText}` +
+      `${clipFractionText}` +
+      `${stoppedEarlyByKl ? ', early_stop=kl' : ''}` +
+      `${usedBestCheckpoint ? ', checkpoint=best_loss' : ''}` +
       ').',
-    episodes,
+    episodes: episodeCursor,
     meanReturn: mean(episodeReturns),
-    finalLoss: trained.finalLoss,
+    finalLoss,
     policyArtifact,
   };
 };

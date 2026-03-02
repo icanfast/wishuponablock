@@ -312,6 +312,10 @@ export type MenuScreenOptions = {
     cursor?: string | null;
   }) => Promise<MenuBotPoliciesPage>;
   onBotLabLoadPolicyById: (id: string) => Promise<string>;
+  onBotLabImportPolicyJson: (payload: {
+    jsonText: string;
+    sourceName?: string | null;
+  }) => Promise<string>;
   onBotLabPublishPolicy: (options?: {
     pin?: boolean;
     setCurrent?: boolean;
@@ -424,6 +428,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onBotLabFetchCurrentPolicy,
     onBotLabListPolicies,
     onBotLabLoadPolicyById,
+    onBotLabImportPolicyJson,
     onBotLabPublishPolicy,
     onBotLabSelectCurrentPolicy,
     onBotLabPinPolicy,
@@ -3230,14 +3235,22 @@ input[type=number] {
   const botLabPolicyButtonsTop = document.createElement('div');
   Object.assign(botLabPolicyButtonsTop.style, {
     display: 'flex',
+    flexWrap: 'wrap',
     gap: '6px',
   });
   const botLabFetchCurrentButton = makeMenuButton('LOAD CURRENT');
   const botLabRefreshPoliciesButton = makeMenuButton('REFRESH LIST');
+  const botLabImportJsonButton = makeMenuButton('IMPORT LOCAL JSON');
   Object.assign(botLabFetchCurrentButton.style, { flex: '1' });
   Object.assign(botLabRefreshPoliciesButton.style, { flex: '1' });
+  Object.assign(botLabImportJsonButton.style, { flex: '1' });
   botLabPolicyButtonsTop.appendChild(botLabFetchCurrentButton);
   botLabPolicyButtonsTop.appendChild(botLabRefreshPoliciesButton);
+  botLabPolicyButtonsTop.appendChild(botLabImportJsonButton);
+  const botLabImportPolicyInput = document.createElement('input');
+  botLabImportPolicyInput.type = 'file';
+  botLabImportPolicyInput.accept = '.json,application/json';
+  botLabImportPolicyInput.style.display = 'none';
   const botLabPoliciesSelect = document.createElement('select');
   botLabPoliciesSelect.size = 7;
   Object.assign(botLabPoliciesSelect.style, {
@@ -3608,6 +3621,7 @@ input[type=number] {
   botLabPanel.appendChild(botLabStatus);
   botLabPanel.appendChild(botLabPolicyLabel);
   botLabPanel.appendChild(botLabPolicyButtonsTop);
+  botLabPanel.appendChild(botLabImportPolicyInput);
   botLabPanel.appendChild(botLabPoliciesSelect);
   botLabPanel.appendChild(botLabPolicyButtonsRow);
   botLabPanel.appendChild(botLabPublishRow);
@@ -4384,6 +4398,7 @@ input[type=number] {
 
     botLabFetchCurrentButton.disabled = !isAdmin || busy;
     botLabRefreshPoliciesButton.disabled = !isAdmin || busy;
+    botLabImportJsonButton.disabled = !isAdmin || busy;
     botLabPoliciesSelect.disabled = !isAdmin || busy || !hasPolicies;
     botLabPolicyNextButton.disabled =
       !isAdmin || busy || botLabPolicyCursor == null;
@@ -4428,6 +4443,7 @@ input[type=number] {
       botLabRefreshPoliciesButton,
       !botLabRefreshPoliciesButton.disabled,
     );
+    setVisualState(botLabImportJsonButton, !botLabImportJsonButton.disabled);
     setVisualState(botLabPolicyNextButton, !botLabPolicyNextButton.disabled);
     setVisualState(botLabPolicyLoadButton, !botLabPolicyLoadButton.disabled);
     setVisualState(
@@ -5479,6 +5495,38 @@ input[type=number] {
     }
   });
 
+  botLabImportJsonButton.addEventListener('click', () => {
+    if (botLabActionPending || botLabListPending) return;
+    botLabImportPolicyInput.value = '';
+    botLabImportPolicyInput.click();
+  });
+
+  botLabImportPolicyInput.addEventListener('change', async () => {
+    const file = botLabImportPolicyInput.files?.[0];
+    botLabImportPolicyInput.value = '';
+    if (!file) return;
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus(`Importing ${file.name}...`);
+    updateBotLabControls();
+    try {
+      const jsonText = await file.text();
+      const message = await onBotLabImportPolicyJson({
+        jsonText,
+        sourceName: file.name,
+      });
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not import bot policy JSON.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
   botLabRefreshPoliciesButton.addEventListener('click', () => {
     botLabPolicyCursor = null;
     void loadBotLabPolicies();
@@ -5598,8 +5646,11 @@ input[type=number] {
           'bag7',
         ),
       });
-      if (botLabPublishCurrentToggle.checked && botLabSelectedPolicyId) {
-        botLabCurrentPolicyId = botLabSelectedPolicyId;
+      if (botLabPublishCurrentToggle.checked) {
+        const publishedMatch = /Published bot policy\s+([a-z0-9-]{36})/i.exec(
+          message,
+        );
+        botLabCurrentPolicyId = publishedMatch?.[1] ?? botLabCurrentPolicyId;
       }
       setBotLabActionStatus(message, 'success');
       await loadBotLabPolicies({ silent: true });

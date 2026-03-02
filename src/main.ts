@@ -67,6 +67,7 @@ import { createTrajectoryReplayGuiInputSource } from './app/trajectoryReplayGuiI
 import {
   createGuiInspectBotInputSource,
   generateBotTrajectoryBatch,
+  parseBotPolicyArtifactFromJson,
   runHeadlessBotValidation,
   runCapabilityBenchmark,
   trainBotPolicyOneShot,
@@ -1560,6 +1561,38 @@ async function boot() {
     adminBotPolicy.id = loaded.policy.id;
     adminBotPolicy.modeId = loaded.policy.modeId;
     return `Loaded bot policy ${loaded.policy.id} (v${loaded.policy.version}).`;
+  };
+
+  const importAdminBotPolicyJson = async (payload: {
+    jsonText: string;
+    sourceName?: string | null;
+  }): Promise<string> => {
+    if (
+      !authState.authenticated ||
+      !authState.user ||
+      !authState.user.isAdmin
+    ) {
+      throw new Error('Admin account required.');
+    }
+    const parsed = parseBotPolicyArtifactFromJson(payload.jsonText);
+    const selector = getBotPolicySelector();
+    adminBotPolicyRecord = null;
+    adminBotPolicy = {
+      ...parsed,
+      modeId: selector.modeId,
+      archId: selector.archId,
+      queuePolicyId: selector.queuePolicyId,
+    };
+    const sourceSuffix =
+      typeof payload.sourceName === 'string' && payload.sourceName.trim().length
+        ? ` from ${payload.sourceName.trim()}`
+        : '';
+    return (
+      `Imported local bot policy${sourceSuffix}: ` +
+      `mode=${adminBotPolicy.modeId}, actionSpace=${adminBotPolicy.actionSpaceKind ?? 'macro_v1'}, ` +
+      `hidden=${adminBotPolicy.hiddenDim}, actionDim=${adminBotPolicy.actionDim}. ` +
+      'Use PUBLISH LOADED POLICY to upload to R2 and register in D1.'
+    );
   };
 
   const publishAdminBotPolicy = async (options?: {
@@ -3764,6 +3797,7 @@ async function boot() {
     onBotLabFetchCurrentPolicy: fetchCurrentAdminBotPolicy,
     onBotLabListPolicies: listAdminBotPolicies,
     onBotLabLoadPolicyById: loadAdminBotPolicyById,
+    onBotLabImportPolicyJson: importAdminBotPolicyJson,
     onBotLabPublishPolicy: (options) =>
       publishAdminBotPolicy({
         pin: options?.pin,
