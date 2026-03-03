@@ -82,6 +82,7 @@ import {
 import {
   MIN_TRAJECTORY_SAMPLES_PER_SESSION,
   TRAJECTORY_SESSION_SCHEMA_V1,
+  parseTrajectorySessionV1,
   type TrajectoryInitialStateV1,
   type TrajectoryReplayStepV1,
   type TrajectorySessionMetaV1,
@@ -1104,6 +1105,41 @@ async function boot() {
       outcome: session.meta?.outcome ?? null,
     };
   };
+
+  const importAdminReplayRecording = async (payload: {
+    jsonText: string;
+    sourceName?: string | null;
+  }): Promise<string> => {
+    const jsonText = payload.jsonText;
+    if (typeof jsonText !== 'string' || jsonText.trim().length === 0) {
+      throw new Error('Imported file is empty.');
+    }
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(jsonText);
+    } catch {
+      throw new Error('Imported file is not valid JSON.');
+    }
+    const parsed = parseTrajectorySessionV1(parsedJson, { minSamples: 1 });
+    if (!parsed.ok) {
+      throw new Error(
+        parsed.error ?? 'Imported JSON is not a valid trajectory recording.',
+      );
+    }
+    const session = parsed.value;
+    adminLoadedRecordingSession = session;
+    const sourceName =
+      typeof payload.sourceName === 'string' &&
+      payload.sourceName.trim().length > 0
+        ? payload.sourceName.trim()
+        : 'local file';
+    return (
+      `Loaded local replay recording (${sourceName}): ` +
+      `session ${session.sessionId}, mode ${session.modeId}, ` +
+      `samples ${session.samples.length}.`
+    );
+  };
+
   const listAdminGlobalBaselines = async (): Promise<
     MenuAdminGlobalBaselineSummary[]
   > => {
@@ -3859,6 +3895,7 @@ async function boot() {
     onAuthSaveCurrentModel: saveCurrentModePersonalModel,
     onAdminListRecordings: listAdminRecordings,
     onAdminLoadRecording: loadAdminRecordingPreview,
+    onAdminImportReplayRecording: importAdminReplayRecording,
     onAdminPublishCurrentModelBaseline: publishCurrentModelAsGlobalBaseline,
     onAdminListGlobalBaselines: listAdminGlobalBaselines,
     onAdminSetGlobalBaselineDefault: setAdminGlobalBaselineDefault,

@@ -55,6 +55,7 @@ const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
 const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
 const TRAJECTORY_MIN_SAMPLE_ID = 8;
+const MAX_COMPLETED_TRAJECTORY_QUEUE = 1;
 
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
@@ -989,6 +990,12 @@ export class BotEnvPool {
       dones.push(out.done);
       infos.push(out.info);
       if (out.completedSession) {
+        if (
+          this.completedTrajectorySessions.length >=
+          MAX_COMPLETED_TRAJECTORY_QUEUE
+        ) {
+          this.completedTrajectorySessions.shift();
+        }
         this.completedTrajectorySessions.push(out.completedSession);
       }
       stepEnvTotalS += out.profile.total_s;

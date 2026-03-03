@@ -274,6 +274,10 @@ export type MenuScreenOptions = {
     query: MenuAdminRecordingsQuery,
   ) => Promise<MenuAdminRecordingsPage>;
   onAdminLoadRecording: (id: string) => Promise<MenuAdminRecordingPreview>;
+  onAdminImportReplayRecording: (payload: {
+    jsonText: string;
+    sourceName?: string | null;
+  }) => Promise<string>;
   onAdminPublishCurrentModelBaseline: (payload?: {
     label?: string;
     setDefault?: boolean;
@@ -415,6 +419,7 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onAuthSaveCurrentModel,
     onAdminListRecordings,
     onAdminLoadRecording,
+    onAdminImportReplayRecording,
     onAdminPublishCurrentModelBaseline,
     onAdminListGlobalBaselines,
     onAdminSetGlobalBaselineDefault,
@@ -3201,9 +3206,15 @@ input[type=number] {
     flexDirection: 'column',
     gap: '6px',
   });
+  const replayLabImportButton = makeMenuButton('IMPORT LOCAL RECORDING');
+  const replayLabImportInput = document.createElement('input');
+  replayLabImportInput.type = 'file';
+  replayLabImportInput.accept = '.json,application/json';
+  replayLabImportInput.style.display = 'none';
   const replayLabRunRecordingButton = makeMenuButton('RUN RECORDING REPLAY');
   const replayLabRunExecutorButton = makeMenuButton('RUN EXECUTOR GUI');
   const replayLabStopButton = makeMenuButton('STOP REPLAY');
+  replayLabButtons.appendChild(replayLabImportButton);
   replayLabButtons.appendChild(replayLabRunRecordingButton);
   replayLabButtons.appendChild(replayLabRunExecutorButton);
   replayLabButtons.appendChild(replayLabStopButton);
@@ -3213,6 +3224,7 @@ input[type=number] {
   replayLabControls.appendChild(replayLabClockSelect);
   replayLabControls.appendChild(replayLabExecutorStepModeLabel);
   replayLabControls.appendChild(replayLabButtons);
+  replayLabControls.appendChild(replayLabImportInput);
   replayLabPanel.appendChild(replayLabTitle);
   replayLabPanel.appendChild(replayLabSummary);
   replayLabPanel.appendChild(replayLabStatus);
@@ -4267,7 +4279,7 @@ input[type=number] {
       hasInitialState?: unknown;
     } | null;
     if (!loadedRaw) {
-      return 'No recording loaded.\nLoad a recording in Admin first.';
+      return 'No recording loaded.\nLoad in Admin or import local recording.';
     }
     const sessionId =
       typeof loadedRaw.sessionId === 'string' ? loadedRaw.sessionId : 'unknown';
@@ -4306,10 +4318,12 @@ input[type=number] {
     replayLabApmInput.disabled = !isAdmin || busy;
     replayLabClockSelect.disabled = !isAdmin || busy;
     replayLabExecutorStepModeToggle.disabled = !isAdmin || busy;
+    replayLabImportButton.disabled = !isAdmin || busy;
     replayLabRunRecordingButton.disabled = !isAdmin || busy;
     replayLabRunExecutorButton.disabled = !isAdmin || busy;
     replayLabStopButton.disabled = !isAdmin || busy;
     for (const button of [
+      replayLabImportButton,
       replayLabRunRecordingButton,
       replayLabRunExecutorButton,
       replayLabStopButton,
@@ -5379,6 +5393,38 @@ input[type=number] {
   adminOpenReplayLabButton.addEventListener('click', () => {
     setReplayLabStatus('');
     show('replay_lab');
+  });
+
+  replayLabImportButton.addEventListener('click', () => {
+    if (replayLabPending) return;
+    replayLabImportInput.value = '';
+    replayLabImportInput.click();
+  });
+
+  replayLabImportInput.addEventListener('change', async () => {
+    const file = replayLabImportInput.files?.[0];
+    replayLabImportInput.value = '';
+    if (!file) return;
+    if (replayLabPending) return;
+    replayLabPending = true;
+    setReplayLabStatus(`Importing ${file.name}...`);
+    updateReplayLabControls();
+    try {
+      const jsonText = await file.text();
+      const message = await onAdminImportReplayRecording({
+        jsonText,
+        sourceName: file.name,
+      });
+      setReplayLabStatus(message, 'success');
+    } catch (error) {
+      setReplayLabStatus(
+        toErrorMessage(error, 'Could not import local replay recording.'),
+        'error',
+      );
+    } finally {
+      replayLabPending = false;
+      updateReplayLabControls();
+    }
   });
 
   replayLabRunRecordingButton.addEventListener('click', async () => {
