@@ -286,6 +286,8 @@ async function boot() {
     import.meta.env.VITE_ENABLE_LEGACY_DATA_TOOLS === 'true';
   const SHOW_PERF_OVERLAY =
     import.meta.env.VITE_SHOW_PERF_OVERLAY === 'true' || import.meta.env.DEV;
+  const ENABLE_BOT_TRAJECTORY_UPLOADS =
+    import.meta.env.VITE_ENABLE_BOT_TRAJECTORY_UPLOADS === 'true';
   const perfOverlay = SHOW_PERF_OVERLAY
     ? createPerfOverlay({
         root: playWindow,
@@ -1740,6 +1742,11 @@ async function boot() {
     maxPiecesPerEpisode?: number;
     pieceSourceProfile?: BotPieceSourceProfile;
   }): Promise<string> => {
+    if (!ENABLE_BOT_TRAJECTORY_UPLOADS) {
+      throw new Error(
+        'Bot trajectory uploads are disabled. Enable VITE_ENABLE_BOT_TRAJECTORY_UPLOADS=true to allow them.',
+      );
+    }
     if (
       !authState.authenticated ||
       !authState.user ||
@@ -2589,6 +2596,8 @@ async function boot() {
     }
     console.info('[trajectory]', event);
   };
+  const isHumanTrajectoryCaptureContext = (): boolean =>
+    !botGuiInspectEnabled && !replayGuiInspectEnabled && !replayDirectRunning;
 
   const getTrajectoryModelArch = (): string => {
     const model = modelService.getModel();
@@ -2700,6 +2709,16 @@ async function boot() {
     });
 
   const beginTrajectoryRun = (modeId: string, state: GameState): void => {
+    if (!isHumanTrajectoryCaptureContext()) {
+      trajectoryDebug('run start blocked (non-human context)', {
+        modeId,
+        botGuiInspectEnabled,
+        replayGuiInspectEnabled,
+        replayDirectRunning,
+      });
+      pendingTrajectoryRunModeId = null;
+      return;
+    }
     const axes = getActiveModelAxes();
     const pipeline = getTrainingPipelineForContext(modeId, axes);
     activeTrajectoryRun = {
@@ -2726,6 +2745,17 @@ async function boot() {
     modeId: string,
     reason: 'start_game' | 'restart',
   ): void => {
+    if (!isHumanTrajectoryCaptureContext()) {
+      pendingTrajectoryRunModeId = null;
+      trajectoryDebug('run start ignored (non-human context)', {
+        modeId,
+        reason,
+        botGuiInspectEnabled,
+        replayGuiInspectEnabled,
+        replayDirectRunning,
+      });
+      return;
+    }
     pendingTrajectoryRunModeId = modeId;
     trajectoryDebug('run start scheduled', { modeId, reason });
   };
@@ -3269,16 +3299,20 @@ async function boot() {
     }
     pendingLineClearSound = false;
     const state = session.getGame().state;
-    pendingTrajectoryReplayStep = {
-      lockPiece: state.active.k,
-      lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
-      lockX: Math.trunc(state.active.x),
-      lockY: Math.trunc(state.active.y),
-      holdUsed: holdUsedSinceLastLock,
-      gameTimeMs: Math.max(0, Math.trunc(state.timeMs)),
-      totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
-      score: Math.max(0, Math.trunc(state.score)),
-    };
+    if (isHumanTrajectoryCaptureContext()) {
+      pendingTrajectoryReplayStep = {
+        lockPiece: state.active.k,
+        lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+        lockX: Math.trunc(state.active.x),
+        lockY: Math.trunc(state.active.y),
+        holdUsed: holdUsedSinceLastLock,
+        gameTimeMs: Math.max(0, Math.trunc(state.timeMs)),
+        totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+        score: Math.max(0, Math.trunc(state.score)),
+      };
+    } else {
+      pendingTrajectoryReplayStep = null;
+    }
     holdUsedSinceLastLock = false;
     const linesLeft =
       state.lineGoal != null
@@ -3300,7 +3334,7 @@ async function boot() {
   };
   const handleHoldSnapshot = (board: Board, hold: PieceKind | null) => {
     if (suppressLockEffects) return;
-    holdUsedSinceLastLock = true;
+    holdUsedSinceLastLock = isHumanTrajectoryCaptureContext();
     const state = session.getGame().state;
     const linesLeft =
       state.lineGoal != null
@@ -3338,6 +3372,10 @@ async function boot() {
       scheduleTrajectoryRunStart(modeController.getState().mode.id, 'restart');
     },
     onModelDecision: (decision) => {
+      if (!isHumanTrajectoryCaptureContext()) {
+        pendingTrajectoryReplayStep = null;
+        return;
+      }
       const modeId = modeController.getState().mode.id;
       const replay = pendingTrajectoryReplayStep;
       pendingTrajectoryReplayStep = null;
@@ -3546,7 +3584,11 @@ async function boot() {
       const generatorType = settingsStore.get().generator.type;
       if (state.active !== lastRecordedActiveRef) {
         lastRecordedActiveRef = state.active;
-        if (pendingTrajectoryReplayStep && !usesModelGenerator(generatorType)) {
+        if (
+          isHumanTrajectoryCaptureContext() &&
+          pendingTrajectoryReplayStep &&
+          !usesModelGenerator(generatorType)
+        ) {
           const pieces = [...PIECES];
           const action = state.active.k;
           const actionIndex = Math.max(0, pieces.indexOf(action));
