@@ -615,6 +615,7 @@ const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
   actionSpaceKind: BotActionSpaceKind,
+  rng: XorShift32 | null = null,
 ): {
   commandsBySlot: Array<InputFrame[] | null>;
   actionMask: Float32Array;
@@ -631,6 +632,8 @@ const buildPlacementChoices = (
     nextPieceOnFirstHold: state.next[0] ?? null,
     maxNodesPerBranch: 20_000,
     allowSoftDrop: true,
+    shuffleSearchActions: rng != null,
+    random: rng ? () => nextFloat(rng) : undefined,
   });
   const actionMask = new Float32Array(actionDim);
   const commandsBySlot: Array<InputFrame[] | null> = new Array(actionDim).fill(
@@ -1102,6 +1105,7 @@ const runRollout = (config: {
             state,
             config.policyParams.actionDim,
             config.policyParams.actionSpaceKind,
+            rng,
           )
         : null;
     const actionMask = placementChoices?.actionMask ?? null;
@@ -2755,6 +2759,7 @@ export const createGuiInspectBotInputSource = (
                 state,
                 params.actionDim,
                 params.actionSpaceKind,
+                rng,
               )
             : null;
         const actionMask = placementChoices?.actionMask ?? null;

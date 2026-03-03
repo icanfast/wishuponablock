@@ -34,8 +34,15 @@ const SEARCH_ACTION_ORDER = [
 ] as const;
 
 type SearchAction = (typeof SEARCH_ACTION_ORDER)[number];
+export type TrajectoryExecutorSearchAction = SearchAction;
 
 export type TrajectoryExecutorCommand = SearchAction | 'hold' | 'hard_drop';
+
+type SearchActionOrderOptions = {
+  allowSoftDrop?: boolean;
+  shuffleSearchActions?: boolean;
+  random?: () => number;
+};
 
 export type TrajectoryExecutorPlanInput = {
   board: Board;
@@ -45,6 +52,8 @@ export type TrajectoryExecutorPlanInput = {
   target: TrajectoryReplayStepV1;
   maxNodes?: number;
   allowSoftDrop?: boolean;
+  shuffleSearchActions?: boolean;
+  random?: () => number;
 };
 
 export type TrajectoryExecutorPlanResult =
@@ -80,6 +89,8 @@ export type TrajectoryExecutorEnumerateInput = {
   nextPieceOnFirstHold?: PieceKind | null;
   maxNodesPerBranch?: number;
   allowSoftDrop?: boolean;
+  shuffleSearchActions?: boolean;
+  random?: () => number;
 };
 
 export type TrajectoryExecutorSimulationResult = {
@@ -107,6 +118,40 @@ const rotateTo = (value: number): number => {
 };
 
 const PIECE_ORDER = new Map(PIECES.map((piece, index) => [piece, index]));
+
+const defaultRandom = (): number => Math.random();
+
+const clampRandom01 = (value: number): number => {
+  if (!Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  if (value >= 1) return 0.999999999999;
+  return value;
+};
+
+const shuffleSearchActions = (
+  values: readonly SearchAction[],
+  random: () => number,
+): SearchAction[] => {
+  const out = [...values];
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(clampRandom01(random()) * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+};
+
+const resolveSearchActionOrder = (
+  options: SearchActionOrderOptions,
+): SearchAction[] => {
+  const allowSoftDrop = options.allowSoftDrop !== false;
+  const base = allowSoftDrop
+    ? SEARCH_ACTION_ORDER
+    : SEARCH_ACTION_ORDER.filter((action) => action !== 'soft_drop');
+  if (options.shuffleSearchActions !== true) {
+    return [...base];
+  }
+  return shuffleSearchActions(base, options.random ?? defaultRandom);
+};
 
 const toInputFrame = (command: TrajectoryExecutorCommand): InputFrame => {
   switch (command) {
@@ -266,7 +311,6 @@ export const planTrajectoryLockExecution = (
   input: TrajectoryExecutorPlanInput,
 ): TrajectoryExecutorPlanResult => {
   const maxNodes = Math.max(1, Math.trunc(input.maxNodes ?? 30_000));
-  const allowSoftDrop = input.allowSoftDrop !== false;
   const startResolved = resolveStartState(input);
   if (!startResolved.ok) {
     return {
@@ -277,9 +321,11 @@ export const planTrajectoryLockExecution = (
     };
   }
 
-  const actionOrder = allowSoftDrop
-    ? SEARCH_ACTION_ORDER
-    : SEARCH_ACTION_ORDER.filter((action) => action !== 'soft_drop');
+  const actionOrder = resolveSearchActionOrder({
+    allowSoftDrop: input.allowSoftDrop,
+    shuffleSearchActions: input.shuffleSearchActions,
+    random: input.random,
+  });
   const queue: SearchNode[] = [
     {
       piece: startResolved.piece,
@@ -330,11 +376,15 @@ const enumerateReachableLockPlacementsForStart = (input: {
   prefix: TrajectoryExecutorCommand[];
   holdUsed: boolean;
   maxNodes: number;
-  allowSoftDrop: boolean;
+  allowSoftDrop?: boolean;
+  shuffleSearchActions?: boolean;
+  random?: () => number;
 }): TrajectoryExecutorReachablePlacement[] => {
-  const actionOrder = input.allowSoftDrop
-    ? SEARCH_ACTION_ORDER
-    : SEARCH_ACTION_ORDER.filter((action) => action !== 'soft_drop');
+  const actionOrder = resolveSearchActionOrder({
+    allowSoftDrop: input.allowSoftDrop,
+    shuffleSearchActions: input.shuffleSearchActions,
+    random: input.random,
+  });
   const queue: SearchNode[] = [
     {
       piece: clonePiece(input.startPiece),
@@ -402,6 +452,8 @@ export const enumerateTrajectoryExecutorPlacements = (
       holdUsed: false,
       maxNodes: maxNodesPerBranch,
       allowSoftDrop,
+      shuffleSearchActions: input.shuffleSearchActions,
+      random: input.random,
     }),
   );
 
@@ -418,6 +470,8 @@ export const enumerateTrajectoryExecutorPlacements = (
             holdUsed: true,
             maxNodes: maxNodesPerBranch,
             allowSoftDrop,
+            shuffleSearchActions: input.shuffleSearchActions,
+            random: input.random,
           }),
         );
       }

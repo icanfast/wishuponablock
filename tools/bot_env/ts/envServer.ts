@@ -70,6 +70,17 @@ const handleStepMany = (id: number, payload: unknown): void => {
   writeResponse({ id, ok: true, result });
 };
 
+const handlePopTrajectory = (id: number): void => {
+  const trajectory = ensurePool().popTrajectorySession();
+  writeResponse({
+    id,
+    ok: true,
+    result: {
+      trajectory,
+    },
+  });
+};
+
 const handleClose = (id: number): void => {
   writeResponse({ id, ok: true, result: { closed: true } });
   process.exit(0);
@@ -90,6 +101,9 @@ const handleRequest = async (line: string): Promise<void> => {
       return;
     case 'step_many':
       handleStepMany(id, parsed.payload);
+      return;
+    case 'pop_trajectory':
+      handlePopTrajectory(id);
       return;
     case 'close':
       handleClose(id);

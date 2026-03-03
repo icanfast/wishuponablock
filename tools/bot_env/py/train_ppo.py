@@ -783,6 +783,26 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
+def write_json_any(path: Path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def pop_latest_trajectory(
+    env: WubEnvBridge,
+    max_drain: int = 128,
+) -> tuple[dict[str, Any] | None, int]:
+    latest: dict[str, Any] | None = None
+    drained = 0
+    for _ in range(max(1, int(max_drain))):
+        result = env.pop_trajectory()
+        candidate = result.get("trajectory")
+        if not isinstance(candidate, dict):
+            break
+        latest = candidate
+        drained += 1
+    return latest, drained
+
+
 def _is_finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
@@ -1020,6 +1040,8 @@ def train(cfg: PPOConfig) -> None:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir = out_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    trajectories_dir = out_dir / "trajectories"
+    trajectories_dir.mkdir(parents=True, exist_ok=True)
 
     server_cmd = (
         shlex.split(cfg.server_cmd.strip())
@@ -1622,6 +1644,30 @@ def train(cfg: PPOConfig) -> None:
                     artifact_path = artifacts_dir / f"bot_policy_update_{update:06d}.json"
                     write_json(artifact_path, artifact)
                     write_json(out_dir / "last_stats.json", stats)
+                    latest_trajectory, drained = pop_latest_trajectory(env)
+                    if latest_trajectory is not None:
+                        trajectory_path = (
+                            trajectories_dir / f"trajectory_update_{update:06d}.json"
+                        )
+                        write_json_any(trajectory_path, latest_trajectory)
+                        sample_count = latest_trajectory.get("samples")
+                        sample_total = (
+                            len(sample_count) if isinstance(sample_count, list) else -1
+                        )
+                        session_id = latest_trajectory.get("sessionId")
+                        print(
+                            "[ppo] "
+                            f"saved trajectory update={update} "
+                            f"session={session_id} "
+                            f"samples={sample_total} "
+                            f"drained={drained} "
+                            f"path={trajectory_path}"
+                        )
+                    else:
+                        print(
+                            "[ppo] "
+                            f"no completed trajectory available at update={update}."
+                        )
                     profile_io_s += time.perf_counter() - io_start
 
         except KeyboardInterrupt:

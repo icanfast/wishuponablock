@@ -13,7 +13,7 @@ export type JsonObject = { [key: string]: JsonValue };
 
 export type BridgeRequest = {
   id: number;
-  cmd: 'init' | 'reset_many' | 'step_many' | 'close';
+  cmd: 'init' | 'reset_many' | 'step_many' | 'pop_trajectory' | 'close';
   payload?: JsonValue;
 };
 

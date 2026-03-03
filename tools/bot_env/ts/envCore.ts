@@ -9,15 +9,23 @@ import { createGeneratorFactory } from '../../../src/core/generators.ts';
 import { Game } from '../../../src/core/game.ts';
 import { getMode } from '../../../src/core/modes.ts';
 import { createModelRunner } from '../../../src/core/modelRunner.ts';
+import { dropDistance } from '../../../src/core/piece.ts';
 import {
   PLACEMENT_ACTION_DIM,
   placementActionIndexFromPlacement,
 } from '../../../src/core/placementActionSpace.ts';
+import { XorShift32 } from '../../../src/core/rng.ts';
 import { GameRunner, type InputSource } from '../../../src/core/runner.ts';
 import { DEFAULT_SETTINGS } from '../../../src/core/settings.ts';
-import type { Board, GameState, InputFrame } from '../../../src/core/types.ts';
+import {
+  PIECES,
+  type Board,
+  type GameState,
+  type InputFrame,
+} from '../../../src/core/types.ts';
 import {
   enumerateTrajectoryExecutorPlacements,
+  type TrajectoryExecutorReachablePlacement,
   trajectoryExecutorCommandToInputFrame,
 } from '../../../src/core/trajectoryExecutor.ts';
 import {
@@ -40,6 +48,12 @@ const FIXED_STEP_MS = 1000 / 120;
 const DEFAULT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
+const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
+const OFFLINE_SOFT_DROP_MS = 0;
+const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
+const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
+const TRAJECTORY_PIECES = [...PIECES];
+const TRAJECTORY_MIN_SAMPLE_ID = 8;
 
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
@@ -242,7 +256,12 @@ const encodeObservation = (
 const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
-): { commandsBySlot: Array<InputFrame[] | null>; actionMask: number[] } => {
+  random: (() => number) | null = null,
+): {
+  commandsBySlot: Array<InputFrame[] | null>;
+  placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
+  actionMask: number[];
+} => {
   const placements = enumerateTrajectoryExecutorPlacements({
     board: state.board,
     active: state.active,
@@ -251,11 +270,15 @@ const buildPlacementChoices = (
     nextPieceOnFirstHold: state.next[0] ?? null,
     maxNodesPerBranch: 20_000,
     allowSoftDrop: true,
+    shuffleSearchActions: random != null,
+    random: random ?? undefined,
   });
   const actionMask = new Array<number>(actionDim).fill(0);
   const commandsBySlot: Array<InputFrame[] | null> = new Array(actionDim).fill(
     null,
   );
+  const placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null> =
+    new Array(actionDim).fill(null);
   for (const placement of placements) {
     const actionIndex = placementActionIndexFromPlacement(placement);
     if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
@@ -265,16 +288,57 @@ const buildPlacementChoices = (
       continue;
     }
     actionMask[actionIndex] = 1;
+    placementsBySlot[actionIndex] = {
+      ...placement,
+      commands: [...placement.commands],
+    };
     commandsBySlot[actionIndex] = placement.commands.map((command) =>
       trajectoryExecutorCommandToInputFrame(command),
     );
   }
   if (actionMask.every((value) => value <= 0)) {
+    const fallbackLockY =
+      state.active.y + dropDistance(state.board, state.active);
     actionMask[0] = 1;
+    placementsBySlot[0] = {
+      lockPiece: state.active.k,
+      lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+      lockX: Math.trunc(state.active.x),
+      lockY: Math.trunc(fallbackLockY),
+      holdUsed: false,
+      commands: ['hard_drop'],
+      searchDepth: 0,
+    };
     commandsBySlot[0] = [trajectoryExecutorCommandToInputFrame('hard_drop')];
   }
-  return { commandsBySlot, actionMask };
+  return { commandsBySlot, placementsBySlot, actionMask };
 };
+
+const boardToOccupancy = (board: Board): number[][] =>
+  board.map((row) => row.map((cell) => (cell != null ? 1 : 0)));
+
+const clampRotation = (value: number): 0 | 1 | 2 | 3 => {
+  const normalized = Math.trunc(value) % 4;
+  if (normalized === 1) return 1;
+  if (normalized === 2) return 2;
+  if (normalized === 3 || normalized === -1) return 3;
+  return 0;
+};
+
+const asPieceOrNull = (value: unknown): string | null => {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  return value;
+};
+
+const pieceIndex = (piece: string | null): number => {
+  if (!piece) return 0;
+  const index = TRAJECTORY_PIECES.indexOf(
+    piece as (typeof TRAJECTORY_PIECES)[number],
+  );
+  return index >= 0 ? index : 0;
+};
+
+const nextFloat = (rng: XorShift32): number => rng.nextU32() / 0xffffffff;
 
 class OneFrameInputSource implements InputSource {
   constructor(private frame: InputFrame) {}
@@ -300,18 +364,36 @@ type BotEnvStepProfile = {
   choices_next_s: number;
 };
 
+type BotEnvStepResult = {
+  obs: number[];
+  actionMask: number[];
+  reward: number;
+  done: boolean;
+  info: JsonObject;
+  profile: BotEnvStepProfile;
+  completedSession: JsonObject | null;
+};
+
 class BotEnv {
   private game: Game;
   private runner: GameRunner;
   private done = false;
   private piecesPlaced = 0;
   private lockCount = 0;
+  private episodeStartWallMs = 0;
+  private episodeSampleSerial = 0;
+  private episodeSessionSerial = 0;
+  private episodeInitialState: JsonObject | null = null;
+  private episodeSamples: JsonObject[] = [];
+  private planningRng: XorShift32;
   private cachedChoices: {
     commandsBySlot: Array<InputFrame[] | null>;
+    placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
     actionMask: number[];
   } | null = null;
 
   constructor(
+    private readonly envId: number,
     private readonly modeId: string,
     private readonly model: LoadedModel,
     private readonly observationSpace: BotObservationSpace,
@@ -320,13 +402,16 @@ class BotEnv {
     private readonly maxPiecesPerEpisode: number,
     seed: number,
   ) {
+    this.planningRng = new XorShift32(seed ^ 0x71e9135b);
     const built = this.buildGame(seed);
     this.game = built.game;
     this.runner = built.runner;
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      () => nextFloat(this.planningRng),
     );
+    this.startEpisodeCapture();
     this.syncPrevMetrics();
   }
 
@@ -343,10 +428,13 @@ class BotEnv {
     this.done = false;
     this.piecesPlaced = 0;
     this.lockCount = 0;
+    this.planningRng = new XorShift32(seed ^ 0x71e9135b);
+    this.startEpisodeCapture();
     const choicesStart = performance.now();
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      () => nextFloat(this.planningRng),
     );
     const choicesElapsedS = (performance.now() - choicesStart) / 1000;
     this.syncPrevMetrics();
@@ -374,14 +462,7 @@ class BotEnv {
     };
   }
 
-  step(actionIndexRaw: number): {
-    obs: number[];
-    actionMask: number[];
-    reward: number;
-    done: boolean;
-    info: JsonObject;
-    profile: BotEnvStepProfile;
-  } {
+  step(actionIndexRaw: number): BotEnvStepResult {
     const stepStart = performance.now();
     if (this.done) {
       const doneChoicesStart = performance.now();
@@ -392,7 +473,9 @@ class BotEnv {
       );
       const choices =
         this.cachedChoices ??
-        buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+        buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM, () =>
+          nextFloat(this.planningRng),
+        );
       this.cachedChoices = choices;
       const doneChoicesElapsedS = (performance.now() - doneChoicesStart) / 1000;
       const totalElapsedS = (performance.now() - stepStart) / 1000;
@@ -402,6 +485,7 @@ class BotEnv {
         reward: 0,
         done: true,
         info: { alreadyDone: true, piecesPlaced: this.piecesPlaced },
+        completedSession: null,
         profile: {
           total_s: totalElapsedS,
           choices_current_s: doneChoicesElapsedS,
@@ -418,7 +502,9 @@ class BotEnv {
     const choicesCurrentStart = performance.now();
     const choices =
       this.cachedChoices ??
-      buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM);
+      buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM, () =>
+        nextFloat(this.planningRng),
+      );
     this.cachedChoices = choices;
     const choicesCurrentElapsedS =
       (performance.now() - choicesCurrentStart) / 1000;
@@ -430,6 +516,7 @@ class BotEnv {
           0,
           choices.actionMask.findIndex((x) => x > 0),
         );
+    const selectedPlacement = choices.placementsBySlot[resolvedActionIndex];
     const commands = choices.commandsBySlot[resolvedActionIndex] ?? [
       trajectoryExecutorCommandToInputFrame('hard_drop'),
     ];
@@ -485,9 +572,21 @@ class BotEnv {
     });
     const rewardElapsedS = (performance.now() - rewardStart) / 1000;
 
+    if (this.lockCount > beforeLockCount) {
+      this.captureEpisodeStep({
+        reward,
+        after,
+        selectedPlacement,
+      });
+    }
+
     this.syncPrevMetrics();
-    if (this.isTerminal() || this.piecesPlaced >= this.maxPiecesPerEpisode) {
+    const becameDone =
+      this.isTerminal() || this.piecesPlaced >= this.maxPiecesPerEpisode;
+    let completedSession: JsonObject | null = null;
+    if (becameDone) {
       this.done = true;
+      completedSession = this.finalizeEpisodeCapture();
     }
 
     const obsStart = performance.now();
@@ -501,6 +600,7 @@ class BotEnv {
     const nextChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      () => nextFloat(this.planningRng),
     );
     const choicesNextElapsedS = (performance.now() - choicesNextStart) / 1000;
     this.cachedChoices = nextChoices;
@@ -518,6 +618,7 @@ class BotEnv {
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
       },
+      completedSession,
       profile: {
         total_s: totalElapsedS,
         choices_current_s: choicesCurrentElapsedS,
@@ -554,6 +655,10 @@ class BotEnv {
     const game = new Game({
       seed,
       ...merged.game,
+      // Offline PPO uses replay-style timing semantics: no passive gravity
+      // progression and instant soft-drop action.
+      gravityMs: OFFLINE_GRAVITY_MS,
+      softDropMs: OFFLINE_SOFT_DROP_MS,
       lockNudgeRate: 0,
       gravityDropRate: 0,
       lockRotateRate: 0,
@@ -574,6 +679,131 @@ class BotEnv {
       game,
       runner: new GameRunner(game, { fixedStepMs: FIXED_STEP_MS }),
     };
+  }
+
+  private startEpisodeCapture(): void {
+    this.episodeStartWallMs = Date.now();
+    this.episodeSampleSerial = 0;
+    this.episodeInitialState = {
+      boardOccupancy: boardToOccupancy(this.game.state.board),
+      hold: asPieceOrNull(this.game.state.hold),
+      active: {
+        k: this.game.state.active.k,
+        r: clampRotation(this.game.state.active.r),
+        x: Math.trunc(this.game.state.active.x),
+        y: Math.trunc(this.game.state.active.y),
+      },
+      next: this.game.state.next.map((piece) => piece),
+      canHold: this.game.state.canHold,
+      timeMs: Math.max(0, Math.trunc(this.game.state.timeMs)),
+      totalLinesCleared: Math.max(
+        0,
+        Math.trunc(this.game.state.totalLinesCleared),
+      ),
+      score: Math.max(0, Math.trunc(this.game.state.score)),
+    };
+    this.episodeSamples = [];
+  }
+
+  private captureEpisodeStep(input: {
+    reward: number;
+    after: {
+      lines: number;
+      score: number;
+      timeMs: number;
+      holes: number;
+      boardScore: number;
+    };
+    selectedPlacement: TrajectoryExecutorReachablePlacement | null;
+  }): void {
+    const placement = input.selectedPlacement;
+    if (!placement) return;
+    const actionPiece = this.game.state.active.k;
+    const actionIndex = pieceIndex(actionPiece);
+    const probabilities = TRAJECTORY_PIECES.map((_, index) =>
+      index === actionIndex ? 1 : 0,
+    );
+    const logits = probabilities.map((value) => (value > 0 ? 1 : 0));
+    const createdAtMs =
+      this.episodeStartWallMs + Math.max(0, Math.trunc(input.after.timeMs));
+    const rewardValue = Number.isFinite(input.reward)
+      ? Math.max(-1e9, Math.min(1e9, input.reward))
+      : null;
+    this.episodeSampleSerial += 1;
+    const sampleIdCore = `${this.envId}_${this.episodeSampleSerial.toString().padStart(6, '0')}`;
+    const sampleId =
+      sampleIdCore.length >= TRAJECTORY_MIN_SAMPLE_ID
+        ? sampleIdCore
+        : sampleIdCore.padEnd(TRAJECTORY_MIN_SAMPLE_ID, '0');
+    this.episodeSamples.push({
+      id: sampleId,
+      createdAtMs,
+      deliberationMs: null,
+      boardOccupancy: boardToOccupancy(this.game.state.board),
+      hold: asPieceOrNull(this.game.state.hold),
+      action: actionPiece,
+      actionIndex,
+      pieces: [...TRAJECTORY_PIECES],
+      logits,
+      probabilities,
+      inferenceMs: 0,
+      samplingMs: 0,
+      totalDecisionMs: 0,
+      reward: rewardValue,
+      replay: {
+        lockPiece: placement.lockPiece,
+        lockRotation: clampRotation(placement.lockRotation),
+        lockX: Math.trunc(placement.lockX),
+        lockY: Math.trunc(placement.lockY),
+        holdUsed: placement.holdUsed,
+        gameTimeMs: Math.max(0, Math.trunc(input.after.timeMs)),
+        totalLinesCleared: Math.max(0, Math.trunc(input.after.lines)),
+        score: Math.max(0, Math.trunc(input.after.score)),
+      },
+    });
+  }
+
+  private finalizeEpisodeCapture(): JsonObject | null {
+    if (!this.episodeInitialState || this.episodeSamples.length <= 0) {
+      return null;
+    }
+    this.episodeSessionSerial += 1;
+    const sessionCore =
+      `bot_offline_env${this.envId}_` +
+      `${this.episodeSessionSerial.toString().padStart(8, '0')}`;
+    const sessionId =
+      sessionCore.length >= 8 ? sessionCore : sessionCore.padEnd(8, '0');
+    const durationMs = Math.max(0, Math.trunc(this.game.state.timeMs));
+    const endedAtMs = this.episodeStartWallMs + durationMs;
+    const outcome = this.game.state.gameWon
+      ? 'game_won'
+      : this.game.state.gameOver
+        ? 'game_over'
+        : this.piecesPlaced >= this.maxPiecesPerEpisode
+          ? 'max_pieces'
+          : 'manual';
+    const session: JsonObject = {
+      schema: TRAJECTORY_SCHEMA,
+      sessionId,
+      modeId: this.modeId,
+      buildVersion: TRAJECTORY_BUILD_VERSION,
+      startedAtMs: this.episodeStartWallMs,
+      endedAtMs,
+      durationMs,
+      initialState: this.episodeInitialState,
+      samples: this.episodeSamples.map((sample) => ({ ...sample })),
+      meta: {
+        outcome,
+        actorType: 'bot',
+        trainingIntent: 'offline_ppo_rollout',
+        queuePolicyId: this.queuePolicyId,
+        pieceSourceProfile: this.pieceSource,
+        pipelineId: 'offline_ppo_v1',
+        pipelineMode: this.modeId,
+        generatorType: this.pieceSource === 'bag7' ? 'bag7' : 'ml',
+      },
+    };
+    return session;
   }
 
   private snapshotMetrics(): {
@@ -609,6 +839,7 @@ class BotEnv {
 
 export class BotEnvPool {
   private readonly envs = new Map<number, BotEnv>();
+  private readonly completedTrajectorySessions: JsonObject[] = [];
 
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
@@ -642,6 +873,7 @@ export class BotEnvPool {
       pool.envs.set(
         i,
         new BotEnv(
+          i,
           modeId,
           model,
           observationSpace,
@@ -718,6 +950,9 @@ export class BotEnvPool {
       rewards.push(out.reward);
       dones.push(out.done);
       infos.push(out.info);
+      if (out.completedSession) {
+        this.completedTrajectorySessions.push(out.completedSession);
+      }
       stepEnvTotalS += out.profile.total_s;
       stepChoicesCurrentS += out.profile.choices_current_s;
       stepRunnerS += out.profile.runner_s;
@@ -746,6 +981,10 @@ export class BotEnvPool {
 
   listEnvIds(): number[] {
     return Array.from(this.envs.keys()).sort((a, b) => a - b);
+  }
+
+  popTrajectorySession(): JsonObject | null {
+    return this.completedTrajectorySessions.shift() ?? null;
   }
 
   private requireEnv(id: number): BotEnv {

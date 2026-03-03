@@ -110,6 +110,9 @@ class WubEnvBridge:
         }
         return self._request("step_many", payload)
 
+    def pop_trajectory(self) -> dict[str, Any]:
+        return self._request("pop_trajectory", {})
+
     def _request(self, cmd: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self._proc is None:
             self.start()
