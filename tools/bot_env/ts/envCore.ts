@@ -50,6 +50,7 @@ const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
 const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
 const OFFLINE_SOFT_DROP_MS = 0;
+const TOP_OUT_PENALTY = 50;
 const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
 const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
@@ -602,11 +603,13 @@ class BotEnv {
       bumpinessDelta: after.bumpiness - before.bumpiness,
       boardScoreDelta: before.boardScore - after.boardScore,
     });
+    const topOutPenalty = this.game.state.gameOver ? TOP_OUT_PENALTY : 0;
+    const finalReward = reward - topOutPenalty;
     const rewardElapsedS = (performance.now() - rewardStart) / 1000;
 
     if (this.lockCount > beforeLockCount) {
       this.captureEpisodeStep({
-        reward,
+        reward: finalReward,
         after,
         selectedPlacement,
       });
@@ -640,13 +643,14 @@ class BotEnv {
     return {
       obs,
       actionMask: nextChoices.actionMask,
-      reward: Number.isFinite(reward) ? reward : 0,
+      reward: Number.isFinite(finalReward) ? finalReward : 0,
       done: this.done,
       info: {
         modeId: this.modeId,
         piecesPlaced: this.piecesPlaced,
         lockObserved: this.lockCount > beforeLockCount,
         ticks,
+        topOutPenalty,
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
       },
