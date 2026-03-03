@@ -2044,6 +2044,8 @@ async function boot() {
       executionMode: stepMode ? 'step' : 'apm',
       seed,
       greedy: options?.greedy !== false,
+      debugTrace: true,
+      onLog: (line) => console.info(line),
       onTargetGhostChange: (ghost) => setBotInspectTargetGhost(ghost),
     });
     botGuiInspectEnabled = true;

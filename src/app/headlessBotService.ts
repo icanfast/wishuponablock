@@ -2614,6 +2614,8 @@ export type BotGuiInputSourceConfig = {
   executionMode?: 'apm' | 'step';
   seed?: number;
   greedy?: boolean;
+  debugTrace?: boolean;
+  onLog?: (line: string) => void;
   onTargetGhostChange?: (ghost: ActivePiece | null) => void;
 };
 
@@ -2631,11 +2633,15 @@ export const createGuiInspectBotInputSource = (
   const clampedApm = clamp(config.apmInput, 20, 1200);
   const actionIntervalMs = 60_000 / clampedApm;
   const stepMode = config.executionMode === 'step';
+  const debugTrace = config.debugTrace !== false;
+  const log = (line: string): void => config.onLog?.(`[bot-gui] ${line}`);
   let rng = new XorShift32(seed ^ 0x517cc1b7);
   let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
+  let debugCommandQueue: string[] = [];
   let cooldownMs = 0;
   let manualStepBudget = 0;
+  let planIndex = 0;
 
   const nextFrame = (frame: InputFrame): InputFrame => ({
     ...EMPTY_INPUT,
@@ -2647,8 +2653,11 @@ export const createGuiInspectBotInputSource = (
     hold: frame.hold,
   });
 
-  const queueFromMacro = (action: BotMacroAction): InputFrame[] => {
+  const queueFromMacro = (
+    action: BotMacroAction,
+  ): { frames: InputFrame[]; debugCommands: string[] } => {
     const frames: InputFrame[] = [];
+    const debugCommands: string[] = [];
     if (action.rotation === 'cw') {
       frames.push(
         nextFrame({
@@ -2662,6 +2671,7 @@ export const createGuiInspectBotInputSource = (
           restart: false,
         }),
       );
+      debugCommands.push('CW');
     } else if (action.rotation === 'ccw') {
       frames.push(
         nextFrame({
@@ -2675,6 +2685,7 @@ export const createGuiInspectBotInputSource = (
           restart: false,
         }),
       );
+      debugCommands.push('CCW');
     } else if (action.rotation === '180') {
       frames.push(
         nextFrame({
@@ -2688,6 +2699,7 @@ export const createGuiInspectBotInputSource = (
           restart: false,
         }),
       );
+      debugCommands.push('R180');
     }
 
     const steps = Math.max(0, Math.min(10, Math.abs(Math.trunc(action.moveX))));
@@ -2705,6 +2717,7 @@ export const createGuiInspectBotInputSource = (
           restart: false,
         }),
       );
+      debugCommands.push(dir < 0 ? 'L' : 'R');
     }
 
     frames.push(
@@ -2719,7 +2732,8 @@ export const createGuiInspectBotInputSource = (
         restart: false,
       }),
     );
-    return frames;
+    debugCommands.push('HD');
+    return { frames, debugCommands };
   };
 
   return {
@@ -2727,6 +2741,7 @@ export const createGuiInspectBotInputSource = (
       cooldownMs = Math.max(0, cooldownMs - Math.max(0, dtMs));
       if (state.active !== activeRef) {
         activeRef = state.active;
+        planIndex += 1;
         const observation = encodeObservation(
           params.observationSpace,
           config.model,
@@ -2762,9 +2777,12 @@ export const createGuiInspectBotInputSource = (
             0,
             placementChoices.actionMask.findIndex((value) => value > 0),
           );
+          const resolvedActionIndex =
+            placementChoices.placementsByActionIndex[actionIndex] != null
+              ? actionIndex
+              : fallbackActionIndex;
           const targetPlacement =
-            placementChoices.placementsByActionIndex[actionIndex] ??
-            placementChoices.placementsByActionIndex[fallbackActionIndex] ??
+            placementChoices.placementsByActionIndex[resolvedActionIndex] ??
             null;
           config.onTargetGhostChange?.(
             targetPlacement
@@ -2777,17 +2795,60 @@ export const createGuiInspectBotInputSource = (
                 }
               : null,
           );
-          queue = placementChoices.commandsBySlot[actionIndex] ??
-            placementChoices.commandsBySlot[fallbackActionIndex] ?? [
-              EMPTY_INPUT,
-            ];
+          queue = placementChoices.commandsBySlot[resolvedActionIndex] ?? [
+            EMPTY_INPUT,
+          ];
+          debugCommandQueue =
+            targetPlacement?.commands.map((command) => {
+              switch (command) {
+                case 'left':
+                  return 'L';
+                case 'right':
+                  return 'R';
+                case 'rotate_cw':
+                  return 'CW';
+                case 'rotate_ccw':
+                  return 'CCW';
+                case 'rotate_180':
+                  return 'R180';
+                case 'soft_drop':
+                  return 'SD';
+                case 'hard_drop':
+                  return 'HD';
+                case 'hold':
+                  return 'HOLD';
+                default:
+                  return String(command);
+              }
+            }) ?? queue.map(() => '?');
+          if (debugTrace) {
+            const targetSummary = targetPlacement
+              ? `target={piece:${targetPlacement.lockPiece},rot:${targetPlacement.lockRotation},x:${targetPlacement.lockX},y:${targetPlacement.lockY},holdUsed:${targetPlacement.holdUsed}}`
+              : 'target={none}';
+            log(
+              `plan #${planIndex} placement: active=${state.active.k}@${state.active.x},${state.active.y},r${state.active.r} hold=${state.hold ?? 'null'} ` +
+                `action=${resolvedActionIndex}` +
+                (resolvedActionIndex !== actionIndex
+                  ? ` (fallback from ${actionIndex}) `
+                  : ' ') +
+                `${targetSummary} commands=[${debugCommandQueue.join(' -> ')}].`,
+            );
+          }
         } else {
           config.onTargetGhostChange?.(null);
           const macroActions =
             params.macroActions ?? actionSpace.map((action) => ({ ...action }));
           const action =
             macroActions[actionIndex] ?? macroActions[0] ?? actionSpace[0];
-          queue = queueFromMacro(action);
+          const macroPlan = queueFromMacro(action);
+          queue = macroPlan.frames;
+          debugCommandQueue = macroPlan.debugCommands;
+          if (debugTrace) {
+            log(
+              `plan #${planIndex} macro: active=${state.active.k}@${state.active.x},${state.active.y},r${state.active.r} hold=${state.hold ?? 'null'} ` +
+                `action={rotation:${action.rotation},moveX:${action.moveX}} commands=[${debugCommandQueue.join(' -> ')}].`,
+            );
+          }
         }
       }
       if (queue.length === 0) return EMPTY_INPUT;
@@ -2798,21 +2859,35 @@ export const createGuiInspectBotInputSource = (
         if (cooldownMs > 0) return EMPTY_INPUT;
         cooldownMs = actionIntervalMs;
       }
-      return queue.shift() ?? EMPTY_INPUT;
+      const frame = queue.shift() ?? EMPTY_INPUT;
+      if (debugTrace) {
+        const debugCommand = debugCommandQueue.shift() ?? '?';
+        log(
+          `emit #${planIndex}: command=${debugCommand} frame={moveX:${frame.moveX},rotate:${frame.rotate},rotate180:${frame.rotate180 ? 1 : 0},softDrop:${frame.softDrop ? 1 : 0},hardDrop:${frame.hardDrop ? 1 : 0},hold:${frame.hold ? 1 : 0}} remaining=${queue.length}.`,
+        );
+      }
+      return frame;
     },
     reset: (nextSeed) => {
       const seeded = Math.max(1, Math.trunc(nextSeed));
       rng = new XorShift32(seeded ^ 0x517cc1b7);
       activeRef = null;
       queue = [];
+      debugCommandQueue = [];
       cooldownMs = 0;
       manualStepBudget = 0;
+      planIndex = 0;
       config.onTargetGhostChange?.(null);
     },
     isStepMode: stepMode,
     requestStep: () => {
       if (!stepMode) return;
       manualStepBudget += 1;
+      if (debugTrace) {
+        log(
+          `manual step granted: budget=${manualStepBudget}, pending=${queue.length}.`,
+        );
+      }
     },
   };
 };
