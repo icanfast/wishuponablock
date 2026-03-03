@@ -175,6 +175,8 @@ const CHARCUTERIE_HOLE_WEIGHTS = {
 } as const;
 const HOLE_DELTA_REWARD_WEIGHT = 0.05;
 const BUMPINESS_DELTA_REWARD_WEIGHT = 0.03;
+const HEIGHT_DELTA_REWARD_WEIGHT = 0.04;
+const PRACTICE_TIME_DELTA_REWARD_WEIGHT = 1e-5;
 
 const getCharcuterieHolePenalty = (board: Board): number => {
   const rows = board.length;
@@ -219,59 +221,84 @@ const scoreCharcuterieBoard = (
   );
 };
 
+type PieceRewardBreakdown = {
+  linesTerm: number;
+  scoreTerm: number;
+  timeTerm: number;
+  heightTerm: number;
+  holeDeltaTerm: number;
+  bumpinessDeltaTerm: number;
+  boardScoreTerm: number;
+};
+
 const computePieceReward = (options: {
   modeId: string;
   linesDelta: number;
   scoreDelta: number;
   timeDeltaMs: number;
+  heightDelta: number;
   holesDelta: number;
   bumpinessDelta: number;
   boardScoreDelta: number;
-}): number => {
+}): {
+  reward: number;
+  breakdown: PieceRewardBreakdown;
+} => {
   const {
     modeId,
     linesDelta,
     scoreDelta,
     timeDeltaMs,
+    heightDelta,
     holesDelta,
     bumpinessDelta,
     boardScoreDelta,
   } = options;
+  let linesTerm = 0;
+  let scoreTerm = 0;
+  let timeTerm = 0;
+  let boardScoreTerm = 0;
+  const heightDeltaTerm = -heightDelta * HEIGHT_DELTA_REWARD_WEIGHT;
   const holeDeltaTerm = -holesDelta * HOLE_DELTA_REWARD_WEIGHT;
   const bumpinessDeltaTerm = -bumpinessDelta * BUMPINESS_DELTA_REWARD_WEIGHT;
   if (modeId === 'sprint') {
-    return (
-      linesDelta * 1.2 +
-      scoreDelta * 0.001 +
-      holeDeltaTerm +
-      bumpinessDeltaTerm -
-      timeDeltaMs / 4000
-    );
+    linesTerm = linesDelta * 1.2;
+    scoreTerm = scoreDelta * 0.001;
+    timeTerm = -(timeDeltaMs / 4000);
+  } else if (modeId === 'classic') {
+    linesTerm = linesDelta * 0.6;
+    scoreTerm = scoreDelta * 0.002;
+  } else if (modeId === 'charcuterie') {
+    boardScoreTerm = boardScoreDelta * 0.12;
+    linesTerm = linesDelta * 0.15;
+    timeTerm = -(timeDeltaMs / 25000);
+  } else if (modeId === 'cheese') {
+    linesTerm = linesDelta * 0.7;
+  } else {
+    linesTerm = linesDelta * 0.5;
+    scoreTerm = scoreDelta * 0.0008;
+    timeTerm = -(timeDeltaMs * PRACTICE_TIME_DELTA_REWARD_WEIGHT);
   }
-  if (modeId === 'classic') {
-    return (
-      linesDelta * 0.6 + scoreDelta * 0.002 + holeDeltaTerm + bumpinessDeltaTerm
-    );
-  }
-  if (modeId === 'charcuterie') {
-    return (
-      boardScoreDelta * 0.12 +
-      linesDelta * 0.15 -
-      timeDeltaMs / 25000 +
-      holeDeltaTerm +
-      bumpinessDeltaTerm
-    );
-  }
-  if (modeId === 'cheese') {
-    return linesDelta * 0.7 + holeDeltaTerm + bumpinessDeltaTerm;
-  }
-  return (
-    linesDelta * 0.5 +
-    scoreDelta * 0.0008 +
+  const reward =
+    linesTerm +
+    scoreTerm +
+    timeTerm +
+    boardScoreTerm +
+    heightDeltaTerm +
     holeDeltaTerm +
-    bumpinessDeltaTerm -
-    timeDeltaMs / 6000
-  );
+    bumpinessDeltaTerm;
+  return {
+    reward,
+    breakdown: {
+      linesTerm,
+      scoreTerm,
+      timeTerm,
+      heightTerm: heightDeltaTerm,
+      holeDeltaTerm,
+      bumpinessDeltaTerm,
+      boardScoreTerm,
+    },
+  };
 };
 
 const encodeObservation = (
@@ -595,15 +622,23 @@ class BotEnv {
 
     const rewardStart = performance.now();
     const after = this.snapshotMetrics();
-    const reward = computePieceReward({
+    const linesDelta = after.lines - before.lines;
+    const scoreDelta = after.score - before.score;
+    const timeDeltaMs = after.timeMs - before.timeMs;
+    const heightDelta = after.height - before.height;
+    const holesDelta = after.holes - before.holes;
+    const bumpinessDelta = after.bumpiness - before.bumpiness;
+    const rewardResult = computePieceReward({
       modeId: this.modeId,
-      linesDelta: after.lines - before.lines,
-      scoreDelta: after.score - before.score,
-      timeDeltaMs: after.timeMs - before.timeMs,
-      holesDelta: after.holes - before.holes,
-      bumpinessDelta: after.bumpiness - before.bumpiness,
+      linesDelta,
+      scoreDelta,
+      timeDeltaMs,
+      heightDelta,
+      holesDelta,
+      bumpinessDelta,
       boardScoreDelta: before.boardScore - after.boardScore,
     });
+    const reward = rewardResult.reward;
     const topOutPenalty = this.game.state.gameOver ? TOP_OUT_PENALTY : 0;
     const finalReward = reward - topOutPenalty;
     const rewardElapsedS = (performance.now() - rewardStart) / 1000;
@@ -651,6 +686,22 @@ class BotEnv {
         piecesPlaced: this.piecesPlaced,
         lockObserved: this.lockCount > beforeLockCount,
         ticks,
+        heightDelta,
+        holesDelta,
+        bumpinessDelta,
+        linesDelta,
+        scoreDelta,
+        timeDeltaMs,
+        boardScoreDelta: before.boardScore - after.boardScore,
+        rewardBase: reward,
+        rewardFinal: finalReward,
+        rewardTermLines: rewardResult.breakdown.linesTerm,
+        rewardTermScore: rewardResult.breakdown.scoreTerm,
+        rewardTermTime: rewardResult.breakdown.timeTerm,
+        rewardTermHeight: rewardResult.breakdown.heightTerm,
+        rewardTermHoles: rewardResult.breakdown.holeDeltaTerm,
+        rewardTermBumpiness: rewardResult.breakdown.bumpinessDeltaTerm,
+        rewardTermBoardScore: rewardResult.breakdown.boardScoreTerm,
         topOutPenalty,
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
@@ -847,6 +898,7 @@ class BotEnv {
     lines: number;
     score: number;
     timeMs: number;
+    height: number;
     holes: number;
     bumpiness: number;
     boardScore: number;
@@ -856,6 +908,7 @@ class BotEnv {
       lines: Math.max(0, Math.trunc(state.totalLinesCleared)),
       score: Math.max(0, Math.trunc(state.score)),
       timeMs: Math.max(0, Math.trunc(state.timeMs)),
+      height: getStackHeight(state.board),
       holes: countBoardHoles(state.board),
       bumpiness: computeBoardBumpiness(state.board),
       boardScore: scoreCharcuterieBoard(

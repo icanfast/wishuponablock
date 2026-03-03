@@ -838,6 +838,28 @@ def _profile_num(profile: Any, key: str) -> float:
     return float(value)
 
 
+def _info_num(info: Any, keys: tuple[str, ...], default: float = 0.0) -> float:
+    if not isinstance(info, dict):
+        return default
+    for key in keys:
+        value = info.get(key)
+        if _is_finite_number(value):
+            return float(value)
+    return default
+
+
+def _safe_recent_mean(values: list[float], window: int = 100) -> float:
+    if not values:
+        return float("nan")
+    return float(np.mean(values[-max(1, int(window)) :]))
+
+
+def _fmt_float(value: Any, precision: int = 3) -> str:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return f"{float(value):.{precision}f}"
+    return "nan"
+
+
 def load_bc_dataset(
     dataset_path: Path,
     obs_dim: int,
@@ -1204,6 +1226,25 @@ def train(cfg: PPOConfig) -> None:
         ep_length = np.zeros(cfg.num_envs, dtype=np.int64)
         completed_returns: list[float] = []
         completed_lengths: list[int] = []
+        reward_component_aliases: dict[str, tuple[str, ...]] = {
+            "reward_final": ("rewardFinal",),
+            "reward_base": ("rewardBase",),
+            "top_out_penalty": ("topOutPenalty",),
+            "term_lines": ("rewardTermLines",),
+            "term_score": ("rewardTermScore",),
+            "term_time": ("rewardTermTime",),
+            "term_height": ("rewardTermHeight",),
+            "term_holes": ("rewardTermHoles",),
+            "term_bumpiness": ("rewardTermBumpiness",),
+            "term_board_score": ("rewardTermBoardScore",),
+        }
+        ep_reward_component_sums = {
+            key: np.zeros(cfg.num_envs, dtype=np.float64)
+            for key in reward_component_aliases
+        }
+        completed_reward_component_sums: dict[str, list[float]] = {
+            key: [] for key in reward_component_aliases
+        }
 
         training_start = time.time()
         best_score = float("-inf")
@@ -1274,6 +1315,8 @@ def train(cfg: PPOConfig) -> None:
                     )
                     ep_return.fill(0.0)
                     ep_length.fill(0)
+                    for component_sum in ep_reward_component_sums.values():
+                        component_sum.fill(0.0)
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -1330,6 +1373,7 @@ def train(cfg: PPOConfig) -> None:
                         repair_stats=mask_repair_update,
                     )
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
+                    infos_raw = step_result.get("infos", [])
                     dones_np = np.asarray(step_result["dones"], dtype=np.float32)
 
                     reward_buf[step] = as_tensor(rewards_np, device)
@@ -1337,13 +1381,55 @@ def train(cfg: PPOConfig) -> None:
 
                     ep_return += rewards_np.astype(np.float64)
                     ep_length += 1
+                    if isinstance(infos_raw, list):
+                        max_info = min(len(infos_raw), cfg.num_envs)
+                        for env_idx in range(max_info):
+                            info = infos_raw[env_idx]
+                            reward_final = _info_num(
+                                info,
+                                reward_component_aliases["reward_final"],
+                                default=float(rewards_np[env_idx]),
+                            )
+                            ep_reward_component_sums["reward_final"][
+                                env_idx
+                            ] += reward_final
+                            for key in (
+                                "reward_base",
+                                "top_out_penalty",
+                                "term_lines",
+                                "term_score",
+                                "term_time",
+                                "term_height",
+                                "term_holes",
+                                "term_bumpiness",
+                                "term_board_score",
+                            ):
+                                ep_reward_component_sums[key][env_idx] += _info_num(
+                                    info,
+                                    reward_component_aliases[key],
+                                    default=0.0,
+                                )
+                        if max_info < cfg.num_envs:
+                            ep_reward_component_sums["reward_final"][
+                                max_info:cfg.num_envs
+                            ] += rewards_np[max_info:cfg.num_envs].astype(np.float64)
+                    else:
+                        ep_reward_component_sums["reward_final"] += rewards_np.astype(
+                            np.float64
+                        )
 
                     done_indices = np.where(dones_np > 0.5)[0]
                     if done_indices.size > 0:
                         completed_returns.extend(ep_return[done_indices].tolist())
                         completed_lengths.extend(ep_length[done_indices].tolist())
+                        for key, sums in ep_reward_component_sums.items():
+                            completed_reward_component_sums[key].extend(
+                                sums[done_indices].tolist()
+                            )
                         ep_return[done_indices] = 0.0
                         ep_length[done_indices] = 0
+                        for sums in ep_reward_component_sums.values():
+                            sums[done_indices] = 0.0
 
                         done_env_ids = [env_ids[int(i)] for i in done_indices.tolist()]
                         done_seeds = [
@@ -1552,6 +1638,10 @@ def train(cfg: PPOConfig) -> None:
                         if completed_lengths
                         else float("nan")
                     ),
+                    "ret100_terms": {
+                        key: _safe_recent_mean(values, window=100)
+                        for key, values in completed_reward_component_sums.items()
+                    },
                 }
                 stats["profile_rollout_s"] = profile_rollout_s
                 stats["profile_env_step_s"] = profile_env_step_s
@@ -1662,6 +1752,18 @@ def train(cfg: PPOConfig) -> None:
                         f"warmup={'y' if warmup_active else 'n'} "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "
+                        f"ret100_terms("
+                        f"lines={_fmt_float(stats['ret100_terms'].get('term_lines'))},"
+                        f"score={_fmt_float(stats['ret100_terms'].get('term_score'))},"
+                        f"time={_fmt_float(stats['ret100_terms'].get('term_time'))},"
+                        f"height={_fmt_float(stats['ret100_terms'].get('term_height'))},"
+                        f"holes={_fmt_float(stats['ret100_terms'].get('term_holes'))},"
+                        f"bump={_fmt_float(stats['ret100_terms'].get('term_bumpiness'))},"
+                        f"board={_fmt_float(stats['ret100_terms'].get('term_board_score'))},"
+                        f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))},"
+                        f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
+                        f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))}"
+                        f") "
                         f"sps={stats['sps']} "
                         f"t_upd={update_seconds:.2f}s "
                         f"t_roll={profile_rollout_s:.2f}s "
