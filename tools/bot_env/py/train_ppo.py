@@ -459,7 +459,7 @@ def parse_args() -> PPOConfig:
         "--alternate-piece-sources",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use weighted source schedule per 5 updates: 4 updates on base source, then 1 update on the other source.",
+        help="Use fixed source schedule per 5 updates: 4 updates on bag7, then 1 update on active_generator.",
     )
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42030)
@@ -592,12 +592,12 @@ def resolve_piece_source_for_update(cfg: PPOConfig, update: int) -> str:
     base = "bag7" if cfg.piece_source_profile == "bag7" else "active_generator"
     if not cfg.alternate_piece_sources:
         return base
-    # Weighted alternation schedule:
-    # 4 updates on base source, then 1 update on alternate source.
-    # Example (base=bag7): bag7, bag7, bag7, bag7, ml, ...
+    # Fixed alternation schedule:
+    # 4 updates on bag7, then 1 update on active_generator.
+    # Example: bag7, bag7, bag7, bag7, active_generator, ...
     if ((update - 1) % 5) == 4:
-        return "active_generator" if base == "bag7" else "bag7"
-    return base
+        return "active_generator"
+    return "bag7"
 
 
 def ensure_action_masks(

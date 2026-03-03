@@ -140,7 +140,7 @@ Outputs:
 Notes:
 
 - When `--observation-space raw_v1` is used, training applies a WUB conv/pool/feature-norm encoder (loaded from `--model-path`) inside PyTorch and trains both encoder + PPO heads together.
-- Piece source uses a weighted schedule by default: 4 updates on base source, then 1 update on the other source. Disable with `--no-alternate-piece-sources`.
+- Piece source uses a fixed schedule by default: 4 updates on `bag7`, then 1 update on `active_generator`. Disable with `--no-alternate-piece-sources`.
 - Exported artifacts from this path are tagged with `observationSpace: "model_head_v1"` and include `encoderModel` so runtime can reproduce the trained encoder exactly.
 - PPO now uses a warmup phase by default (`--warmup-updates 50`) with conservative settings (`--warmup-ent-coef 0.001`, `--warmup-target-kl 0.01`) before switching to your regular `--ent-coef` / `--target-kl`.
 - Value loss clipping is enabled by default; disable only if needed with `--no-clip-vloss`.
