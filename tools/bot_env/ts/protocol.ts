@@ -13,7 +13,13 @@ export type JsonObject = { [key: string]: JsonValue };
 
 export type BridgeRequest = {
   id: number;
-  cmd: 'init' | 'reset_many' | 'step_many' | 'pop_trajectory' | 'close';
+  cmd:
+    | 'init'
+    | 'set_piece_source'
+    | 'reset_many'
+    | 'step_many'
+    | 'pop_trajectory'
+    | 'close';
   payload?: JsonValue;
 };
 
@@ -38,6 +44,10 @@ export type InitPayload = {
 export type ResetManyPayload = {
   envIds?: number[];
   seeds?: number[];
+};
+
+export type SetPieceSourcePayload = {
+  pieceSourceProfile?: PieceSourceProfile;
 };
 
 export type StepManyPayload = {

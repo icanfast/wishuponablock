@@ -1924,7 +1924,7 @@ export const parseBotPolicyArtifactFromUnknown = (
     return raw.map((item) => Number(item));
   };
   const modeIdRaw = typeof value.modeId === 'string' ? value.modeId.trim() : '';
-  const modeId = modeIdRaw.length > 0 ? modeIdRaw.toLowerCase() : 'charcuterie';
+  const modeId = modeIdRaw.length > 0 ? modeIdRaw.toLowerCase() : 'practice';
   const createdAtRaw = Number(value.createdAtMs);
   const createdAtMs =
     Number.isFinite(createdAtRaw) && createdAtRaw > 0

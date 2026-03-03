@@ -30,6 +30,7 @@ tools/ml/runs/
 tools/ml/checkpoints/
 tools/ml/exports/
 tools/bot_env/output/
+tools/bot_env/recordings_all/
 tools/bot_env/py/__pycache__/
 tools/bot_env/py/**/*.pyc
 

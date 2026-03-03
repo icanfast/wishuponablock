@@ -1,6 +1,12 @@
 #!/usr/bin/env -S node --enable-source-maps
 
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  open as openFile,
+  readFile,
+  readdir,
+  stat,
+} from 'node:fs/promises';
 import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
@@ -33,7 +39,6 @@ const DEFAULT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_MAX_NODES = 20_000;
 const DEFAULT_OUTPUT_PATH = 'tools/bot_env/output/bc_dataset.json';
 const DEFAULT_MODEL_PATH = 'public/models/model_v4.json';
-const DEFAULT_MODE_FILTER = 'charcuterie';
 const SPAWN_X = 3;
 const SPAWN_Y = -1;
 
@@ -111,7 +116,7 @@ const printUsage = (): void => {
     [--output ${DEFAULT_OUTPUT_PATH}] \\
     [--model-path ${DEFAULT_MODEL_PATH}] \\
     [--observation-space raw_v1] \\
-    [--mode ${DEFAULT_MODE_FILTER}] \\
+    [--mode <mode_id> | --all-modes] \\
     [--action-dim ${DEFAULT_ACTION_DIM}] \\
     [--max-nodes ${DEFAULT_MAX_NODES}] \\
     [--return-gamma 0.995] \\
@@ -124,7 +129,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
   let outputPath = DEFAULT_OUTPUT_PATH;
   let modelPath = DEFAULT_MODEL_PATH;
   let observationSpace: BotObservationSpace = 'raw_v1';
-  let modeFilter: string | null = DEFAULT_MODE_FILTER;
+  let modeFilter: string | null = null;
   let actionDim = DEFAULT_ACTION_DIM;
   let maxNodesPerBranch = DEFAULT_MAX_NODES;
   let returnGamma = 0.995;
@@ -376,6 +381,117 @@ const toSessions = (raw: unknown): unknown[] => {
   return [raw];
 };
 
+type ProgressSnapshot = {
+  filesDone: number;
+  filesTotal: number;
+  sessionsParsed: number;
+  sessionsUsed: number;
+  records: number;
+};
+
+const formatDuration = (elapsedMs: number): string => {
+  const totalSec = Math.max(0, Math.floor(elapsedMs / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (hours > 0) {
+    return `${hours}h${String(minutes).padStart(2, '0')}m${String(
+      seconds,
+    ).padStart(2, '0')}s`;
+  }
+  return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+};
+
+const createProgressReporter = () => {
+  const startedAt = Date.now();
+  const tty = Boolean(process.stdout.isTTY);
+  let lastRenderedAt = 0;
+  let lastLoggedAt = 0;
+  let lastLineLength = 0;
+
+  const render = (snapshot: ProgressSnapshot, force = false): void => {
+    const now = Date.now();
+    const elapsedMs = now - startedAt;
+    if (!force && now - lastRenderedAt < 200) return;
+    lastRenderedAt = now;
+
+    const fileRatio =
+      snapshot.filesTotal > 0
+        ? clamp(snapshot.filesDone / snapshot.filesTotal, 0, 1)
+        : 1;
+    const barWidth = 24;
+    const filled = Math.max(
+      0,
+      Math.min(barWidth, Math.round(fileRatio * barWidth)),
+    );
+    const bar = `${'#'.repeat(filled)}${'-'.repeat(Math.max(0, barWidth - filled))}`;
+    const recPerSec =
+      elapsedMs > 0 ? snapshot.records / Math.max(1e-3, elapsedMs / 1000) : 0;
+
+    const line =
+      `[bc-dataset] [${bar}] ${snapshot.filesDone}/${snapshot.filesTotal} files ` +
+      `| sessions ${snapshot.sessionsParsed} (${snapshot.sessionsUsed} used) ` +
+      `| records ${snapshot.records} ` +
+      `| ${recPerSec.toFixed(1)} rec/s ` +
+      `| ${formatDuration(elapsedMs)}`;
+
+    if (tty) {
+      const padded = line.padEnd(lastLineLength, ' ');
+      lastLineLength = Math.max(lastLineLength, line.length);
+      process.stdout.write(`\r${padded}`);
+      return;
+    }
+
+    if (force || now - lastLoggedAt >= 5_000) {
+      lastLoggedAt = now;
+      console.log(line);
+    }
+  };
+
+  const close = (snapshot: ProgressSnapshot): void => {
+    render(snapshot, true);
+    if (tty) process.stdout.write('\n');
+  };
+
+  return {
+    render,
+    close,
+  };
+};
+
+const writeDatasetStreaming = async (params: {
+  outputPath: string;
+  header: Omit<BcDataset, 'records' | 'summary'>;
+  records: BcRecord[];
+  summary: BcDataset['summary'];
+}): Promise<void> => {
+  const fh = await openFile(params.outputPath, 'w');
+  try {
+    await fh.write(
+      `{"schema":${JSON.stringify(params.header.schema)},"createdAtMs":${
+        params.header.createdAtMs
+      },"modelPath":${JSON.stringify(
+        params.header.modelPath,
+      )},"observationSpace":${JSON.stringify(
+        params.header.observationSpace,
+      )},"modeFilter":${JSON.stringify(
+        params.header.modeFilter,
+      )},"obsDim":${params.header.obsDim},"actionDim":${
+        params.header.actionDim
+      },"records":[`,
+    );
+
+    for (let i = 0; i < params.records.length; i += 1) {
+      if (i > 0) await fh.write(',');
+      await fh.write(JSON.stringify(params.records[i]));
+    }
+
+    await fh.write(`],"summary":${JSON.stringify(params.summary)}}\n`);
+  } finally {
+    await fh.close();
+  }
+};
+
 const main = async (): Promise<void> => {
   const options = parseArgs(process.argv);
   if (!options) return;
@@ -393,6 +509,7 @@ const main = async (): Promise<void> => {
     }
   }
   const files = [...discovered].sort();
+  const progress = createProgressReporter();
 
   const records: BcRecord[] = [];
   const skipped: BcDataset['summary']['skipped'] = {
@@ -411,11 +528,31 @@ const main = async (): Promise<void> => {
 
   let sessionsParsed = 0;
   let sessionsUsed = 0;
+  let filesDone = 0;
+  progress.render(
+    {
+      filesDone,
+      filesTotal: files.length,
+      sessionsParsed,
+      sessionsUsed,
+      records: records.length,
+    },
+    true,
+  );
 
-  for (const filePath of files) {
+  for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+    const filePath = files[fileIndex];
     const parsed = await loadJsonUnknown(filePath).catch(() => null);
     if (!parsed) {
       skipped.parseFailed += 1;
+      filesDone = fileIndex + 1;
+      progress.render({
+        filesDone,
+        filesTotal: files.length,
+        sessionsParsed,
+        sessionsUsed,
+        records: records.length,
+      });
       continue;
     }
     const candidates = toSessions(parsed);
@@ -582,17 +719,46 @@ const main = async (): Promise<void> => {
       if (options.maxRecords != null && records.length >= options.maxRecords) {
         break;
       }
+      progress.render({
+        filesDone,
+        filesTotal: files.length,
+        sessionsParsed,
+        sessionsUsed,
+        records: records.length,
+      });
     }
+    filesDone = fileIndex + 1;
+    progress.render({
+      filesDone,
+      filesTotal: files.length,
+      sessionsParsed,
+      sessionsUsed,
+      records: records.length,
+    });
     if (options.maxRecords != null && records.length >= options.maxRecords) {
       break;
     }
   }
+  progress.close({
+    filesDone,
+    filesTotal: files.length,
+    sessionsParsed,
+    sessionsUsed,
+    records: records.length,
+  });
 
   if (records.length === 0) {
     throw new Error('No compatible BC records were produced.');
   }
 
-  const dataset: BcDataset = {
+  const summary: BcDataset['summary'] = {
+    filesScanned: files.length,
+    sessionsParsed,
+    sessionsUsed,
+    records: records.length,
+    skipped,
+  };
+  const header: Omit<BcDataset, 'records' | 'summary'> = {
     schema: 'wishuponablock.bot_bc_dataset.v1',
     createdAtMs: Date.now(),
     modelPath: options.modelPath,
@@ -600,19 +766,16 @@ const main = async (): Promise<void> => {
     modeFilter: options.modeFilter,
     obsDim: records[0].obs.length,
     actionDim: options.actionDim,
-    records,
-    summary: {
-      filesScanned: files.length,
-      sessionsParsed,
-      sessionsUsed,
-      records: records.length,
-      skipped,
-    },
   };
 
   const outputPath = path.resolve(options.outputPath);
   await mkdir(path.dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, `${JSON.stringify(dataset, null, 2)}\n`, 'utf8');
+  await writeDatasetStreaming({
+    outputPath,
+    header,
+    records,
+    summary,
+  });
   console.log(
     `[bc-dataset] wrote ${records.length} records from ${sessionsUsed}/${sessionsParsed} sessions -> ${outputPath}`,
   );

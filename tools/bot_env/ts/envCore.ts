@@ -82,7 +82,7 @@ const normalizeObservationSpace = (value: unknown): BotObservationSpace =>
   normalizeBotObservationSpace(typeof value === 'string' ? value : null);
 
 const normalizeModeId = (value: unknown): string => {
-  if (typeof value !== 'string') return 'charcuterie';
+  if (typeof value !== 'string') return 'practice';
   const v = value.trim().toLowerCase();
   if (
     v === 'practice' ||
@@ -93,7 +93,7 @@ const normalizeModeId = (value: unknown): string => {
   ) {
     return v;
   }
-  return 'charcuterie';
+  return 'practice';
 };
 
 const countBoardHoles = (board: Board): number => {
@@ -112,6 +112,32 @@ const countBoardHoles = (board: Board): number => {
     }
   }
   return holes;
+};
+
+const computeColumnHeights = (board: Board): number[] => {
+  if (board.length === 0 || board[0].length === 0) return [];
+  const rows = board.length;
+  const cols = board[0].length;
+  const heights = new Array<number>(cols).fill(0);
+  for (let x = 0; x < cols; x += 1) {
+    for (let y = 0; y < rows; y += 1) {
+      if (board[y][x] != null) {
+        heights[x] = rows - y;
+        break;
+      }
+    }
+  }
+  return heights;
+};
+
+const computeBoardBumpiness = (board: Board): number => {
+  const heights = computeColumnHeights(board);
+  if (heights.length <= 1) return 0;
+  let bumpiness = 0;
+  for (let i = 0; i < heights.length - 1; i += 1) {
+    bumpiness += Math.abs(heights[i] - heights[i + 1]);
+  }
+  return bumpiness;
 };
 
 const countBoardBlocks = (board: Board): number => {
@@ -145,8 +171,8 @@ const CHARCUTERIE_HOLE_WEIGHTS = {
   bottom: 5,
   mid: 2,
 } as const;
-
-const CHARCUTERIE_WARMUP_TARGET_BLOCKS = 56;
+const HOLE_DELTA_REWARD_WEIGHT = 0.05;
+const BUMPINESS_DELTA_REWARD_WEIGHT = 0.03;
 
 const getCharcuterieHolePenalty = (board: Board): number => {
   const rows = board.length;
@@ -191,17 +217,14 @@ const scoreCharcuterieBoard = (
   );
 };
 
-const clamp = (value: number, min: number, max: number): number =>
-  Math.min(max, Math.max(min, value));
-
 const computePieceReward = (options: {
   modeId: string;
   linesDelta: number;
   scoreDelta: number;
   timeDeltaMs: number;
   holesDelta: number;
+  bumpinessDelta: number;
   boardScoreDelta: number;
-  charcuterieWarmupProgress?: number;
 }): number => {
   const {
     modeId,
@@ -209,34 +232,43 @@ const computePieceReward = (options: {
     scoreDelta,
     timeDeltaMs,
     holesDelta,
+    bumpinessDelta,
     boardScoreDelta,
-    charcuterieWarmupProgress,
   } = options;
-  const survivalBonus = 0.02;
+  const holeDeltaTerm = -holesDelta * HOLE_DELTA_REWARD_WEIGHT;
+  const bumpinessDeltaTerm = -bumpinessDelta * BUMPINESS_DELTA_REWARD_WEIGHT;
   if (modeId === 'sprint') {
     return (
-      linesDelta * 1.2 + scoreDelta * 0.001 - timeDeltaMs / 4000 + survivalBonus
+      linesDelta * 1.2 +
+      scoreDelta * 0.001 +
+      holeDeltaTerm +
+      bumpinessDeltaTerm -
+      timeDeltaMs / 4000
     );
   }
   if (modeId === 'classic') {
-    return linesDelta * 0.6 + scoreDelta * 0.002 + survivalBonus;
+    return (
+      linesDelta * 0.6 + scoreDelta * 0.002 + holeDeltaTerm + bumpinessDeltaTerm
+    );
   }
   if (modeId === 'charcuterie') {
-    const warmupProgress = clamp(charcuterieWarmupProgress ?? 1, 0, 1);
-    const adjustedBoardScoreDelta =
-      boardScoreDelta >= 0 ? boardScoreDelta : boardScoreDelta * warmupProgress;
     return (
-      adjustedBoardScoreDelta * 0.12 +
+      boardScoreDelta * 0.12 +
       linesDelta * 0.15 -
       timeDeltaMs / 25000 +
-      survivalBonus
+      holeDeltaTerm +
+      bumpinessDeltaTerm
     );
   }
   if (modeId === 'cheese') {
-    return linesDelta * 0.7 - Math.max(0, holesDelta) * 0.03 + survivalBonus;
+    return linesDelta * 0.7 + holeDeltaTerm + bumpinessDeltaTerm;
   }
   return (
-    linesDelta * 0.5 + scoreDelta * 0.0008 - timeDeltaMs / 6000 + survivalBonus
+    linesDelta * 0.5 +
+    scoreDelta * 0.0008 +
+    holeDeltaTerm +
+    bumpinessDeltaTerm -
+    timeDeltaMs / 6000
   );
 };
 
@@ -377,6 +409,7 @@ type BotEnvStepResult = {
 class BotEnv {
   private game: Game;
   private runner: GameRunner;
+  private pieceSource: PieceSourceProfile;
   private done = false;
   private piecesPlaced = 0;
   private lockCount = 0;
@@ -397,11 +430,12 @@ class BotEnv {
     private readonly modeId: string,
     private readonly model: LoadedModel,
     private readonly observationSpace: BotObservationSpace,
-    private readonly pieceSource: PieceSourceProfile,
+    pieceSource: PieceSourceProfile,
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
     seed: number,
   ) {
+    this.pieceSource = pieceSource;
     this.planningRng = new XorShift32(seed ^ 0x71e9135b);
     const built = this.buildGame(seed);
     this.game = built.game;
@@ -460,6 +494,10 @@ class BotEnv {
         choices_s: choicesElapsedS,
       },
     };
+  }
+
+  setPieceSource(pieceSource: PieceSourceProfile): void {
+    this.pieceSource = pieceSource;
   }
 
   step(actionIndexRaw: number): BotEnvStepResult {
@@ -555,20 +593,14 @@ class BotEnv {
 
     const rewardStart = performance.now();
     const after = this.snapshotMetrics();
-    const blocks = countBoardBlocks(this.game.state.board);
-    const warmupProgress = clamp(
-      blocks / CHARCUTERIE_WARMUP_TARGET_BLOCKS,
-      0,
-      1,
-    );
     const reward = computePieceReward({
       modeId: this.modeId,
       linesDelta: after.lines - before.lines,
       scoreDelta: after.score - before.score,
       timeDeltaMs: after.timeMs - before.timeMs,
       holesDelta: after.holes - before.holes,
+      bumpinessDelta: after.bumpiness - before.bumpiness,
       boardScoreDelta: before.boardScore - after.boardScore,
-      charcuterieWarmupProgress: warmupProgress,
     });
     const rewardElapsedS = (performance.now() - rewardStart) / 1000;
 
@@ -811,6 +843,7 @@ class BotEnv {
     score: number;
     timeMs: number;
     holes: number;
+    bumpiness: number;
     boardScore: number;
   } {
     const state = this.game.state;
@@ -819,6 +852,7 @@ class BotEnv {
       score: Math.max(0, Math.trunc(state.score)),
       timeMs: Math.max(0, Math.trunc(state.timeMs)),
       holes: countBoardHoles(state.board),
+      bumpiness: computeBoardBumpiness(state.board),
       boardScore: scoreCharcuterieBoard(
         state.board,
         state.gameOver,
@@ -981,6 +1015,14 @@ export class BotEnvPool {
 
   listEnvIds(): number[] {
     return Array.from(this.envs.keys()).sort((a, b) => a - b);
+  }
+
+  setPieceSource(pieceSourceProfile: unknown): PieceSourceProfile {
+    const normalized = normalizePieceSource(pieceSourceProfile);
+    for (const env of this.envs.values()) {
+      env.setPieceSource(normalized);
+    }
+    return normalized;
   }
 
   popTrajectorySession(): JsonObject | null {

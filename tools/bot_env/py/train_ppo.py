@@ -32,6 +32,7 @@ class PPOConfig:
     observation_space: str
     queue_policy_id: str
     piece_source_profile: str
+    alternate_piece_sources: bool
     max_pieces_per_episode: int
     seed: int
     num_envs: int
@@ -441,7 +442,7 @@ def parse_args() -> PPOConfig:
     parser = argparse.ArgumentParser(
         description="Train WUB headless bot with full PPO in local PyTorch."
     )
-    parser.add_argument("--mode-id", default="charcuterie")
+    parser.add_argument("--mode-id", default="practice")
     parser.add_argument("--model-path", default="public/models/model_v4.json")
     parser.add_argument(
         "--observation-space",
@@ -449,7 +450,17 @@ def parse_args() -> PPOConfig:
         choices=["model_head_v1", "raw_v1"],
     )
     parser.add_argument("--queue-policy-id", default="next_piece_v1")
-    parser.add_argument("--piece-source-profile", default="bag7")
+    parser.add_argument(
+        "--piece-source-profile",
+        default="active_generator",
+        choices=["active_generator", "bag7"],
+    )
+    parser.add_argument(
+        "--alternate-piece-sources",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Alternate piece source every update: base source on odd updates, the other source on even updates.",
+    )
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42030)
 
@@ -507,7 +518,7 @@ def parse_args() -> PPOConfig:
     )
 
     args = parser.parse_args()
-    run_name = args.run_name.strip() or f"ppo_{args.mode_id}_{int(time.time())}"
+    run_name = args.run_name.strip() or f"ppo_baseline_{int(time.time())}"
     return PPOConfig(
         mode_id=args.mode_id.strip().lower(),
         model_path=args.model_path,
@@ -516,10 +527,9 @@ def parse_args() -> PPOConfig:
         ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
         piece_source_profile=(
-            "active_generator"
-            if args.piece_source_profile == "active_generator"
-            else "bag7"
+            "bag7" if args.piece_source_profile == "bag7" else "active_generator"
         ),
+        alternate_piece_sources=bool(args.alternate_piece_sources),
         max_pieces_per_episode=max(1, int(args.max_pieces_per_episode)),
         seed=max(1, int(args.seed)),
         num_envs=max(1, int(args.num_envs)),
@@ -576,6 +586,15 @@ def choose_device(device_name: str) -> torch.device:
     if device_name == "cuda":
         return torch.device("cuda")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_piece_source_for_update(cfg: PPOConfig, update: int) -> str:
+    base = "bag7" if cfg.piece_source_profile == "bag7" else "active_generator"
+    if not cfg.alternate_piece_sources:
+        return base
+    if update % 2 == 1:
+        return base
+    return "active_generator" if base == "bag7" else "bag7"
 
 
 def ensure_action_masks(
@@ -655,7 +674,7 @@ def export_bot_policy_artifact(
 
     now_ms = int(time.time() * 1000)
     artifact = {
-        "id": f"bot_policy_{cfg.mode_id}_{now_ms}",
+        "id": f"bot_policy_baseline_{now_ms}",
         "modeId": cfg.mode_id,
         "archId": "full",
         "queuePolicyId": cfg.queue_policy_id,
@@ -1076,6 +1095,11 @@ def train(cfg: PPOConfig) -> None:
             np.asarray(reset_result["action_masks"], dtype=np.float32),
             repair_stats=mask_repair_total,
         )
+        current_piece_source = (
+            "bag7"
+            if cfg.piece_source_profile == "bag7"
+            else "active_generator"
+        )
         raw_obs_dim = infer_obs_dim(reset_result["obs"])
         action_dim = infer_action_dim(reset_result["action_masks"])
 
@@ -1153,7 +1177,9 @@ def train(cfg: PPOConfig) -> None:
             f"(device={device.type}, env_obs_space={cfg.observation_space}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
-            f"batch_size={batch_size}, updates={num_updates})"
+            f"batch_size={batch_size}, updates={num_updates}, "
+            f"piece_source_base={cfg.piece_source_profile}, "
+            f"alternate_sources={'y' if cfg.alternate_piece_sources else 'n'})"
         )
         write_json(
             out_dir / "config.json",
@@ -1212,6 +1238,39 @@ def train(cfg: PPOConfig) -> None:
                 profile_opt_s = 0.0
                 profile_io_s = 0.0
                 mask_repair_update = {"rows": 0, "batches": 0}
+
+                desired_piece_source = resolve_piece_source_for_update(cfg, update)
+                if desired_piece_source != current_piece_source:
+                    switch_result = env.set_piece_source(desired_piece_source)
+                    current_piece_source = str(
+                        switch_result.get("piece_source_profile", desired_piece_source)
+                    )
+                    source_reset_seeds = [
+                        cfg.seed + update * 100_003 + i * 101 for i in range(cfg.num_envs)
+                    ]
+                    env_reset_start = time.perf_counter()
+                    source_reset = env.reset_many(env_ids=env_ids, seeds=source_reset_seeds)
+                    profile_env_reset_s += time.perf_counter() - env_reset_start
+                    reset_profile = source_reset.get("profile", {})
+                    profile_env_reset_batch_s += _profile_num(
+                        reset_profile, "batch_total_s"
+                    )
+                    profile_env_reset_core_s += _profile_num(
+                        reset_profile, "reset_env_total_s"
+                    )
+                    profile_env_reset_obs_s += _profile_num(
+                        reset_profile, "reset_obs_s"
+                    )
+                    profile_env_reset_choices_s += _profile_num(
+                        reset_profile, "reset_choices_s"
+                    )
+                    obs_np = np.asarray(source_reset["obs"], dtype=np.float32)
+                    mask_np = ensure_action_masks(
+                        np.asarray(source_reset["action_masks"], dtype=np.float32),
+                        repair_stats=mask_repair_update,
+                    )
+                    ep_return.fill(0.0)
+                    ep_length.fill(0)
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -1466,6 +1525,7 @@ def train(cfg: PPOConfig) -> None:
                 stats = {
                     "update": update,
                     "global_step": global_step,
+                    "piece_source_profile": current_piece_source,
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
@@ -1595,6 +1655,7 @@ def train(cfg: PPOConfig) -> None:
                         f"clip={stats['clip_fraction']:.3f} "
                         f"ent_coef={ent_coef_now:.5f} "
                         f"target_kl={target_kl_now:.5f} "
+                        f"src={'ml' if current_piece_source == 'active_generator' else 'bag7'} "
                         f"warmup={'y' if warmup_active else 'n'} "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "

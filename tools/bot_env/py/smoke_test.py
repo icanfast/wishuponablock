@@ -22,7 +22,7 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     with WubEnvBridge(cwd=repo_root) as env:
         init_result = env.init(
-            mode_id="charcuterie",
+            mode_id="practice",
             num_envs=2,
             model_path="public/models/model_v4.json",
             piece_source_profile="bag7",

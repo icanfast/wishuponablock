@@ -75,7 +75,7 @@ class WubEnvBridge:
 
     def init(
         self,
-        mode_id: str = "charcuterie",
+        mode_id: str = "practice",
         num_envs: int = 1,
         model_path: str = "public/models/model_v4.json",
         observation_space: str = "raw_v1",
@@ -102,6 +102,12 @@ class WubEnvBridge:
         if seeds is not None:
             payload["seeds"] = [int(v) for v in seeds]
         return self._request("reset_many", payload)
+
+    def set_piece_source(self, piece_source_profile: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "pieceSourceProfile": str(piece_source_profile).strip().lower(),
+        }
+        return self._request("set_piece_source", payload)
 
     def step_many(self, env_ids: list[int], actions: list[int]) -> dict[str, Any]:
         payload = {

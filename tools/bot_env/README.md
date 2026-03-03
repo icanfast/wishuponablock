@@ -65,7 +65,6 @@ Using a current session cookie:
 python3 tools/bot_env/py/download_recordings.py \
   --base-url https://dev.wishuponablock.com \
   --cookie "<wub_session_cookie_value>" \
-  --mode charcuterie \
   --min-samples 2 \
   --out-dir tools/bot_env/recordings
 ```
@@ -77,7 +76,6 @@ python3 tools/bot_env/py/download_recordings.py \
   --base-url https://dev.wishuponablock.com \
   --email "<your_email>" \
   --password "<your_password>" \
-  --mode charcuterie \
   --min-samples 2 \
   --out-dir tools/bot_env/recordings
 ```
@@ -92,14 +90,13 @@ If you hit TLS trust errors on local Python:
 ```bash
 npx --yes tsx tools/bot_env/ts/buildBcDataset.ts \
   --input tools/bot_env/recordings \
-  --output tools/bot_env/output/bc_dataset_charcuterie.json \
+  --output tools/bot_env/output/bc_dataset_baseline.json \
   --observation-space raw_v1 \
-  --mode charcuterie \
   --model-path public/models/model_v4.json \
   --return-gamma 0.995
 ```
 
-You can pass `--input` multiple times (file or directory). Incompatible samples are skipped silently and only reflected in summary counters.
+You can pass `--input` multiple times (file or directory). Use `--mode <mode_id>` if you want to filter; by default all modes are included. Incompatible samples are skipped silently and only reflected in summary counters.
 
 ### 2) Train PPO
 
@@ -107,27 +104,25 @@ Minimal run:
 
 ```bash
 python3 tools/bot_env/py/train_ppo.py \
-  --mode-id charcuterie \
+  --mode-id practice \
   --model-path public/models/model_v4.json \
   --observation-space raw_v1 \
   --num-envs 16 \
   --num-steps 256 \
-  --total-timesteps 2000000 \
-  --piece-source-profile bag7
+  --total-timesteps 2000000
 ```
 
 With BC warm-start:
 
 ```bash
 python3 tools/bot_env/py/train_ppo.py \
-  --mode-id charcuterie \
+  --mode-id practice \
   --model-path public/models/model_v4.json \
   --observation-space raw_v1 \
   --num-envs 16 \
   --num-steps 256 \
   --total-timesteps 2000000 \
-  --piece-source-profile bag7 \
-  --bc-dataset tools/bot_env/output/bc_dataset_charcuterie.json \
+  --bc-dataset tools/bot_env/output/bc_dataset_baseline.json \
   --bc-epochs 5 \
   --bc-batch-size 4096 \
   --bc-learning-rate 1e-3 \
@@ -145,6 +140,7 @@ Outputs:
 Notes:
 
 - When `--observation-space raw_v1` is used, training applies a WUB conv/pool/feature-norm encoder (loaded from `--model-path`) inside PyTorch and trains both encoder + PPO heads together.
+- Piece source alternates per update by default (`active_generator` on odd updates, `bag7` on even updates). Disable with `--no-alternate-piece-sources`.
 - Exported artifacts from this path are tagged with `observationSpace: "model_head_v1"` and include `encoderModel` so runtime can reproduce the trained encoder exactly.
 - PPO now uses a warmup phase by default (`--warmup-updates 50`) with conservative settings (`--warmup-ent-coef 0.001`, `--warmup-target-kl 0.01`) before switching to your regular `--ent-coef` / `--target-kl`.
 - Value loss clipping is enabled by default; disable only if needed with `--no-clip-vloss`.

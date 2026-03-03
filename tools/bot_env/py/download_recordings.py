@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cookie", default=None, help="Raw wub_session cookie value.")
     parser.add_argument("--email", default=None, help="Email login (optional).")
     parser.add_argument("--password", default=None, help="Email password (optional).")
-    parser.add_argument("--mode", default="charcuterie")
+    parser.add_argument("--mode", default=None)
     parser.add_argument("--build", default=None)
     parser.add_argument("--user-id", default=None)
     parser.add_argument("--arch", default=None)

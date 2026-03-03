@@ -306,8 +306,7 @@ export function createAdminBotPolicyService(
         id:
           asString(response.headers.get('x-wub-bot-policy-id')) ?? normalizedId,
         modeId:
-          normalizeAxis(response.headers.get('x-wub-bot-mode')) ??
-          'charcuterie',
+          normalizeAxis(response.headers.get('x-wub-bot-mode')) ?? 'practice',
         archId: normalizeAxis(response.headers.get('x-wub-bot-arch')) ?? 'full',
         queuePolicyId:
           normalizeAxis(response.headers.get('x-wub-bot-queue-policy')) ??
