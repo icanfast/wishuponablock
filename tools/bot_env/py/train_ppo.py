@@ -825,6 +825,67 @@ def pop_latest_trajectory(
     return latest, drained
 
 
+def capture_single_policy_rollout(
+    env: WubEnvBridge,
+    env_id: int,
+    seed: int,
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    device: torch.device,
+    max_steps: int,
+    deterministic: bool = True,
+) -> dict[str, Any]:
+    reset = env.reset_many(env_ids=[env_id], seeds=[seed])
+    obs = np.asarray(reset["obs"], dtype=np.float32)
+    mask = ensure_action_masks(np.asarray(reset["action_masks"], dtype=np.float32))
+    if obs.shape[0] <= 0 or mask.shape[0] <= 0:
+        return {
+            "episode_return": 0.0,
+            "episode_length": 0,
+            "done": False,
+            "trajectory": None,
+            "drained": 0,
+        }
+
+    episode_return = 0.0
+    episode_length = 0
+    done = False
+
+    for _ in range(max(1, int(max_steps))):
+        raw_obs_t = as_tensor(obs, device)
+        mask_t = as_tensor(mask, device)
+        with torch.no_grad():
+            features_t = obs_adapter(raw_obs_t)
+            logits_t, _values_t = model(features_t)
+            dist_t = masked_categorical(logits_t, mask_t)
+            if deterministic:
+                action_t = torch.argmax(dist_t.probs, dim=-1)
+            else:
+                action_t = dist_t.sample()
+        action = int(action_t.detach().cpu().numpy()[0])
+        step = env.step_many(env_ids=[env_id], actions=[action])
+        rewards = np.asarray(step.get("rewards", [0.0]), dtype=np.float32)
+        dones = np.asarray(step.get("dones", [False]), dtype=np.float32)
+        episode_return += float(rewards[0]) if rewards.size > 0 else 0.0
+        episode_length += 1
+        done = bool(dones[0] > 0.5) if dones.size > 0 else False
+        if done:
+            break
+        obs = np.asarray(step["obs"], dtype=np.float32)
+        mask = ensure_action_masks(
+            np.asarray(step["action_masks"], dtype=np.float32)
+        )
+
+    trajectory, drained = pop_latest_trajectory(env, max_drain=64)
+    return {
+        "episode_return": float(episode_return),
+        "episode_length": int(episode_length),
+        "done": bool(done),
+        "trajectory": trajectory,
+        "drained": int(drained),
+    }
+
+
 def _is_finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
@@ -1184,10 +1245,83 @@ def train(cfg: PPOConfig) -> None:
             )
             if bc_stats.get("enabled"):
                 write_json(out_dir / "bc_stats.json", bc_stats)
+                post_bc_artifact = export_bot_policy_artifact(
+                    model,
+                    obs_adapter,
+                    cfg,
+                    obs_dim,
+                    action_dim,
+                    policy_observation_space,
+                    pipeline_id="bot_ppo_offline_post_bc_v1",
+                )
+                post_bc_artifact_path = artifacts_dir / "bot_policy_post_bc.json"
+                write_json(post_bc_artifact_path, post_bc_artifact)
+
+                snapshot_seed = cfg.seed + 900_001
+                rollout = capture_single_policy_rollout(
+                    env=env,
+                    env_id=env_ids[0],
+                    seed=snapshot_seed,
+                    model=model,
+                    obs_adapter=obs_adapter,
+                    device=device,
+                    max_steps=max(1, cfg.max_pieces_per_episode * 4),
+                    deterministic=True,
+                )
+                post_bc_trajectory_path: Path | None = None
+                trajectory_payload = rollout.get("trajectory")
+                if isinstance(trajectory_payload, dict):
+                    post_bc_trajectory_path = trajectories_dir / "trajectory_post_bc.json"
+                    write_json_any(post_bc_trajectory_path, trajectory_payload)
+
+                post_bc_stats = {
+                    "enabled": True,
+                    "seed": int(snapshot_seed),
+                    "policy_path": str(post_bc_artifact_path),
+                    "trajectory_path": (
+                        str(post_bc_trajectory_path)
+                        if post_bc_trajectory_path is not None
+                        else None
+                    ),
+                    "trajectory_drained": int(rollout.get("drained", 0)),
+                    "episode_return": float(rollout.get("episode_return", 0.0)),
+                    "episode_length": int(rollout.get("episode_length", 0)),
+                    "episode_done": bool(rollout.get("done", False)),
+                    "trajectory_session_id": (
+                        trajectory_payload.get("sessionId")
+                        if isinstance(trajectory_payload, dict)
+                        else None
+                    ),
+                    "trajectory_samples": (
+                        len(trajectory_payload.get("samples", []))
+                        if isinstance(trajectory_payload, dict)
+                        and isinstance(trajectory_payload.get("samples"), list)
+                        else 0
+                    ),
+                }
+                write_json(out_dir / "post_bc_stats.json", post_bc_stats)
+                print(
+                    "[ppo] "
+                    f"post_bc snapshot saved "
+                    f"(policy={post_bc_artifact_path.name}, "
+                    f"trajectory={'yes' if post_bc_trajectory_path is not None else 'no'}, "
+                    f"ret={post_bc_stats['episode_return']:.3f}, "
+                    f"len={post_bc_stats['episode_length']})"
+                )
             optimizer = torch.optim.Adam(
                 trainable_parameters(model, obs_adapter),
                 lr=cfg.learning_rate,
                 eps=1e-5,
+            )
+
+            # Reinitialize env batch after post-BC snapshot capture so PPO
+            # always starts from a clean synchronized state.
+            reset_seeds = [cfg.seed + i * 101 for i in range(cfg.num_envs)]
+            reset_result = env.reset_many(env_ids=env_ids, seeds=reset_seeds)
+            obs_np = np.asarray(reset_result["obs"], dtype=np.float32)
+            mask_np = ensure_action_masks(
+                np.asarray(reset_result["action_masks"], dtype=np.float32),
+                repair_stats=mask_repair_total,
             )
 
         batch_size = cfg.num_envs * cfg.num_steps
