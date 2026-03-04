@@ -23,6 +23,7 @@ RAW_PIECES_ORDER = ("I", "O", "T", "S", "Z", "J", "L")
 RAW_CONTEXT_DIM = len(RAW_PIECES_ORDER) + (len(RAW_PIECES_ORDER) + 1) + len(RAW_PIECES_ORDER) + 5
 DEFAULT_BOARD_ROWS = 20
 DEFAULT_BOARD_COLS = 10
+PPO_OBS_ADAPTER_LR_SCALE = 0.1
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class PPOConfig:
     mode_id: str
     model_path: str
     observation_space: str
+    placement_execution_mode: str
     queue_policy_id: str
     piece_source_profile: str
     alternate_piece_sources: bool
@@ -42,7 +44,8 @@ class PPOConfig:
     learning_rate: float
     gamma: float
     gae_lambda: float
-    clip_coef: float
+    policy_clip_coef: float
+    value_clip_coef: float
     clip_vloss: bool
     ent_coef: float
     vf_coef: float
@@ -53,6 +56,8 @@ class PPOConfig:
     warmup_updates: int
     warmup_ent_coef: float
     warmup_target_kl: float
+    warmup_policy_lr_scale: float
+    warmup_value_lr_scale: float
     device: str
     save_every_updates: int
     log_every_updates: int
@@ -68,24 +73,40 @@ class PPOConfig:
     bc_learning_rate: float
     bc_value_weight: float
     bc_max_records: int | None
+    bc_normalize_returns: bool
+    bc_return_clip: float
 
 
 class PolicyValueNet(nn.Module):
     def __init__(self, obs_dim: int, hidden_dim: int, action_dim: int) -> None:
         super().__init__()
+
+        def init_layer(
+            layer: nn.Linear,
+            std: float = math.sqrt(2.0),
+            bias_const: float = 0.0,
+        ) -> nn.Linear:
+            nn.init.orthogonal_(layer.weight, std)
+            nn.init.constant_(layer.bias, bias_const)
+            return layer
+
         self.fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.policy_head = nn.Linear(hidden_dim, action_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
 
-        nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.kaiming_uniform_(self.policy_head.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.policy_head.bias)
-        nn.init.kaiming_uniform_(self.value_head.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.value_head.bias)
+        # PPO-friendly init:
+        # - Hidden ReLU layers: orthogonal gain sqrt(2)
+        # - Policy head: tiny gain so initial logits are near-uniform
+        # - Value head: gain 1.0
+        init_layer(self.fc1, std=math.sqrt(2.0))
+        init_layer(self.fc2, std=math.sqrt(2.0))
+        init_layer(self.policy_head, std=0.01)
+        init_layer(self.value_head, std=1.0)
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = torch.relu(self.fc1(obs))
+        hidden = torch.relu(self.fc2(hidden))
         logits = self.policy_head(hidden)
         value = self.value_head(hidden).squeeze(-1)
         return logits, value
@@ -449,6 +470,12 @@ def parse_args() -> PPOConfig:
         default="raw_v1",
         choices=["model_head_v1", "raw_v1"],
     )
+    parser.add_argument(
+        "--placement-execution-mode",
+        default="teleport",
+        choices=["commands", "teleport"],
+        help="How env executes placement actions: deterministic command playback or direct teleport+harddrop.",
+    )
     parser.add_argument("--queue-policy-id", default="next_piece_v1")
     parser.add_argument(
         "--piece-source-profile",
@@ -468,11 +495,24 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--total-timesteps", type=int, default=2_000_000)
     parser.add_argument("--num-steps", type=int, default=256)
 
-    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--clip-coef", type=float, default=0.2)
+    parser.add_argument(
+        "--policy-clip-coef",
+        "--clip-coef",
+        dest="policy_clip_coef",
+        type=float,
+        default=0.2,
+        help="PPO policy ratio clipping epsilon.",
+    )
+    parser.add_argument(
+        "--value-clip-coef",
+        type=float,
+        default=0.4,
+        help="Value function clipping epsilon (used when --clip-vloss is enabled).",
+    )
     parser.add_argument(
         "--clip-vloss",
         action=argparse.BooleanOptionalAction,
@@ -487,6 +527,18 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--warmup-updates", type=int, default=50)
     parser.add_argument("--warmup-ent-coef", type=float, default=0.001)
     parser.add_argument("--warmup-target-kl", type=float, default=0.01)
+    parser.add_argument(
+        "--warmup-policy-lr-scale",
+        type=float,
+        default=0.1,
+        help="Scale for policy/trunk/encoder learning rate during warmup updates.",
+    )
+    parser.add_argument(
+        "--warmup-value-lr-scale",
+        type=float,
+        default=1.0,
+        help="Scale for value-head learning rate during warmup updates.",
+    )
 
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-every-updates", type=int, default=10)
@@ -511,6 +563,18 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--bc-learning-rate", type=float, default=1e-3)
     parser.add_argument("--bc-value-weight", type=float, default=0.25)
     parser.add_argument(
+        "--bc-normalize-returns",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize BC return-to-go targets over valid records before value fitting.",
+    )
+    parser.add_argument(
+        "--bc-return-clip",
+        type=float,
+        default=10.0,
+        help="Clip BC value targets after optional normalization (<=0 disables clipping).",
+    )
+    parser.add_argument(
         "--bc-max-records",
         type=int,
         default=0,
@@ -524,6 +588,11 @@ def parse_args() -> PPOConfig:
         model_path=args.model_path,
         observation_space=(
             "raw_v1" if args.observation_space == "raw_v1" else "model_head_v1"
+        ),
+        placement_execution_mode=(
+            "commands"
+            if args.placement_execution_mode == "commands"
+            else "teleport"
         ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
         piece_source_profile=(
@@ -539,7 +608,8 @@ def parse_args() -> PPOConfig:
         learning_rate=float(args.learning_rate),
         gamma=float(args.gamma),
         gae_lambda=float(args.gae_lambda),
-        clip_coef=float(args.clip_coef),
+        policy_clip_coef=float(args.policy_clip_coef),
+        value_clip_coef=float(args.value_clip_coef),
         clip_vloss=bool(args.clip_vloss),
         ent_coef=float(args.ent_coef),
         vf_coef=float(args.vf_coef),
@@ -550,6 +620,8 @@ def parse_args() -> PPOConfig:
         warmup_updates=max(0, int(args.warmup_updates)),
         warmup_ent_coef=max(0.0, float(args.warmup_ent_coef)),
         warmup_target_kl=max(0.0, float(args.warmup_target_kl)),
+        warmup_policy_lr_scale=max(0.0, float(args.warmup_policy_lr_scale)),
+        warmup_value_lr_scale=max(0.0, float(args.warmup_value_lr_scale)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
         log_every_updates=max(1, int(args.log_every_updates)),
@@ -569,6 +641,8 @@ def parse_args() -> PPOConfig:
         bc_max_records=(
             max(1, int(args.bc_max_records)) if int(args.bc_max_records) > 0 else None
         ),
+        bc_normalize_returns=bool(args.bc_normalize_returns),
+        bc_return_clip=float(args.bc_return_clip),
     )
 
 
@@ -656,6 +730,78 @@ def trainable_parameters(
     return params
 
 
+def scale_obs_adapter_gradients(obs_adapter: ObservationAdapter, scale: float) -> None:
+    if not math.isfinite(scale) or scale <= 0.0 or abs(scale - 1.0) < 1e-12:
+        return
+    for param in obs_adapter.parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            continue
+        param.grad.mul_(scale)
+
+
+def build_ppo_optimizer(
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    learning_rate: float,
+) -> torch.optim.Optimizer:
+    # Split optimizer groups so we can slow policy/trunk updates during PPO warmup
+    # while keeping value-head updates at full speed.
+    policy_params: list[nn.Parameter] = []
+    policy_params.extend(
+        [p for p in model.fc1.parameters() if p.requires_grad]
+    )
+    policy_params.extend(
+        [p for p in model.fc2.parameters() if p.requires_grad]
+    )
+    policy_params.extend(
+        [p for p in model.policy_head.parameters() if p.requires_grad]
+    )
+    policy_params.extend([p for p in obs_adapter.parameters() if p.requires_grad])
+
+    value_params = [p for p in model.value_head.parameters() if p.requires_grad]
+
+    param_groups: list[dict[str, Any]] = []
+    if policy_params:
+        param_groups.append(
+            {
+                "params": policy_params,
+                "lr": learning_rate,
+                "group_name": "policy",
+            }
+        )
+    if value_params:
+        param_groups.append(
+            {
+                "params": value_params,
+                "lr": learning_rate,
+                "group_name": "value",
+            }
+        )
+    if not param_groups:
+        raise ValueError("No trainable parameters found for PPO optimizer.")
+    return torch.optim.Adam(param_groups, lr=learning_rate, eps=1e-5)
+
+
+def apply_warmup_lr_schedule(
+    optimizer: torch.optim.Optimizer,
+    base_lr: float,
+    warmup_active: bool,
+    warmup_policy_lr_scale: float,
+    warmup_value_lr_scale: float,
+) -> tuple[float, float]:
+    policy_lr = base_lr * (warmup_policy_lr_scale if warmup_active else 1.0)
+    value_lr = base_lr * (warmup_value_lr_scale if warmup_active else 1.0)
+    for group in optimizer.param_groups:
+        group_name = str(group.get("group_name", "policy"))
+        if group_name == "value":
+            group["lr"] = value_lr
+        else:
+            group["lr"] = policy_lr
+    return float(policy_lr), float(value_lr)
+
+
 def export_bot_policy_artifact(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
@@ -668,6 +814,8 @@ def export_bot_policy_artifact(
     with torch.no_grad():
         w1 = model.fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
         b1 = model.fc1.bias.detach().cpu().numpy().astype(np.float32)  # [H]
+        w2 = model.fc2.weight.detach().cpu().numpy().astype(np.float32)  # [H, H]
+        b2 = model.fc2.bias.detach().cpu().numpy().astype(np.float32)  # [H]
         wp = (
             model.policy_head.weight.detach().cpu().numpy().astype(np.float32)
         )  # [A, H]
@@ -693,6 +841,8 @@ def export_bot_policy_artifact(
         "weights": {
             "w1": w1.T.reshape(-1).tolist(),  # [I, H]
             "b1": b1.reshape(-1).tolist(),
+            "w2": w2.T.reshape(-1).tolist(),  # [H, H]
+            "b2": b2.reshape(-1).tolist(),
             "wp": wp.T.reshape(-1).tolist(),  # [H, A]
             "bp": bp.reshape(-1).tolist(),
             "wv": wv.reshape(-1).tolist(),  # [H]
@@ -737,6 +887,16 @@ def load_from_artifact(
 
     w1 = np.asarray(weights.get("w1", []), dtype=np.float32).reshape(input_dim, hidden_dim)
     b1 = np.asarray(weights.get("b1", []), dtype=np.float32).reshape(hidden_dim)
+    w2_payload = weights.get("w2")
+    b2_payload = weights.get("b2")
+    has_second_layer = isinstance(w2_payload, list) and isinstance(b2_payload, list)
+    if has_second_layer:
+        w2 = np.asarray(w2_payload, dtype=np.float32).reshape(hidden_dim, hidden_dim)
+        b2 = np.asarray(b2_payload, dtype=np.float32).reshape(hidden_dim)
+    else:
+        # Backward compatibility for one-hidden-layer artifacts.
+        w2 = np.eye(hidden_dim, dtype=np.float32)
+        b2 = np.zeros((hidden_dim,), dtype=np.float32)
     wp = np.asarray(weights.get("wp", []), dtype=np.float32).reshape(hidden_dim, action_dim)
     bp = np.asarray(weights.get("bp", []), dtype=np.float32).reshape(action_dim)
     wv = np.asarray(weights.get("wv", []), dtype=np.float32).reshape(hidden_dim)
@@ -745,6 +905,8 @@ def load_from_artifact(
     with torch.no_grad():
         model.fc1.weight.copy_(torch.from_numpy(w1.T))
         model.fc1.bias.copy_(torch.from_numpy(b1))
+        model.fc2.weight.copy_(torch.from_numpy(w2.T))
+        model.fc2.bias.copy_(torch.from_numpy(b2))
         model.policy_head.weight.copy_(torch.from_numpy(wp.T))
         model.policy_head.bias.copy_(torch.from_numpy(bp))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
@@ -791,11 +953,34 @@ def load_checkpoint(
     map_device: torch.device,
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model_state = checkpoint["model_state_dict"]
+    if (
+        isinstance(model_state, dict)
+        and ("fc2.weight" not in model_state or "fc2.bias" not in model_state)
+    ):
+        # Backward compatibility for checkpoints saved before fc2 existed.
+        with torch.no_grad():
+            eye = torch.eye(
+                model.fc2.out_features,
+                model.fc2.in_features,
+                dtype=model.fc2.weight.dtype,
+                device=model.fc2.weight.device,
+            )
+            model.fc2.weight.copy_(eye)
+            model.fc2.bias.zero_()
+    model.load_state_dict(model_state, strict=False)
     adapter_state = checkpoint.get("obs_adapter_state_dict")
     if isinstance(adapter_state, dict):
         obs_adapter.load_state_dict(adapter_state, strict=False)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if isinstance(optimizer_state, dict):
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except ValueError as error:
+            print(
+                "[ppo] warning: optimizer state was not loaded from checkpoint "
+                f"(param-group mismatch). Using fresh optimizer state. detail={error}"
+            )
     global_step = int(checkpoint.get("global_step", 0))
     update = int(checkpoint.get("update", 0))
     return global_step, update
@@ -1036,6 +1221,35 @@ def run_bc_pretrain(
     actions_t = torch.from_numpy(batch["actions"]).to(device)
     returns_t = as_tensor(batch["returns"], device)
     returns_mask_t = as_tensor(batch["returns_mask"], device)
+    returns_target_t = returns_t.clone()
+
+    valid_return_count = int(torch.sum(returns_mask_t).detach().cpu().item())
+    return_norm_mean = 0.0
+    return_norm_std = 1.0
+    return_clip_used = (
+        float(cfg.bc_return_clip)
+        if math.isfinite(cfg.bc_return_clip) and cfg.bc_return_clip > 0
+        else None
+    )
+    if valid_return_count > 0:
+        valid_mask_bool = returns_mask_t > 0.5
+        valid_returns = returns_t[valid_mask_bool]
+        if cfg.bc_normalize_returns:
+            return_norm_mean = float(valid_returns.mean().detach().cpu().item())
+            return_norm_std = float(
+                valid_returns.std(unbiased=False).detach().cpu().item()
+            )
+            if not math.isfinite(return_norm_std) or return_norm_std < 1e-6:
+                return_norm_std = 1.0
+            returns_target_t[valid_mask_bool] = (
+                valid_returns - return_norm_mean
+            ) / return_norm_std
+        if return_clip_used is not None:
+            returns_target_t[valid_mask_bool] = torch.clamp(
+                returns_target_t[valid_mask_bool],
+                -return_clip_used,
+                return_clip_used,
+            )
 
     sample_count = int(obs_t.shape[0])
     batch_size = min(cfg.bc_batch_size, sample_count)
@@ -1047,6 +1261,13 @@ def run_bc_pretrain(
     best_state: dict[str, torch.Tensor] | None = None
     best_adapter_state: dict[str, torch.Tensor] | None = None
     epoch_logs: list[dict[str, float]] = []
+    print(
+        "[bc] "
+        f"returns preprocess: normalize={'y' if cfg.bc_normalize_returns else 'n'} "
+        f"clip={return_clip_used if return_clip_used is not None else 'off'} "
+        f"valid_targets={valid_return_count} "
+        f"mean={return_norm_mean:.4f} std={return_norm_std:.4f}"
+    )
 
     for epoch in range(1, cfg.bc_epochs + 1):
         perm = torch.randperm(sample_count, device=device)
@@ -1067,7 +1288,7 @@ def run_bc_pretrain(
                 mb_return_mask = returns_mask_t[idx]
                 valid_returns = torch.sum(mb_return_mask)
                 if float(valid_returns.detach().cpu().item()) > 0:
-                    sq_err = (values - returns_t[idx]) ** 2
+                    sq_err = (values - returns_target_t[idx]) ** 2
                     value_loss = 0.5 * torch.sum(sq_err * mb_return_mask) / valid_returns
 
             total_loss = actor_loss + cfg.bc_value_weight * value_loss
@@ -1126,6 +1347,11 @@ def run_bc_pretrain(
         "batch_size": batch_size,
         "learning_rate": cfg.bc_learning_rate,
         "value_weight": cfg.bc_value_weight,
+        "normalize_returns": cfg.bc_normalize_returns,
+        "return_norm_mean": return_norm_mean,
+        "return_norm_std": return_norm_std,
+        "return_clip_used": return_clip_used,
+        "returns_with_targets": valid_return_count,
         "dataset_stats": dataset_stats,
         "best_total_loss": best_loss,
         "epoch_logs": epoch_logs,
@@ -1160,6 +1386,7 @@ def train(cfg: PPOConfig) -> None:
             num_envs=cfg.num_envs,
             model_path=cfg.model_path,
             observation_space=cfg.observation_space,
+            placement_execution_mode=cfg.placement_execution_mode,
             piece_source_profile=cfg.piece_source_profile,
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
@@ -1209,11 +1436,7 @@ def train(cfg: PPOConfig) -> None:
         global_step = 0
         start_update = 0
         if cfg.resume_checkpoint:
-            optimizer = torch.optim.Adam(
-                trainable_parameters(model, obs_adapter),
-                lr=cfg.learning_rate,
-                eps=1e-5,
-            )
+            optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
             global_step, start_update = load_checkpoint(
                 checkpoint_path, model, obs_adapter, optimizer, device
@@ -1308,11 +1531,7 @@ def train(cfg: PPOConfig) -> None:
                     f"ret={post_bc_stats['episode_return']:.3f}, "
                     f"len={post_bc_stats['episode_length']})"
                 )
-            optimizer = torch.optim.Adam(
-                trainable_parameters(model, obs_adapter),
-                lr=cfg.learning_rate,
-                eps=1e-5,
-            )
+            optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
 
             # Reinitialize env batch after post-BC snapshot capture so PPO
             # always starts from a clean synchronized state.
@@ -1334,11 +1553,17 @@ def train(cfg: PPOConfig) -> None:
         print(
             "[ppo] starting training "
             f"(device={device.type}, env_obs_space={cfg.observation_space}, "
+            f"placement_exec={cfg.placement_execution_mode}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"batch_size={batch_size}, updates={num_updates}, "
             f"piece_source_base={cfg.piece_source_profile}, "
-            f"alternate_sources={'y' if cfg.alternate_piece_sources else 'n'})"
+            f"alternate_sources={'y' if cfg.alternate_piece_sources else 'n'}, "
+            f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
+            f"value_clip_coef={cfg.value_clip_coef:.4f}, "
+            f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
+            f"warmup_value_lr_scale={cfg.warmup_value_lr_scale:.3f}, "
+            f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f})"
         )
         write_json(
             out_dir / "config.json",
@@ -1395,6 +1620,13 @@ def train(cfg: PPOConfig) -> None:
                 )
                 target_kl_now = (
                     cfg.warmup_target_kl if warmup_active else cfg.target_kl
+                )
+                policy_lr_now, value_lr_now = apply_warmup_lr_schedule(
+                    optimizer=optimizer,
+                    base_lr=cfg.learning_rate,
+                    warmup_active=warmup_active,
+                    warmup_policy_lr_scale=cfg.warmup_policy_lr_scale,
+                    warmup_value_lr_scale=cfg.warmup_value_lr_scale,
                 )
                 update_start_wall = time.time()
                 update_start_perf = time.perf_counter()
@@ -1644,6 +1876,7 @@ def train(cfg: PPOConfig) -> None:
                 entropy_value = 0.0
                 updates_done = 0
                 early_stopped = False
+                early_stop_epoch: int | None = None
                 approx_kl_values: list[float] = []
 
                 optimize_start = time.perf_counter()
@@ -1669,7 +1902,7 @@ def train(cfg: PPOConfig) -> None:
                         with torch.no_grad():
                             approx_kl = ((ratio - 1.0) - logratio).mean()
                             clipfrac = (
-                                (ratio - 1.0).abs() > cfg.clip_coef
+                                (ratio - 1.0).abs() > cfg.policy_clip_coef
                             ).float().mean()
                             approx_kl_value = float(approx_kl.detach().cpu().item())
                             approx_kl_values.append(approx_kl_value)
@@ -1679,7 +1912,9 @@ def train(cfg: PPOConfig) -> None:
                         mb_adv = b_advantages[mb_inds]
                         pg_loss_1 = -mb_adv * ratio
                         pg_loss_2 = -mb_adv * torch.clamp(
-                            ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef
+                            ratio,
+                            1.0 - cfg.policy_clip_coef,
+                            1.0 + cfg.policy_clip_coef,
                         )
                         policy_loss = torch.max(pg_loss_1, pg_loss_2).mean()
 
@@ -1687,7 +1922,7 @@ def train(cfg: PPOConfig) -> None:
                         if cfg.clip_vloss:
                             value_pred_clipped = b_values[mb_inds] + (
                                 value_pred - b_values[mb_inds]
-                            ).clamp(-cfg.clip_coef, cfg.clip_coef)
+                            ).clamp(-cfg.value_clip_coef, cfg.value_clip_coef)
                             value_losses = (value_pred - b_returns[mb_inds]) ** 2
                             value_losses_clipped = (
                                 value_pred_clipped - b_returns[mb_inds]
@@ -1709,6 +1944,9 @@ def train(cfg: PPOConfig) -> None:
 
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
+                        scale_obs_adapter_gradients(
+                            obs_adapter, PPO_OBS_ADAPTER_LR_SCALE
+                        )
                         nn.utils.clip_grad_norm_(
                             trainable_parameters(model, obs_adapter), cfg.max_grad_norm
                         )
@@ -1726,6 +1964,13 @@ def train(cfg: PPOConfig) -> None:
                     )
                     if target_kl_now > 0 and epoch_approx_kl_mean > target_kl_now:
                         early_stopped = True
+                        early_stop_epoch = _epoch + 1
+                        print(
+                            "[ppo] "
+                            f"target kl early stop epoch {early_stop_epoch}/{cfg.update_epochs} "
+                            f"(update {update}/{num_updates}, "
+                            f"mean_kl={epoch_approx_kl_mean:.5f}, target_kl={target_kl_now:.5f})"
+                        )
                         break
                 profile_opt_s = time.perf_counter() - optimize_start
 
@@ -1760,6 +2005,10 @@ def train(cfg: PPOConfig) -> None:
                     "warmup_active": warmup_active,
                     "ent_coef_used": ent_coef_now,
                     "target_kl_used": target_kl_now,
+                    "policy_clip_coef_used": cfg.policy_clip_coef,
+                    "value_clip_coef_used": cfg.value_clip_coef,
+                    "policy_lr_used": policy_lr_now,
+                    "value_lr_used": value_lr_now,
                     "sps": sps,
                     "update_seconds": update_seconds,
                     "mean_episode_return_recent": (
@@ -1881,6 +2130,10 @@ def train(cfg: PPOConfig) -> None:
                         f"kl={stats['approx_kl']:.5f} "
                         f"clip={stats['clip_fraction']:.3f} "
                         f"ent_coef={ent_coef_now:.5f} "
+                        f"pclip={cfg.policy_clip_coef:.4f} "
+                        f"vclip={cfg.value_clip_coef:.4f} "
+                        f"p_lr={policy_lr_now:.6g} "
+                        f"v_lr={value_lr_now:.6g} "
                         f"target_kl={target_kl_now:.5f} "
                         f"src={'ml' if current_piece_source == 'active_generator' else 'bag7'} "
                         f"warmup={'y' if warmup_active else 'n'} "

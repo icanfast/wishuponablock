@@ -1,5 +1,6 @@
 export type PieceSourceProfile = 'bag7' | 'active_generator';
 export type BotObservationSpace = 'model_head_v1' | 'raw_v1';
+export type PlacementExecutionMode = 'commands' | 'teleport';
 
 export type JsonValue =
   | null
@@ -35,6 +36,7 @@ export type InitPayload = {
   numEnvs?: number;
   modelPath?: string;
   observationSpace?: BotObservationSpace;
+  placementExecutionMode?: PlacementExecutionMode;
   pieceSourceProfile?: PieceSourceProfile;
   queuePolicyId?: string;
   maxPiecesPerEpisode?: number;

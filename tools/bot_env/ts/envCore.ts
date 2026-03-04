@@ -9,7 +9,7 @@ import { createGeneratorFactory } from '../../../src/core/generators.ts';
 import { Game } from '../../../src/core/game.ts';
 import { getMode } from '../../../src/core/modes.ts';
 import { createModelRunner } from '../../../src/core/modelRunner.ts';
-import { dropDistance } from '../../../src/core/piece.ts';
+import { collides, dropDistance } from '../../../src/core/piece.ts';
 import {
   PLACEMENT_ACTION_DIM,
   placementActionIndexFromPlacement,
@@ -40,6 +40,7 @@ import {
 import type {
   InitPayload,
   JsonObject,
+  PlacementExecutionMode,
   PieceSourceProfile,
   StepBatchResult,
 } from './protocol.ts';
@@ -50,7 +51,7 @@ const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
 const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
 const OFFLINE_SOFT_DROP_MS = 0;
-const TOP_OUT_PENALTY = 5;
+const TOP_OUT_PENALTY = 50;
 const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
 const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
@@ -82,6 +83,10 @@ const normalizePieceSource = (value: unknown): PieceSourceProfile =>
 
 const normalizeObservationSpace = (value: unknown): BotObservationSpace =>
   normalizeBotObservationSpace(typeof value === 'string' ? value : null);
+
+const normalizePlacementExecutionMode = (
+  value: unknown,
+): PlacementExecutionMode => (value === 'commands' ? 'commands' : 'teleport');
 
 const normalizeModeId = (value: unknown): string => {
   if (typeof value !== 'string') return 'practice';
@@ -462,6 +467,7 @@ class BotEnv {
     pieceSource: PieceSourceProfile,
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
+    private readonly placementExecutionMode: PlacementExecutionMode,
     seed: number,
   ) {
     this.pieceSource = pieceSource;
@@ -589,19 +595,24 @@ class BotEnv {
     ];
 
     let ticks = 0;
-    const stepFrames = [...commands];
+    let executionPath: 'commands' | 'teleport' = 'commands';
     const runnerStart = performance.now();
-    while (
-      !this.isTerminal() &&
-      this.lockCount === beforeLockCount &&
-      ticks < STEP_MAX_TICKS
+    if (
+      this.placementExecutionMode === 'teleport' &&
+      selectedPlacement != null
     ) {
-      const frame =
-        stepFrames.length > 0
-          ? (stepFrames.shift() ?? EMPTY_INPUT)
-          : EMPTY_INPUT;
-      this.runner.step(new OneFrameInputSource(frame));
-      ticks += 1;
+      const teleport = this.executePlacementByTeleport(
+        selectedPlacement,
+        beforeLockCount,
+      );
+      if (teleport.applied) {
+        ticks += teleport.ticks;
+        executionPath = 'teleport';
+      } else {
+        ticks += this.executePlacementByCommands(commands, beforeLockCount);
+      }
+    } else {
+      ticks += this.executePlacementByCommands(commands, beforeLockCount);
     }
 
     if (this.lockCount === beforeLockCount && !this.isTerminal()) {
@@ -685,6 +696,8 @@ class BotEnv {
         modeId: this.modeId,
         piecesPlaced: this.piecesPlaced,
         lockObserved: this.lockCount > beforeLockCount,
+        placementExecutionMode: this.placementExecutionMode,
+        executionPath,
         ticks,
         heightDelta,
         holesDelta,
@@ -716,6 +729,74 @@ class BotEnv {
         choices_next_s: choicesNextElapsedS,
       },
     };
+  }
+
+  private executePlacementByCommands(
+    commands: InputFrame[],
+    beforeLockCount: number,
+  ): number {
+    let ticks = 0;
+    const stepFrames = [...commands];
+    while (
+      !this.isTerminal() &&
+      this.lockCount === beforeLockCount &&
+      ticks < STEP_MAX_TICKS
+    ) {
+      const frame =
+        stepFrames.length > 0
+          ? (stepFrames.shift() ?? EMPTY_INPUT)
+          : EMPTY_INPUT;
+      this.runner.step(new OneFrameInputSource(frame));
+      ticks += 1;
+    }
+    return ticks;
+  }
+
+  private executePlacementByTeleport(
+    placement: TrajectoryExecutorReachablePlacement,
+    beforeLockCount: number,
+  ): {
+    ticks: number;
+    applied: boolean;
+  } {
+    let ticks = 0;
+
+    if (placement.holdUsed) {
+      if (!this.game.state.canHold) {
+        return { ticks: 0, applied: false };
+      }
+      this.runner.step(
+        new OneFrameInputSource({
+          ...EMPTY_INPUT,
+          hold: true,
+        }),
+      );
+      ticks += 1;
+      if (this.isTerminal() || this.lockCount > beforeLockCount) {
+        return { ticks, applied: true };
+      }
+    }
+
+    const target: GameState['active'] = {
+      k: placement.lockPiece,
+      r: clampRotation(placement.lockRotation),
+      x: Math.trunc(placement.lockX),
+      y: Math.trunc(placement.lockY),
+    };
+
+    if (collides(this.game.state.board, target, target.r, 0, 0)) {
+      return { ticks, applied: false };
+    }
+
+    this.game.state.active = target;
+    this.runner.step(
+      new OneFrameInputSource({
+        ...EMPTY_INPUT,
+        hardDrop: true,
+      }),
+    );
+    ticks += 1;
+    return { ticks, applied: true };
   }
 
   private buildGame(seed: number): { game: Game; runner: GameRunner } {
@@ -939,6 +1020,9 @@ export class BotEnvPool {
     const observationSpace = normalizeObservationSpace(
       payload.observationSpace,
     );
+    const placementExecutionMode = normalizePlacementExecutionMode(
+      payload.placementExecutionMode,
+    );
     const pieceSourceProfile = normalizePieceSource(payload.pieceSourceProfile);
     const queuePolicyId =
       typeof payload.queuePolicyId === 'string' && payload.queuePolicyId.trim()
@@ -972,6 +1056,7 @@ export class BotEnvPool {
           pieceSourceProfile,
           queuePolicyId,
           maxPiecesPerEpisode,
+          placementExecutionMode,
           seed,
         ),
       );

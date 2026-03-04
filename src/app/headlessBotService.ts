@@ -156,6 +156,8 @@ export type BotPolicyArtifact = {
   weights: {
     w1: number[];
     b1: number[];
+    w2?: number[];
+    b2?: number[];
     wp: number[];
     bp: number[];
     wv?: number[];
@@ -314,6 +316,8 @@ type PolicyParams = {
   encoderModel: LoadedModel | null;
   w1: Float32Array;
   b1: Float32Array;
+  w2: Float32Array;
+  b2: Float32Array;
   wp: Float32Array;
   bp: Float32Array;
   wv: Float32Array;
@@ -340,6 +344,8 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   encoderModel: params.encoderModel,
   w1: new Float32Array(params.w1),
   b1: new Float32Array(params.b1),
+  w2: new Float32Array(params.w2),
+  b2: new Float32Array(params.b2),
   wp: new Float32Array(params.wp),
   bp: new Float32Array(params.bp),
   wv: new Float32Array(params.wv),
@@ -690,6 +696,8 @@ const randomizeParams = (
 ): PolicyParams => {
   const w1 = new Float32Array(inputDim * hiddenDim);
   const b1 = new Float32Array(hiddenDim);
+  const w2 = new Float32Array(hiddenDim * hiddenDim);
+  const b2 = new Float32Array(hiddenDim);
   const wp = new Float32Array(hiddenDim * actionDim);
   const bp = new Float32Array(actionDim);
   const wv = new Float32Array(hiddenDim);
@@ -701,6 +709,9 @@ const randomizeParams = (
   }
   for (let i = 0; i < wp.length; i += 1) {
     wp[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
+  }
+  for (let i = 0; i < w2.length; i += 1) {
+    w2[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
   }
   for (let i = 0; i < wv.length; i += 1) {
     wv[i] = (nextFloat(rng) * 2 - 1) * scaleHidden;
@@ -715,6 +726,8 @@ const randomizeParams = (
     encoderModel: null,
     w1,
     b1,
+    w2,
+    b2,
     wp,
     bp,
     wv,
@@ -736,11 +749,20 @@ const forwardValue = (
   params: PolicyParams,
   observation: Float32Array,
 ): number => {
-  let value = params.bv[0] ?? 0;
+  const hidden1 = new Float32Array(params.hiddenDim);
   for (let h = 0; h < params.hiddenDim; h += 1) {
     let sum = params.b1[h];
     for (let i = 0; i < params.inputDim; i += 1) {
       sum += observation[i] * params.w1[i * params.hiddenDim + h];
+    }
+    hidden1[h] = sum > 0 ? sum : 0;
+  }
+
+  let value = params.bv[0] ?? 0;
+  for (let h = 0; h < params.hiddenDim; h += 1) {
+    let sum = params.b2[h];
+    for (let i = 0; i < params.hiddenDim; i += 1) {
+      sum += hidden1[i] * params.w2[i * params.hiddenDim + h];
     }
     const hidden = sum > 0 ? sum : 0;
     value += hidden * params.wv[h];
@@ -812,19 +834,27 @@ const forwardPolicy = (
   logits: Float32Array;
   probabilities: Float32Array;
 } => {
-  const hidden = new Float32Array(params.hiddenDim);
+  const hidden1 = new Float32Array(params.hiddenDim);
   for (let h = 0; h < params.hiddenDim; h += 1) {
     let sum = params.b1[h];
     for (let i = 0; i < params.inputDim; i += 1) {
       sum += observation[i] * params.w1[i * params.hiddenDim + h];
     }
-    hidden[h] = sum > 0 ? sum : 0;
+    hidden1[h] = sum > 0 ? sum : 0;
+  }
+  const hidden2 = new Float32Array(params.hiddenDim);
+  for (let h = 0; h < params.hiddenDim; h += 1) {
+    let sum = params.b2[h];
+    for (let i = 0; i < params.hiddenDim; i += 1) {
+      sum += hidden1[i] * params.w2[i * params.hiddenDim + h];
+    }
+    hidden2[h] = sum > 0 ? sum : 0;
   }
   const logits = new Float32Array(params.actionDim);
   for (let a = 0; a < params.actionDim; a += 1) {
     let sum = params.bp[a];
     for (let h = 0; h < params.hiddenDim; h += 1) {
-      sum += hidden[h] * params.wp[h * params.actionDim + a];
+      sum += hidden2[h] * params.wp[h * params.actionDim + a];
     }
     logits[a] =
       actionMask && actionMask[a] <= 0 ? Number.NEGATIVE_INFINITY : sum;
@@ -1308,6 +1338,13 @@ const trainWithTfjsReinforce = async (options: {
     ]),
   );
   const b1 = tf.variable(tf.tensor1d(options.params.b1));
+  const w2 = tf.variable(
+    tf.tensor2d(options.params.w2, [
+      options.params.hiddenDim,
+      options.params.hiddenDim,
+    ]),
+  );
+  const b2 = tf.variable(tf.tensor1d(options.params.b2));
   const wp = tf.variable(
     tf.tensor2d(options.params.wp, [
       options.params.hiddenDim,
@@ -1338,6 +1375,8 @@ const trainWithTfjsReinforce = async (options: {
     encoderModel: options.params.encoderModel,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
+    w2: new Float32Array(w2.dataSync() as Float32Array),
+    b2: new Float32Array(b2.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
     bp: new Float32Array(bp.dataSync() as Float32Array),
     wv: new Float32Array(wv.dataSync() as Float32Array),
@@ -1346,8 +1385,9 @@ const trainWithTfjsReinforce = async (options: {
   for (let epoch = 0; epoch < options.epochs; epoch += 1) {
     const checkpointBeforeStep = snapshotCurrentParams();
     const lossTensor = optimizer.minimize(() => {
-      const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
-      const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
+      const hidden1 = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
+      const hidden2 = tf.relu(tf.add(tf.matMul(hidden1, w2), b2));
+      const logitsRaw = tf.add(tf.matMul(hidden2, wp), bp);
       const logits = actionMaskTensor
         ? tf.sub(
             logitsRaw,
@@ -1357,7 +1397,7 @@ const trainWithTfjsReinforce = async (options: {
       const logProbs = tf.logSoftmax(logits, 1);
       const probs = tf.softmax(logits, 1);
       const selectedLogProb = tf.sum(tf.mul(logProbs, oneHot), 1);
-      const values = tf.squeeze(tf.add(tf.matMul(hidden, wv), bv), [1]);
+      const values = tf.squeeze(tf.add(tf.matMul(hidden2, wv), bv), [1]);
       const rawAdvantage = tf.sub(returnsTensor, values);
       const advMean = tf.mean(rawAdvantage);
       const centeredAdv = tf.sub(rawAdvantage, advMean);
@@ -1394,6 +1434,8 @@ const trainWithTfjsReinforce = async (options: {
       if (
         isFiniteArray(checkpointBeforeStep.w1) &&
         isFiniteArray(checkpointBeforeStep.b1) &&
+        isFiniteArray(checkpointBeforeStep.w2) &&
+        isFiniteArray(checkpointBeforeStep.b2) &&
         isFiniteArray(checkpointBeforeStep.wp) &&
         isFiniteArray(checkpointBeforeStep.bp) &&
         isFiniteArray(checkpointBeforeStep.wv) &&
@@ -1426,6 +1468,8 @@ const trainWithTfjsReinforce = async (options: {
     oneHot,
     w1,
     b1,
+    w2,
+    b2,
     wp,
     bp,
     wv,
@@ -1499,6 +1543,13 @@ const trainWithTfjsPpo = async (options: {
     ]),
   );
   const b1 = tf.variable(tf.tensor1d(options.params.b1));
+  const w2 = tf.variable(
+    tf.tensor2d(options.params.w2, [
+      options.params.hiddenDim,
+      options.params.hiddenDim,
+    ]),
+  );
+  const b2 = tf.variable(tf.tensor1d(options.params.b2));
   const wp = tf.variable(
     tf.tensor2d(options.params.wp, [
       options.params.hiddenDim,
@@ -1532,6 +1583,8 @@ const trainWithTfjsPpo = async (options: {
     encoderModel: options.params.encoderModel,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
+    w2: new Float32Array(w2.dataSync() as Float32Array),
+    b2: new Float32Array(b2.dataSync() as Float32Array),
     wp: new Float32Array(wp.dataSync() as Float32Array),
     bp: new Float32Array(bp.dataSync() as Float32Array),
     wv: new Float32Array(wv.dataSync() as Float32Array),
@@ -1605,8 +1658,9 @@ const trainWithTfjsPpo = async (options: {
       const oneHot = tf.oneHot(actionTensor, options.params.actionDim);
 
       const lossTensor = optimizer.minimize(() => {
-        const hidden = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
-        const logitsRaw = tf.add(tf.matMul(hidden, wp), bp);
+        const hidden1 = tf.relu(tf.add(tf.matMul(inputTensor, w1), b1));
+        const hidden2 = tf.relu(tf.add(tf.matMul(hidden1, w2), b2));
+        const logitsRaw = tf.add(tf.matMul(hidden2, wp), bp);
         const logits = tf.sub(
           logitsRaw,
           tf.mul(tf.sub(tf.scalar(1), actionMaskTensor), tf.scalar(1e9)),
@@ -1621,7 +1675,7 @@ const trainWithTfjsPpo = async (options: {
         const surrogateB = tf.mul(clippedRatio, advantageTensor);
         const policyLoss = tf.neg(tf.mean(tf.minimum(surrogateA, surrogateB)));
 
-        const values = tf.squeeze(tf.add(tf.matMul(hidden, wv), bv), [1]);
+        const values = tf.squeeze(tf.add(tf.matMul(hidden2, wv), bv), [1]);
         const valueDelta = tf.sub(values, oldValueTensor);
         const valueClipped = tf.add(
           oldValueTensor,
@@ -1685,6 +1739,8 @@ const trainWithTfjsPpo = async (options: {
     if (
       isFiniteArray(checkpoint.w1) &&
       isFiniteArray(checkpoint.b1) &&
+      isFiniteArray(checkpoint.w2) &&
+      isFiniteArray(checkpoint.b2) &&
       isFiniteArray(checkpoint.wp) &&
       isFiniteArray(checkpoint.bp) &&
       isFiniteArray(checkpoint.wv) &&
@@ -1750,7 +1806,7 @@ const trainWithTfjsPpo = async (options: {
       (bestLoss != null && bestLoss < finalLoss));
   finalLoss = hasBestFiniteLoss ? bestLoss : null;
 
-  tf.dispose([w1, b1, wp, bp, wv, bv]);
+  tf.dispose([w1, b1, w2, b2, wp, bp, wv, bv]);
   return {
     params: trained,
     finalLoss,
@@ -1789,6 +1845,8 @@ const toArtifact = (
   weights: {
     w1: Array.from(params.w1),
     b1: Array.from(params.b1),
+    w2: Array.from(params.w2),
+    b2: Array.from(params.b2),
     wp: Array.from(params.wp),
     bp: Array.from(params.bp),
     wv: Array.from(params.wv),
@@ -1844,6 +1902,23 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
       : null;
   const w1 = new Float32Array(policy.weights.w1);
   const b1 = new Float32Array(policy.weights.b1);
+  const hasSecondLayer =
+    Array.isArray(policy.weights.w2) &&
+    Array.isArray(policy.weights.b2) &&
+    policy.weights.w2.length > 0 &&
+    policy.weights.b2.length > 0;
+  const w2 = hasSecondLayer
+    ? new Float32Array(policy.weights.w2 ?? [])
+    : (() => {
+        const identity = new Float32Array(hiddenDim * hiddenDim);
+        for (let i = 0; i < hiddenDim; i += 1) {
+          identity[i * hiddenDim + i] = 1;
+        }
+        return identity;
+      })();
+  const b2 = hasSecondLayer
+    ? new Float32Array(policy.weights.b2 ?? [])
+    : new Float32Array(hiddenDim);
   const wp = new Float32Array(policy.weights.wp);
   const bp = new Float32Array(policy.weights.bp);
   const valueHead = defaultValueHead(hiddenDim);
@@ -1856,6 +1931,8 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   if (
     w1.length !== inputDim * hiddenDim ||
     b1.length !== hiddenDim ||
+    w2.length !== hiddenDim * hiddenDim ||
+    b2.length !== hiddenDim ||
     wp.length !== hiddenDim * actionDim ||
     bp.length !== actionDim ||
     wv.length !== hiddenDim ||
@@ -1879,6 +1956,8 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   if (
     !isFiniteArray(w1) ||
     !isFiniteArray(b1) ||
+    !isFiniteArray(w2) ||
+    !isFiniteArray(b2) ||
     !isFiniteArray(wp) ||
     !isFiniteArray(bp) ||
     !isFiniteArray(wv) ||
@@ -1901,6 +1980,8 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     encoderModel,
     w1,
     b1,
+    w2,
+    b2,
     wp,
     bp,
     wv,
@@ -1983,6 +2064,8 @@ export const parseBotPolicyArtifactFromUnknown = (
     weights: {
       w1: asArray('w1'),
       b1: asArray('b1'),
+      w2: asArray('w2'),
+      b2: asArray('b2'),
       wp: asArray('wp'),
       bp: asArray('bp'),
       wv: asArray('wv'),
@@ -2133,6 +2216,8 @@ export const trainBotPolicyOneShot = async (
         warmParams.actionDim === BOT_PLACEMENT_ACTION_DIM &&
         isFiniteArray(warmParams.w1) &&
         isFiniteArray(warmParams.b1) &&
+        isFiniteArray(warmParams.w2) &&
+        isFiniteArray(warmParams.b2) &&
         isFiniteArray(warmParams.wp) &&
         isFiniteArray(warmParams.bp) &&
         isFiniteArray(warmParams.wv) &&
@@ -2301,6 +2386,8 @@ export const trainBotPolicyOneShot = async (
     if (
       !isFiniteArray(trained.params.w1) ||
       !isFiniteArray(trained.params.b1) ||
+      !isFiniteArray(trained.params.w2) ||
+      !isFiniteArray(trained.params.b2) ||
       !isFiniteArray(trained.params.wp) ||
       !isFiniteArray(trained.params.bp) ||
       !isFiniteArray(trained.params.wv) ||
