@@ -75,6 +75,7 @@ class PPOConfig:
     bc_max_records: int | None
     bc_normalize_returns: bool
     bc_return_clip: float
+    freeze_encoder_after_bc: bool
 
 
 class PolicyValueNet(nn.Module):
@@ -575,6 +576,12 @@ def parse_args() -> PPOConfig:
         help="Clip BC value targets after optional normalization (<=0 disables clipping).",
     )
     parser.add_argument(
+        "--freeze-encoder-after-bc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze observation encoder params for PPO after BC completes.",
+    )
+    parser.add_argument(
         "--bc-max-records",
         type=int,
         default=0,
@@ -643,6 +650,7 @@ def parse_args() -> PPOConfig:
         ),
         bc_normalize_returns=bool(args.bc_normalize_returns),
         bc_return_clip=float(args.bc_return_clip),
+        freeze_encoder_after_bc=bool(args.freeze_encoder_after_bc),
     )
 
 
@@ -1457,6 +1465,8 @@ def train(cfg: PPOConfig) -> None:
                 )
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
 
+        encoder_frozen_for_ppo = False
+
         if not cfg.resume_checkpoint:
             bc_stats = run_bc_pretrain(
                 model=model,
@@ -1531,6 +1541,32 @@ def train(cfg: PPOConfig) -> None:
                     f"ret={post_bc_stats['episode_return']:.3f}, "
                     f"len={post_bc_stats['episode_length']})"
                 )
+            if cfg.freeze_encoder_after_bc:
+                if bc_stats.get("enabled"):
+                    encoder_param_total = 0
+                    encoder_param_trainable = 0
+                    for param in obs_adapter.parameters():
+                        param_count = int(param.numel())
+                        encoder_param_total += param_count
+                        if param.requires_grad:
+                            encoder_param_trainable += param_count
+                        param.requires_grad = False
+                    encoder_frozen_for_ppo = encoder_param_total > 0
+                    if encoder_frozen_for_ppo:
+                        print(
+                            "[ppo] encoder frozen after BC "
+                            f"(params={encoder_param_total}, trainable_before={encoder_param_trainable})"
+                        )
+                    else:
+                        print(
+                            "[ppo] encoder freeze requested after BC, "
+                            "but no trainable encoder params were found."
+                        )
+                else:
+                    print(
+                        "[ppo] encoder freeze requested after BC, "
+                        "but BC was skipped/disabled."
+                    )
             optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
 
             # Reinitialize env batch after post-BC snapshot capture so PPO
@@ -1563,7 +1599,8 @@ def train(cfg: PPOConfig) -> None:
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
             f"warmup_value_lr_scale={cfg.warmup_value_lr_scale:.3f}, "
-            f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f})"
+            f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
+            f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'})"
         )
         write_json(
             out_dir / "config.json",
@@ -1574,6 +1611,7 @@ def train(cfg: PPOConfig) -> None:
                 "policy_obs_dim": obs_dim,
                 "policy_observation_space": policy_observation_space,
                 "observation_adapter": obs_adapter.__class__.__name__,
+                "encoder_frozen_after_bc_applied": encoder_frozen_for_ppo,
                 "action_dim": action_dim,
                 "batch_size": batch_size,
                 "num_updates": num_updates,
