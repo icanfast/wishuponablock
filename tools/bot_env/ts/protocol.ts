@@ -17,6 +17,7 @@ export type BridgeRequest = {
   cmd:
     | 'init'
     | 'set_piece_source'
+    | 'set_curriculum'
     | 'reset_many'
     | 'step_many'
     | 'pop_trajectory'
@@ -52,6 +53,12 @@ export type SetPieceSourcePayload = {
   pieceSourceProfile?: PieceSourceProfile;
 };
 
+export type SetCurriculumPayload = {
+  topK?: number;
+  biasStrength?: number;
+  dangerHeight?: number;
+};
+
 export type StepManyPayload = {
   envIds?: number[];
   actions?: number[];
@@ -60,6 +67,7 @@ export type StepManyPayload = {
 export type StepBatchResult = {
   obs: number[][];
   action_masks: number[][];
+  action_biases: number[][];
   rewards: number[];
   dones: boolean[];
   infos: JsonObject[];

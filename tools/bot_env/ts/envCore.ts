@@ -9,6 +9,7 @@ import { createGeneratorFactory } from '../../../src/core/generators.ts';
 import { Game } from '../../../src/core/game.ts';
 import { getMode } from '../../../src/core/modes.ts';
 import { createModelRunner } from '../../../src/core/modelRunner.ts';
+import { clearLines } from '../../../src/core/board.ts';
 import { collides, dropDistance } from '../../../src/core/piece.ts';
 import {
   PLACEMENT_ACTION_DIM,
@@ -22,7 +23,9 @@ import {
   type Board,
   type GameState,
   type InputFrame,
+  type PieceKind,
 } from '../../../src/core/types.ts';
+import { TETROMINOES } from '../../../src/core/tetromino.ts';
 import {
   enumerateTrajectoryExecutorPlacements,
   type TrajectoryExecutorReachablePlacement,
@@ -42,6 +45,7 @@ import type {
   JsonObject,
   PlacementExecutionMode,
   PieceSourceProfile,
+  SetCurriculumPayload,
   StepBatchResult,
 } from './protocol.ts';
 
@@ -57,6 +61,19 @@ const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
 const TRAJECTORY_MIN_SAMPLE_ID = 8;
 const MAX_COMPLETED_TRAJECTORY_QUEUE = 1;
+const DEFAULT_CURRICULUM_DANGER_HEIGHT = 14;
+
+type ActionCurriculumConfig = {
+  topK: number;
+  biasStrength: number;
+  dangerHeight: number;
+};
+
+const DEFAULT_ACTION_CURRICULUM: ActionCurriculumConfig = {
+  topK: 0,
+  biasStrength: 0,
+  dangerHeight: DEFAULT_CURRICULUM_DANGER_HEIGHT,
+};
 
 const EMPTY_INPUT: InputFrame = {
   moveX: 0,
@@ -87,6 +104,29 @@ const normalizeObservationSpace = (value: unknown): BotObservationSpace =>
 const normalizePlacementExecutionMode = (
   value: unknown,
 ): PlacementExecutionMode => (value === 'commands' ? 'commands' : 'teleport');
+
+const normalizeActionCurriculum = (
+  payload: SetCurriculumPayload | null | undefined,
+): ActionCurriculumConfig => {
+  const topK = clampInt(payload?.topK, 0, 0, DEFAULT_ACTION_DIM);
+  const biasStrengthRaw =
+    typeof payload?.biasStrength === 'number' &&
+    Number.isFinite(payload.biasStrength)
+      ? payload.biasStrength
+      : 0;
+  const biasStrength = Math.max(0, Math.min(1, biasStrengthRaw));
+  const dangerHeight = clampInt(
+    payload?.dangerHeight,
+    DEFAULT_CURRICULUM_DANGER_HEIGHT,
+    1,
+    64,
+  );
+  return {
+    topK,
+    biasStrength,
+    dangerHeight,
+  };
+};
 
 const normalizeModeId = (value: unknown): string => {
   if (typeof value !== 'string') return 'practice';
@@ -306,6 +346,211 @@ const computePieceReward = (options: {
   };
 };
 
+type BoardQualityMetrics = {
+  aggregateHeight: number;
+  maxHeight: number;
+  bumpiness: number;
+  openHoles: number;
+  enclosedHoles: number;
+  holeCoverDepth: number;
+  quality: number;
+};
+
+const BOARD_QUALITY_WEIGHTS = {
+  aggregateHeight: 0.03,
+  bumpiness: 0.12,
+  openHoles: 1.4,
+  enclosedHoles: 2.2,
+  holeCoverDepth: 0.15,
+  dangerQuadratic: 0.35,
+} as const;
+
+const BOARD_QUALITY_DANGER_HEIGHT = 12;
+const PLACEMENT_LINE_CLEAR_BONUS = 3.0;
+const PLACEMENT_COMPLEXITY_CMD_WEIGHT = 0.01;
+const PLACEMENT_COMPLEXITY_ROT_WEIGHT = 0.03;
+const PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT = 0.005;
+const PLACEMENT_HOLD_COMPLEXITY_PENALTY = 0.05;
+const PLACEMENT_TOP_OUT_PENALTY = 5.0;
+
+const cloneBoard = (board: Board): Board => board.map((row) => [...row]);
+
+const evaluateBoardQuality = (board: Board): BoardQualityMetrics => {
+  if (board.length === 0 || board[0].length === 0) {
+    return {
+      aggregateHeight: 0,
+      maxHeight: 0,
+      bumpiness: 0,
+      openHoles: 0,
+      enclosedHoles: 0,
+      holeCoverDepth: 0,
+      quality: 0,
+    };
+  }
+  const rows = board.length;
+  const cols = board[0].length;
+  const heights = computeColumnHeights(board);
+  const aggregateHeight = heights.reduce((sum, h) => sum + h, 0);
+  const maxHeight = heights.reduce((maxH, h) => Math.max(maxH, h), 0);
+  const bumpiness = computeBoardBumpiness(board);
+
+  const reachable: boolean[][] = Array.from({ length: rows }, () =>
+    Array(cols).fill(false),
+  );
+  const queue: Array<[number, number]> = [];
+  for (let x = 0; x < cols; x += 1) {
+    if (board[0][x] == null) {
+      reachable[0][x] = true;
+      queue.push([x, 0]);
+    }
+  }
+  let qi = 0;
+  while (qi < queue.length) {
+    const [x, y] = queue[qi] ?? [0, 0];
+    qi += 1;
+    const neighbors: Array<[number, number]> = [
+      [x + 1, y],
+      [x - 1, y],
+      [x, y + 1],
+      [x, y - 1],
+    ];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+      if (reachable[ny][nx]) continue;
+      if (board[ny][nx] != null) continue;
+      reachable[ny][nx] = true;
+      queue.push([nx, ny]);
+    }
+  }
+
+  let openHoles = 0;
+  let enclosedHoles = 0;
+  let holeCoverDepth = 0;
+  for (let x = 0; x < cols; x += 1) {
+    let seenBlock = false;
+    let filledAbove = 0;
+    for (let y = 0; y < rows; y += 1) {
+      const filled = board[y][x] != null;
+      if (filled) {
+        seenBlock = true;
+        filledAbove += 1;
+      } else if (seenBlock) {
+        if (reachable[y][x]) openHoles += 1;
+        else enclosedHoles += 1;
+        holeCoverDepth += filledAbove;
+      }
+    }
+  }
+
+  const danger = Math.max(0, maxHeight - BOARD_QUALITY_DANGER_HEIGHT);
+  const quality =
+    aggregateHeight * BOARD_QUALITY_WEIGHTS.aggregateHeight +
+    bumpiness * BOARD_QUALITY_WEIGHTS.bumpiness +
+    openHoles * BOARD_QUALITY_WEIGHTS.openHoles +
+    enclosedHoles * BOARD_QUALITY_WEIGHTS.enclosedHoles +
+    holeCoverDepth * BOARD_QUALITY_WEIGHTS.holeCoverDepth +
+    danger * danger * BOARD_QUALITY_WEIGHTS.dangerQuadratic;
+
+  return {
+    aggregateHeight,
+    maxHeight,
+    bumpiness,
+    openHoles,
+    enclosedHoles,
+    holeCoverDepth,
+    quality,
+  };
+};
+
+const applyPlacementToBoard = (
+  board: Board,
+  placement: TrajectoryExecutorReachablePlacement,
+): {
+  boardAfter: Board;
+  linesCleared: number;
+  hasAboveTop: boolean;
+  invalid: boolean;
+} => {
+  const boardAfter = cloneBoard(board);
+  const rows = boardAfter.length;
+  const cols = rows > 0 ? boardAfter[0].length : 0;
+  const pieceKind = placement.lockPiece as PieceKind;
+  const shape = TETROMINOES[pieceKind][clampRotation(placement.lockRotation)];
+
+  let hasAboveTop = false;
+  for (const [ox, oy] of shape) {
+    const x = Math.trunc(placement.lockX + ox);
+    const y = Math.trunc(placement.lockY + oy);
+    if (x < 0 || x >= cols || y >= rows) {
+      return {
+        boardAfter,
+        linesCleared: 0,
+        hasAboveTop: false,
+        invalid: true,
+      };
+    }
+    if (y < 0) {
+      hasAboveTop = true;
+      continue;
+    }
+    if (boardAfter[y][x] != null) {
+      return {
+        boardAfter,
+        linesCleared: 0,
+        hasAboveTop: false,
+        invalid: true,
+      };
+    }
+    boardAfter[y][x] = placement.lockPiece;
+  }
+  const linesCleared = clearLines(boardAfter).length;
+  return {
+    boardAfter,
+    linesCleared,
+    hasAboveTop,
+    invalid: false,
+  };
+};
+
+const scorePlacementCandidate = (options: {
+  beforeMetrics: BoardQualityMetrics;
+  placement: TrajectoryExecutorReachablePlacement;
+  board: Board;
+}): number => {
+  const { beforeMetrics, placement, board } = options;
+  const applied = applyPlacementToBoard(board, placement);
+  if (applied.invalid) return -1e9;
+  const afterMetrics = evaluateBoardQuality(applied.boardAfter);
+  const improvement = beforeMetrics.quality - afterMetrics.quality;
+
+  let rotateCount = 0;
+  let softDropCount = 0;
+  for (const command of placement.commands) {
+    if (
+      command === 'rotate_cw' ||
+      command === 'rotate_ccw' ||
+      command === 'rotate_180'
+    ) {
+      rotateCount += 1;
+    } else if (command === 'soft_drop') {
+      softDropCount += 1;
+    }
+  }
+  const complexityPenalty =
+    placement.commands.length * PLACEMENT_COMPLEXITY_CMD_WEIGHT +
+    rotateCount * PLACEMENT_COMPLEXITY_ROT_WEIGHT +
+    softDropCount * PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT +
+    (placement.holdUsed ? PLACEMENT_HOLD_COMPLEXITY_PENALTY : 0);
+
+  let score =
+    improvement +
+    applied.linesCleared * PLACEMENT_LINE_CLEAR_BONUS -
+    complexityPenalty;
+  if (applied.hasAboveTop) score -= PLACEMENT_TOP_OUT_PENALTY;
+  if (!Number.isFinite(score)) score = -1e9;
+  return score;
+};
+
 const encodeObservation = (
   observationSpace: BotObservationSpace,
   model: LoadedModel,
@@ -322,11 +567,13 @@ const encodeObservation = (
 const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
+  curriculum: ActionCurriculumConfig,
   random: (() => number) | null = null,
 ): {
   commandsBySlot: Array<InputFrame[] | null>;
   placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
   actionMask: number[];
+  actionBiases: number[];
 } => {
   const placements = enumerateTrajectoryExecutorPlacements({
     board: state.board,
@@ -345,15 +592,30 @@ const buildPlacementChoices = (
   );
   const placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null> =
     new Array(actionDim).fill(null);
+  const actionBiases = new Array<number>(actionDim).fill(0);
+  const scoresBySlot = new Array<number>(actionDim).fill(
+    Number.NEGATIVE_INFINITY,
+  );
+  const beforeMetrics = evaluateBoardQuality(state.board);
   for (const placement of placements) {
     const actionIndex = placementActionIndexFromPlacement(placement);
     if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
       continue;
     }
-    if (actionMask[actionIndex] > 0 && commandsBySlot[actionIndex]) {
+    const score = scorePlacementCandidate({
+      beforeMetrics,
+      placement,
+      board: state.board,
+    });
+    if (
+      actionMask[actionIndex] > 0 &&
+      commandsBySlot[actionIndex] &&
+      score <= scoresBySlot[actionIndex]
+    ) {
       continue;
     }
     actionMask[actionIndex] = 1;
+    scoresBySlot[actionIndex] = score;
     placementsBySlot[actionIndex] = {
       ...placement,
       commands: [...placement.commands],
@@ -366,6 +628,7 @@ const buildPlacementChoices = (
     const fallbackLockY =
       state.active.y + dropDistance(state.board, state.active);
     actionMask[0] = 1;
+    scoresBySlot[0] = 0;
     placementsBySlot[0] = {
       lockPiece: state.active.k,
       lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
@@ -377,7 +640,65 @@ const buildPlacementChoices = (
     };
     commandsBySlot[0] = [trajectoryExecutorCommandToInputFrame('hard_drop')];
   }
-  return { commandsBySlot, placementsBySlot, actionMask };
+
+  const legalIndices: number[] = [];
+  for (let i = 0; i < actionMask.length; i += 1) {
+    if (actionMask[i] > 0) legalIndices.push(i);
+  }
+  const dangerBypass = beforeMetrics.maxHeight >= curriculum.dangerHeight;
+
+  if (
+    curriculum.topK > 0 &&
+    !dangerBypass &&
+    legalIndices.length > curriculum.topK
+  ) {
+    const ranked = [...legalIndices].sort((a, b) => {
+      const sa = Number.isFinite(scoresBySlot[a]) ? scoresBySlot[a] : -1e12;
+      const sb = Number.isFinite(scoresBySlot[b]) ? scoresBySlot[b] : -1e12;
+      return sb - sa;
+    });
+    const keptSet = new Set<number>(ranked.slice(0, curriculum.topK));
+    for (const index of legalIndices) {
+      if (!keptSet.has(index)) actionMask[index] = 0;
+    }
+  }
+
+  const kept = actionMask
+    .map((value, index) => (value > 0 ? index : -1))
+    .filter((value) => value >= 0);
+  if (kept.length > 0) {
+    const finiteScorePairs = kept
+      .map((index) => ({ index, score: scoresBySlot[index] }))
+      .filter((entry) => Number.isFinite(entry.score));
+    if (finiteScorePairs.length > 0) {
+      let minScore = Number.POSITIVE_INFINITY;
+      let maxScore = Number.NEGATIVE_INFINITY;
+      for (const entry of finiteScorePairs) {
+        if (entry.score < minScore) minScore = entry.score;
+        if (entry.score > maxScore) maxScore = entry.score;
+      }
+      const span = maxScore - minScore;
+      if (span > 1e-9) {
+        for (const entry of finiteScorePairs) {
+          actionBiases[entry.index] = Math.max(
+            0,
+            Math.min(1, (entry.score - minScore) / span),
+          );
+        }
+      } else {
+        for (const index of kept) actionBiases[index] = 1;
+      }
+    } else {
+      for (const index of kept) actionBiases[index] = 1;
+    }
+  }
+
+  if (actionMask.every((value) => value <= 0)) {
+    const fallbackIndex = legalIndices.length > 0 ? legalIndices[0] : 0;
+    actionMask[fallbackIndex] = 1;
+    actionBiases[fallbackIndex] = 1;
+  }
+  return { commandsBySlot, placementsBySlot, actionMask, actionBiases };
 };
 
 const boardToOccupancy = (board: Board): number[][] =>
@@ -433,6 +754,7 @@ type BotEnvStepProfile = {
 type BotEnvStepResult = {
   obs: number[];
   actionMask: number[];
+  actionBias: number[];
   reward: number;
   done: boolean;
   info: JsonObject;
@@ -453,10 +775,14 @@ class BotEnv {
   private episodeInitialState: JsonObject | null = null;
   private episodeSamples: JsonObject[] = [];
   private planningRng: XorShift32;
+  private actionCurriculum: ActionCurriculumConfig = {
+    ...DEFAULT_ACTION_CURRICULUM,
+  };
   private cachedChoices: {
     commandsBySlot: Array<InputFrame[] | null>;
     placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
     actionMask: number[];
+    actionBiases: number[];
   } | null = null;
 
   constructor(
@@ -478,6 +804,7 @@ class BotEnv {
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
     this.startEpisodeCapture();
@@ -487,6 +814,7 @@ class BotEnv {
   reset(seed: number): {
     obs: number[];
     actionMask: number[];
+    actionBias: number[];
     info: JsonObject;
     profile: BotEnvResetProfile;
   } {
@@ -503,6 +831,7 @@ class BotEnv {
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
     const choicesElapsedS = (performance.now() - choicesStart) / 1000;
@@ -519,6 +848,7 @@ class BotEnv {
     return {
       obs,
       actionMask: choices?.actionMask ?? [],
+      actionBias: choices?.actionBiases ?? [],
       info: {
         modeId: this.modeId,
         seed,
@@ -535,6 +865,18 @@ class BotEnv {
     this.pieceSource = pieceSource;
   }
 
+  setActionCurriculum(curriculum: ActionCurriculumConfig): void {
+    this.actionCurriculum = {
+      ...curriculum,
+    };
+    this.cachedChoices = buildPlacementChoices(
+      this.game.state,
+      DEFAULT_ACTION_DIM,
+      this.actionCurriculum,
+      () => nextFloat(this.planningRng),
+    );
+  }
+
   step(actionIndexRaw: number): BotEnvStepResult {
     const stepStart = performance.now();
     if (this.done) {
@@ -546,8 +888,11 @@ class BotEnv {
       );
       const choices =
         this.cachedChoices ??
-        buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM, () =>
-          nextFloat(this.planningRng),
+        buildPlacementChoices(
+          this.game.state,
+          DEFAULT_ACTION_DIM,
+          this.actionCurriculum,
+          () => nextFloat(this.planningRng),
         );
       this.cachedChoices = choices;
       const doneChoicesElapsedS = (performance.now() - doneChoicesStart) / 1000;
@@ -555,6 +900,7 @@ class BotEnv {
       return {
         obs,
         actionMask: choices.actionMask,
+        actionBias: choices.actionBiases,
         reward: 0,
         done: true,
         info: { alreadyDone: true, piecesPlaced: this.piecesPlaced },
@@ -575,8 +921,11 @@ class BotEnv {
     const choicesCurrentStart = performance.now();
     const choices =
       this.cachedChoices ??
-      buildPlacementChoices(this.game.state, DEFAULT_ACTION_DIM, () =>
-        nextFloat(this.planningRng),
+      buildPlacementChoices(
+        this.game.state,
+        DEFAULT_ACTION_DIM,
+        this.actionCurriculum,
+        () => nextFloat(this.planningRng),
       );
     this.cachedChoices = choices;
     const choicesCurrentElapsedS =
@@ -682,6 +1031,7 @@ class BotEnv {
     const nextChoices = buildPlacementChoices(
       this.game.state,
       DEFAULT_ACTION_DIM,
+      this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
     const choicesNextElapsedS = (performance.now() - choicesNextStart) / 1000;
@@ -690,6 +1040,7 @@ class BotEnv {
     return {
       obs,
       actionMask: nextChoices.actionMask,
+      actionBias: nextChoices.actionBiases,
       reward: Number.isFinite(finalReward) ? finalReward : 0,
       done: this.done,
       info: {
@@ -1013,6 +1364,9 @@ class BotEnv {
 export class BotEnvPool {
   private readonly envs = new Map<number, BotEnv>();
   private readonly completedTrajectorySessions: JsonObject[] = [];
+  private actionCurriculum: ActionCurriculumConfig = {
+    ...DEFAULT_ACTION_CURRICULUM,
+  };
 
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
@@ -1061,6 +1415,7 @@ export class BotEnvPool {
         ),
       );
     }
+    pool.setCurriculum(null);
     return pool;
   }
 
@@ -1068,6 +1423,7 @@ export class BotEnvPool {
     const batchStart = performance.now();
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
+    const actionBiases: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
@@ -1081,6 +1437,7 @@ export class BotEnvPool {
       const out = env.reset(seed);
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
+      actionBiases.push(out.actionBias);
       rewards.push(0);
       dones.push(false);
       infos.push(out.info);
@@ -1091,6 +1448,7 @@ export class BotEnvPool {
     return {
       obs,
       action_masks: actionMasks,
+      action_biases: actionBiases,
       rewards,
       dones,
       infos,
@@ -1108,6 +1466,7 @@ export class BotEnvPool {
     const batchStart = performance.now();
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
+    const actionBiases: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
@@ -1124,6 +1483,7 @@ export class BotEnvPool {
       const out = env.step(action);
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
+      actionBiases.push(out.actionBias);
       rewards.push(out.reward);
       dones.push(out.done);
       infos.push(out.info);
@@ -1146,6 +1506,7 @@ export class BotEnvPool {
     return {
       obs,
       action_masks: actionMasks,
+      action_biases: actionBiases,
       rewards,
       dones,
       infos,
@@ -1172,6 +1533,16 @@ export class BotEnvPool {
       env.setPieceSource(normalized);
     }
     return normalized;
+  }
+
+  setCurriculum(
+    payload: SetCurriculumPayload | null | undefined,
+  ): ActionCurriculumConfig {
+    this.actionCurriculum = normalizeActionCurriculum(payload);
+    for (const env of this.envs.values()) {
+      env.setActionCurriculum(this.actionCurriculum);
+    }
+    return { ...this.actionCurriculum };
   }
 
   popTrajectorySession(): JsonObject | null {

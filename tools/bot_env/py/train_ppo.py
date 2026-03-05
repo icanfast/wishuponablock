@@ -58,6 +58,13 @@ class PPOConfig:
     warmup_target_kl: float
     warmup_policy_lr_scale: float
     warmup_value_lr_scale: float
+    curriculum_topk_start: int
+    curriculum_topk_end: int
+    curriculum_topk_ramp_updates: int
+    curriculum_bias_start: float
+    curriculum_bias_end: float
+    curriculum_bias_ramp_updates: int
+    curriculum_danger_height: int
     device: str
     save_every_updates: int
     log_every_updates: int
@@ -549,6 +556,48 @@ def parse_args() -> PPOConfig:
         default=1.0,
         help="Scale for value-head learning rate during warmup updates.",
     )
+    parser.add_argument(
+        "--curriculum-topk-start",
+        type=int,
+        default=12,
+        help="Curriculum top-K at update 1 (0 disables top-K pruning).",
+    )
+    parser.add_argument(
+        "--curriculum-topk-end",
+        type=int,
+        default=48,
+        help="Curriculum top-K after ramp completes (0 disables top-K pruning).",
+    )
+    parser.add_argument(
+        "--curriculum-topk-ramp-updates",
+        type=int,
+        default=400,
+        help="Number of updates to linearly ramp top-K from start to end.",
+    )
+    parser.add_argument(
+        "--curriculum-bias-start",
+        type=float,
+        default=0.25,
+        help="Heuristic logit-bias strength at update 1 (0 disables bias).",
+    )
+    parser.add_argument(
+        "--curriculum-bias-end",
+        type=float,
+        default=0.0,
+        help="Heuristic logit-bias strength after ramp completes (0 disables bias).",
+    )
+    parser.add_argument(
+        "--curriculum-bias-ramp-updates",
+        type=int,
+        default=400,
+        help="Number of updates to linearly ramp bias strength from start to end.",
+    )
+    parser.add_argument(
+        "--curriculum-danger-height",
+        type=int,
+        default=14,
+        help="Disable top-K pruning when stack max height is at/above this threshold.",
+    )
 
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-every-updates", type=int, default=10)
@@ -644,6 +693,13 @@ def parse_args() -> PPOConfig:
         warmup_target_kl=max(0.0, float(args.warmup_target_kl)),
         warmup_policy_lr_scale=max(0.0, float(args.warmup_policy_lr_scale)),
         warmup_value_lr_scale=max(0.0, float(args.warmup_value_lr_scale)),
+        curriculum_topk_start=max(0, int(args.curriculum_topk_start)),
+        curriculum_topk_end=max(0, int(args.curriculum_topk_end)),
+        curriculum_topk_ramp_updates=max(0, int(args.curriculum_topk_ramp_updates)),
+        curriculum_bias_start=max(0.0, float(args.curriculum_bias_start)),
+        curriculum_bias_end=max(0.0, float(args.curriculum_bias_end)),
+        curriculum_bias_ramp_updates=max(0, int(args.curriculum_bias_ramp_updates)),
+        curriculum_danger_height=max(1, int(args.curriculum_danger_height)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
         log_every_updates=max(1, int(args.log_every_updates)),
@@ -698,6 +754,41 @@ def resolve_piece_source_for_update(cfg: PPOConfig, update: int) -> str:
     return "bag7"
 
 
+def curriculum_schedule_value(
+    start: float,
+    end: float,
+    ramp_updates: int,
+    update: int,
+) -> float:
+    if ramp_updates <= 1:
+        return float(end)
+    clamped_update = max(1, int(update))
+    progress = min(1.0, max(0.0, float(clamped_update - 1) / float(ramp_updates - 1)))
+    return float(start + (end - start) * progress)
+
+
+def curriculum_topk_for_update(cfg: PPOConfig, update: int) -> int:
+    value = curriculum_schedule_value(
+        float(cfg.curriculum_topk_start),
+        float(cfg.curriculum_topk_end),
+        cfg.curriculum_topk_ramp_updates,
+        update,
+    )
+    return max(0, int(round(value)))
+
+
+def curriculum_bias_for_update(cfg: PPOConfig, update: int) -> float:
+    return max(
+        0.0,
+        curriculum_schedule_value(
+            cfg.curriculum_bias_start,
+            cfg.curriculum_bias_end,
+            cfg.curriculum_bias_ramp_updates,
+            update,
+        ),
+    )
+
+
 def ensure_action_masks(
     mask_np: np.ndarray,
     repair_stats: dict[str, int] | None = None,
@@ -718,10 +809,56 @@ def ensure_action_masks(
     return mask
 
 
-def masked_categorical(logits: torch.Tensor, action_mask: torch.Tensor) -> Categorical:
-    huge = torch.tensor(1e9, device=logits.device, dtype=logits.dtype)
-    masked_logits = logits - (1.0 - action_mask) * huge
-    return Categorical(logits=masked_logits)
+def ensure_action_biases(
+    mask_np: np.ndarray,
+    bias_np: np.ndarray | None,
+) -> np.ndarray:
+    mask = np.asarray(mask_np, dtype=np.float32)
+    if bias_np is None:
+        return np.zeros_like(mask, dtype=np.float32)
+    bias = np.asarray(bias_np, dtype=np.float32)
+    if bias.shape != mask.shape:
+        return np.zeros_like(mask, dtype=np.float32)
+    finite = np.where(np.isfinite(bias), bias, 0.0).astype(np.float32, copy=False)
+    finite = np.maximum(finite, 0.0)
+    finite *= (mask > 0).astype(np.float32)
+    return finite
+
+
+def masked_categorical(
+    logits: torch.Tensor,
+    action_mask: torch.Tensor,
+    action_bias: torch.Tensor | None = None,
+    bias_alpha: float = 0.0,
+) -> Categorical:
+    valid_mask = action_mask > 0
+    large_neg = torch.full_like(logits, -1e9)
+    masked_logits = torch.where(valid_mask, logits, large_neg)
+    policy_probs = torch.softmax(masked_logits, dim=-1)
+
+    alpha = float(max(0.0, min(1.0, bias_alpha)))
+    if action_bias is not None and alpha > 0.0:
+        bias = torch.clamp(action_bias, min=0.0) * valid_mask.to(dtype=logits.dtype)
+        bias_sum = torch.sum(bias, dim=-1, keepdim=True)
+        valid_count = torch.sum(valid_mask.to(dtype=logits.dtype), dim=-1, keepdim=True)
+        uniform = valid_mask.to(dtype=logits.dtype) / torch.clamp(valid_count, min=1.0)
+        bias_probs = torch.where(bias_sum > 1e-8, bias / bias_sum, uniform)
+        mixed = (1.0 - alpha) * policy_probs + alpha * bias_probs
+    else:
+        mixed = policy_probs
+
+    mixed = mixed * valid_mask.to(dtype=logits.dtype)
+    mixed_sum = torch.sum(mixed, dim=-1, keepdim=True)
+    probs = torch.where(
+        mixed_sum > 1e-8,
+        mixed / mixed_sum,
+        valid_mask.to(dtype=logits.dtype)
+        / torch.clamp(
+            torch.sum(valid_mask.to(dtype=logits.dtype), dim=-1, keepdim=True),
+            min=1.0,
+        ),
+    )
+    return Categorical(probs=probs)
 
 
 def infer_action_dim(mask_batch: list[list[float]]) -> int:
@@ -1114,10 +1251,17 @@ def capture_single_policy_rollout(
     device: torch.device,
     max_steps: int,
     deterministic: bool = True,
+    bias_alpha: float = 0.0,
 ) -> dict[str, Any]:
     reset = env.reset_many(env_ids=[env_id], seeds=[seed])
     obs = np.asarray(reset["obs"], dtype=np.float32)
     mask = ensure_action_masks(np.asarray(reset["action_masks"], dtype=np.float32))
+    action_bias = ensure_action_biases(
+        mask,
+        np.asarray(reset.get("action_biases", []), dtype=np.float32)
+        if "action_biases" in reset
+        else None,
+    )
     if obs.shape[0] <= 0 or mask.shape[0] <= 0:
         return {
             "episode_return": 0.0,
@@ -1134,10 +1278,16 @@ def capture_single_policy_rollout(
     for _ in range(max(1, int(max_steps))):
         raw_obs_t = as_tensor(obs, device)
         mask_t = as_tensor(mask, device)
+        action_bias_t = as_tensor(action_bias, device)
         with torch.no_grad():
             features_t = obs_adapter(raw_obs_t)
             logits_t, _values_t = model(features_t)
-            dist_t = masked_categorical(logits_t, mask_t)
+            dist_t = masked_categorical(
+                logits_t,
+                mask_t,
+                action_bias=action_bias_t,
+                bias_alpha=bias_alpha,
+            )
             if deterministic:
                 action_t = torch.argmax(dist_t.probs, dim=-1)
             else:
@@ -1154,6 +1304,12 @@ def capture_single_policy_rollout(
         obs = np.asarray(step["obs"], dtype=np.float32)
         mask = ensure_action_masks(
             np.asarray(step["action_masks"], dtype=np.float32)
+        )
+        action_bias = ensure_action_biases(
+            mask,
+            np.asarray(step.get("action_biases", []), dtype=np.float32)
+            if "action_biases" in step
+            else None,
         )
 
     trajectory, drained = pop_latest_trajectory(env, max_drain=64)
@@ -1503,6 +1659,12 @@ def train(cfg: PPOConfig) -> None:
             np.asarray(reset_result["action_masks"], dtype=np.float32),
             repair_stats=mask_repair_total,
         )
+        action_bias_np = ensure_action_biases(
+            mask_np,
+            np.asarray(reset_result.get("action_biases", []), dtype=np.float32)
+            if "action_biases" in reset_result
+            else None,
+        )
         current_piece_source = (
             "bag7"
             if cfg.piece_source_profile == "bag7"
@@ -1701,6 +1863,12 @@ def train(cfg: PPOConfig) -> None:
                 np.asarray(reset_result["action_masks"], dtype=np.float32),
                 repair_stats=mask_repair_total,
             )
+            action_bias_np = ensure_action_biases(
+                mask_np,
+                np.asarray(reset_result.get("action_biases", []), dtype=np.float32)
+                if "action_biases" in reset_result
+                else None,
+            )
 
         batch_size = cfg.num_envs * cfg.num_steps
         if cfg.minibatch_size > batch_size:
@@ -1722,6 +1890,11 @@ def train(cfg: PPOConfig) -> None:
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
             f"warmup_value_lr_scale={cfg.warmup_value_lr_scale:.3f}, "
+            f"curriculum_topk={cfg.curriculum_topk_start}->{cfg.curriculum_topk_end}/"
+            f"{cfg.curriculum_topk_ramp_updates}, "
+            f"curriculum_bias={cfg.curriculum_bias_start:.3f}->{cfg.curriculum_bias_end:.3f}/"
+            f"{cfg.curriculum_bias_ramp_updates}, "
+            f"curriculum_danger_height={cfg.curriculum_danger_height}, "
             f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -1811,6 +1984,13 @@ def train(cfg: PPOConfig) -> None:
                 profile_opt_s = 0.0
                 profile_io_s = 0.0
                 mask_repair_update = {"rows": 0, "batches": 0}
+                curriculum_topk_now = curriculum_topk_for_update(cfg, update)
+                curriculum_bias_now = curriculum_bias_for_update(cfg, update)
+                env.set_curriculum(
+                    top_k=curriculum_topk_now,
+                    bias_strength=curriculum_bias_now,
+                    danger_height=cfg.curriculum_danger_height,
+                )
 
                 desired_piece_source = resolve_piece_source_for_update(cfg, update)
                 if desired_piece_source != current_piece_source:
@@ -1842,6 +2022,12 @@ def train(cfg: PPOConfig) -> None:
                         np.asarray(source_reset["action_masks"], dtype=np.float32),
                         repair_stats=mask_repair_update,
                     )
+                    action_bias_np = ensure_action_biases(
+                        mask_np,
+                        np.asarray(source_reset.get("action_biases", []), dtype=np.float32)
+                        if "action_biases" in source_reset
+                        else None,
+                    )
                     ep_return.fill(0.0)
                     ep_length.fill(0)
                     for component_sum in ep_reward_component_sums.values():
@@ -1852,6 +2038,9 @@ def train(cfg: PPOConfig) -> None:
                     (cfg.num_steps, cfg.num_envs, raw_obs_dim), device=device
                 )
                 mask_buf = torch.zeros((cfg.num_steps, cfg.num_envs, action_dim), device=device)
+                action_bias_buf = torch.zeros(
+                    (cfg.num_steps, cfg.num_envs, action_dim), device=device
+                )
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
                 logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
                 reward_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
@@ -1861,14 +2050,21 @@ def train(cfg: PPOConfig) -> None:
                 for step in range(cfg.num_steps):
                     raw_obs_t = as_tensor(obs_np, device)
                     mask_t = as_tensor(mask_np, device)
+                    action_bias_t = as_tensor(action_bias_np, device)
                     raw_obs_buf[step] = raw_obs_t
                     mask_buf[step] = mask_t
+                    action_bias_buf[step] = action_bias_t
 
                     policy_forward_start = time.perf_counter()
                     with torch.no_grad():
                         obs_t = obs_adapter(raw_obs_t)
                         logits, values = model(obs_t)
-                        dist = masked_categorical(logits, mask_t)
+                        dist = masked_categorical(
+                            logits,
+                            mask_t,
+                            action_bias=action_bias_t,
+                            bias_alpha=curriculum_bias_now,
+                        )
                         if cfg.deterministic_eval:
                             actions_t = torch.argmax(dist.probs, dim=-1)
                         else:
@@ -1900,6 +2096,12 @@ def train(cfg: PPOConfig) -> None:
                     next_mask_np = ensure_action_masks(
                         np.asarray(step_result["action_masks"], dtype=np.float32),
                         repair_stats=mask_repair_update,
+                    )
+                    next_action_bias_np = ensure_action_biases(
+                        next_mask_np,
+                        np.asarray(step_result.get("action_biases", []), dtype=np.float32)
+                        if "action_biases" in step_result
+                        else None,
                     )
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
                     infos_raw = step_result.get("infos", [])
@@ -1986,12 +2188,20 @@ def train(cfg: PPOConfig) -> None:
                             np.asarray(reset_done["action_masks"], dtype=np.float32),
                             repair_stats=mask_repair_update,
                         )
+                        reset_action_biases = ensure_action_biases(
+                            reset_masks,
+                            np.asarray(reset_done.get("action_biases", []), dtype=np.float32)
+                            if "action_biases" in reset_done
+                            else None,
+                        )
                         for local_pos, env_idx in enumerate(done_indices.tolist()):
                             next_obs_np[env_idx] = reset_obs[local_pos]
                             next_mask_np[env_idx] = reset_masks[local_pos]
+                            next_action_bias_np[env_idx] = reset_action_biases[local_pos]
 
                     obs_np = next_obs_np
                     mask_np = next_mask_np
+                    action_bias_np = next_action_bias_np
                     global_step += cfg.num_envs
 
                 profile_rollout_s = time.perf_counter() - rollout_start_perf
@@ -2020,6 +2230,7 @@ def train(cfg: PPOConfig) -> None:
 
                 b_raw_obs = raw_obs_buf.reshape((-1, raw_obs_dim))
                 b_masks = mask_buf.reshape((-1, action_dim))
+                b_action_bias = action_bias_buf.reshape((-1, action_dim))
                 b_actions = action_buf.reshape(-1)
                 b_logprobs = logprob_buf.reshape(-1)
                 b_advantages = advantages.reshape(-1)
@@ -2055,7 +2266,12 @@ def train(cfg: PPOConfig) -> None:
 
                         mb_features = obs_adapter(b_raw_obs[mb_inds])
                         logits, new_values = model(mb_features)
-                        dist = masked_categorical(logits, b_masks[mb_inds])
+                        dist = masked_categorical(
+                            logits,
+                            b_masks[mb_inds],
+                            action_bias=b_action_bias[mb_inds],
+                            bias_alpha=curriculum_bias_now,
+                        )
                         new_logprob = dist.log_prob(b_actions[mb_inds])
                         entropy = dist.entropy().mean()
 
@@ -2172,6 +2388,9 @@ def train(cfg: PPOConfig) -> None:
                     "value_clip_coef_used": cfg.value_clip_coef,
                     "policy_lr_used": policy_lr_now,
                     "value_lr_used": value_lr_now,
+                    "curriculum_topk_used": curriculum_topk_now,
+                    "curriculum_bias_used": curriculum_bias_now,
+                    "curriculum_danger_height_used": cfg.curriculum_danger_height,
                     "sps": sps,
                     "update_seconds": update_seconds,
                     "mean_episode_return_recent": (
@@ -2298,6 +2517,8 @@ def train(cfg: PPOConfig) -> None:
                         f"p_lr={policy_lr_now:.6g} "
                         f"v_lr={value_lr_now:.6g} "
                         f"target_kl={target_kl_now:.5f} "
+                        f"topk={curriculum_topk_now} "
+                        f"bias={curriculum_bias_now:.3f} "
                         f"src={'ml' if current_piece_source == 'active_generator' else 'bag7'} "
                         f"warmup={'y' if warmup_active else 'n'} "
                         f"ev={stats['explained_variance']:.3f} "

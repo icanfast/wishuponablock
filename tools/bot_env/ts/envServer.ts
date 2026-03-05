@@ -7,6 +7,7 @@ import type {
   InitPayload,
   JsonObject,
   ResetManyPayload,
+  SetCurriculumPayload,
   SetPieceSourcePayload,
   StepManyPayload,
 } from './protocol.ts';
@@ -74,6 +75,20 @@ const handleSetPieceSource = (id: number, payload: unknown): void => {
   });
 };
 
+const handleSetCurriculum = (id: number, payload: unknown): void => {
+  const data = asObject(payload) as unknown as SetCurriculumPayload;
+  const config = ensurePool().setCurriculum(data);
+  writeResponse({
+    id,
+    ok: true,
+    result: {
+      top_k: config.topK,
+      bias_strength: config.biasStrength,
+      danger_height: config.dangerHeight,
+    },
+  });
+};
+
 const handleStepMany = (id: number, payload: unknown): void => {
   const data = asObject(payload) as unknown as StepManyPayload;
   const envIds = parseNumberArray(data.envIds);
@@ -113,6 +128,9 @@ const handleRequest = async (line: string): Promise<void> => {
       return;
     case 'set_piece_source':
       handleSetPieceSource(id, parsed.payload);
+      return;
+    case 'set_curriculum':
+      handleSetCurriculum(id, parsed.payload);
       return;
     case 'reset_many':
       handleResetMany(id, parsed.payload);

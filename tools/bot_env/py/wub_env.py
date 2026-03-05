@@ -111,6 +111,21 @@ class WubEnvBridge:
         }
         return self._request("set_piece_source", payload)
 
+    def set_curriculum(
+        self,
+        top_k: int | None = None,
+        bias_strength: float | None = None,
+        danger_height: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if top_k is not None:
+            payload["topK"] = int(top_k)
+        if bias_strength is not None:
+            payload["biasStrength"] = float(bias_strength)
+        if danger_height is not None:
+            payload["dangerHeight"] = int(danger_height)
+        return self._request("set_curriculum", payload)
+
     def step_many(self, env_ids: list[int], actions: list[int]) -> dict[str, Any]:
         payload = {
             "envIds": [int(v) for v in env_ids],
