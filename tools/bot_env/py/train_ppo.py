@@ -76,6 +76,7 @@ class PPOConfig:
     bc_normalize_returns: bool
     bc_return_clip: float
     freeze_encoder_after_bc: bool
+    freeze_conv_after_bc: bool
 
 
 class PolicyValueNet(nn.Module):
@@ -91,25 +92,33 @@ class PolicyValueNet(nn.Module):
             nn.init.constant_(layer.bias, bias_const)
             return layer
 
-        self.fc1 = nn.Linear(obs_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.policy_fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.policy_fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.policy_head = nn.Linear(hidden_dim, action_dim)
+
+        self.value_fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.value_fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
 
         # PPO-friendly init:
         # - Hidden ReLU layers: orthogonal gain sqrt(2)
         # - Policy head: tiny gain so initial logits are near-uniform
         # - Value head: gain 1.0
-        init_layer(self.fc1, std=math.sqrt(2.0))
-        init_layer(self.fc2, std=math.sqrt(2.0))
+        init_layer(self.policy_fc1, std=math.sqrt(2.0))
+        init_layer(self.policy_fc2, std=math.sqrt(2.0))
+        init_layer(self.value_fc1, std=math.sqrt(2.0))
+        init_layer(self.value_fc2, std=math.sqrt(2.0))
         init_layer(self.policy_head, std=0.01)
         init_layer(self.value_head, std=1.0)
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = torch.relu(self.fc1(obs))
-        hidden = torch.relu(self.fc2(hidden))
-        logits = self.policy_head(hidden)
-        value = self.value_head(hidden).squeeze(-1)
+        policy_hidden = torch.relu(self.policy_fc1(obs))
+        policy_hidden = torch.relu(self.policy_fc2(policy_hidden))
+        logits = self.policy_head(policy_hidden)
+
+        value_hidden = torch.relu(self.value_fc1(obs))
+        value_hidden = torch.relu(self.value_fc2(value_hidden))
+        value = self.value_head(value_hidden).squeeze(-1)
         return logits, value
 
 
@@ -582,6 +591,12 @@ def parse_args() -> PPOConfig:
         help="Freeze observation encoder params for PPO after BC completes.",
     )
     parser.add_argument(
+        "--freeze-conv-after-bc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze only encoder conv layers after BC (keeps policy/value MLP trainable).",
+    )
+    parser.add_argument(
         "--bc-max-records",
         type=int,
         default=0,
@@ -651,6 +666,7 @@ def parse_args() -> PPOConfig:
         bc_normalize_returns=bool(args.bc_normalize_returns),
         bc_return_clip=float(args.bc_return_clip),
         freeze_encoder_after_bc=bool(args.freeze_encoder_after_bc),
+        freeze_conv_after_bc=bool(args.freeze_conv_after_bc),
     )
 
 
@@ -758,17 +774,24 @@ def build_ppo_optimizer(
     # while keeping value-head updates at full speed.
     policy_params: list[nn.Parameter] = []
     policy_params.extend(
-        [p for p in model.fc1.parameters() if p.requires_grad]
+        [p for p in model.policy_fc1.parameters() if p.requires_grad]
     )
     policy_params.extend(
-        [p for p in model.fc2.parameters() if p.requires_grad]
+        [p for p in model.policy_fc2.parameters() if p.requires_grad]
     )
     policy_params.extend(
         [p for p in model.policy_head.parameters() if p.requires_grad]
     )
     policy_params.extend([p for p in obs_adapter.parameters() if p.requires_grad])
 
-    value_params = [p for p in model.value_head.parameters() if p.requires_grad]
+    value_params: list[nn.Parameter] = []
+    value_params.extend(
+        [p for p in model.value_fc1.parameters() if p.requires_grad]
+    )
+    value_params.extend(
+        [p for p in model.value_fc2.parameters() if p.requires_grad]
+    )
+    value_params.extend([p for p in model.value_head.parameters() if p.requires_grad])
 
     param_groups: list[dict[str, Any]] = []
     if policy_params:
@@ -820,14 +843,21 @@ def export_bot_policy_artifact(
     pipeline_id: str = "bot_ppo_offline_v1",
 ) -> dict[str, Any]:
     with torch.no_grad():
-        w1 = model.fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
-        b1 = model.fc1.bias.detach().cpu().numpy().astype(np.float32)  # [H]
-        w2 = model.fc2.weight.detach().cpu().numpy().astype(np.float32)  # [H, H]
-        b2 = model.fc2.bias.detach().cpu().numpy().astype(np.float32)  # [H]
+        # Policy tower (kept on legacy keys for client/runtime backward compatibility).
+        w1 = model.policy_fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
+        b1 = model.policy_fc1.bias.detach().cpu().numpy().astype(np.float32)  # [H]
+        w2 = model.policy_fc2.weight.detach().cpu().numpy().astype(np.float32)  # [H, H]
+        b2 = model.policy_fc2.bias.detach().cpu().numpy().astype(np.float32)  # [H]
         wp = (
             model.policy_head.weight.detach().cpu().numpy().astype(np.float32)
         )  # [A, H]
         bp = model.policy_head.bias.detach().cpu().numpy().astype(np.float32)  # [A]
+
+        # Value tower (new in split actor/critic architecture).
+        wv1 = model.value_fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
+        bv1 = model.value_fc1.bias.detach().cpu().numpy().astype(np.float32)  # [H]
+        wv2 = model.value_fc2.weight.detach().cpu().numpy().astype(np.float32)  # [H, H]
+        bv2 = model.value_fc2.bias.detach().cpu().numpy().astype(np.float32)  # [H]
         wv = model.value_head.weight.detach().cpu().numpy().astype(np.float32)  # [1, H]
         bv = model.value_head.bias.detach().cpu().numpy().astype(np.float32)  # [1]
 
@@ -853,6 +883,10 @@ def export_bot_policy_artifact(
             "b2": b2.reshape(-1).tolist(),
             "wp": wp.T.reshape(-1).tolist(),  # [H, A]
             "bp": bp.reshape(-1).tolist(),
+            "wv1": wv1.T.reshape(-1).tolist(),  # [I, H]
+            "bv1": bv1.reshape(-1).tolist(),
+            "wv2": wv2.T.reshape(-1).tolist(),  # [H, H]
+            "bv2": bv2.reshape(-1).tolist(),
             "wv": wv.reshape(-1).tolist(),  # [H]
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
@@ -880,13 +914,13 @@ def load_from_artifact(
     if input_dim <= 0 or hidden_dim <= 0 or action_dim <= 0:
         raise ValueError("Invalid artifact dims.")
 
-    if model.fc1.in_features != input_dim:
+    if model.policy_fc1.in_features != input_dim:
         raise ValueError(
-            f"Artifact inputDim mismatch. artifact={input_dim} model={model.fc1.in_features}"
+            f"Artifact inputDim mismatch. artifact={input_dim} model={model.policy_fc1.in_features}"
         )
-    if model.fc1.out_features != hidden_dim:
+    if model.policy_fc1.out_features != hidden_dim:
         raise ValueError(
-            f"Artifact hiddenDim mismatch. artifact={hidden_dim} model={model.fc1.out_features}"
+            f"Artifact hiddenDim mismatch. artifact={hidden_dim} model={model.policy_fc1.out_features}"
         )
     if model.policy_head.out_features != action_dim:
         raise ValueError(
@@ -907,16 +941,44 @@ def load_from_artifact(
         b2 = np.zeros((hidden_dim,), dtype=np.float32)
     wp = np.asarray(weights.get("wp", []), dtype=np.float32).reshape(hidden_dim, action_dim)
     bp = np.asarray(weights.get("bp", []), dtype=np.float32).reshape(action_dim)
+
+    wv1_payload = weights.get("wv1")
+    bv1_payload = weights.get("bv1")
+    wv2_payload = weights.get("wv2")
+    bv2_payload = weights.get("bv2")
+    has_split_value_tower = (
+        isinstance(wv1_payload, list)
+        and isinstance(bv1_payload, list)
+        and isinstance(wv2_payload, list)
+        and isinstance(bv2_payload, list)
+    )
+    if has_split_value_tower:
+        wv1 = np.asarray(wv1_payload, dtype=np.float32).reshape(input_dim, hidden_dim)
+        bv1 = np.asarray(bv1_payload, dtype=np.float32).reshape(hidden_dim)
+        wv2 = np.asarray(wv2_payload, dtype=np.float32).reshape(hidden_dim, hidden_dim)
+        bv2 = np.asarray(bv2_payload, dtype=np.float32).reshape(hidden_dim)
+    else:
+        # Backward compatibility for artifacts before split actor/critic towers.
+        # Start value tower from policy tower weights and keep old value head.
+        wv1 = w1.copy()
+        bv1 = b1.copy()
+        wv2 = w2.copy()
+        bv2 = b2.copy()
+
     wv = np.asarray(weights.get("wv", []), dtype=np.float32).reshape(hidden_dim)
     bv = np.asarray(weights.get("bv", []), dtype=np.float32).reshape(1)
 
     with torch.no_grad():
-        model.fc1.weight.copy_(torch.from_numpy(w1.T))
-        model.fc1.bias.copy_(torch.from_numpy(b1))
-        model.fc2.weight.copy_(torch.from_numpy(w2.T))
-        model.fc2.bias.copy_(torch.from_numpy(b2))
+        model.policy_fc1.weight.copy_(torch.from_numpy(w1.T))
+        model.policy_fc1.bias.copy_(torch.from_numpy(b1))
+        model.policy_fc2.weight.copy_(torch.from_numpy(w2.T))
+        model.policy_fc2.bias.copy_(torch.from_numpy(b2))
         model.policy_head.weight.copy_(torch.from_numpy(wp.T))
         model.policy_head.bias.copy_(torch.from_numpy(bp))
+        model.value_fc1.weight.copy_(torch.from_numpy(wv1.T))
+        model.value_fc1.bias.copy_(torch.from_numpy(bv1))
+        model.value_fc2.weight.copy_(torch.from_numpy(wv2.T))
+        model.value_fc2.bias.copy_(torch.from_numpy(bv2))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
         model.value_head.bias.copy_(torch.from_numpy(bv))
     encoder_payload = raw.get("encoderModel")
@@ -962,20 +1024,45 @@ def load_checkpoint(
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
     model_state = checkpoint["model_state_dict"]
-    if (
-        isinstance(model_state, dict)
-        and ("fc2.weight" not in model_state or "fc2.bias" not in model_state)
-    ):
-        # Backward compatibility for checkpoints saved before fc2 existed.
-        with torch.no_grad():
-            eye = torch.eye(
-                model.fc2.out_features,
-                model.fc2.in_features,
-                dtype=model.fc2.weight.dtype,
-                device=model.fc2.weight.device,
-            )
-            model.fc2.weight.copy_(eye)
-            model.fc2.bias.zero_()
+    if isinstance(model_state, dict):
+        # Backward compatibility for checkpoints from shared-torso models.
+        if "policy_fc1.weight" not in model_state and "fc1.weight" in model_state:
+            fc1_w = model_state.get("fc1.weight")
+            fc1_b = model_state.get("fc1.bias")
+            fc2_w = model_state.get("fc2.weight")
+            fc2_b = model_state.get("fc2.bias")
+            if fc1_w is not None and fc1_b is not None:
+                model_state["policy_fc1.weight"] = fc1_w
+                model_state["policy_fc1.bias"] = fc1_b
+                model_state["value_fc1.weight"] = fc1_w
+                model_state["value_fc1.bias"] = fc1_b
+            if fc2_w is not None and fc2_b is not None:
+                model_state["policy_fc2.weight"] = fc2_w
+                model_state["policy_fc2.bias"] = fc2_b
+                model_state["value_fc2.weight"] = fc2_w
+                model_state["value_fc2.bias"] = fc2_b
+
+        # Backward compatibility for checkpoints saved before second hidden layer existed.
+        if "policy_fc2.weight" not in model_state or "policy_fc2.bias" not in model_state:
+            with torch.no_grad():
+                eye = torch.eye(
+                    model.policy_fc2.out_features,
+                    model.policy_fc2.in_features,
+                    dtype=model.policy_fc2.weight.dtype,
+                    device=model.policy_fc2.weight.device,
+                )
+                model.policy_fc2.weight.copy_(eye)
+                model.policy_fc2.bias.zero_()
+        if "value_fc2.weight" not in model_state or "value_fc2.bias" not in model_state:
+            with torch.no_grad():
+                eye = torch.eye(
+                    model.value_fc2.out_features,
+                    model.value_fc2.in_features,
+                    dtype=model.value_fc2.weight.dtype,
+                    device=model.value_fc2.weight.device,
+                )
+                model.value_fc2.weight.copy_(eye)
+                model.value_fc2.bias.zero_()
     model.load_state_dict(model_state, strict=False)
     adapter_state = checkpoint.get("obs_adapter_state_dict")
     if isinstance(adapter_state, dict):
@@ -1466,6 +1553,7 @@ def train(cfg: PPOConfig) -> None:
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
 
         encoder_frozen_for_ppo = False
+        encoder_freeze_mode_applied = "none"
 
         if not cfg.resume_checkpoint:
             bc_stats = run_bc_pretrain(
@@ -1541,30 +1629,65 @@ def train(cfg: PPOConfig) -> None:
                     f"ret={post_bc_stats['episode_return']:.3f}, "
                     f"len={post_bc_stats['episode_length']})"
                 )
-            if cfg.freeze_encoder_after_bc:
+            if cfg.freeze_encoder_after_bc or cfg.freeze_conv_after_bc:
                 if bc_stats.get("enabled"):
-                    encoder_param_total = 0
-                    encoder_param_trainable = 0
-                    for param in obs_adapter.parameters():
-                        param_count = int(param.numel())
-                        encoder_param_total += param_count
-                        if param.requires_grad:
-                            encoder_param_trainable += param_count
-                        param.requires_grad = False
-                    encoder_frozen_for_ppo = encoder_param_total > 0
-                    if encoder_frozen_for_ppo:
-                        print(
-                            "[ppo] encoder frozen after BC "
-                            f"(params={encoder_param_total}, trainable_before={encoder_param_trainable})"
-                        )
-                    else:
-                        print(
-                            "[ppo] encoder freeze requested after BC, "
-                            "but no trainable encoder params were found."
-                        )
+                    if cfg.freeze_encoder_after_bc:
+                        encoder_param_total = 0
+                        encoder_param_trainable = 0
+                        for param in obs_adapter.parameters():
+                            param_count = int(param.numel())
+                            encoder_param_total += param_count
+                            if param.requires_grad:
+                                encoder_param_trainable += param_count
+                            param.requires_grad = False
+                        encoder_frozen_for_ppo = encoder_param_total > 0
+                        if encoder_frozen_for_ppo:
+                            encoder_freeze_mode_applied = "all"
+                            print(
+                                "[ppo] encoder frozen after BC "
+                                f"(params={encoder_param_total}, trainable_before={encoder_param_trainable})"
+                            )
+                        else:
+                            print(
+                                "[ppo] encoder freeze requested after BC, "
+                                "but no trainable encoder params were found."
+                            )
+                    elif cfg.freeze_conv_after_bc:
+                        if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+                            conv_param_total = 0
+                            conv_param_trainable = 0
+                            for conv in obs_adapter.conv_layers:
+                                for param in conv.parameters():
+                                    param_count = int(param.numel())
+                                    conv_param_total += param_count
+                                    if param.requires_grad:
+                                        conv_param_trainable += param_count
+                                    param.requires_grad = False
+                            encoder_frozen_for_ppo = conv_param_total > 0
+                            if encoder_frozen_for_ppo:
+                                encoder_freeze_mode_applied = "conv"
+                                print(
+                                    "[ppo] encoder conv frozen after BC "
+                                    f"(params={conv_param_total}, trainable_before={conv_param_trainable})"
+                                )
+                            else:
+                                print(
+                                    "[ppo] conv freeze requested after BC, "
+                                    "but no trainable conv params were found."
+                                )
+                        else:
+                            print(
+                                "[ppo] conv freeze requested after BC, "
+                                "but observation adapter has no conv layers."
+                            )
                 else:
+                    freeze_label = (
+                        "encoder"
+                        if cfg.freeze_encoder_after_bc
+                        else "encoder conv"
+                    )
                     print(
-                        "[ppo] encoder freeze requested after BC, "
+                        f"[ppo] {freeze_label} freeze requested after BC, "
                         "but BC was skipped/disabled."
                     )
             optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
@@ -1600,7 +1723,8 @@ def train(cfg: PPOConfig) -> None:
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
             f"warmup_value_lr_scale={cfg.warmup_value_lr_scale:.3f}, "
             f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
-            f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'})"
+            f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
+            f"encoder_freeze_mode={encoder_freeze_mode_applied})"
         )
         write_json(
             out_dir / "config.json",
@@ -1612,6 +1736,7 @@ def train(cfg: PPOConfig) -> None:
                 "policy_observation_space": policy_observation_space,
                 "observation_adapter": obs_adapter.__class__.__name__,
                 "encoder_frozen_after_bc_applied": encoder_frozen_for_ppo,
+                "encoder_freeze_mode_applied": encoder_freeze_mode_applied,
                 "action_dim": action_dim,
                 "batch_size": batch_size,
                 "num_updates": num_updates,
