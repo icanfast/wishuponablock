@@ -65,6 +65,10 @@ class PPOConfig:
     curriculum_bias_end: float
     curriculum_bias_ramp_updates: int
     curriculum_danger_height: int
+    distill_coef_start: float
+    distill_coef_end: float
+    distill_coef_ramp_updates: int
+    validation_episodes_per_env: int
     device: str
     save_every_updates: int
     log_every_updates: int
@@ -598,6 +602,30 @@ def parse_args() -> PPOConfig:
         default=14,
         help="Disable top-K pruning when stack max height is at/above this threshold.",
     )
+    parser.add_argument(
+        "--distill-coef-start",
+        type=float,
+        default=0.15,
+        help="Distillation loss coefficient at update 1.",
+    )
+    parser.add_argument(
+        "--distill-coef-end",
+        type=float,
+        default=0.0,
+        help="Distillation loss coefficient after ramp completes.",
+    )
+    parser.add_argument(
+        "--distill-coef-ramp-updates",
+        type=int,
+        default=400,
+        help="Number of updates to linearly ramp distillation coefficient.",
+    )
+    parser.add_argument(
+        "--validation-episodes-per-env",
+        type=int,
+        default=2,
+        help="Validation episodes per env on each logged update (0 disables validation).",
+    )
 
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-every-updates", type=int, default=10)
@@ -700,6 +728,10 @@ def parse_args() -> PPOConfig:
         curriculum_bias_end=max(0.0, float(args.curriculum_bias_end)),
         curriculum_bias_ramp_updates=max(0, int(args.curriculum_bias_ramp_updates)),
         curriculum_danger_height=max(1, int(args.curriculum_danger_height)),
+        distill_coef_start=max(0.0, float(args.distill_coef_start)),
+        distill_coef_end=max(0.0, float(args.distill_coef_end)),
+        distill_coef_ramp_updates=max(0, int(args.distill_coef_ramp_updates)),
+        validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
         log_every_updates=max(1, int(args.log_every_updates)),
@@ -789,6 +821,18 @@ def curriculum_bias_for_update(cfg: PPOConfig, update: int) -> float:
     )
 
 
+def distill_coef_for_update(cfg: PPOConfig, update: int) -> float:
+    return max(
+        0.0,
+        curriculum_schedule_value(
+            cfg.distill_coef_start,
+            cfg.distill_coef_end,
+            cfg.distill_coef_ramp_updates,
+            update,
+        ),
+    )
+
+
 def ensure_action_masks(
     mask_np: np.ndarray,
     repair_stats: dict[str, int] | None = None,
@@ -825,6 +869,19 @@ def ensure_action_biases(
     return finite
 
 
+def build_teacher_probs(
+    action_mask: torch.Tensor,
+    action_bias: torch.Tensor,
+) -> torch.Tensor:
+    valid = action_mask > 0
+    valid_f = valid.to(dtype=action_mask.dtype)
+    bias = torch.clamp(action_bias, min=0.0) * valid_f
+    bias_sum = torch.sum(bias, dim=-1, keepdim=True)
+    valid_count = torch.sum(valid_f, dim=-1, keepdim=True)
+    uniform = valid_f / torch.clamp(valid_count, min=1.0)
+    return torch.where(bias_sum > 1e-8, bias / bias_sum, uniform)
+
+
 def masked_categorical(
     logits: torch.Tensor,
     action_mask: torch.Tensor,
@@ -834,31 +891,21 @@ def masked_categorical(
     valid_mask = action_mask > 0
     large_neg = torch.full_like(logits, -1e9)
     masked_logits = torch.where(valid_mask, logits, large_neg)
-    policy_probs = torch.softmax(masked_logits, dim=-1)
 
     alpha = float(max(0.0, min(1.0, bias_alpha)))
     if action_bias is not None and alpha > 0.0:
         bias = torch.clamp(action_bias, min=0.0) * valid_mask.to(dtype=logits.dtype)
-        bias_sum = torch.sum(bias, dim=-1, keepdim=True)
         valid_count = torch.sum(valid_mask.to(dtype=logits.dtype), dim=-1, keepdim=True)
-        uniform = valid_mask.to(dtype=logits.dtype) / torch.clamp(valid_count, min=1.0)
-        bias_probs = torch.where(bias_sum > 1e-8, bias / bias_sum, uniform)
-        mixed = (1.0 - alpha) * policy_probs + alpha * bias_probs
-    else:
-        mixed = policy_probs
-
-    mixed = mixed * valid_mask.to(dtype=logits.dtype)
-    mixed_sum = torch.sum(mixed, dim=-1, keepdim=True)
-    probs = torch.where(
-        mixed_sum > 1e-8,
-        mixed / mixed_sum,
-        valid_mask.to(dtype=logits.dtype)
-        / torch.clamp(
-            torch.sum(valid_mask.to(dtype=logits.dtype), dim=-1, keepdim=True),
-            min=1.0,
-        ),
-    )
-    return Categorical(probs=probs)
+        bias_mean = torch.sum(bias, dim=-1, keepdim=True) / torch.clamp(
+            valid_count, min=1.0
+        )
+        centered_bias = bias - bias_mean
+        masked_logits = torch.where(
+            valid_mask,
+            masked_logits + alpha * centered_bias,
+            large_neg,
+        )
+    return Categorical(logits=masked_logits)
 
 
 def infer_action_dim(mask_batch: list[list[float]]) -> int:
@@ -1320,6 +1367,176 @@ def capture_single_policy_rollout(
         "trajectory": trajectory,
         "drained": int(drained),
     }
+
+
+def run_validation_eval(
+    *,
+    cfg: PPOConfig,
+    repo_root: Path,
+    server_cmd: list[str] | None,
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    device: torch.device,
+    update: int,
+    piece_source_profile: str,
+    reward_component_aliases: dict[str, tuple[str, ...]],
+) -> dict[str, Any]:
+    episodes_per_env = max(0, int(cfg.validation_episodes_per_env))
+    if episodes_per_env <= 0:
+        return {"enabled": False}
+
+    was_model_training = model.training
+    was_adapter_training = obs_adapter.training
+    model.eval()
+    obs_adapter.eval()
+    try:
+        with WubEnvBridge(server_cmd=server_cmd, cwd=repo_root) as val_env:
+            init_result = val_env.init(
+                mode_id=cfg.mode_id,
+                num_envs=cfg.num_envs,
+                model_path=cfg.model_path,
+                observation_space=cfg.observation_space,
+                placement_execution_mode=cfg.placement_execution_mode,
+                piece_source_profile=piece_source_profile,
+                queue_policy_id=cfg.queue_policy_id,
+                max_pieces_per_episode=cfg.max_pieces_per_episode,
+                seed=cfg.seed + update * 1777 + 31,
+            )
+            env_ids: list[int] = [int(v) for v in init_result.get("env_ids", [])]
+            if not env_ids:
+                return {"enabled": False, "error": "validation init returned no env ids"}
+
+            val_env.set_piece_source(piece_source_profile)
+            val_env.set_curriculum(
+                top_k=0,
+                bias_strength=0.0,
+                danger_height=cfg.curriculum_danger_height,
+            )
+
+            returns: list[float] = []
+            lengths: list[int] = []
+            term_values: dict[str, list[float]] = {
+                key: [] for key in reward_component_aliases
+            }
+            max_steps = max(8, int(cfg.max_pieces_per_episode) * 2)
+
+            for episode_round in range(episodes_per_env):
+                seeds = [
+                    cfg.seed
+                    + update * 1_000_003
+                    + episode_round * 10_007
+                    + env_idx * 101
+                    for env_idx in range(len(env_ids))
+                ]
+                reset_result = val_env.reset_many(env_ids=env_ids, seeds=seeds)
+                obs_np = np.asarray(reset_result["obs"], dtype=np.float32)
+                mask_np = ensure_action_masks(
+                    np.asarray(reset_result["action_masks"], dtype=np.float32)
+                )
+                action_bias_np = ensure_action_biases(
+                    mask_np,
+                    np.asarray(reset_result.get("action_biases", []), dtype=np.float32)
+                    if "action_biases" in reset_result
+                    else None,
+                )
+
+                env_count = obs_np.shape[0]
+                ep_return = np.zeros(env_count, dtype=np.float64)
+                ep_length = np.zeros(env_count, dtype=np.int64)
+                ep_terms = {
+                    key: np.zeros(env_count, dtype=np.float64)
+                    for key in reward_component_aliases
+                }
+                done_mask = np.zeros(env_count, dtype=np.bool_)
+
+                for _ in range(max_steps):
+                    raw_obs_t = as_tensor(obs_np, device)
+                    mask_t = as_tensor(mask_np, device)
+                    action_bias_t = as_tensor(action_bias_np, device)
+                    with torch.no_grad():
+                        features_t = obs_adapter(raw_obs_t)
+                        logits_t, _values_t = model(features_t)
+                        dist_t = masked_categorical(
+                            logits_t,
+                            mask_t,
+                            action_bias=action_bias_t,
+                            bias_alpha=0.0,  # Validation is actor-only.
+                        )
+                        actions_t = torch.argmax(dist_t.probs, dim=-1)
+                    actions_np = (
+                        actions_t.detach().cpu().numpy().astype(np.int64).tolist()
+                    )
+
+                    step_result = val_env.step_many(env_ids=env_ids, actions=actions_np)
+                    rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
+                    dones_np = np.asarray(step_result["dones"], dtype=np.float32)
+                    infos_raw = step_result.get("infos", [])
+
+                    active_mask = ~done_mask
+                    ep_return[active_mask] += rewards_np[active_mask].astype(np.float64)
+                    ep_length[active_mask] += 1
+
+                    if isinstance(infos_raw, list):
+                        max_info = min(len(infos_raw), env_count)
+                        for env_idx in range(max_info):
+                            if not active_mask[env_idx]:
+                                continue
+                            info = infos_raw[env_idx]
+                            reward_final = _info_num(
+                                info,
+                                reward_component_aliases["reward_final"],
+                                default=float(rewards_np[env_idx]),
+                            )
+                            ep_terms["reward_final"][env_idx] += reward_final
+                            for key in reward_component_aliases.keys():
+                                if key == "reward_final":
+                                    continue
+                                ep_terms[key][env_idx] += _info_num(
+                                    info,
+                                    reward_component_aliases[key],
+                                    default=0.0,
+                                )
+                    else:
+                        ep_terms["reward_final"][active_mask] += rewards_np[
+                            active_mask
+                        ].astype(np.float64)
+
+                    done_mask |= dones_np > 0.5
+                    if bool(np.all(done_mask)):
+                        break
+
+                    obs_np = np.asarray(step_result["obs"], dtype=np.float32)
+                    mask_np = ensure_action_masks(
+                        np.asarray(step_result["action_masks"], dtype=np.float32)
+                    )
+                    action_bias_np = ensure_action_biases(
+                        mask_np,
+                        np.asarray(step_result.get("action_biases", []), dtype=np.float32)
+                        if "action_biases" in step_result
+                        else None,
+                    )
+
+                returns.extend(ep_return.tolist())
+                lengths.extend(ep_length.tolist())
+                for key, arr in ep_terms.items():
+                    term_values[key].extend(arr.tolist())
+
+            return {
+                "enabled": True,
+                "episodes": int(len(returns)),
+                "piece_source_profile": piece_source_profile,
+                "mean_return": _safe_recent_mean(returns, window=len(returns)),
+                "mean_length": _safe_recent_mean(lengths, window=len(lengths)),
+                "terms": {
+                    key: _safe_recent_mean(values, window=len(values))
+                    for key, values in term_values.items()
+                },
+            }
+    finally:
+        if was_model_training:
+            model.train()
+        if was_adapter_training:
+            obs_adapter.train()
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -1895,6 +2112,8 @@ def train(cfg: PPOConfig) -> None:
             f"curriculum_bias={cfg.curriculum_bias_start:.3f}->{cfg.curriculum_bias_end:.3f}/"
             f"{cfg.curriculum_bias_ramp_updates}, "
             f"curriculum_danger_height={cfg.curriculum_danger_height}, "
+            f"distill_coef={cfg.distill_coef_start:.4f}->{cfg.distill_coef_end:.4f}/"
+            f"{cfg.distill_coef_ramp_updates}, "
             f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -1987,6 +2206,7 @@ def train(cfg: PPOConfig) -> None:
                 mask_repair_update = {"rows": 0, "batches": 0}
                 curriculum_topk_now = curriculum_topk_for_update(cfg, update)
                 curriculum_bias_now = curriculum_bias_for_update(cfg, update)
+                distill_coef_now = distill_coef_for_update(cfg, update)
                 env.set_curriculum(
                     top_k=curriculum_topk_now,
                     bias_strength=curriculum_bias_now,
@@ -2250,6 +2470,7 @@ def train(cfg: PPOConfig) -> None:
                 policy_loss_value = 0.0
                 value_loss_value = 0.0
                 entropy_value = 0.0
+                distill_loss_value = 0.0
                 updates_done = 0
                 early_stopped = False
                 early_stop_epoch: int | None = None
@@ -2268,10 +2489,12 @@ def train(cfg: PPOConfig) -> None:
 
                         mb_features = obs_adapter(b_raw_obs[mb_inds])
                         logits, new_values = model(mb_features)
+                        mb_mask = b_masks[mb_inds]
+                        mb_action_bias = b_action_bias[mb_inds]
                         dist = masked_categorical(
                             logits,
-                            b_masks[mb_inds],
-                            action_bias=b_action_bias[mb_inds],
+                            mb_mask,
+                            action_bias=mb_action_bias,
                             bias_alpha=curriculum_bias_now,
                         )
                         new_logprob = dist.log_prob(b_actions[mb_inds])
@@ -2317,10 +2540,26 @@ def train(cfg: PPOConfig) -> None:
                                 0.5 * ((value_pred - b_returns[mb_inds]) ** 2).mean()
                             )
 
+                        # Distillation: teacher from heuristic action_bias, student from
+                        # raw masked policy logits (no heuristic prior injection).
+                        student_valid = mb_mask > 0
+                        student_large_neg = torch.full_like(logits, -1e9)
+                        student_logits = torch.where(
+                            student_valid, logits, student_large_neg
+                        )
+                        student_log_probs = torch.log_softmax(
+                            student_logits, dim=-1
+                        )
+                        teacher_probs = build_teacher_probs(mb_mask, mb_action_bias)
+                        distill_loss = -torch.sum(
+                            teacher_probs * student_log_probs, dim=-1
+                        ).mean()
+
                         loss = (
                             policy_loss
                             + cfg.vf_coef * value_loss
                             - ent_coef_now * entropy
+                            + distill_coef_now * distill_loss
                         )
 
                         optimizer.zero_grad(set_to_none=True)
@@ -2336,6 +2575,9 @@ def train(cfg: PPOConfig) -> None:
                         policy_loss_value = float(policy_loss.detach().cpu().item())
                         value_loss_value = float(value_loss.detach().cpu().item())
                         entropy_value = float(entropy.detach().cpu().item())
+                        distill_loss_value = float(
+                            distill_loss.detach().cpu().item()
+                        )
                         updates_done += 1
 
                     epoch_approx_kl_mean = (
@@ -2378,6 +2620,7 @@ def train(cfg: PPOConfig) -> None:
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
+                    "distill_loss": distill_loss_value,
                     "approx_kl": approx_kl_mean,
                     "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
                     "explained_variance": explained_var,
@@ -2390,6 +2633,7 @@ def train(cfg: PPOConfig) -> None:
                     "value_clip_coef_used": cfg.value_clip_coef,
                     "policy_lr_used": policy_lr_now,
                     "value_lr_used": value_lr_now,
+                    "distill_coef_used": distill_coef_now,
                     "curriculum_topk_used": curriculum_topk_now,
                     "curriculum_bias_used": curriculum_bias_now,
                     "curriculum_danger_height_used": cfg.curriculum_danger_height,
@@ -2410,6 +2654,41 @@ def train(cfg: PPOConfig) -> None:
                         for key, values in completed_reward_component_sums.items()
                     },
                 }
+                should_log = (
+                    update % cfg.log_every_updates == 0
+                    or update == 1
+                    or update == num_updates
+                )
+                validation: dict[str, Any] | None = None
+                if should_log and cfg.validation_episodes_per_env > 0:
+                    try:
+                        validation = run_validation_eval(
+                            cfg=cfg,
+                            repo_root=repo_root,
+                            server_cmd=server_cmd,
+                            model=model,
+                            obs_adapter=obs_adapter,
+                            device=device,
+                            update=update,
+                            piece_source_profile=current_piece_source,
+                            reward_component_aliases=reward_component_aliases,
+                        )
+                    except Exception as error:
+                        validation = {"enabled": False, "error": str(error)}
+                        print(
+                            "[ppo] "
+                            f"validation failed at update={update}: {error}"
+                        )
+                if isinstance(validation, dict):
+                    stats["validation"] = validation
+                    if bool(validation.get("enabled", False)):
+                        stats["validation_mean_return"] = validation.get(
+                            "mean_return", float("nan")
+                        )
+                        stats["validation_mean_length"] = validation.get(
+                            "mean_length", float("nan")
+                        )
+                        stats["validation_terms"] = validation.get("terms", {})
                 stats["profile_rollout_s"] = profile_rollout_s
                 stats["profile_env_step_s"] = profile_env_step_s
                 stats["profile_env_reset_s"] = profile_env_reset_s
@@ -2486,7 +2765,7 @@ def train(cfg: PPOConfig) -> None:
                     profile_io_s += time.perf_counter() - io_start
                     print("[ppo] " f"new_best update={update} ret100={best_score:.3f}")
 
-                if update % cfg.log_every_updates == 0 or update == 1 or update == num_updates:
+                if should_log:
                     profile_env_total_s = profile_env_step_s + profile_env_reset_s
                     profile_env_batch_s = profile_env_step_batch_s + profile_env_reset_batch_s
                     profile_env_core_s = profile_env_step_core_s + profile_env_reset_core_s
@@ -2510,10 +2789,12 @@ def train(cfg: PPOConfig) -> None:
                         f"step={global_step} "
                         f"ploss={stats['policy_loss']:.4f} "
                         f"vloss={stats['value_loss']:.4f} "
+                        f"dloss={stats['distill_loss']:.4f} "
                         f"ent={stats['entropy']:.4f} "
                         f"kl={stats['approx_kl']:.5f} "
                         f"clip={stats['clip_fraction']:.3f} "
                         f"ent_coef={ent_coef_now:.5f} "
+                        f"distill_coef={distill_coef_now:.5f} "
                         f"pclip={cfg.policy_clip_coef:.4f} "
                         f"vclip={cfg.value_clip_coef:.4f} "
                         f"p_lr={policy_lr_now:.6g} "
@@ -2537,6 +2818,20 @@ def train(cfg: PPOConfig) -> None:
                         f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))},"
                         f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
                         f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))}"
+                        f") "
+                        f"val={_fmt_float(stats.get('validation_mean_return'))} "
+                        f"val_terms("
+                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('term_lines'))},"
+                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('term_score'))},"
+                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('term_time'))},"
+                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('term_height'))},"
+                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('term_holes'))},"
+                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('term_bumpiness'))},"
+                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('term_board_score'))},"
+                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('term_board_quality'))},"
+                        f"topout={_fmt_float((stats.get('validation_terms') or {}).get('top_out_penalty'))},"
+                        f"base={_fmt_float((stats.get('validation_terms') or {}).get('reward_base'))},"
+                        f"final={_fmt_float((stats.get('validation_terms') or {}).get('reward_final'))}"
                         f") "
                         f"sps={stats['sps']} "
                         f"t_upd={update_seconds:.2f}s "
