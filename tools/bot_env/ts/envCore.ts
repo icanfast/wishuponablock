@@ -55,7 +55,7 @@ const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
 const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
 const OFFLINE_SOFT_DROP_MS = 0;
-const TOP_OUT_PENALTY = 50;
+const TOP_OUT_PENALTY = 100;
 const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
 const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
@@ -222,6 +222,7 @@ const HOLE_DELTA_REWARD_WEIGHT = 0.05;
 const BUMPINESS_DELTA_REWARD_WEIGHT = 0.03;
 const HEIGHT_DELTA_REWARD_WEIGHT = 0.04;
 const PRACTICE_TIME_DELTA_REWARD_WEIGHT = 1e-5;
+const BOARD_QUALITY_DELTA_REWARD_WEIGHT = 0.1;
 
 const getCharcuterieHolePenalty = (board: Board): number => {
   const rows = board.length;
@@ -274,6 +275,7 @@ type PieceRewardBreakdown = {
   holeDeltaTerm: number;
   bumpinessDeltaTerm: number;
   boardScoreTerm: number;
+  boardQualityDeltaTerm: number;
 };
 
 const computePieceReward = (options: {
@@ -285,6 +287,7 @@ const computePieceReward = (options: {
   holesDelta: number;
   bumpinessDelta: number;
   boardScoreDelta: number;
+  boardQualityDelta: number;
 }): {
   reward: number;
   breakdown: PieceRewardBreakdown;
@@ -298,6 +301,7 @@ const computePieceReward = (options: {
     holesDelta,
     bumpinessDelta,
     boardScoreDelta,
+    boardQualityDelta,
   } = options;
   let linesTerm = 0;
   let scoreTerm = 0;
@@ -306,6 +310,8 @@ const computePieceReward = (options: {
   const heightDeltaTerm = -heightDelta * HEIGHT_DELTA_REWARD_WEIGHT;
   const holeDeltaTerm = -holesDelta * HOLE_DELTA_REWARD_WEIGHT;
   const bumpinessDeltaTerm = -bumpinessDelta * BUMPINESS_DELTA_REWARD_WEIGHT;
+  const boardQualityDeltaTerm =
+    boardQualityDelta * BOARD_QUALITY_DELTA_REWARD_WEIGHT;
   if (modeId === 'sprint') {
     linesTerm = linesDelta * 1.2;
     scoreTerm = scoreDelta * 0.001;
@@ -329,6 +335,7 @@ const computePieceReward = (options: {
     scoreTerm +
     timeTerm +
     boardScoreTerm +
+    boardQualityDeltaTerm +
     heightDeltaTerm +
     holeDeltaTerm +
     bumpinessDeltaTerm;
@@ -342,6 +349,7 @@ const computePieceReward = (options: {
       holeDeltaTerm,
       bumpinessDeltaTerm,
       boardScoreTerm,
+      boardQualityDeltaTerm,
     },
   };
 };
@@ -988,6 +996,7 @@ class BotEnv {
     const heightDelta = after.height - before.height;
     const holesDelta = after.holes - before.holes;
     const bumpinessDelta = after.bumpiness - before.bumpiness;
+    const boardQualityDelta = before.boardQuality - after.boardQuality;
     const rewardResult = computePieceReward({
       modeId: this.modeId,
       linesDelta,
@@ -997,6 +1006,7 @@ class BotEnv {
       holesDelta,
       bumpinessDelta,
       boardScoreDelta: before.boardScore - after.boardScore,
+      boardQualityDelta,
     });
     const reward = rewardResult.reward;
     const topOutPenalty = this.game.state.gameOver ? TOP_OUT_PENALTY : 0;
@@ -1066,6 +1076,7 @@ class BotEnv {
         rewardTermHoles: rewardResult.breakdown.holeDeltaTerm,
         rewardTermBumpiness: rewardResult.breakdown.bumpinessDeltaTerm,
         rewardTermBoardScore: rewardResult.breakdown.boardScoreTerm,
+        rewardTermBoardQuality: rewardResult.breakdown.boardQualityDeltaTerm,
         topOutPenalty,
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
@@ -1334,8 +1345,10 @@ class BotEnv {
     holes: number;
     bumpiness: number;
     boardScore: number;
+    boardQuality: number;
   } {
     const state = this.game.state;
+    const quality = evaluateBoardQuality(state.board);
     return {
       lines: Math.max(0, Math.trunc(state.totalLinesCleared)),
       score: Math.max(0, Math.trunc(state.score)),
@@ -1348,6 +1361,7 @@ class BotEnv {
         state.gameOver,
         state.totalLinesCleared,
       ),
+      boardQuality: quality.quality,
     };
   }
 

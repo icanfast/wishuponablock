@@ -1932,6 +1932,7 @@ def train(cfg: PPOConfig) -> None:
             "term_holes": ("rewardTermHoles",),
             "term_bumpiness": ("rewardTermBumpiness",),
             "term_board_score": ("rewardTermBoardScore",),
+            "term_board_quality": ("rewardTermBoardQuality",),
         }
         ep_reward_component_sums = {
             key: np.zeros(cfg.num_envs, dtype=np.float64)
@@ -2134,6 +2135,7 @@ def train(cfg: PPOConfig) -> None:
                                 "term_holes",
                                 "term_bumpiness",
                                 "term_board_score",
+                                "term_board_quality",
                             ):
                                 ep_reward_component_sums[key][env_idx] += _info_num(
                                     info,
@@ -2531,6 +2533,7 @@ def train(cfg: PPOConfig) -> None:
                         f"holes={_fmt_float(stats['ret100_terms'].get('term_holes'))},"
                         f"bump={_fmt_float(stats['ret100_terms'].get('term_bumpiness'))},"
                         f"board={_fmt_float(stats['ret100_terms'].get('term_board_score'))},"
+                        f"q={_fmt_float(stats['ret100_terms'].get('term_board_quality'))},"
                         f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))},"
                         f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
                         f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))}"
