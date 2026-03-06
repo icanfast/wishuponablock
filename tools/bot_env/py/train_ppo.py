@@ -2471,6 +2471,32 @@ def train(cfg: PPOConfig) -> None:
                 value_loss_value = 0.0
                 entropy_value = 0.0
                 distill_loss_value = 0.0
+                total_loss_value = 0.0
+                policy_term_value = 0.0
+                value_term_value = 0.0
+                entropy_term_value = 0.0
+                distill_term_value = 0.0
+                policy_loss_sum = 0.0
+                value_loss_sum = 0.0
+                entropy_sum = 0.0
+                distill_loss_sum = 0.0
+                total_loss_sum = 0.0
+                policy_term_sum = 0.0
+                value_term_sum = 0.0
+                entropy_term_sum = 0.0
+                distill_term_sum = 0.0
+                teacher_entropy_value = 0.0
+                teacher_max_prob_value = 0.0
+                teacher_uniform_row_frac_value = 0.0
+                teacher_bias_row_frac_value = 0.0
+                teacher_prob_sum_value = 0.0
+                teacher_valid_actions_value = 0.0
+                teacher_entropy_sum = 0.0
+                teacher_max_prob_sum = 0.0
+                teacher_uniform_row_frac_sum = 0.0
+                teacher_bias_row_frac_sum = 0.0
+                teacher_prob_sum_sum = 0.0
+                teacher_valid_actions_sum = 0.0
                 updates_done = 0
                 early_stopped = False
                 early_stop_epoch: int | None = None
@@ -2555,11 +2581,15 @@ def train(cfg: PPOConfig) -> None:
                             teacher_probs * student_log_probs, dim=-1
                         ).mean()
 
+                        policy_term = policy_loss
+                        value_term = cfg.vf_coef * value_loss
+                        entropy_term = -ent_coef_now * entropy
+                        distill_term = distill_coef_now * distill_loss
                         loss = (
-                            policy_loss
-                            + cfg.vf_coef * value_loss
-                            - ent_coef_now * entropy
-                            + distill_coef_now * distill_loss
+                            policy_term
+                            + value_term
+                            + entropy_term
+                            + distill_term
                         )
 
                         optimizer.zero_grad(set_to_none=True)
@@ -2578,6 +2608,56 @@ def train(cfg: PPOConfig) -> None:
                         distill_loss_value = float(
                             distill_loss.detach().cpu().item()
                         )
+                        policy_term_value = float(policy_term.detach().cpu().item())
+                        value_term_value = float(value_term.detach().cpu().item())
+                        entropy_term_value = float(entropy_term.detach().cpu().item())
+                        distill_term_value = float(distill_term.detach().cpu().item())
+                        total_loss_value = float(loss.detach().cpu().item())
+                        policy_loss_sum += policy_loss_value
+                        value_loss_sum += value_loss_value
+                        entropy_sum += entropy_value
+                        distill_loss_sum += distill_loss_value
+                        policy_term_sum += policy_term_value
+                        value_term_sum += value_term_value
+                        entropy_term_sum += entropy_term_value
+                        distill_term_sum += distill_term_value
+                        total_loss_sum += total_loss_value
+                        valid_f = (mb_mask > 0).to(dtype=teacher_probs.dtype)
+                        raw_bias = torch.clamp(mb_action_bias, min=0.0) * valid_f
+                        raw_bias_mass = torch.sum(raw_bias, dim=-1)
+                        teacher_used_bias_rows = (raw_bias_mass > 1e-8).to(
+                            dtype=teacher_probs.dtype
+                        )
+                        teacher_bias_row_frac_value = float(
+                            teacher_used_bias_rows.mean().detach().cpu().item()
+                        )
+                        teacher_uniform_row_frac_value = 1.0 - teacher_bias_row_frac_value
+                        teacher_entropy_value = float(
+                            (
+                                -torch.sum(
+                                    teacher_probs * torch.log(torch.clamp(teacher_probs, min=1e-8)),
+                                    dim=-1,
+                                ).mean()
+                            )
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        teacher_max_prob_value = float(
+                            teacher_probs.max(dim=-1).values.mean().detach().cpu().item()
+                        )
+                        teacher_prob_sum_value = float(
+                            teacher_probs.sum(dim=-1).mean().detach().cpu().item()
+                        )
+                        teacher_valid_actions_value = float(
+                            valid_f.sum(dim=-1).mean().detach().cpu().item()
+                        )
+                        teacher_entropy_sum += teacher_entropy_value
+                        teacher_max_prob_sum += teacher_max_prob_value
+                        teacher_uniform_row_frac_sum += teacher_uniform_row_frac_value
+                        teacher_bias_row_frac_sum += teacher_bias_row_frac_value
+                        teacher_prob_sum_sum += teacher_prob_sum_value
+                        teacher_valid_actions_sum += teacher_valid_actions_value
                         updates_done += 1
 
                     epoch_approx_kl_mean = (
@@ -2596,6 +2676,26 @@ def train(cfg: PPOConfig) -> None:
                         )
                         break
                 profile_opt_s = time.perf_counter() - optimize_start
+                updates_done_denom = float(max(1, updates_done))
+                policy_loss_value = policy_loss_sum / updates_done_denom
+                value_loss_value = value_loss_sum / updates_done_denom
+                entropy_value = entropy_sum / updates_done_denom
+                distill_loss_value = distill_loss_sum / updates_done_denom
+                policy_term_value = policy_term_sum / updates_done_denom
+                value_term_value = value_term_sum / updates_done_denom
+                entropy_term_value = entropy_term_sum / updates_done_denom
+                distill_term_value = distill_term_sum / updates_done_denom
+                total_loss_value = total_loss_sum / updates_done_denom
+                teacher_entropy_value = teacher_entropy_sum / updates_done_denom
+                teacher_max_prob_value = teacher_max_prob_sum / updates_done_denom
+                teacher_uniform_row_frac_value = (
+                    teacher_uniform_row_frac_sum / updates_done_denom
+                )
+                teacher_bias_row_frac_value = (
+                    teacher_bias_row_frac_sum / updates_done_denom
+                )
+                teacher_prob_sum_value = teacher_prob_sum_sum / updates_done_denom
+                teacher_valid_actions_value = teacher_valid_actions_sum / updates_done_denom
 
                 y_pred = b_values.detach().cpu().numpy()
                 y_true = b_returns.detach().cpu().numpy()
@@ -2621,6 +2721,11 @@ def train(cfg: PPOConfig) -> None:
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
                     "distill_loss": distill_loss_value,
+                    "loss_total": total_loss_value,
+                    "loss_policy_term": policy_term_value,
+                    "loss_value_term": value_term_value,
+                    "loss_entropy_term": entropy_term_value,
+                    "loss_distill_term": distill_term_value,
                     "approx_kl": approx_kl_mean,
                     "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
                     "explained_variance": explained_var,
@@ -2637,6 +2742,12 @@ def train(cfg: PPOConfig) -> None:
                     "curriculum_topk_used": curriculum_topk_now,
                     "curriculum_bias_used": curriculum_bias_now,
                     "curriculum_danger_height_used": cfg.curriculum_danger_height,
+                    "teacher_entropy": teacher_entropy_value,
+                    "teacher_max_prob": teacher_max_prob_value,
+                    "teacher_uniform_row_frac": teacher_uniform_row_frac_value,
+                    "teacher_bias_row_frac": teacher_bias_row_frac_value,
+                    "teacher_prob_sum": teacher_prob_sum_value,
+                    "teacher_valid_actions": teacher_valid_actions_value,
                     "sps": sps,
                     "update_seconds": update_seconds,
                     "mean_episode_return_recent": (
@@ -2790,6 +2901,13 @@ def train(cfg: PPOConfig) -> None:
                         f"ploss={stats['policy_loss']:.4f} "
                         f"vloss={stats['value_loss']:.4f} "
                         f"dloss={stats['distill_loss']:.4f} "
+                        f"loss={stats['loss_total']:.4f} "
+                        f"loss_terms("
+                        f"p={stats['loss_policy_term']:.4f},"
+                        f"v={stats['loss_value_term']:.4f},"
+                        f"ent={stats['loss_entropy_term']:.4f},"
+                        f"dist={stats['loss_distill_term']:.4f}"
+                        f") "
                         f"ent={stats['entropy']:.4f} "
                         f"kl={stats['approx_kl']:.5f} "
                         f"clip={stats['clip_fraction']:.3f} "
@@ -2804,6 +2922,14 @@ def train(cfg: PPOConfig) -> None:
                         f"bias={curriculum_bias_now:.3f} "
                         f"src={'ml' if current_piece_source == 'active_generator' else 'bag7'} "
                         f"warmup={'y' if warmup_active else 'n'} "
+                        f"teacher("
+                        f"ent={stats['teacher_entropy']:.3f},"
+                        f"maxp={stats['teacher_max_prob']:.3f},"
+                        f"uniform={stats['teacher_uniform_row_frac']:.3f},"
+                        f"bias_rows={stats['teacher_bias_row_frac']:.3f},"
+                        f"psum={stats['teacher_prob_sum']:.3f},"
+                        f"valid={stats['teacher_valid_actions']:.1f}"
+                        f") "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "
                         f"ret100_terms("
