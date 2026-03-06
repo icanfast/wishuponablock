@@ -68,6 +68,7 @@ class PPOConfig:
     distill_coef_start: float
     distill_coef_end: float
     distill_coef_ramp_updates: int
+    distill_teacher_tau: float
     validation_episodes_per_env: int
     device: str
     save_every_updates: int
@@ -621,6 +622,12 @@ def parse_args() -> PPOConfig:
         help="Number of updates to linearly ramp distillation coefficient.",
     )
     parser.add_argument(
+        "--distill-teacher-tau",
+        type=float,
+        default=0.35,
+        help="Teacher temperature for distillation softmax(score / tau). Lower is sharper.",
+    )
+    parser.add_argument(
         "--validation-episodes-per-env",
         type=int,
         default=2,
@@ -731,6 +738,7 @@ def parse_args() -> PPOConfig:
         distill_coef_start=max(0.0, float(args.distill_coef_start)),
         distill_coef_end=max(0.0, float(args.distill_coef_end)),
         distill_coef_ramp_updates=max(0, int(args.distill_coef_ramp_updates)),
+        distill_teacher_tau=max(1e-4, float(args.distill_teacher_tau)),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
@@ -869,17 +877,43 @@ def ensure_action_biases(
     return finite
 
 
+def ensure_action_scores(
+    mask_np: np.ndarray,
+    scores_np: np.ndarray | None,
+) -> np.ndarray:
+    mask = np.asarray(mask_np, dtype=np.float32)
+    if scores_np is None:
+        return np.zeros_like(mask, dtype=np.float32)
+    scores = np.asarray(scores_np, dtype=np.float32)
+    if scores.shape != mask.shape:
+        return np.zeros_like(mask, dtype=np.float32)
+    finite = np.where(np.isfinite(scores), scores, 0.0).astype(np.float32, copy=False)
+    finite *= (mask > 0).astype(np.float32)
+    return finite
+
+
 def build_teacher_probs(
     action_mask: torch.Tensor,
-    action_bias: torch.Tensor,
-) -> torch.Tensor:
+    action_scores: torch.Tensor,
+    tau: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     valid = action_mask > 0
     valid_f = valid.to(dtype=action_mask.dtype)
-    bias = torch.clamp(action_bias, min=0.0) * valid_f
-    bias_sum = torch.sum(bias, dim=-1, keepdim=True)
     valid_count = torch.sum(valid_f, dim=-1, keepdim=True)
-    uniform = valid_f / torch.clamp(valid_count, min=1.0)
-    return torch.where(bias_sum > 1e-8, bias / bias_sum, uniform)
+    safe_valid_count = torch.clamp(valid_count, min=1.0)
+    masked_scores = torch.where(valid, action_scores, torch.zeros_like(action_scores))
+    row_mean = torch.sum(masked_scores, dim=-1, keepdim=True) / safe_valid_count
+    row_var = torch.sum(
+        ((masked_scores - row_mean) * valid_f) ** 2,
+        dim=-1,
+        keepdim=True,
+    ) / safe_valid_count
+    row_is_uniform = (row_var <= 1e-12).to(dtype=action_mask.dtype)
+    safe_tau = max(1e-4, float(tau))
+    large_neg = torch.full_like(action_scores, -1e9)
+    teacher_logits = torch.where(valid, action_scores / safe_tau, large_neg)
+    teacher_probs = torch.softmax(teacher_logits, dim=-1)
+    return teacher_probs, row_is_uniform
 
 
 def masked_categorical(
@@ -1882,6 +1916,12 @@ def train(cfg: PPOConfig) -> None:
             if "action_biases" in reset_result
             else None,
         )
+        action_score_np = ensure_action_scores(
+            mask_np,
+            np.asarray(reset_result.get("action_scores", []), dtype=np.float32)
+            if "action_scores" in reset_result
+            else None,
+        )
         current_piece_source = (
             "bag7"
             if cfg.piece_source_profile == "bag7"
@@ -2086,6 +2126,12 @@ def train(cfg: PPOConfig) -> None:
                 if "action_biases" in reset_result
                 else None,
             )
+            action_score_np = ensure_action_scores(
+                mask_np,
+                np.asarray(reset_result.get("action_scores", []), dtype=np.float32)
+                if "action_scores" in reset_result
+                else None,
+            )
 
         batch_size = cfg.num_envs * cfg.num_steps
         if cfg.minibatch_size > batch_size:
@@ -2114,6 +2160,7 @@ def train(cfg: PPOConfig) -> None:
             f"curriculum_danger_height={cfg.curriculum_danger_height}, "
             f"distill_coef={cfg.distill_coef_start:.4f}->{cfg.distill_coef_end:.4f}/"
             f"{cfg.distill_coef_ramp_updates}, "
+            f"distill_teacher_tau={cfg.distill_teacher_tau:.4f}, "
             f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -2249,6 +2296,12 @@ def train(cfg: PPOConfig) -> None:
                         if "action_biases" in source_reset
                         else None,
                     )
+                    action_score_np = ensure_action_scores(
+                        mask_np,
+                        np.asarray(source_reset.get("action_scores", []), dtype=np.float32)
+                        if "action_scores" in source_reset
+                        else None,
+                    )
                     ep_return.fill(0.0)
                     ep_length.fill(0)
                     for component_sum in ep_reward_component_sums.values():
@@ -2262,6 +2315,9 @@ def train(cfg: PPOConfig) -> None:
                 action_bias_buf = torch.zeros(
                     (cfg.num_steps, cfg.num_envs, action_dim), device=device
                 )
+                action_score_buf = torch.zeros(
+                    (cfg.num_steps, cfg.num_envs, action_dim), device=device
+                )
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
                 logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
                 reward_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
@@ -2272,9 +2328,11 @@ def train(cfg: PPOConfig) -> None:
                     raw_obs_t = as_tensor(obs_np, device)
                     mask_t = as_tensor(mask_np, device)
                     action_bias_t = as_tensor(action_bias_np, device)
+                    action_score_t = as_tensor(action_score_np, device)
                     raw_obs_buf[step] = raw_obs_t
                     mask_buf[step] = mask_t
                     action_bias_buf[step] = action_bias_t
+                    action_score_buf[step] = action_score_t
 
                     policy_forward_start = time.perf_counter()
                     with torch.no_grad():
@@ -2322,6 +2380,12 @@ def train(cfg: PPOConfig) -> None:
                         next_mask_np,
                         np.asarray(step_result.get("action_biases", []), dtype=np.float32)
                         if "action_biases" in step_result
+                        else None,
+                    )
+                    next_action_score_np = ensure_action_scores(
+                        next_mask_np,
+                        np.asarray(step_result.get("action_scores", []), dtype=np.float32)
+                        if "action_scores" in step_result
                         else None,
                     )
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
@@ -2416,14 +2480,22 @@ def train(cfg: PPOConfig) -> None:
                             if "action_biases" in reset_done
                             else None,
                         )
+                        reset_action_scores = ensure_action_scores(
+                            reset_masks,
+                            np.asarray(reset_done.get("action_scores", []), dtype=np.float32)
+                            if "action_scores" in reset_done
+                            else None,
+                        )
                         for local_pos, env_idx in enumerate(done_indices.tolist()):
                             next_obs_np[env_idx] = reset_obs[local_pos]
                             next_mask_np[env_idx] = reset_masks[local_pos]
                             next_action_bias_np[env_idx] = reset_action_biases[local_pos]
+                            next_action_score_np[env_idx] = reset_action_scores[local_pos]
 
                     obs_np = next_obs_np
                     mask_np = next_mask_np
                     action_bias_np = next_action_bias_np
+                    action_score_np = next_action_score_np
                     global_step += cfg.num_envs
 
                 profile_rollout_s = time.perf_counter() - rollout_start_perf
@@ -2453,6 +2525,7 @@ def train(cfg: PPOConfig) -> None:
                 b_raw_obs = raw_obs_buf.reshape((-1, raw_obs_dim))
                 b_masks = mask_buf.reshape((-1, action_dim))
                 b_action_bias = action_bias_buf.reshape((-1, action_dim))
+                b_action_scores = action_score_buf.reshape((-1, action_dim))
                 b_actions = action_buf.reshape(-1)
                 b_logprobs = logprob_buf.reshape(-1)
                 b_advantages = advantages.reshape(-1)
@@ -2517,6 +2590,7 @@ def train(cfg: PPOConfig) -> None:
                         logits, new_values = model(mb_features)
                         mb_mask = b_masks[mb_inds]
                         mb_action_bias = b_action_bias[mb_inds]
+                        mb_action_scores = b_action_scores[mb_inds]
                         dist = masked_categorical(
                             logits,
                             mb_mask,
@@ -2576,7 +2650,11 @@ def train(cfg: PPOConfig) -> None:
                         student_log_probs = torch.log_softmax(
                             student_logits, dim=-1
                         )
-                        teacher_probs = build_teacher_probs(mb_mask, mb_action_bias)
+                        teacher_probs, teacher_uniform_rows = build_teacher_probs(
+                            mb_mask,
+                            mb_action_scores,
+                            cfg.distill_teacher_tau,
+                        )
                         distill_loss = -torch.sum(
                             teacher_probs * student_log_probs, dim=-1
                         ).mean()
@@ -2623,15 +2701,10 @@ def train(cfg: PPOConfig) -> None:
                         distill_term_sum += distill_term_value
                         total_loss_sum += total_loss_value
                         valid_f = (mb_mask > 0).to(dtype=teacher_probs.dtype)
-                        raw_bias = torch.clamp(mb_action_bias, min=0.0) * valid_f
-                        raw_bias_mass = torch.sum(raw_bias, dim=-1)
-                        teacher_used_bias_rows = (raw_bias_mass > 1e-8).to(
-                            dtype=teacher_probs.dtype
+                        teacher_uniform_row_frac_value = float(
+                            teacher_uniform_rows.mean().detach().cpu().item()
                         )
-                        teacher_bias_row_frac_value = float(
-                            teacher_used_bias_rows.mean().detach().cpu().item()
-                        )
-                        teacher_uniform_row_frac_value = 1.0 - teacher_bias_row_frac_value
+                        teacher_bias_row_frac_value = 1.0 - teacher_uniform_row_frac_value
                         teacher_entropy_value = float(
                             (
                                 -torch.sum(
@@ -2739,6 +2812,7 @@ def train(cfg: PPOConfig) -> None:
                     "policy_lr_used": policy_lr_now,
                     "value_lr_used": value_lr_now,
                     "distill_coef_used": distill_coef_now,
+                    "distill_teacher_tau_used": cfg.distill_teacher_tau,
                     "curriculum_topk_used": curriculum_topk_now,
                     "curriculum_bias_used": curriculum_bias_now,
                     "curriculum_danger_height_used": cfg.curriculum_danger_height,
@@ -2913,6 +2987,7 @@ def train(cfg: PPOConfig) -> None:
                         f"clip={stats['clip_fraction']:.3f} "
                         f"ent_coef={ent_coef_now:.5f} "
                         f"distill_coef={distill_coef_now:.5f} "
+                        f"tau={cfg.distill_teacher_tau:.3f} "
                         f"pclip={cfg.policy_clip_coef:.4f} "
                         f"vclip={cfg.value_clip_coef:.4f} "
                         f"p_lr={policy_lr_now:.6g} "

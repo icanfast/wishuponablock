@@ -68,6 +68,7 @@ export type StepBatchResult = {
   obs: number[][];
   action_masks: number[][];
   action_biases: number[][];
+  action_scores: number[][];
   rewards: number[];
   dones: boolean[];
   infos: JsonObject[];

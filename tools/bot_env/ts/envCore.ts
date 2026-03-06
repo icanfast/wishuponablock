@@ -582,6 +582,7 @@ const buildPlacementChoices = (
   placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
   actionMask: number[];
   actionBiases: number[];
+  actionScores: number[];
 } => {
   const placements = enumerateTrajectoryExecutorPlacements({
     board: state.board,
@@ -604,6 +605,7 @@ const buildPlacementChoices = (
   const scoresBySlot = new Array<number>(actionDim).fill(
     Number.NEGATIVE_INFINITY,
   );
+  const actionScores = new Array<number>(actionDim).fill(0);
   const beforeMetrics = evaluateBoardQuality(state.board);
   for (const placement of placements) {
     const actionIndex = placementActionIndexFromPlacement(placement);
@@ -624,6 +626,7 @@ const buildPlacementChoices = (
     }
     actionMask[actionIndex] = 1;
     scoresBySlot[actionIndex] = score;
+    actionScores[actionIndex] = Number.isFinite(score) ? score : 0;
     placementsBySlot[actionIndex] = {
       ...placement,
       commands: [...placement.commands],
@@ -637,6 +640,7 @@ const buildPlacementChoices = (
       state.active.y + dropDistance(state.board, state.active);
     actionMask[0] = 1;
     scoresBySlot[0] = 0;
+    actionScores[0] = 0;
     placementsBySlot[0] = {
       lockPiece: state.active.k,
       lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
@@ -705,8 +709,17 @@ const buildPlacementChoices = (
     const fallbackIndex = legalIndices.length > 0 ? legalIndices[0] : 0;
     actionMask[fallbackIndex] = 1;
     actionBiases[fallbackIndex] = 1;
+    actionScores[fallbackIndex] = Number.isFinite(scoresBySlot[fallbackIndex])
+      ? scoresBySlot[fallbackIndex]
+      : 0;
   }
-  return { commandsBySlot, placementsBySlot, actionMask, actionBiases };
+  return {
+    commandsBySlot,
+    placementsBySlot,
+    actionMask,
+    actionBiases,
+    actionScores,
+  };
 };
 
 const boardToOccupancy = (board: Board): number[][] =>
@@ -763,6 +776,7 @@ type BotEnvStepResult = {
   obs: number[];
   actionMask: number[];
   actionBias: number[];
+  actionScores: number[];
   reward: number;
   done: boolean;
   info: JsonObject;
@@ -791,6 +805,7 @@ class BotEnv {
     placementsBySlot: Array<TrajectoryExecutorReachablePlacement | null>;
     actionMask: number[];
     actionBiases: number[];
+    actionScores: number[];
   } | null = null;
 
   constructor(
@@ -823,6 +838,7 @@ class BotEnv {
     obs: number[];
     actionMask: number[];
     actionBias: number[];
+    actionScores: number[];
     info: JsonObject;
     profile: BotEnvResetProfile;
   } {
@@ -857,6 +873,7 @@ class BotEnv {
       obs,
       actionMask: choices?.actionMask ?? [],
       actionBias: choices?.actionBiases ?? [],
+      actionScores: choices?.actionScores ?? [],
       info: {
         modeId: this.modeId,
         seed,
@@ -909,6 +926,7 @@ class BotEnv {
         obs,
         actionMask: choices.actionMask,
         actionBias: choices.actionBiases,
+        actionScores: choices.actionScores,
         reward: 0,
         done: true,
         info: { alreadyDone: true, piecesPlaced: this.piecesPlaced },
@@ -1051,6 +1069,7 @@ class BotEnv {
       obs,
       actionMask: nextChoices.actionMask,
       actionBias: nextChoices.actionBiases,
+      actionScores: nextChoices.actionScores,
       reward: Number.isFinite(finalReward) ? finalReward : 0,
       done: this.done,
       info: {
@@ -1438,6 +1457,7 @@ export class BotEnvPool {
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
     const actionBiases: number[][] = [];
+    const actionScores: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
@@ -1452,6 +1472,7 @@ export class BotEnvPool {
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);
+      actionScores.push(out.actionScores);
       rewards.push(0);
       dones.push(false);
       infos.push(out.info);
@@ -1463,6 +1484,7 @@ export class BotEnvPool {
       obs,
       action_masks: actionMasks,
       action_biases: actionBiases,
+      action_scores: actionScores,
       rewards,
       dones,
       infos,
@@ -1481,6 +1503,7 @@ export class BotEnvPool {
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
     const actionBiases: number[][] = [];
+    const actionScores: number[][] = [];
     const rewards: number[] = [];
     const dones: boolean[] = [];
     const infos: JsonObject[] = [];
@@ -1498,6 +1521,7 @@ export class BotEnvPool {
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);
+      actionScores.push(out.actionScores);
       rewards.push(out.reward);
       dones.push(out.done);
       infos.push(out.info);
@@ -1521,6 +1545,7 @@ export class BotEnvPool {
       obs,
       action_masks: actionMasks,
       action_biases: actionBiases,
+      action_scores: actionScores,
       rewards,
       dones,
       infos,
