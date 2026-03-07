@@ -199,6 +199,13 @@ export type MenuBotPoliciesPage = {
   };
 };
 
+type MenuGameModeId =
+  | 'practice'
+  | 'sprint'
+  | 'classic'
+  | 'cheese'
+  | 'charcuterie';
+
 export type LabelingProgressState = {
   buildVersion: string;
   labeledBoards: number | null;
@@ -346,6 +353,7 @@ export type MenuScreenOptions = {
     apmInput?: number;
     seed?: number;
     pieceSourceProfile?: 'bag7' | 'active_generator';
+    modeId?: MenuGameModeId;
     pieces?: number;
     greedy?: boolean;
     stepMode?: boolean;
@@ -3518,6 +3526,20 @@ input[type=number] {
   botLabGuiPiecesInput.step = '1';
   botLabGuiPiecesInput.value = '20';
   botLabGuiPiecesInput.placeholder = 'pieces';
+  const botLabGuiModeSelect = document.createElement('select');
+  for (const [value, label] of [
+    ['practice', 'Mode: practice'],
+    ['sprint', 'Mode: sprint'],
+    ['classic', 'Mode: classic'],
+    ['cheese', 'Mode: cheese'],
+    ['charcuterie', 'Mode: charcuterie'],
+  ] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    botLabGuiModeSelect.appendChild(option);
+  }
+  botLabGuiModeSelect.value = 'practice';
   const botLabGuiSourceSelect = document.createElement('select');
   for (const [value, label] of [
     ['bag7', 'GUI source: bag7'],
@@ -3555,10 +3577,21 @@ input[type=number] {
     width: '100%',
     boxSizing: 'border-box',
   });
+  Object.assign(botLabGuiModeSelect.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
   botLabGuiControls.appendChild(
     makeBotLabField('APM (actions/min)', botLabGuiApmInput),
   );
   botLabGuiControls.appendChild(makeBotLabField('Seed', botLabGuiSeedInput));
+  botLabGuiControls.appendChild(makeBotLabField('Mode', botLabGuiModeSelect));
   botLabGuiControls.appendChild(
     makeBotLabField('Pieces (GUI run)', botLabGuiPiecesInput),
   );
@@ -4340,6 +4373,18 @@ input[type=number] {
   ): 'bag7' | 'active_generator' =>
     value === 'active_generator' ? 'active_generator' : fallback;
 
+  const parseBotGuiModeId = (value: string): MenuGameModeId => {
+    switch (value) {
+      case 'sprint':
+      case 'classic':
+      case 'cheese':
+      case 'charcuterie':
+        return value;
+      default:
+        return 'practice';
+    }
+  };
+
   const readOptionalSeedInput = (
     input: HTMLInputElement,
   ): number | undefined => {
@@ -4466,6 +4511,7 @@ input[type=number] {
     botLabGuiApmInput.disabled = !isAdmin || busy;
     botLabGuiSeedInput.disabled = !isAdmin || busy;
     botLabGuiPiecesInput.disabled = !isAdmin || busy;
+    botLabGuiModeSelect.disabled = !isAdmin || busy;
     botLabGuiSourceSelect.disabled = !isAdmin || busy;
     botLabGuiGreedyToggle.disabled = !isAdmin || busy;
     botLabGuiStepModeToggle.disabled = !isAdmin || busy;
@@ -5811,6 +5857,7 @@ input[type=number] {
       const message = await onBotLabStartGuiInspect({
         apmInput: parsePositiveIntInput(botLabGuiApmInput),
         seed: readOptionalSeedInput(botLabGuiSeedInput),
+        modeId: parseBotGuiModeId(botLabGuiModeSelect.value),
         pieces: parsePositiveIntInput(botLabGuiPiecesInput),
         pieceSourceProfile: parseBotPieceSourceProfile(
           botLabGuiSourceSelect.value,

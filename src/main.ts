@@ -2051,6 +2051,7 @@ async function boot() {
     apmInput?: number;
     seed?: number;
     pieceSourceProfile?: BotPieceSourceProfile;
+    modeId?: 'practice' | 'sprint' | 'classic' | 'cheese' | 'charcuterie';
     pieces?: number;
     greedy?: boolean;
     stepMode?: boolean;
@@ -2063,8 +2064,18 @@ async function boot() {
       throw new Error('Admin account required.');
     }
     const { policy, policyId } = ensureBotPolicyLoaded();
-    const modeId = modeController.getState().mode.id;
-    const reference = await loadBotReferenceModel(modeId);
+    const selectedModeId = (() => {
+      switch (options?.modeId) {
+        case 'sprint':
+        case 'classic':
+        case 'cheese':
+        case 'charcuterie':
+          return options.modeId;
+        default:
+          return 'practice';
+      }
+    })();
+    const reference = await loadBotReferenceModel(selectedModeId);
     const apmInput = Math.max(
       20,
       Math.min(1200, Math.trunc(options?.apmInput ?? 240)),
@@ -2094,10 +2105,20 @@ async function boot() {
     botGuiInspectEnabled = true;
     botGuiStepMode = stepMode;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
-    modeController.startCharcuterie(Math.max(1, options?.pieces ?? 20), {
-      simCount: charcuterieDefaultSimCount,
-      ...(Number.isFinite(seed) ? { seed: Math.trunc(seed) } : {}),
-    });
+    if (selectedModeId === 'charcuterie') {
+      modeController.startCharcuterie(Math.max(1, options?.pieces ?? 20), {
+        simCount: charcuterieDefaultSimCount,
+        ...(Number.isFinite(seed) ? { seed: Math.trunc(seed) } : {}),
+      });
+    } else if (selectedModeId === 'cheese') {
+      modeController.startCheese(10);
+    } else if (selectedModeId === 'sprint') {
+      modeController.startSprint();
+    } else if (selectedModeId === 'classic') {
+      modeController.startClassic();
+    } else {
+      modeController.startPractice();
+    }
     await startGameWithModelReady();
     session.getGame().setConfig({
       gravityMs: Number.POSITIVE_INFINITY,
@@ -2110,6 +2131,7 @@ async function boot() {
     runtime?.renderNow();
     return (
       `GUI inspect started for ${policyId}. ` +
+      `game_mode=${selectedModeId}, ` +
       `mode=${stepMode ? 'step' : `apm:${apmInput}`}, piece_source=${pieceSourceProfile}, ` +
       `policy_mode=${options?.greedy === false ? 'sampled' : 'greedy'}.`
     );
