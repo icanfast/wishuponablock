@@ -1804,11 +1804,12 @@ export class BotEnvPool {
     let stepRewardS = 0;
     let stepObsS = 0;
     let stepChoicesNextS = 0;
+    const batchBlendWeights = this.nextRewardBlendWeights(envIds.length);
     for (let i = 0; i < envIds.length; i += 1) {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
       const action = clampInt(actions[i], 0, 0, DEFAULT_ACTION_DIM - 1);
-      const out = env.step(action, this.nextRewardBlendWeights());
+      const out = env.step(action, batchBlendWeights);
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);
@@ -1865,6 +1866,24 @@ export class BotEnvPool {
     return normalized;
   }
 
+  setPieceSources(
+    envIds: number[],
+    pieceSourceProfiles: unknown[],
+  ): { assigned: number; counts: Record<string, number> } {
+    const assigned = Math.min(envIds.length, pieceSourceProfiles.length);
+    const counts: Record<string, number> = {};
+    for (let i = 0; i < assigned; i += 1) {
+      const env = this.requireEnv(envIds[i]);
+      const normalized = normalizePieceSource(pieceSourceProfiles[i]);
+      env.setPieceSource(normalized);
+      counts[normalized] = (counts[normalized] ?? 0) + 1;
+    }
+    return {
+      assigned,
+      counts,
+    };
+  }
+
   setCurriculum(
     payload: SetCurriculumPayload | null | undefined,
   ): ActionCurriculumConfig {
@@ -1873,6 +1892,12 @@ export class BotEnvPool {
       env.setActionCurriculum(this.actionCurriculum);
     }
     return { ...this.actionCurriculum };
+  }
+
+  setRewardBlendTransitionStep(value: unknown): number {
+    const next = clampInt(value, 0, 0, 1_000_000_000);
+    this.rewardBlendTransitionStep = next;
+    return next;
   }
 
   popTrajectorySession(): JsonObject | null {
@@ -1887,7 +1912,9 @@ export class BotEnvPool {
     return env;
   }
 
-  private nextRewardBlendWeights(): RewardBlendWeights {
+  private nextRewardBlendWeights(
+    transitionIncrement: number = 1,
+  ): RewardBlendWeights {
     const transitionTotalSteps = Math.max(1, this.rewardBlendTimesteps);
     const transitionStep = Math.max(0, this.rewardBlendTransitionStep);
     const progress = Math.max(
@@ -1896,7 +1923,8 @@ export class BotEnvPool {
     );
     const legacyWeight = 1 - progress;
     const targetWeight = progress;
-    this.rewardBlendTransitionStep = transitionStep + 1;
+    const increment = Math.max(0, Math.trunc(transitionIncrement));
+    this.rewardBlendTransitionStep = transitionStep + increment;
     return {
       legacyWeight,
       targetWeight,

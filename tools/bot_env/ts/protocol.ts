@@ -17,7 +17,9 @@ export type BridgeRequest = {
   cmd:
     | 'init'
     | 'set_piece_source'
+    | 'set_piece_sources'
     | 'set_curriculum'
+    | 'set_reward_blend_step'
     | 'reset_many'
     | 'step_many'
     | 'pop_trajectory'
@@ -55,10 +57,19 @@ export type SetPieceSourcePayload = {
   pieceSourceProfile?: PieceSourceProfile;
 };
 
+export type SetPieceSourcesPayload = {
+  envIds?: number[];
+  pieceSourceProfiles?: PieceSourceProfile[];
+};
+
 export type SetCurriculumPayload = {
   topK?: number;
   biasStrength?: number;
   dangerHeight?: number;
+};
+
+export type SetRewardBlendStepPayload = {
+  transitionStep?: number;
 };
 
 export type StepManyPayload = {

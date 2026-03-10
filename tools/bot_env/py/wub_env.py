@@ -115,6 +115,19 @@ class WubEnvBridge:
         }
         return self._request("set_piece_source", payload)
 
+    def set_piece_sources(
+        self,
+        env_ids: list[int],
+        piece_source_profiles: list[str],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "envIds": [int(v) for v in env_ids],
+            "pieceSourceProfiles": [
+                str(v).strip().lower() for v in piece_source_profiles
+            ],
+        }
+        return self._request("set_piece_sources", payload)
+
     def set_curriculum(
         self,
         top_k: int | None = None,
@@ -129,6 +142,12 @@ class WubEnvBridge:
         if danger_height is not None:
             payload["dangerHeight"] = int(danger_height)
         return self._request("set_curriculum", payload)
+
+    def set_reward_blend_step(self, transition_step: int) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "transitionStep": max(0, int(transition_step)),
+        }
+        return self._request("set_reward_blend_step", payload)
 
     def step_many(self, env_ids: list[int], actions: list[int]) -> dict[str, Any]:
         payload = {

@@ -507,10 +507,11 @@ def parse_args() -> PPOConfig:
         nargs="+",
         default=None,
         help=(
-            "Cyclic piece-source schedule per PPO update. "
+            "Piece-source specification for proportional per-env mixing each update. "
+            "Duplicates act as weights across env slots (cycled by env index). "
             "Accepts space/comma-separated list of: bag7, active_generator, random. "
-            "Examples: --generators bag7 random | "
-            "--generators bag7 bag7 bag7 bag7 active_generator"
+            "Examples: --generators bag7 random (50/50 with even num-envs) | "
+            "--generators bag7 bag7 bag7 bag7 active_generator (~80/20)"
         ),
     )
     parser.add_argument(
@@ -863,10 +864,34 @@ def choose_device(device_name: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def resolve_piece_source_for_update(cfg: PPOConfig, update: int) -> str:
+def build_env_piece_source_assignment(
+    cfg: PPOConfig, env_ids: list[int]
+) -> tuple[list[str], dict[str, int]]:
     schedule = cfg.generator_schedule if cfg.generator_schedule else ("bag7",)
-    index = (max(1, int(update)) - 1) % len(schedule)
-    return schedule[index]
+    normalized_schedule = tuple(str(v).strip().lower() for v in schedule if str(v).strip())
+    if not normalized_schedule:
+        normalized_schedule = ("bag7",)
+    piece_sources: list[str] = []
+    counts: dict[str, int] = {}
+    for i in range(len(env_ids)):
+        source = normalized_schedule[i % len(normalized_schedule)]
+        piece_sources.append(source)
+        counts[source] = counts.get(source, 0) + 1
+    return piece_sources, counts
+
+
+def unique_generator_sources(cfg: PPOConfig) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in cfg.generator_schedule if cfg.generator_schedule else ("bag7",):
+        source = str(raw).strip().lower()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        ordered.append(source)
+    if not ordered:
+        ordered.append("bag7")
+    return ordered
 
 
 def curriculum_schedule_value(
@@ -1651,6 +1676,14 @@ def run_validation_eval(
             term_values: dict[str, list[float]] = {
                 key: [] for key in reward_component_aliases
             }
+            blend_step_term_values: dict[str, list[float]] = {
+                key: [] for key in BLEND_STEP_TERM_KEYS
+            }
+            episode_term_keys = [
+                key
+                for key in reward_component_aliases.keys()
+                if key not in BLEND_STEP_TERM_KEYS
+            ]
             max_steps = max(8, int(cfg.max_pieces_per_episode) * 2)
 
             for episode_round in range(episodes_per_env):
@@ -1678,7 +1711,7 @@ def run_validation_eval(
                 ep_length = np.zeros(env_count, dtype=np.int64)
                 ep_terms = {
                     key: np.zeros(env_count, dtype=np.float64)
-                    for key in reward_component_aliases
+                    for key in episode_term_keys
                 }
                 done_mask = np.zeros(env_count, dtype=np.bool_)
 
@@ -1711,6 +1744,26 @@ def run_validation_eval(
 
                     if isinstance(infos_raw, list):
                         max_info = min(len(infos_raw), env_count)
+                        for blend_key in BLEND_STEP_TERM_KEYS:
+                            alias_keys = reward_component_aliases.get(blend_key)
+                            if not alias_keys:
+                                continue
+                            values: list[float] = []
+                            for env_idx in range(max_info):
+                                if not active_mask[env_idx]:
+                                    continue
+                                info = infos_raw[env_idx]
+                                value = _info_num(
+                                    info,
+                                    alias_keys,
+                                    default=float("nan"),
+                                )
+                                if math.isfinite(value):
+                                    values.append(value)
+                            if values:
+                                blend_step_term_values[blend_key].append(
+                                    float(np.mean(values))
+                                )
                         for env_idx in range(max_info):
                             if not active_mask[env_idx]:
                                 continue
@@ -1721,7 +1774,7 @@ def run_validation_eval(
                                 default=float(rewards_np[env_idx]),
                             )
                             ep_terms["reward_final"][env_idx] += reward_final
-                            for key in reward_component_aliases.keys():
+                            for key in episode_term_keys:
                                 if key == "reward_final":
                                     continue
                                 ep_terms[key][env_idx] += _info_num(
@@ -1754,16 +1807,23 @@ def run_validation_eval(
                 for key, arr in ep_terms.items():
                     term_values[key].extend(arr.tolist())
 
+            terms = {
+                key: _safe_recent_mean(values, window=len(values))
+                for key, values in term_values.items()
+            }
+            for key in BLEND_STEP_TERM_KEYS:
+                terms[key] = _safe_recent_mean(
+                    blend_step_term_values.get(key, []),
+                    window=100,
+                )
+
             return {
                 "enabled": True,
                 "episodes": int(len(returns)),
                 "piece_source_profile": piece_source_profile,
                 "mean_return": _safe_recent_mean(returns, window=len(returns)),
                 "mean_length": _safe_recent_mean(lengths, window=len(lengths)),
-                "terms": {
-                    key: _safe_recent_mean(values, window=len(values))
-                    for key, values in term_values.items()
-                },
+                "terms": terms,
             }
     finally:
         if was_model_training:
@@ -1805,6 +1865,15 @@ def _fmt_float(value: Any, precision: int = 3) -> str:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return f"{float(value):.{precision}f}"
     return "nan"
+
+
+BLEND_STEP_TERM_KEYS: tuple[str, ...] = (
+    "blend_t",
+    "blend_legacy_weight",
+    "blend_target_weight",
+    "blend_transition_step",
+    "blend_transition_total_steps",
+)
 
 
 def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]:
@@ -2159,6 +2228,16 @@ def train(cfg: PPOConfig) -> None:
                 f"Bridge init env count mismatch. expected={cfg.num_envs} got={len(env_ids)}"
             )
 
+        env_piece_sources, env_piece_source_counts = build_env_piece_source_assignment(
+            cfg, env_ids
+        )
+        env.set_piece_sources(env_ids=env_ids, piece_source_profiles=env_piece_sources)
+        validation_sources = unique_generator_sources(cfg)
+        source_mix_label = ",".join(
+            f"{key}:{env_piece_source_counts[key]}"
+            for key in sorted(env_piece_source_counts.keys())
+        )
+
         reset_seeds = [cfg.seed + i * 101 for i in range(cfg.num_envs)]
         reset_result = env.reset_many(env_ids=env_ids, seeds=reset_seeds)
         obs_np = np.asarray(reset_result["obs"], dtype=np.float32)
@@ -2179,7 +2258,6 @@ def train(cfg: PPOConfig) -> None:
             if "action_scores" in reset_result
             else None,
         )
-        current_piece_source = cfg.generator_schedule[0]
         raw_obs_dim = infer_obs_dim(reset_result["obs"])
         action_dim = infer_action_dim(reset_result["action_masks"])
 
@@ -2216,9 +2294,12 @@ def train(cfg: PPOConfig) -> None:
             if cfg.resume_mode == "continue":
                 global_step = loaded_global_step
                 start_update = loaded_update
+                blend_result = env.set_reward_blend_step(global_step)
+                blend_step = int(blend_result.get("transition_step", global_step))
                 print(
                     f"[ppo] resumed checkpoint (continue): {checkpoint_path} "
-                    f"(global_step={global_step}, update={start_update})"
+                    f"(global_step={global_step}, update={start_update}, "
+                    f"blend_transition_step={blend_step})"
                 )
             else:
                 global_step = 0
@@ -2430,7 +2511,9 @@ def train(cfg: PPOConfig) -> None:
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"batch_size={batch_size}, updates={num_updates}, "
-            f"generators_cycle={list(cfg.generator_schedule)}, "
+            f"generators_spec={list(cfg.generator_schedule)}, "
+            f"generators_mix={source_mix_label}, "
+            f"validation_sources={validation_sources}, "
             f"reward_blend_timesteps={cfg.reward_blend_timesteps}, "
             f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
@@ -2462,6 +2545,8 @@ def train(cfg: PPOConfig) -> None:
                 "action_dim": action_dim,
                 "batch_size": batch_size,
                 "num_updates": num_updates,
+                "generator_mix_by_env": env_piece_source_counts,
+                "validation_sources": validation_sources,
             },
         )
 
@@ -2508,12 +2593,20 @@ def train(cfg: PPOConfig) -> None:
             "v2_term_board_score": ("rewardTargetContributionTermBoardScore",),
             "v2_term_board_quality": ("rewardTargetContributionTermBoardQuality",),
         }
+        episode_reward_term_keys = [
+            key
+            for key in reward_component_aliases.keys()
+            if key not in BLEND_STEP_TERM_KEYS
+        ]
         ep_reward_component_sums = {
             key: np.zeros(cfg.num_envs, dtype=np.float64)
-            for key in reward_component_aliases
+            for key in episode_reward_term_keys
         }
         completed_reward_component_sums: dict[str, list[float]] = {
             key: [] for key in reward_component_aliases
+        }
+        step_reward_component_values: dict[str, list[float]] = {
+            key: [] for key in BLEND_STEP_TERM_KEYS
         }
 
         training_start = time.time()
@@ -2573,53 +2666,6 @@ def train(cfg: PPOConfig) -> None:
                     bias_strength=curriculum_bias_now,
                     danger_height=cfg.curriculum_danger_height,
                 )
-
-                desired_piece_source = resolve_piece_source_for_update(cfg, update)
-                if desired_piece_source != current_piece_source:
-                    switch_result = env.set_piece_source(desired_piece_source)
-                    current_piece_source = str(
-                        switch_result.get("piece_source_profile", desired_piece_source)
-                    )
-                    source_reset_seeds = [
-                        cfg.seed + update * 100_003 + i * 101 for i in range(cfg.num_envs)
-                    ]
-                    env_reset_start = time.perf_counter()
-                    source_reset = env.reset_many(env_ids=env_ids, seeds=source_reset_seeds)
-                    profile_env_reset_s += time.perf_counter() - env_reset_start
-                    reset_profile = source_reset.get("profile", {})
-                    profile_env_reset_batch_s += _profile_num(
-                        reset_profile, "batch_total_s"
-                    )
-                    profile_env_reset_core_s += _profile_num(
-                        reset_profile, "reset_env_total_s"
-                    )
-                    profile_env_reset_obs_s += _profile_num(
-                        reset_profile, "reset_obs_s"
-                    )
-                    profile_env_reset_choices_s += _profile_num(
-                        reset_profile, "reset_choices_s"
-                    )
-                    obs_np = np.asarray(source_reset["obs"], dtype=np.float32)
-                    mask_np = ensure_action_masks(
-                        np.asarray(source_reset["action_masks"], dtype=np.float32),
-                        repair_stats=mask_repair_update,
-                    )
-                    action_bias_np = ensure_action_biases(
-                        mask_np,
-                        np.asarray(source_reset.get("action_biases", []), dtype=np.float32)
-                        if "action_biases" in source_reset
-                        else None,
-                    )
-                    action_score_np = ensure_action_scores(
-                        mask_np,
-                        np.asarray(source_reset.get("action_scores", []), dtype=np.float32)
-                        if "action_scores" in source_reset
-                        else None,
-                    )
-                    ep_return.fill(0.0)
-                    ep_length.fill(0)
-                    for component_sum in ep_reward_component_sums.values():
-                        component_sum.fill(0.0)
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -2713,6 +2759,24 @@ def train(cfg: PPOConfig) -> None:
                     ep_length += 1
                     if isinstance(infos_raw, list):
                         max_info = min(len(infos_raw), cfg.num_envs)
+                        for blend_key in BLEND_STEP_TERM_KEYS:
+                            alias_keys = reward_component_aliases.get(blend_key)
+                            if not alias_keys:
+                                continue
+                            values: list[float] = []
+                            for env_idx in range(max_info):
+                                info = infos_raw[env_idx]
+                                value = _info_num(
+                                    info,
+                                    alias_keys,
+                                    default=float("nan"),
+                                )
+                                if math.isfinite(value):
+                                    values.append(value)
+                            if values:
+                                step_reward_component_values[blend_key].append(
+                                    float(np.mean(values))
+                                )
                         for env_idx in range(max_info):
                             info = infos_raw[env_idx]
                             reward_final = _info_num(
@@ -2723,7 +2787,7 @@ def train(cfg: PPOConfig) -> None:
                             ep_reward_component_sums["reward_final"][
                                 env_idx
                             ] += reward_final
-                            for key in reward_component_aliases.keys():
+                            for key in episode_reward_term_keys:
                                 if key == "reward_final":
                                     continue
                                 ep_reward_component_sums[key][env_idx] += _info_num(
@@ -3091,10 +3155,20 @@ def train(cfg: PPOConfig) -> None:
                 approx_kl_mean = (
                     float(np.mean(approx_kl_values)) if approx_kl_values else 0.0
                 )
+                ret100_terms = {
+                    key: _safe_recent_mean(values, window=100)
+                    for key, values in completed_reward_component_sums.items()
+                }
+                for key in BLEND_STEP_TERM_KEYS:
+                    ret100_terms[key] = _safe_recent_mean(
+                        step_reward_component_values.get(key, []),
+                        window=100,
+                    )
                 stats = {
                     "update": update,
                     "global_step": global_step,
-                    "piece_source_profile": current_piece_source,
+                    "piece_source_profile": "mixed",
+                    "piece_source_mix": dict(env_piece_source_counts),
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
@@ -3166,10 +3240,7 @@ def train(cfg: PPOConfig) -> None:
                         if completed_lengths
                         else float("nan")
                     ),
-                    "ret100_terms": {
-                        key: _safe_recent_mean(values, window=100)
-                        for key, values in completed_reward_component_sums.items()
-                    },
+                    "ret100_terms": ret100_terms,
                 }
                 stats["ret100_hierarchy"] = _reward_hierarchy_from_terms(
                     stats.get("ret100_terms")
@@ -3180,26 +3251,32 @@ def train(cfg: PPOConfig) -> None:
                     or update == num_updates
                 )
                 validation: dict[str, Any] | None = None
+                validation_by_source: dict[str, Any] = {}
                 if should_log and cfg.validation_episodes_per_env > 0:
-                    try:
-                        validation = run_validation_eval(
-                            cfg=cfg,
-                            repo_root=repo_root,
-                            server_cmd=server_cmd,
-                            model=model,
-                            obs_adapter=obs_adapter,
-                            device=device,
-                            update=update,
-                            global_step=global_step,
-                            piece_source_profile=current_piece_source,
-                            reward_component_aliases=reward_component_aliases,
-                        )
-                    except Exception as error:
-                        validation = {"enabled": False, "error": str(error)}
-                        print(
-                            "[ppo] "
-                            f"validation failed at update={update}: {error}"
-                        )
+                    for validation_source in validation_sources:
+                        try:
+                            validation_item = run_validation_eval(
+                                cfg=cfg,
+                                repo_root=repo_root,
+                                server_cmd=server_cmd,
+                                model=model,
+                                obs_adapter=obs_adapter,
+                                device=device,
+                                update=update,
+                                global_step=global_step,
+                                piece_source_profile=validation_source,
+                                reward_component_aliases=reward_component_aliases,
+                            )
+                        except Exception as error:
+                            validation_item = {"enabled": False, "error": str(error)}
+                            print(
+                                "[ppo] "
+                                f"validation failed at update={update} "
+                                f"source={validation_source}: {error}"
+                            )
+                        validation_by_source[validation_source] = validation_item
+                    if validation_sources:
+                        validation = validation_by_source.get(validation_sources[0])
                 if isinstance(validation, dict):
                     stats["validation"] = validation
                     if bool(validation.get("enabled", False)):
@@ -3213,6 +3290,8 @@ def train(cfg: PPOConfig) -> None:
                         stats["validation_hierarchy"] = _reward_hierarchy_from_terms(
                             stats.get("validation_terms")
                         )
+                if validation_by_source:
+                    stats["validation_by_source"] = validation_by_source
                 stats["profile_rollout_s"] = profile_rollout_s
                 stats["profile_env_step_s"] = profile_env_step_s
                 stats["profile_env_reset_s"] = profile_env_reset_s
@@ -3309,11 +3388,7 @@ def train(cfg: PPOConfig) -> None:
                     profile_overhead_s = max(0.0, update_seconds - profile_accounted_s)
                     ret_terms = stats["ret100_terms"]
                     val_terms = stats.get("validation_terms") or {}
-                    source_label = (
-                        "ml"
-                        if current_piece_source == "active_generator"
-                        else current_piece_source
-                    )
+                    source_label = source_mix_label
                     adapter_checks_label = (
                         "ok" if stats["adapter_checks_ok"] else "warn"
                     )
@@ -3428,6 +3503,20 @@ def train(cfg: PPOConfig) -> None:
                             f"w2={_fmt_float(val_terms.get('blend_target_weight'))} "
                             f"t={_fmt_float(val_terms.get('blend_t'))} "
                             f"topout={_fmt_float(val_terms.get('top_out_penalty'))}"
+                        ),
+                        (
+                            "  validation_by_source: "
+                            + (
+                                ", ".join(
+                                    (
+                                        f"{source}="
+                                        f"{_fmt_float(((stats.get('validation_by_source') or {}).get(source) or {}).get('mean_return'))}"
+                                    )
+                                    for source in validation_sources
+                                )
+                                if validation_sources
+                                else "none"
+                            )
                         ),
                         (
                             "    val_v1_terms: "
