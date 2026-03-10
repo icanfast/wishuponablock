@@ -1126,6 +1126,125 @@ def apply_warmup_lr_schedule(
     return float(policy_lr), float(value_lr)
 
 
+def summarize_adapter_state(
+    obs_adapter: ObservationAdapter,
+    optimizer: torch.optim.Optimizer,
+    policy_lr: float,
+    obs_adapter_lr_scale: float,
+) -> dict[str, Any]:
+    adapter_params = list(obs_adapter.parameters())
+    adapter_total = int(sum(int(p.numel()) for p in adapter_params))
+    adapter_trainable = int(
+        sum(int(p.numel()) for p in adapter_params if p.requires_grad)
+    )
+    trainable_ids = {id(p) for p in adapter_params if p.requires_grad}
+    optimizer_adapter_params = 0
+    optimizer_groups: set[str] = set()
+    for group in optimizer.param_groups:
+        group_name = str(group.get("group_name", "policy"))
+        for param in group.get("params", []):
+            if id(param) in trainable_ids:
+                optimizer_adapter_params += int(param.numel())
+                optimizer_groups.add(group_name)
+
+    conv_total = 0
+    conv_trainable = 0
+    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+        for conv in obs_adapter.conv_layers:
+            for param in conv.parameters():
+                count = int(param.numel())
+                conv_total += count
+                if param.requires_grad:
+                    conv_trainable += count
+
+    adapter_frozen = adapter_trainable <= 0
+    in_optimizer = optimizer_adapter_params > 0
+    effective_lr = (
+        float(policy_lr) * float(obs_adapter_lr_scale)
+        if (adapter_trainable > 0 and in_optimizer)
+        else 0.0
+    )
+    if adapter_total <= 0:
+        status = "absent"
+    elif adapter_frozen:
+        status = "frozen"
+    elif optimizer_adapter_params == adapter_trainable:
+        status = "trainable"
+    elif in_optimizer:
+        status = "trainable_partial_optimizer"
+    else:
+        status = "trainable_not_in_optimizer"
+
+    conv_status = "n/a"
+    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+        if conv_total <= 0:
+            conv_status = "none"
+        elif conv_trainable <= 0:
+            conv_status = "frozen"
+        elif conv_trainable >= conv_total:
+            conv_status = "trainable"
+        else:
+            conv_status = "partial"
+
+    checks: list[str] = []
+    if adapter_trainable > 0 and optimizer_adapter_params <= 0:
+        checks.append("adapter_trainable_but_missing_from_optimizer")
+    if adapter_trainable > 0 and optimizer_adapter_params != adapter_trainable:
+        checks.append(
+            f"optimizer_adapter_param_count_mismatch(trainable={adapter_trainable},optimizer={optimizer_adapter_params})"
+        )
+    if adapter_frozen and optimizer_adapter_params > 0:
+        checks.append("adapter_frozen_but_present_in_optimizer")
+    if conv_status == "partial":
+        checks.append("adapter_conv_partially_frozen")
+    return {
+        "status": status,
+        "adapter_total": adapter_total,
+        "adapter_trainable": adapter_trainable,
+        "adapter_in_optimizer": in_optimizer,
+        "optimizer_adapter_params": optimizer_adapter_params,
+        "optimizer_groups": sorted(optimizer_groups),
+        "obs_adapter_lr_scale": float(obs_adapter_lr_scale),
+        "policy_lr": float(policy_lr),
+        "effective_lr": float(effective_lr),
+        "conv_total": conv_total,
+        "conv_trainable": conv_trainable,
+        "has_conv": isinstance(obs_adapter, WubHeadFromRawObservationAdapter),
+        "conv_status": conv_status,
+        "checks_ok": len(checks) == 0,
+        "checks": checks,
+    }
+
+
+def format_adapter_state_log(summary: dict[str, Any]) -> str:
+    groups = summary.get("optimizer_groups") or []
+    if isinstance(groups, list) and groups:
+        groups_str = ",".join(str(v) for v in groups)
+    else:
+        groups_str = "-"
+    checks_ok = bool(summary.get("checks_ok", False))
+    checks = summary.get("checks") or []
+    if checks_ok:
+        checks_str = "ok"
+    elif isinstance(checks, list) and checks:
+        checks_str = ";".join(str(v) for v in checks)
+    else:
+        checks_str = "unknown"
+    return (
+        "adapter("
+        f"status={summary.get('status')},"
+        f"conv={summary.get('conv_status')},"
+        f"trainable={summary.get('adapter_trainable')}/{summary.get('adapter_total')},"
+        f"in_opt={'y' if summary.get('adapter_in_optimizer') else 'n'},"
+        f"opt_params={summary.get('optimizer_adapter_params')},"
+        f"groups={groups_str},"
+        f"lr_scale={float(summary.get('obs_adapter_lr_scale', 0.0)):.3f},"
+        f"eff_lr={float(summary.get('effective_lr', 0.0)):.6g},"
+        f"checks={checks_str}"
+        ")"
+    )
+
+
 def export_bot_policy_artifact(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
@@ -2282,6 +2401,20 @@ def train(cfg: PPOConfig) -> None:
                 f"minibatch_size ({cfg.minibatch_size}) exceeds batch_size ({batch_size})."
             )
         num_updates = max(1, cfg.total_timesteps // batch_size)
+        first_update_index = start_update + 1
+        first_update_warmup_active = (
+            cfg.warmup_updates > 0 and first_update_index <= cfg.warmup_updates
+        )
+        first_update_policy_lr = cfg.learning_rate * (
+            cfg.warmup_policy_lr_scale if first_update_warmup_active else 1.0
+        )
+        startup_adapter_state = summarize_adapter_state(
+            obs_adapter=obs_adapter,
+            optimizer=optimizer,
+            policy_lr=first_update_policy_lr,
+            obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
+        )
+        print("[ppo] " + format_adapter_state_log(startup_adapter_state))
 
         print(
             "[ppo] starting training "
@@ -2393,6 +2526,12 @@ def train(cfg: PPOConfig) -> None:
                     warmup_active=warmup_active,
                     warmup_policy_lr_scale=cfg.warmup_policy_lr_scale,
                     warmup_value_lr_scale=cfg.warmup_value_lr_scale,
+                )
+                adapter_state_now = summarize_adapter_state(
+                    obs_adapter=obs_adapter,
+                    optimizer=optimizer,
+                    policy_lr=policy_lr_now,
+                    obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
                 )
                 update_start_wall = time.time()
                 update_start_perf = time.perf_counter()
@@ -2965,6 +3104,33 @@ def train(cfg: PPOConfig) -> None:
                     "value_clip_coef_used": cfg.value_clip_coef,
                     "policy_lr_used": policy_lr_now,
                     "value_lr_used": value_lr_now,
+                    "adapter_status": adapter_state_now.get("status"),
+                    "adapter_conv_status": adapter_state_now.get("conv_status"),
+                    "adapter_trainable_params": int(
+                        adapter_state_now.get("adapter_trainable", 0)
+                    ),
+                    "adapter_total_params": int(
+                        adapter_state_now.get("adapter_total", 0)
+                    ),
+                    "adapter_in_optimizer": bool(
+                        adapter_state_now.get("adapter_in_optimizer", False)
+                    ),
+                    "adapter_optimizer_params": int(
+                        adapter_state_now.get("optimizer_adapter_params", 0)
+                    ),
+                    "adapter_optimizer_groups": list(
+                        adapter_state_now.get("optimizer_groups", [])
+                    ),
+                    "adapter_lr_scale_used": float(
+                        adapter_state_now.get("obs_adapter_lr_scale", 0.0)
+                    ),
+                    "adapter_effective_lr_used": float(
+                        adapter_state_now.get("effective_lr", 0.0)
+                    ),
+                    "adapter_checks_ok": bool(
+                        adapter_state_now.get("checks_ok", False)
+                    ),
+                    "adapter_checks": list(adapter_state_now.get("checks", [])),
                     "distill_coef_used": distill_coef_now,
                     "distill_teacher_tau_used": cfg.distill_teacher_tau,
                     "curriculum_topk_used": curriculum_topk_now,
@@ -3153,6 +3319,11 @@ def train(cfg: PPOConfig) -> None:
                         f"vclip={cfg.value_clip_coef:.4f} "
                         f"p_lr={policy_lr_now:.6g} "
                         f"v_lr={value_lr_now:.6g} "
+                        f"adapter(status={stats['adapter_status']},"
+                        f"conv={stats['adapter_conv_status']},"
+                        f"lr_scale={stats['adapter_lr_scale_used']:.3f},"
+                        f"eff_lr={stats['adapter_effective_lr_used']:.6g},"
+                        f"checks={'ok' if stats['adapter_checks_ok'] else 'warn'}) "
                         f"target_kl={target_kl_now:.5f} "
                         f"topk={curriculum_topk_now} "
                         f"bias={curriculum_bias_now:.3f} "
@@ -3252,6 +3423,11 @@ def train(cfg: PPOConfig) -> None:
                         f"mask_fix_rows={mask_repair_update['rows']} "
                         f"mask_fix_rows_total={mask_repair_total['rows']}"
                     )
+                    if not stats["adapter_checks_ok"]:
+                        print(
+                            "[ppo] adapter integrity warning "
+                            + format_adapter_state_log(adapter_state_now)
+                        )
 
                 if update % cfg.save_every_updates == 0 or update == num_updates:
                     io_start = time.perf_counter()
