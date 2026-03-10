@@ -1903,7 +1903,11 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
         "overall": {
             "final": data.get("reward_final"),
             "base": data.get("reward_base"),
-            "top_out_penalty": data.get("top_out_penalty"),
+            "top_out_term": (
+                data.get("top_out_term")
+                if data.get("top_out_term") is not None
+                else data.get("top_out_penalty")
+            ),
         },
         "blend": {
             "t": data.get("blend_t"),
@@ -1924,6 +1928,7 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "bumpiness": data.get("v1_term_bumpiness"),
                 "board_score": data.get("v1_term_board_score"),
                 "board_quality": data.get("v1_term_board_quality"),
+                "top_out": data.get("v1_term_top_out"),
             },
         },
         "v2": {
@@ -1938,6 +1943,7 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "bumpiness": data.get("v2_term_bumpiness"),
                 "board_score": data.get("v2_term_board_score"),
                 "board_quality": data.get("v2_term_board_quality"),
+                "top_out": data.get("v2_term_top_out"),
             },
         },
         "blended_terms": {
@@ -1949,6 +1955,7 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "bumpiness": data.get("term_bumpiness"),
             "board_score": data.get("term_board_score"),
             "board_quality": data.get("term_board_quality"),
+            "top_out": data.get("term_top_out"),
         },
     }
 
@@ -2586,7 +2593,7 @@ def train(cfg: PPOConfig) -> None:
         reward_component_aliases: dict[str, tuple[str, ...]] = {
             "reward_final": ("rewardFinal",),
             "reward_base": ("rewardBase",),
-            "top_out_penalty": ("topOutPenalty",),
+            "top_out_term": ("topOutTerm", "topOutPenalty"),
             "blend_t": ("rewardBlendT",),
             "blend_legacy_weight": ("rewardBlendLegacyWeight",),
             "blend_target_weight": ("rewardBlendTargetWeight",),
@@ -2604,6 +2611,7 @@ def train(cfg: PPOConfig) -> None:
             "term_bumpiness": ("rewardTermBumpiness",),
             "term_board_score": ("rewardTermBoardScore",),
             "term_board_quality": ("rewardTermBoardQuality",),
+            "term_top_out": ("rewardTermTopOut",),
             "v1_term_lines": ("rewardLegacyContributionTermLines",),
             "v1_term_score": ("rewardLegacyContributionTermScore",),
             "v1_term_time": ("rewardLegacyContributionTermTime",),
@@ -2612,6 +2620,7 @@ def train(cfg: PPOConfig) -> None:
             "v1_term_bumpiness": ("rewardLegacyContributionTermBumpiness",),
             "v1_term_board_score": ("rewardLegacyContributionTermBoardScore",),
             "v1_term_board_quality": ("rewardLegacyContributionTermBoardQuality",),
+            "v1_term_top_out": ("rewardLegacyContributionTermTopOut",),
             "v2_term_lines": ("rewardTargetContributionTermLines",),
             "v2_term_score": ("rewardTargetContributionTermScore",),
             "v2_term_time": ("rewardTargetContributionTermTime",),
@@ -2620,6 +2629,7 @@ def train(cfg: PPOConfig) -> None:
             "v2_term_bumpiness": ("rewardTargetContributionTermBumpiness",),
             "v2_term_board_score": ("rewardTargetContributionTermBoardScore",),
             "v2_term_board_quality": ("rewardTargetContributionTermBoardQuality",),
+            "v2_term_top_out": ("rewardTargetContributionTermTopOut",),
         }
         episode_reward_term_keys = [
             key
@@ -2644,6 +2654,7 @@ def train(cfg: PPOConfig) -> None:
         best_state_dict: dict[str, torch.Tensor] | None = None
         best_adapter_state_dict: dict[str, torch.Tensor] | None = None
         did_interrupt = False
+        last_log_wall: float | None = None
         try:
             for update in range(start_update + 1, num_updates + 1):
                 warmup_active = cfg.warmup_updates > 0 and update <= cfg.warmup_updates
@@ -2668,6 +2679,9 @@ def train(cfg: PPOConfig) -> None:
                 )
                 update_start_wall = time.time()
                 update_start_perf = time.perf_counter()
+                validation_wall_s = 0.0
+                save_wall_s = 0.0
+                log_emit_wall_s = 0.0
                 profile_policy_forward_s = 0.0
                 profile_env_step_s = 0.0
                 profile_env_reset_s = 0.0
@@ -3183,7 +3197,7 @@ def train(cfg: PPOConfig) -> None:
                     else 1.0 - float(np.var(y_true - y_pred) / var_y)
                 )
 
-                update_seconds = max(1e-6, time.time() - update_start_wall)
+                update_core_seconds = max(1e-6, time.time() - update_start_wall)
                 total_seconds = max(1e-6, time.time() - training_start)
                 sps = int(global_step / total_seconds)
 
@@ -3267,7 +3281,8 @@ def train(cfg: PPOConfig) -> None:
                     "teacher_prob_sum": teacher_prob_sum_value,
                     "teacher_valid_actions": teacher_valid_actions_value,
                     "sps": sps,
-                    "update_seconds": update_seconds,
+                    "update_seconds": update_core_seconds,
+                    "update_core_seconds": update_core_seconds,
                     "mean_episode_return_recent": (
                         float(np.mean(completed_returns[-100:]))
                         if completed_returns
@@ -3291,6 +3306,7 @@ def train(cfg: PPOConfig) -> None:
                 validation: dict[str, Any] | None = None
                 validation_by_source: dict[str, Any] = {}
                 if should_log and cfg.validation_episodes_per_env > 0:
+                    validation_wall_start = time.time()
                     for validation_source in validation_sources:
                         try:
                             validation_item = run_validation_eval(
@@ -3315,6 +3331,7 @@ def train(cfg: PPOConfig) -> None:
                         validation_by_source[validation_source] = validation_item
                     if validation_sources:
                         validation = validation_by_source.get(validation_sources[0])
+                    validation_wall_s += max(0.0, time.time() - validation_wall_start)
                 if isinstance(validation, dict):
                     stats["validation"] = validation
                     if bool(validation.get("enabled", False)):
@@ -3423,7 +3440,9 @@ def train(cfg: PPOConfig) -> None:
                         + profile_opt_s
                         + profile_io_s
                     )
-                    profile_overhead_s = max(0.0, update_seconds - profile_accounted_s)
+                    profile_overhead_s = max(
+                        0.0, update_core_seconds - profile_accounted_s
+                    )
                     ret_terms = stats["ret100_terms"]
                     val_terms = stats.get("validation_terms") or {}
                     source_label = source_mix_label
@@ -3493,7 +3512,7 @@ def train(cfg: PPOConfig) -> None:
                             f"w1={_fmt_float(ret_terms.get('blend_legacy_weight'))} "
                             f"w2={_fmt_float(ret_terms.get('blend_target_weight'))} "
                             f"t={_fmt_float(ret_terms.get('blend_t'))} "
-                            f"topout={_fmt_float(ret_terms.get('top_out_penalty'))}"
+                            f"topout={_fmt_float(ret_terms.get('top_out_term'))}"
                         ),
                         (
                             "    v1_terms: "
@@ -3504,7 +3523,8 @@ def train(cfg: PPOConfig) -> None:
                             f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
                             f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))}"
+                            f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
+                            f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
                         ),
                         (
                             "    v2_terms: "
@@ -3515,7 +3535,8 @@ def train(cfg: PPOConfig) -> None:
                             f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
                             f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))}"
+                            f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))} "
+                            f"topout={_fmt_float(ret_terms.get('v2_term_top_out'))}"
                         ),
                         (
                             "    blend_terms: "
@@ -3526,7 +3547,8 @@ def train(cfg: PPOConfig) -> None:
                             f"holes={_fmt_float(ret_terms.get('term_holes'))} "
                             f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('term_board_quality'))}"
+                            f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
+                            f"topout={_fmt_float(ret_terms.get('term_top_out'))}"
                         ),
                         (
                             "  validation: "
@@ -3540,7 +3562,7 @@ def train(cfg: PPOConfig) -> None:
                             f"w1={_fmt_float(val_terms.get('blend_legacy_weight'))} "
                             f"w2={_fmt_float(val_terms.get('blend_target_weight'))} "
                             f"t={_fmt_float(val_terms.get('blend_t'))} "
-                            f"topout={_fmt_float(val_terms.get('top_out_penalty'))}"
+                            f"topout={_fmt_float(val_terms.get('top_out_term'))}"
                         ),
                         (
                             "  validation_by_source: "
@@ -3565,7 +3587,8 @@ def train(cfg: PPOConfig) -> None:
                             f"holes={_fmt_float(val_terms.get('v1_term_holes'))} "
                             f"bump={_fmt_float(val_terms.get('v1_term_bumpiness'))} "
                             f"board={_fmt_float(val_terms.get('v1_term_board_score'))} "
-                            f"q={_fmt_float(val_terms.get('v1_term_board_quality'))}"
+                            f"q={_fmt_float(val_terms.get('v1_term_board_quality'))} "
+                            f"topout={_fmt_float(val_terms.get('v1_term_top_out'))}"
                         ),
                         (
                             "    val_v2_terms: "
@@ -3576,11 +3599,12 @@ def train(cfg: PPOConfig) -> None:
                             f"holes={_fmt_float(val_terms.get('v2_term_holes'))} "
                             f"bump={_fmt_float(val_terms.get('v2_term_bumpiness'))} "
                             f"board={_fmt_float(val_terms.get('v2_term_board_score'))} "
-                            f"q={_fmt_float(val_terms.get('v2_term_board_quality'))}"
+                            f"q={_fmt_float(val_terms.get('v2_term_board_quality'))} "
+                            f"topout={_fmt_float(val_terms.get('v2_term_top_out'))}"
                         ),
                         (
                             "  timing: "
-                            f"t_upd={update_seconds:.2f}s "
+                            f"t_upd_core={update_core_seconds:.2f}s "
                             f"t_roll={profile_rollout_s:.2f}s "
                             f"t_env={profile_env_total_s:.2f}s "
                             f"t_env_batch={profile_env_batch_s:.2f}s "
@@ -3602,14 +3626,17 @@ def train(cfg: PPOConfig) -> None:
                             f"rows_total={mask_repair_total['rows']}"
                         ),
                     ]
+                    log_emit_start = time.time()
                     print("\n".join(log_lines))
                     if not stats["adapter_checks_ok"]:
                         print(
                             "[ppo] adapter integrity warning "
                             + format_adapter_state_log(adapter_state_now)
                         )
+                    log_emit_wall_s += max(0.0, time.time() - log_emit_start)
 
                 if update % cfg.save_every_updates == 0 or update == num_updates:
+                    save_wall_start = time.time()
                     io_start = time.perf_counter()
                     ckpt_path = checkpoints_dir / f"ppo_update_{update:06d}.pt"
                     save_checkpoint(
@@ -3660,6 +3687,37 @@ def train(cfg: PPOConfig) -> None:
                             f"no completed trajectory available at update={update}."
                         )
                     profile_io_s += time.perf_counter() - io_start
+                    save_wall_s += max(0.0, time.time() - save_wall_start)
+
+                update_total_seconds = max(1e-6, time.time() - update_start_wall)
+                update_outside_core_seconds = max(
+                    0.0, update_total_seconds - update_core_seconds
+                )
+                stats["update_seconds"] = update_total_seconds
+                stats["update_validation_seconds"] = validation_wall_s
+                stats["update_save_seconds"] = save_wall_s
+                stats["update_log_emit_seconds"] = log_emit_wall_s
+                stats["update_outside_core_seconds"] = update_outside_core_seconds
+
+                if should_log:
+                    now_wall = time.time()
+                    log_gap_seconds = (
+                        max(0.0, now_wall - last_log_wall)
+                        if last_log_wall is not None
+                        else float("nan")
+                    )
+                    last_log_wall = now_wall
+                    print(
+                        "[ppo] timing_ext "
+                        f"update={update}/{num_updates} "
+                        f"t_core={update_core_seconds:.2f}s "
+                        f"t_val={validation_wall_s:.2f}s "
+                        f"t_save={save_wall_s:.2f}s "
+                        f"t_log={log_emit_wall_s:.2f}s "
+                        f"t_outside={update_outside_core_seconds:.2f}s "
+                        f"t_total={update_total_seconds:.2f}s "
+                        f"t_since_last_log={_fmt_float(log_gap_seconds)}s"
+                    )
 
         except KeyboardInterrupt:
             did_interrupt = True

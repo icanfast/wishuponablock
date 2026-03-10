@@ -281,6 +281,7 @@ type PieceRewardBreakdown = {
   bumpinessDeltaTerm: number;
   boardScoreTerm: number;
   boardQualityDeltaTerm: number;
+  topOutTerm: number;
 };
 
 type PieceRewardInputs = {
@@ -293,6 +294,7 @@ type PieceRewardInputs = {
   bumpinessDelta: number;
   boardScoreDelta: number;
   boardQualityDelta: number;
+  topOut: boolean;
 };
 
 type PieceRewardResult = {
@@ -371,6 +373,7 @@ const blendPieceReward = (options: {
         legacy.breakdown.boardQualityDeltaTerm,
         target.breakdown.boardQualityDeltaTerm,
       ),
+      topOutTerm: mix(legacy.breakdown.topOutTerm, target.breakdown.topOutTerm),
     },
   };
 };
@@ -388,6 +391,7 @@ const computePieceRewardV1 = (
     bumpinessDelta,
     boardScoreDelta,
     boardQualityDelta,
+    topOut,
   } = options;
   let linesTerm = 0;
   let scoreTerm = 0;
@@ -398,6 +402,7 @@ const computePieceRewardV1 = (
   const bumpinessDeltaTerm = -bumpinessDelta * BUMPINESS_DELTA_REWARD_WEIGHT;
   const boardQualityDeltaTerm =
     boardQualityDelta * BOARD_QUALITY_DELTA_REWARD_WEIGHT;
+  const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
   if (modeId === 'sprint') {
     linesTerm = linesDelta * 1.2;
     scoreTerm = scoreDelta * 0.001;
@@ -424,7 +429,8 @@ const computePieceRewardV1 = (
     boardQualityDeltaTerm +
     heightDeltaTerm +
     holeDeltaTerm +
-    bumpinessDeltaTerm;
+    bumpinessDeltaTerm +
+    topOutTerm;
   return {
     reward,
     breakdown: {
@@ -436,6 +442,7 @@ const computePieceRewardV1 = (
       bumpinessDeltaTerm,
       boardScoreTerm,
       boardQualityDeltaTerm,
+      topOutTerm,
     },
   };
 };
@@ -514,6 +521,7 @@ const computePieceRewardV2 = (
     boardQualityDelta,
     holesDelta,
     placementComplexityPenalty,
+    topOut,
   } = options;
   const linesTerm = linesDelta * REWARD_V2_LINE_WEIGHT;
   const boardQualityDeltaTerm =
@@ -523,7 +531,9 @@ const computePieceRewardV2 = (
     holesDelta >= 0
       ? -holesDelta * REWARD_V2_HOLE_CREATE_WEIGHT
       : -holesDelta * REWARD_V2_HOLE_REMOVE_WEIGHT;
-  const reward = linesTerm + boardQualityDeltaTerm + timeTerm + holeDeltaTerm;
+  const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
+  const reward =
+    linesTerm + boardQualityDeltaTerm + timeTerm + holeDeltaTerm + topOutTerm;
   return {
     reward,
     breakdown: {
@@ -535,6 +545,7 @@ const computePieceRewardV2 = (
       bumpinessDeltaTerm: 0,
       boardScoreTerm: 0,
       boardQualityDeltaTerm,
+      topOutTerm,
     },
   };
 };
@@ -1178,6 +1189,7 @@ class BotEnv {
       bumpinessDelta,
       boardScoreDelta: before.boardScore - after.boardScore,
       boardQualityDelta,
+      topOut: this.game.state.gameOver,
     });
     const rewardTarget = computePieceRewardV2({
       modeId: this.modeId,
@@ -1189,6 +1201,7 @@ class BotEnv {
       bumpinessDelta,
       boardScoreDelta: before.boardScore - after.boardScore,
       boardQualityDelta,
+      topOut: this.game.state.gameOver,
       placementComplexityPenalty:
         computePlacementComplexityPenalty(selectedPlacement),
     });
@@ -1215,6 +1228,7 @@ class BotEnv {
       boardQualityDeltaTerm:
         rewardLegacy.breakdown.boardQualityDeltaTerm *
         blendWeights.legacyWeight,
+      topOutTerm: rewardLegacy.breakdown.topOutTerm * blendWeights.legacyWeight,
     };
     const rewardTargetContributionBreakdown = {
       linesTerm: rewardTarget.breakdown.linesTerm * blendWeights.targetWeight,
@@ -1230,10 +1244,10 @@ class BotEnv {
       boardQualityDeltaTerm:
         rewardTarget.breakdown.boardQualityDeltaTerm *
         blendWeights.targetWeight,
+      topOutTerm: rewardTarget.breakdown.topOutTerm * blendWeights.targetWeight,
     };
     const reward = rewardResult.reward;
-    const topOutPenalty = this.game.state.gameOver ? TOP_OUT_PENALTY : 0;
-    const finalReward = reward - topOutPenalty;
+    const finalReward = reward;
     const rewardElapsedS = (performance.now() - rewardStart) / 1000;
 
     if (this.lockCount > beforeLockCount) {
@@ -1302,6 +1316,7 @@ class BotEnv {
         rewardBlendTransitionTotalSteps: blendWeights.transitionTotalSteps,
         rewardBase: reward,
         rewardFinal: finalReward,
+        topOutTerm: rewardResult.breakdown.topOutTerm,
         rewardLegacyTermLines: rewardLegacy.breakdown.linesTerm,
         rewardLegacyTermScore: rewardLegacy.breakdown.scoreTerm,
         rewardLegacyTermTime: rewardLegacy.breakdown.timeTerm,
@@ -1311,6 +1326,7 @@ class BotEnv {
         rewardLegacyTermBoardScore: rewardLegacy.breakdown.boardScoreTerm,
         rewardLegacyTermBoardQuality:
           rewardLegacy.breakdown.boardQualityDeltaTerm,
+        rewardLegacyTermTopOut: rewardLegacy.breakdown.topOutTerm,
         rewardTargetTermLines: rewardTarget.breakdown.linesTerm,
         rewardTargetTermScore: rewardTarget.breakdown.scoreTerm,
         rewardTargetTermTime: rewardTarget.breakdown.timeTerm,
@@ -1320,6 +1336,7 @@ class BotEnv {
         rewardTargetTermBoardScore: rewardTarget.breakdown.boardScoreTerm,
         rewardTargetTermBoardQuality:
           rewardTarget.breakdown.boardQualityDeltaTerm,
+        rewardTargetTermTopOut: rewardTarget.breakdown.topOutTerm,
         rewardLegacyContributionTermLines:
           rewardLegacyContributionBreakdown.linesTerm,
         rewardLegacyContributionTermScore:
@@ -1336,6 +1353,8 @@ class BotEnv {
           rewardLegacyContributionBreakdown.boardScoreTerm,
         rewardLegacyContributionTermBoardQuality:
           rewardLegacyContributionBreakdown.boardQualityDeltaTerm,
+        rewardLegacyContributionTermTopOut:
+          rewardLegacyContributionBreakdown.topOutTerm,
         rewardTargetContributionTermLines:
           rewardTargetContributionBreakdown.linesTerm,
         rewardTargetContributionTermScore:
@@ -1352,6 +1371,8 @@ class BotEnv {
           rewardTargetContributionBreakdown.boardScoreTerm,
         rewardTargetContributionTermBoardQuality:
           rewardTargetContributionBreakdown.boardQualityDeltaTerm,
+        rewardTargetContributionTermTopOut:
+          rewardTargetContributionBreakdown.topOutTerm,
         rewardTermLines: rewardResult.breakdown.linesTerm,
         rewardTermScore: rewardResult.breakdown.scoreTerm,
         rewardTermTime: rewardResult.breakdown.timeTerm,
@@ -1360,7 +1381,7 @@ class BotEnv {
         rewardTermBumpiness: rewardResult.breakdown.bumpinessDeltaTerm,
         rewardTermBoardScore: rewardResult.breakdown.boardScoreTerm,
         rewardTermBoardQuality: rewardResult.breakdown.boardQualityDeltaTerm,
-        topOutPenalty,
+        rewardTermTopOut: rewardResult.breakdown.topOutTerm,
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
       },
