@@ -72,7 +72,9 @@ class PPOConfig:
     distill_coef_end: float
     distill_coef_ramp_updates: int
     distill_teacher_tau: float
+    distill_teacher_top_m: int
     validation_episodes_per_env: int
+    validate_every_updates: int
     device: str
     save_every_updates: int
     log_every_updates: int
@@ -666,13 +668,31 @@ def parse_args() -> PPOConfig:
         "--distill-teacher-tau",
         type=float,
         default=0.35,
-        help="Teacher temperature for distillation softmax(score / tau). Lower is sharper.",
+        help="Teacher temperature for distillation softmax(teacher_logits / tau).",
+    )
+    parser.add_argument(
+        "--distill-teacher-top-m",
+        type=int,
+        default=0,
+        help=(
+            "Optional sparse teacher support size over legal actions. "
+            "0 disables top-M sparsification."
+        ),
     )
     parser.add_argument(
         "--validation-episodes-per-env",
         type=int,
         default=2,
-        help="Validation episodes per env on each logged update (0 disables validation).",
+        help="Validation episodes per env per validation run (0 disables validation).",
+    )
+    parser.add_argument(
+        "--validate-every-updates",
+        type=int,
+        default=10,
+        help=(
+            "Run validation once every N updates (independent of --log-every-updates). "
+            "Use 1 to validate every update."
+        ),
     )
 
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -834,7 +854,9 @@ def parse_args() -> PPOConfig:
         distill_coef_end=max(0.0, float(args.distill_coef_end)),
         distill_coef_ramp_updates=max(0, int(args.distill_coef_ramp_updates)),
         distill_teacher_tau=max(1e-4, float(args.distill_teacher_tau)),
+        distill_teacher_top_m=max(0, int(args.distill_teacher_top_m)),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
+        validate_every_updates=max(1, int(args.validate_every_updates)),
         device=args.device,
         save_every_updates=max(1, int(args.save_every_updates)),
         log_every_updates=max(1, int(args.log_every_updates)),
@@ -1014,26 +1036,55 @@ def ensure_action_scores(
 
 def build_teacher_probs(
     action_mask: torch.Tensor,
+    student_logits: torch.Tensor,
     action_scores: torch.Tensor,
     tau: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    bias_alpha: float,
+    top_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Distill toward the policy that would result from adding a heuristic prior
+    # to the current actor logits, with actor logits detached for a fixed target.
     valid = action_mask > 0
-    valid_f = valid.to(dtype=action_mask.dtype)
+    valid_f = valid.to(dtype=student_logits.dtype)
     valid_count = torch.sum(valid_f, dim=-1, keepdim=True)
     safe_valid_count = torch.clamp(valid_count, min=1.0)
     masked_scores = torch.where(valid, action_scores, torch.zeros_like(action_scores))
     row_mean = torch.sum(masked_scores, dim=-1, keepdim=True) / safe_valid_count
-    row_var = torch.sum(
-        ((masked_scores - row_mean) * valid_f) ** 2,
-        dim=-1,
-        keepdim=True,
-    ) / safe_valid_count
-    row_is_uniform = (row_var <= 1e-12).to(dtype=action_mask.dtype)
+    centered_scores = (masked_scores - row_mean) * valid_f
+    row_var = torch.sum(centered_scores**2, dim=-1, keepdim=True) / safe_valid_count
+    row_has_signal = row_var > 1e-12
+    row_prior_inactive = (~row_has_signal).to(dtype=student_logits.dtype)
     safe_tau = max(1e-4, float(tau))
-    large_neg = torch.full_like(action_scores, -1e9)
-    teacher_logits = torch.where(valid, action_scores / safe_tau, large_neg)
+    large_neg = torch.full_like(student_logits, -1e9)
+    teacher_logits = torch.where(valid, student_logits.detach(), large_neg)
+    # Use current curriculum bias magnitude as distillation prior strength so the
+    # teacher reflects the same steering used during rollout action selection.
+    prior_alpha = float(max(0.0, min(1.0, bias_alpha)))
+    if prior_alpha <= 0.0:
+        row_prior_inactive = torch.ones_like(row_prior_inactive)
+    if prior_alpha > 0.0:
+        teacher_logits = torch.where(
+            valid, teacher_logits + prior_alpha * centered_scores, large_neg
+        )
+
+    row_topm_applied = torch.zeros_like(row_prior_inactive)
+    if top_m and top_m > 0:
+        action_dim = int(action_mask.shape[-1])
+        keep_k = max(1, min(int(top_m), action_dim))
+        if keep_k < action_dim:
+            heuristic_for_topk = torch.where(valid, centered_scores, large_neg)
+            topk_idx = torch.topk(heuristic_for_topk, k=keep_k, dim=-1).indices
+            keep_mask = torch.zeros_like(valid, dtype=torch.bool)
+            keep_mask.scatter_(1, topk_idx, True)
+            keep_mask = keep_mask & valid
+            teacher_logits = torch.where(keep_mask, teacher_logits, large_neg)
+            row_topm_applied = (valid_count > float(keep_k)).to(
+                dtype=student_logits.dtype
+            )
+
+    teacher_logits = teacher_logits / safe_tau
     teacher_probs = torch.softmax(teacher_logits, dim=-1)
-    return teacher_probs, row_is_uniform
+    return teacher_probs, row_prior_inactive, row_topm_applied
 
 
 def masked_categorical(
@@ -2548,6 +2599,7 @@ def train(cfg: PPOConfig) -> None:
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
             f"validation_sources={validation_sources}, "
+            f"validate_every_updates={cfg.validate_every_updates}, "
             f"reward_blend={cfg.reward_blend_span}({cfg.reward_blend_unit},env_total={reward_blend_total_for_env(cfg)}), "
             f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
@@ -2561,6 +2613,7 @@ def train(cfg: PPOConfig) -> None:
             f"distill_coef={cfg.distill_coef_start:.4f}->{cfg.distill_coef_end:.4f}/"
             f"{cfg.distill_coef_ramp_updates}, "
             f"distill_teacher_tau={cfg.distill_teacher_tau:.4f}, "
+            f"distill_teacher_top_m={cfg.distill_teacher_top_m}, "
             f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -2980,12 +3033,14 @@ def train(cfg: PPOConfig) -> None:
                 teacher_max_prob_value = 0.0
                 teacher_uniform_row_frac_value = 0.0
                 teacher_bias_row_frac_value = 0.0
+                teacher_topm_row_frac_value = 0.0
                 teacher_prob_sum_value = 0.0
                 teacher_valid_actions_value = 0.0
                 teacher_entropy_sum = 0.0
                 teacher_max_prob_sum = 0.0
                 teacher_uniform_row_frac_sum = 0.0
                 teacher_bias_row_frac_sum = 0.0
+                teacher_topm_row_frac_sum = 0.0
                 teacher_prob_sum_sum = 0.0
                 teacher_valid_actions_sum = 0.0
                 updates_done = 0
@@ -3058,8 +3113,8 @@ def train(cfg: PPOConfig) -> None:
                                 0.5 * ((value_pred - b_returns[mb_inds]) ** 2).mean()
                             )
 
-                        # Distillation: teacher from heuristic action_bias, student from
-                        # raw masked policy logits (no heuristic prior injection).
+                        # Distillation: teacher from stop-grad steered policy
+                        # (student logits + heuristic prior in logit space).
                         student_valid = mb_mask > 0
                         student_large_neg = torch.full_like(logits, -1e9)
                         student_logits = torch.where(
@@ -3068,10 +3123,15 @@ def train(cfg: PPOConfig) -> None:
                         student_log_probs = torch.log_softmax(
                             student_logits, dim=-1
                         )
-                        teacher_probs, teacher_uniform_rows = build_teacher_probs(
-                            mb_mask,
-                            mb_action_scores,
-                            cfg.distill_teacher_tau,
+                        teacher_probs, teacher_prior_inactive_rows, teacher_topm_rows = (
+                            build_teacher_probs(
+                                mb_mask,
+                                student_logits,
+                                mb_action_scores,
+                                cfg.distill_teacher_tau,
+                                curriculum_bias_now,
+                                cfg.distill_teacher_top_m,
+                            )
                         )
                         distill_loss = -torch.sum(
                             teacher_probs * student_log_probs, dim=-1
@@ -3120,9 +3180,12 @@ def train(cfg: PPOConfig) -> None:
                         total_loss_sum += total_loss_value
                         valid_f = (mb_mask > 0).to(dtype=teacher_probs.dtype)
                         teacher_uniform_row_frac_value = float(
-                            teacher_uniform_rows.mean().detach().cpu().item()
+                            teacher_prior_inactive_rows.mean().detach().cpu().item()
                         )
                         teacher_bias_row_frac_value = 1.0 - teacher_uniform_row_frac_value
+                        teacher_topm_row_frac_value = float(
+                            teacher_topm_rows.mean().detach().cpu().item()
+                        )
                         teacher_entropy_value = float(
                             (
                                 -torch.sum(
@@ -3147,6 +3210,7 @@ def train(cfg: PPOConfig) -> None:
                         teacher_max_prob_sum += teacher_max_prob_value
                         teacher_uniform_row_frac_sum += teacher_uniform_row_frac_value
                         teacher_bias_row_frac_sum += teacher_bias_row_frac_value
+                        teacher_topm_row_frac_sum += teacher_topm_row_frac_value
                         teacher_prob_sum_sum += teacher_prob_sum_value
                         teacher_valid_actions_sum += teacher_valid_actions_value
                         updates_done += 1
@@ -3184,6 +3248,9 @@ def train(cfg: PPOConfig) -> None:
                 )
                 teacher_bias_row_frac_value = (
                     teacher_bias_row_frac_sum / updates_done_denom
+                )
+                teacher_topm_row_frac_value = (
+                    teacher_topm_row_frac_sum / updates_done_denom
                 )
                 teacher_prob_sum_value = teacher_prob_sum_sum / updates_done_denom
                 teacher_valid_actions_value = teacher_valid_actions_sum / updates_done_denom
@@ -3271,6 +3338,7 @@ def train(cfg: PPOConfig) -> None:
                     "adapter_checks": list(adapter_state_now.get("checks", [])),
                     "distill_coef_used": distill_coef_now,
                     "distill_teacher_tau_used": cfg.distill_teacher_tau,
+                    "distill_teacher_top_m_used": cfg.distill_teacher_top_m,
                     "curriculum_topk_used": curriculum_topk_now,
                     "curriculum_bias_used": curriculum_bias_now,
                     "curriculum_danger_height_used": cfg.curriculum_danger_height,
@@ -3278,6 +3346,7 @@ def train(cfg: PPOConfig) -> None:
                     "teacher_max_prob": teacher_max_prob_value,
                     "teacher_uniform_row_frac": teacher_uniform_row_frac_value,
                     "teacher_bias_row_frac": teacher_bias_row_frac_value,
+                    "teacher_topm_row_frac": teacher_topm_row_frac_value,
                     "teacher_prob_sum": teacher_prob_sum_value,
                     "teacher_valid_actions": teacher_valid_actions_value,
                     "sps": sps,
@@ -3303,9 +3372,16 @@ def train(cfg: PPOConfig) -> None:
                     or update == 1
                     or update == num_updates
                 )
+                should_validate = (
+                    cfg.validation_episodes_per_env > 0
+                    and (
+                        update % cfg.validate_every_updates == 0
+                        or update == num_updates
+                    )
+                )
                 validation: dict[str, Any] | None = None
                 validation_by_source: dict[str, Any] = {}
-                if should_log and cfg.validation_episodes_per_env > 0:
+                if should_validate:
                     validation_wall_start = time.time()
                     for validation_source in validation_sources:
                         try:
@@ -3444,7 +3520,7 @@ def train(cfg: PPOConfig) -> None:
                         0.0, update_core_seconds - profile_accounted_s
                     )
                     ret_terms = stats["ret100_terms"]
-                    val_terms = stats.get("validation_terms") or {}
+                    validation_by_source = stats.get("validation_by_source") or {}
                     source_label = source_mix_label
                     adapter_checks_label = (
                         "ok" if stats["adapter_checks_ok"] else "warn"
@@ -3476,11 +3552,13 @@ def train(cfg: PPOConfig) -> None:
                             f"ent_coef={ent_coef_now:.5f} "
                             f"distill_coef={distill_coef_now:.5f} "
                             f"tau={cfg.distill_teacher_tau:.3f} "
+                            f"teacher_topm={cfg.distill_teacher_top_m} "
                             f"pclip={cfg.policy_clip_coef:.4f} "
                             f"vclip={cfg.value_clip_coef:.4f} "
                             f"p_lr={policy_lr_now:.6g} "
                             f"v_lr={value_lr_now:.6g} "
-                            f"target_kl={target_kl_now:.5f}"
+                            f"target_kl={target_kl_now:.5f} "
+                            f"validate={'y' if should_validate else 'n'}"
                         ),
                         (
                             "  adapter: "
@@ -3498,6 +3576,7 @@ def train(cfg: PPOConfig) -> None:
                             f"maxp={stats['teacher_max_prob']:.3f},"
                             f"uniform={stats['teacher_uniform_row_frac']:.3f},"
                             f"bias_rows={stats['teacher_bias_row_frac']:.3f},"
+                            f"topm_rows={stats['teacher_topm_row_frac']:.3f},"
                             f"psum={stats['teacher_prob_sum']:.3f},"
                             f"valid={stats['teacher_valid_actions']:.1f})"
                         ),
@@ -3551,58 +3630,6 @@ def train(cfg: PPOConfig) -> None:
                             f"topout={_fmt_float(ret_terms.get('term_top_out'))}"
                         ),
                         (
-                            "  validation: "
-                            f"ret={_fmt_float(stats.get('validation_mean_return'))} "
-                            f"final={_fmt_float(val_terms.get('reward_final'))} "
-                            f"base={_fmt_float(val_terms.get('reward_base'))} "
-                            f"v1={_fmt_float(val_terms.get('v1_base'))} "
-                            f"v2={_fmt_float(val_terms.get('v2_base'))} "
-                            f"v1_raw={_fmt_float(val_terms.get('v1_base_raw'))} "
-                            f"v2_raw={_fmt_float(val_terms.get('v2_base_raw'))} "
-                            f"w1={_fmt_float(val_terms.get('blend_legacy_weight'))} "
-                            f"w2={_fmt_float(val_terms.get('blend_target_weight'))} "
-                            f"t={_fmt_float(val_terms.get('blend_t'))} "
-                            f"topout={_fmt_float(val_terms.get('top_out_term'))}"
-                        ),
-                        (
-                            "  validation_by_source: "
-                            + (
-                                ", ".join(
-                                    (
-                                        f"{source}="
-                                        f"{_fmt_float(((stats.get('validation_by_source') or {}).get(source) or {}).get('mean_return'))}"
-                                    )
-                                    for source in validation_sources
-                                )
-                                if validation_sources
-                                else "none"
-                            )
-                        ),
-                        (
-                            "    val_v1_terms: "
-                            f"lines={_fmt_float(val_terms.get('v1_term_lines'))} "
-                            f"score={_fmt_float(val_terms.get('v1_term_score'))} "
-                            f"time={_fmt_float(val_terms.get('v1_term_time'))} "
-                            f"height={_fmt_float(val_terms.get('v1_term_height'))} "
-                            f"holes={_fmt_float(val_terms.get('v1_term_holes'))} "
-                            f"bump={_fmt_float(val_terms.get('v1_term_bumpiness'))} "
-                            f"board={_fmt_float(val_terms.get('v1_term_board_score'))} "
-                            f"q={_fmt_float(val_terms.get('v1_term_board_quality'))} "
-                            f"topout={_fmt_float(val_terms.get('v1_term_top_out'))}"
-                        ),
-                        (
-                            "    val_v2_terms: "
-                            f"lines={_fmt_float(val_terms.get('v2_term_lines'))} "
-                            f"score={_fmt_float(val_terms.get('v2_term_score'))} "
-                            f"time={_fmt_float(val_terms.get('v2_term_time'))} "
-                            f"height={_fmt_float(val_terms.get('v2_term_height'))} "
-                            f"holes={_fmt_float(val_terms.get('v2_term_holes'))} "
-                            f"bump={_fmt_float(val_terms.get('v2_term_bumpiness'))} "
-                            f"board={_fmt_float(val_terms.get('v2_term_board_score'))} "
-                            f"q={_fmt_float(val_terms.get('v2_term_board_quality'))} "
-                            f"topout={_fmt_float(val_terms.get('v2_term_top_out'))}"
-                        ),
-                        (
                             "  timing: "
                             f"t_upd_core={update_core_seconds:.2f}s "
                             f"t_roll={profile_rollout_s:.2f}s "
@@ -3626,6 +3653,78 @@ def train(cfg: PPOConfig) -> None:
                             f"rows_total={mask_repair_total['rows']}"
                         ),
                     ]
+                    if not validation_by_source:
+                        log_lines.append("  validation: skipped")
+                    else:
+                        for source in validation_sources:
+                            source_item = (
+                                validation_by_source.get(source)
+                                if isinstance(validation_by_source, dict)
+                                else None
+                            )
+                            source_dict = (
+                                source_item if isinstance(source_item, dict) else {}
+                            )
+                            source_terms = source_dict.get("terms")
+                            source_terms_dict = (
+                                source_terms if isinstance(source_terms, dict) else {}
+                            )
+                            if bool(source_dict.get("enabled", False)):
+                                log_lines.append(
+                                    "  validation["
+                                    + source
+                                    + "]: "
+                                    + f"ret={_fmt_float(source_dict.get('mean_return'))} "
+                                    + f"final={_fmt_float(source_terms_dict.get('reward_final'))} "
+                                    + f"base={_fmt_float(source_terms_dict.get('reward_base'))} "
+                                    + f"v1={_fmt_float(source_terms_dict.get('v1_base'))} "
+                                    + f"v2={_fmt_float(source_terms_dict.get('v2_base'))} "
+                                    + f"v1_raw={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
+                                    + f"v2_raw={_fmt_float(source_terms_dict.get('v2_base_raw'))} "
+                                    + f"w1={_fmt_float(source_terms_dict.get('blend_legacy_weight'))} "
+                                    + f"w2={_fmt_float(source_terms_dict.get('blend_target_weight'))} "
+                                    + f"t={_fmt_float(source_terms_dict.get('blend_t'))} "
+                                    + f"topout={_fmt_float(source_terms_dict.get('top_out_term'))}"
+                                )
+                                log_lines.append(
+                                    "    val_v1_terms["
+                                    + source
+                                    + "]: "
+                                    + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
+                                    + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
+                                    + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
+                                    + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
+                                    + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
+                                    + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
+                                    + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
+                                    + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
+                                    + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
+                                )
+                                log_lines.append(
+                                    "    val_v2_terms["
+                                    + source
+                                    + "]: "
+                                    + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
+                                    + f"score={_fmt_float(source_terms_dict.get('v2_term_score'))} "
+                                    + f"time={_fmt_float(source_terms_dict.get('v2_term_time'))} "
+                                    + f"height={_fmt_float(source_terms_dict.get('v2_term_height'))} "
+                                    + f"holes={_fmt_float(source_terms_dict.get('v2_term_holes'))} "
+                                    + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
+                                    + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
+                                    + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
+                                    + f"topout={_fmt_float(source_terms_dict.get('v2_term_top_out'))}"
+                                )
+                            else:
+                                log_lines.append(
+                                    "  validation["
+                                    + source
+                                    + "]: "
+                                    + (
+                                        f"error={source_dict.get('error')}"
+                                        if source_dict.get("error")
+                                        else "disabled"
+                                    )
+                                )
                     log_emit_start = time.time()
                     print("\n".join(log_lines))
                     if not stats["adapter_checks_ok"]:

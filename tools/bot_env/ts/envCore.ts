@@ -523,7 +523,8 @@ const computePieceRewardV2 = (
     placementComplexityPenalty,
     topOut,
   } = options;
-  const linesTerm = linesDelta * REWARD_V2_LINE_WEIGHT;
+  const clampedLines = Math.max(0, linesDelta);
+  const linesTerm = Math.pow(clampedLines, 1.5) * REWARD_V2_LINE_WEIGHT;
   const boardQualityDeltaTerm =
     boardQualityDelta * REWARD_V2_BOARD_QUALITY_WEIGHT;
   const timeTerm = -placementComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
