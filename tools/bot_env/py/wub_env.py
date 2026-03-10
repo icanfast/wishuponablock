@@ -84,6 +84,7 @@ class WubEnvBridge:
         queue_policy_id: str = "next_piece_v1",
         max_pieces_per_episode: int = 512,
         reward_blend_timesteps: int = 10_000_000,
+        reward_blend_unit: str = "updates",
         reward_blend_start_step: int = 0,
         seed: int | None = None,
     ) -> dict[str, Any]:
@@ -97,6 +98,11 @@ class WubEnvBridge:
             "queuePolicyId": queue_policy_id,
             "maxPiecesPerEpisode": max_pieces_per_episode,
             "rewardBlendTimesteps": int(reward_blend_timesteps),
+            "rewardBlendUnit": (
+                "timesteps"
+                if str(reward_blend_unit).strip().lower() == "timesteps"
+                else "updates"
+            ),
             "rewardBlendStartStep": int(reward_blend_start_step),
         }
         if seed is not None:

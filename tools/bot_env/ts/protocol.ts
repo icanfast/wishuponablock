@@ -44,6 +44,7 @@ export type InitPayload = {
   queuePolicyId?: string;
   maxPiecesPerEpisode?: number;
   rewardBlendTimesteps?: number;
+  rewardBlendUnit?: 'timesteps' | 'updates';
   rewardBlendStartStep?: number;
   seed?: number;
 };

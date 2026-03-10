@@ -36,7 +36,8 @@ class PPOConfig:
     queue_policy_id: str
     generator_schedule: tuple[str, ...]
     max_pieces_per_episode: int
-    reward_blend_timesteps: int
+    reward_blend_span: int
+    reward_blend_unit: str
     seed: int
     num_envs: int
     total_timesteps: int
@@ -528,13 +529,19 @@ def parse_args() -> PPOConfig:
     )
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
     parser.add_argument(
+        "--reward-blend-updates",
+        type=int,
+        default=10,
+        help=(
+            "Number of PPO updates used to linearly blend reward_v1 -> reward_v2. "
+            "Blend weight t goes 1.0 -> 0.0 over this many updates."
+        ),
+    )
+    parser.add_argument(
         "--reward-blend-timesteps",
         type=int,
-        default=10_000_000,
-        help=(
-            "Global env transitions used to linearly blend reward_v1 -> reward_v2. "
-            "Blend weight t goes 1.0 -> 0.0 over this many timesteps."
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--seed", type=int, default=42030)
 
@@ -770,6 +777,12 @@ def parse_args() -> PPOConfig:
     except ValueError as error:
         parser.error(str(error))
 
+    reward_blend_unit = "updates"
+    reward_blend_span = max(1, int(args.reward_blend_updates))
+    if args.reward_blend_timesteps is not None:
+        reward_blend_unit = "timesteps"
+        reward_blend_span = max(1, int(args.reward_blend_timesteps))
+
     run_name = args.run_name.strip() or f"ppo_baseline_{int(time.time())}"
     return PPOConfig(
         mode_id=args.mode_id.strip().lower(),
@@ -785,7 +798,8 @@ def parse_args() -> PPOConfig:
         queue_policy_id=args.queue_policy_id.strip().lower(),
         generator_schedule=generator_schedule,
         max_pieces_per_episode=max(1, int(args.max_pieces_per_episode)),
-        reward_blend_timesteps=max(1, int(args.reward_blend_timesteps)),
+        reward_blend_span=reward_blend_span,
+        reward_blend_unit=reward_blend_unit,
         seed=max(1, int(args.seed)),
         num_envs=max(1, int(args.num_envs)),
         total_timesteps=max(1, int(args.total_timesteps)),
@@ -892,6 +906,12 @@ def unique_generator_sources(cfg: PPOConfig) -> list[str]:
     if not ordered:
         ordered.append("bag7")
     return ordered
+
+
+def reward_blend_total_for_env(cfg: PPOConfig) -> int:
+    if cfg.reward_blend_unit == "updates":
+        return max(1, int(cfg.reward_blend_span) - 1)
+    return max(1, int(cfg.reward_blend_span))
 
 
 def curriculum_schedule_value(
@@ -1633,7 +1653,7 @@ def run_validation_eval(
     obs_adapter: ObservationAdapter,
     device: torch.device,
     update: int,
-    global_step: int,
+    reward_blend_step: int,
     piece_source_profile: str,
     reward_component_aliases: dict[str, tuple[str, ...]],
 ) -> dict[str, Any]:
@@ -1656,8 +1676,9 @@ def run_validation_eval(
                 piece_source_profile=piece_source_profile,
                 queue_policy_id=cfg.queue_policy_id,
                 max_pieces_per_episode=cfg.max_pieces_per_episode,
-                reward_blend_timesteps=cfg.reward_blend_timesteps,
-                reward_blend_start_step=max(0, int(global_step)),
+                reward_blend_timesteps=reward_blend_total_for_env(cfg),
+                reward_blend_unit=cfg.reward_blend_unit,
+                reward_blend_start_step=max(0, int(reward_blend_step)),
                 seed=cfg.seed + update * 1777 + 31,
             )
             env_ids: list[int] = [int(v) for v in init_result.get("env_ids", [])]
@@ -2216,7 +2237,8 @@ def train(cfg: PPOConfig) -> None:
             piece_source_profile=cfg.generator_schedule[0],
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
-            reward_blend_timesteps=cfg.reward_blend_timesteps,
+            reward_blend_timesteps=reward_blend_total_for_env(cfg),
+            reward_blend_unit=cfg.reward_blend_unit,
             reward_blend_start_step=0,
             seed=cfg.seed,
         )
@@ -2294,8 +2316,13 @@ def train(cfg: PPOConfig) -> None:
             if cfg.resume_mode == "continue":
                 global_step = loaded_global_step
                 start_update = loaded_update
-                blend_result = env.set_reward_blend_step(global_step)
-                blend_step = int(blend_result.get("transition_step", global_step))
+                blend_resume_step = (
+                    start_update if cfg.reward_blend_unit == "updates" else global_step
+                )
+                blend_result = env.set_reward_blend_step(blend_resume_step)
+                blend_step = int(
+                    blend_result.get("transition_step", blend_resume_step)
+                )
                 print(
                     f"[ppo] resumed checkpoint (continue): {checkpoint_path} "
                     f"(global_step={global_step}, update={start_update}, "
@@ -2514,7 +2541,7 @@ def train(cfg: PPOConfig) -> None:
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
             f"validation_sources={validation_sources}, "
-            f"reward_blend_timesteps={cfg.reward_blend_timesteps}, "
+            f"reward_blend={cfg.reward_blend_span}({cfg.reward_blend_unit},env_total={reward_blend_total_for_env(cfg)}), "
             f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
@@ -2547,6 +2574,7 @@ def train(cfg: PPOConfig) -> None:
                 "num_updates": num_updates,
                 "generator_mix_by_env": env_piece_source_counts,
                 "validation_sources": validation_sources,
+                "reward_blend_env_total": reward_blend_total_for_env(cfg),
             },
         )
 
@@ -2666,6 +2694,13 @@ def train(cfg: PPOConfig) -> None:
                     bias_strength=curriculum_bias_now,
                     danger_height=cfg.curriculum_danger_height,
                 )
+                blend_step_now = (
+                    max(0, int(update - 1))
+                    if cfg.reward_blend_unit == "updates"
+                    else max(0, int(global_step))
+                )
+                if cfg.reward_blend_unit == "updates":
+                    env.set_reward_blend_step(blend_step_now)
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -3169,6 +3204,9 @@ def train(cfg: PPOConfig) -> None:
                     "global_step": global_step,
                     "piece_source_profile": "mixed",
                     "piece_source_mix": dict(env_piece_source_counts),
+                    "reward_blend_unit": cfg.reward_blend_unit,
+                    "reward_blend_span": cfg.reward_blend_span,
+                    "reward_blend_step_used": blend_step_now,
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
@@ -3260,13 +3298,13 @@ def train(cfg: PPOConfig) -> None:
                                 repo_root=repo_root,
                                 server_cmd=server_cmd,
                                 model=model,
-                                obs_adapter=obs_adapter,
-                                device=device,
-                                update=update,
-                                global_step=global_step,
-                                piece_source_profile=validation_source,
-                                reward_component_aliases=reward_component_aliases,
-                            )
+                            obs_adapter=obs_adapter,
+                            device=device,
+                            update=update,
+                            reward_blend_step=blend_step_now,
+                            piece_source_profile=validation_source,
+                            reward_component_aliases=reward_component_aliases,
+                        )
                         except Exception as error:
                             validation_item = {"enabled": False, "error": str(error)}
                             print(

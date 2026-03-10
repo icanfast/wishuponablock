@@ -308,6 +308,8 @@ type RewardBlendWeights = {
   transitionTotalSteps: number;
 };
 
+type RewardBlendUnit = 'timesteps' | 'updates';
+
 const normalizeRewardBlendWeights = (
   input: RewardBlendWeights | null | undefined,
 ): RewardBlendWeights => {
@@ -1677,6 +1679,7 @@ export class BotEnvPool {
   };
   private rewardBlendTimesteps = DEFAULT_REWARD_BLEND_TIMESTEPS;
   private rewardBlendTransitionStep = 0;
+  private rewardBlendUnit: RewardBlendUnit = 'updates';
 
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
@@ -1704,6 +1707,8 @@ export class BotEnvPool {
       1,
       1_000_000_000,
     );
+    const rewardBlendUnit: RewardBlendUnit =
+      payload.rewardBlendUnit === 'timesteps' ? 'timesteps' : 'updates';
     const rewardBlendStartStep = clampInt(
       payload.rewardBlendStartStep,
       0,
@@ -1739,6 +1744,7 @@ export class BotEnvPool {
     }
     pool.rewardBlendTimesteps = rewardBlendTimesteps;
     pool.rewardBlendTransitionStep = rewardBlendStartStep;
+    pool.rewardBlendUnit = rewardBlendUnit;
     pool.setCurriculum(null);
     return pool;
   }
@@ -1804,7 +1810,9 @@ export class BotEnvPool {
     let stepRewardS = 0;
     let stepObsS = 0;
     let stepChoicesNextS = 0;
-    const batchBlendWeights = this.nextRewardBlendWeights(envIds.length);
+    const blendIncrement =
+      this.rewardBlendUnit === 'timesteps' ? envIds.length : 0;
+    const batchBlendWeights = this.nextRewardBlendWeights(blendIncrement);
     for (let i = 0; i < envIds.length; i += 1) {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
