@@ -23,7 +23,8 @@ RAW_PIECES_ORDER = ("I", "O", "T", "S", "Z", "J", "L")
 RAW_CONTEXT_DIM = len(RAW_PIECES_ORDER) + (len(RAW_PIECES_ORDER) + 1) + len(RAW_PIECES_ORDER) + 5
 DEFAULT_BOARD_ROWS = 20
 DEFAULT_BOARD_COLS = 10
-PPO_OBS_ADAPTER_LR_SCALE = 0.1
+DEFAULT_OBS_ADAPTER_LR_SCALE = 0.1
+VALID_GENERATOR_SOURCES = ("bag7", "active_generator", "random")
 
 
 @dataclass(frozen=True)
@@ -33,15 +34,16 @@ class PPOConfig:
     observation_space: str
     placement_execution_mode: str
     queue_policy_id: str
-    piece_source_profile: str
-    alternate_piece_sources: bool
+    generator_schedule: tuple[str, ...]
     max_pieces_per_episode: int
+    reward_blend_timesteps: int
     seed: int
     num_envs: int
     total_timesteps: int
     num_steps: int
     hidden_dim: int
     learning_rate: float
+    obs_adapter_lr_scale: float
     gamma: float
     gae_lambda: float
     policy_clip_coef: float
@@ -77,6 +79,7 @@ class PPOConfig:
     run_name: str
     server_cmd: str | None
     resume_checkpoint: str | None
+    resume_mode: str
     init_artifact: str | None
     deterministic_eval: bool
     bc_dataset: str | None
@@ -500,17 +503,38 @@ def parse_args() -> PPOConfig:
     )
     parser.add_argument("--queue-policy-id", default="next_piece_v1")
     parser.add_argument(
+        "--generators",
+        nargs="+",
+        default=None,
+        help=(
+            "Cyclic piece-source schedule per PPO update. "
+            "Accepts space/comma-separated list of: bag7, active_generator, random. "
+            "Examples: --generators bag7 random | "
+            "--generators bag7 bag7 bag7 bag7 active_generator"
+        ),
+    )
+    parser.add_argument(
         "--piece-source-profile",
         default="active_generator",
-        choices=["active_generator", "bag7"],
+        choices=["active_generator", "bag7", "random"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--alternate-piece-sources",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use fixed source schedule per 5 updates: 4 updates on bag7, then 1 update on active_generator.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
+    parser.add_argument(
+        "--reward-blend-timesteps",
+        type=int,
+        default=10_000_000,
+        help=(
+            "Global env transitions used to linearly blend reward_v1 -> reward_v2. "
+            "Blend weight t goes 1.0 -> 0.0 over this many timesteps."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42030)
 
     parser.add_argument("--num-envs", type=int, default=16)
@@ -519,6 +543,15 @@ def parse_args() -> PPOConfig:
 
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--obs-adapter-lr-scale",
+        type=float,
+        default=DEFAULT_OBS_ADAPTER_LR_SCALE,
+        help=(
+            "Gradient scale for observation adapter (conv stack in raw_v1). "
+            "Effective adapter LR ~= learning_rate * obs_adapter_lr_scale."
+        ),
+    )
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument(
@@ -645,6 +678,17 @@ def parse_args() -> PPOConfig:
         help='Override bridge server command (example: "npx --yes tsx tools/bot_env/ts/envServer.ts").',
     )
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument(
+        "--resume-mode",
+        choices=["fresh", "continue"],
+        default="fresh",
+        help=(
+            "When using --resume-checkpoint: "
+            "'fresh' warm-starts from checkpoint weights but resets training clock "
+            "(update/step schedules restart from 1); "
+            "'continue' preserves checkpoint progress and optimizer state."
+        ),
+    )
     parser.add_argument("--init-artifact", default=None)
     parser.add_argument("--deterministic-eval", action="store_true")
     parser.add_argument(
@@ -688,6 +732,43 @@ def parse_args() -> PPOConfig:
     )
 
     args = parser.parse_args()
+
+    def _normalize_generator_source(value: str) -> str:
+        normalized = str(value).strip().lower()
+        aliases = {
+            "ml": "active_generator",
+            "active": "active_generator",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in VALID_GENERATOR_SOURCES:
+            raise ValueError(
+                f"Unsupported generator source '{value}'. "
+                f"Allowed: {', '.join(VALID_GENERATOR_SOURCES)}"
+            )
+        return normalized
+
+    def _parse_generator_schedule() -> tuple[str, ...]:
+        raw_values = args.generators
+        expanded: list[str] = []
+        if isinstance(raw_values, list):
+            for token in raw_values:
+                for part in str(token).split(","):
+                    stripped = part.strip()
+                    if stripped:
+                        expanded.append(stripped)
+        if expanded:
+            return tuple(_normalize_generator_source(v) for v in expanded)
+        # Backward compatibility fallback for old flags.
+        base = _normalize_generator_source(args.piece_source_profile)
+        if bool(args.alternate_piece_sources):
+            return ("bag7", "bag7", "bag7", "bag7", "active_generator")
+        return (base,)
+
+    try:
+        generator_schedule = _parse_generator_schedule()
+    except ValueError as error:
+        parser.error(str(error))
+
     run_name = args.run_name.strip() or f"ppo_baseline_{int(time.time())}"
     return PPOConfig(
         mode_id=args.mode_id.strip().lower(),
@@ -701,17 +782,16 @@ def parse_args() -> PPOConfig:
             else "teleport"
         ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
-        piece_source_profile=(
-            "bag7" if args.piece_source_profile == "bag7" else "active_generator"
-        ),
-        alternate_piece_sources=bool(args.alternate_piece_sources),
+        generator_schedule=generator_schedule,
         max_pieces_per_episode=max(1, int(args.max_pieces_per_episode)),
+        reward_blend_timesteps=max(1, int(args.reward_blend_timesteps)),
         seed=max(1, int(args.seed)),
         num_envs=max(1, int(args.num_envs)),
         total_timesteps=max(1, int(args.total_timesteps)),
         num_steps=max(1, int(args.num_steps)),
         hidden_dim=max(8, int(args.hidden_dim)),
         learning_rate=float(args.learning_rate),
+        obs_adapter_lr_scale=max(0.0, float(args.obs_adapter_lr_scale)),
         gamma=float(args.gamma),
         gae_lambda=float(args.gae_lambda),
         policy_clip_coef=float(args.policy_clip_coef),
@@ -747,6 +827,7 @@ def parse_args() -> PPOConfig:
         run_name=run_name,
         server_cmd=args.server_cmd,
         resume_checkpoint=args.resume_checkpoint,
+        resume_mode=str(args.resume_mode),
         init_artifact=args.init_artifact,
         deterministic_eval=bool(args.deterministic_eval),
         bc_dataset=(
@@ -783,15 +864,9 @@ def choose_device(device_name: str) -> torch.device:
 
 
 def resolve_piece_source_for_update(cfg: PPOConfig, update: int) -> str:
-    base = "bag7" if cfg.piece_source_profile == "bag7" else "active_generator"
-    if not cfg.alternate_piece_sources:
-        return base
-    # Fixed alternation schedule:
-    # 4 updates on bag7, then 1 update on active_generator.
-    # Example: bag7, bag7, bag7, bag7, active_generator, ...
-    if ((update - 1) % 5) == 4:
-        return "active_generator"
-    return "bag7"
+    schedule = cfg.generator_schedule if cfg.generator_schedule else ("bag7",)
+    index = (max(1, int(update)) - 1) % len(schedule)
+    return schedule[index]
 
 
 def curriculum_schedule_value(
@@ -1086,7 +1161,8 @@ def export_bot_policy_artifact(
         "archId": "full",
         "queuePolicyId": cfg.queue_policy_id,
         "pipelineId": pipeline_id,
-        "pieceSourceProfile": cfg.piece_source_profile,
+        "pieceSourceProfile": cfg.generator_schedule[0],
+        "pieceSourceSchedule": list(cfg.generator_schedule),
         "observationSpace": policy_observation_space,
         "createdAtMs": now_ms,
         "inputDim": int(obs_dim),
@@ -1239,6 +1315,7 @@ def load_checkpoint(
     obs_adapter: ObservationAdapter,
     optimizer: torch.optim.Optimizer,
     map_device: torch.device,
+    load_optimizer_state: bool = True,
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
     model_state = checkpoint["model_state_dict"]
@@ -1286,7 +1363,7 @@ def load_checkpoint(
     if isinstance(adapter_state, dict):
         obs_adapter.load_state_dict(adapter_state, strict=False)
     optimizer_state = checkpoint.get("optimizer_state_dict")
-    if isinstance(optimizer_state, dict):
+    if load_optimizer_state and isinstance(optimizer_state, dict):
         try:
             optimizer.load_state_dict(optimizer_state)
         except ValueError as error:
@@ -1412,6 +1489,7 @@ def run_validation_eval(
     obs_adapter: ObservationAdapter,
     device: torch.device,
     update: int,
+    global_step: int,
     piece_source_profile: str,
     reward_component_aliases: dict[str, tuple[str, ...]],
 ) -> dict[str, Any]:
@@ -1434,6 +1512,8 @@ def run_validation_eval(
                 piece_source_profile=piece_source_profile,
                 queue_policy_id=cfg.queue_policy_id,
                 max_pieces_per_episode=cfg.max_pieces_per_episode,
+                reward_blend_timesteps=cfg.reward_blend_timesteps,
+                reward_blend_start_step=max(0, int(global_step)),
                 seed=cfg.seed + update * 1777 + 31,
             )
             env_ids: list[int] = [int(v) for v in init_result.get("env_ids", [])]
@@ -1606,6 +1686,55 @@ def _fmt_float(value: Any, precision: int = 3) -> str:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return f"{float(value):.{precision}f}"
     return "nan"
+
+
+def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]:
+    data = terms if isinstance(terms, dict) else {}
+    return {
+        "overall": {
+            "final": data.get("reward_final"),
+            "base": data.get("reward_base"),
+            "top_out_penalty": data.get("top_out_penalty"),
+        },
+        "v1": {
+            "base": data.get("v1_base"),
+            "base_raw": data.get("v1_base_raw"),
+            "terms": {
+                "lines": data.get("v1_term_lines"),
+                "score": data.get("v1_term_score"),
+                "time": data.get("v1_term_time"),
+                "height": data.get("v1_term_height"),
+                "holes": data.get("v1_term_holes"),
+                "bumpiness": data.get("v1_term_bumpiness"),
+                "board_score": data.get("v1_term_board_score"),
+                "board_quality": data.get("v1_term_board_quality"),
+            },
+        },
+        "v2": {
+            "base": data.get("v2_base"),
+            "base_raw": data.get("v2_base_raw"),
+            "terms": {
+                "lines": data.get("v2_term_lines"),
+                "score": data.get("v2_term_score"),
+                "time": data.get("v2_term_time"),
+                "height": data.get("v2_term_height"),
+                "holes": data.get("v2_term_holes"),
+                "bumpiness": data.get("v2_term_bumpiness"),
+                "board_score": data.get("v2_term_board_score"),
+                "board_quality": data.get("v2_term_board_quality"),
+            },
+        },
+        "blended_terms": {
+            "lines": data.get("term_lines"),
+            "score": data.get("term_score"),
+            "time": data.get("term_time"),
+            "height": data.get("term_height"),
+            "holes": data.get("term_holes"),
+            "bumpiness": data.get("term_bumpiness"),
+            "board_score": data.get("term_board_score"),
+            "board_quality": data.get("term_board_quality"),
+        },
+    }
 
 
 def load_bc_dataset(
@@ -1889,9 +2018,11 @@ def train(cfg: PPOConfig) -> None:
             model_path=cfg.model_path,
             observation_space=cfg.observation_space,
             placement_execution_mode=cfg.placement_execution_mode,
-            piece_source_profile=cfg.piece_source_profile,
+            piece_source_profile=cfg.generator_schedule[0],
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
+            reward_blend_timesteps=cfg.reward_blend_timesteps,
+            reward_blend_start_step=0,
             seed=cfg.seed,
         )
         env_ids: list[int] = [int(v) for v in init_result.get("env_ids", [])]
@@ -1922,11 +2053,7 @@ def train(cfg: PPOConfig) -> None:
             if "action_scores" in reset_result
             else None,
         )
-        current_piece_source = (
-            "bag7"
-            if cfg.piece_source_profile == "bag7"
-            else "active_generator"
-        )
+        current_piece_source = cfg.generator_schedule[0]
         raw_obs_dim = infer_obs_dim(reset_result["obs"])
         action_dim = infer_action_dim(reset_result["action_masks"])
 
@@ -1952,13 +2079,29 @@ def train(cfg: PPOConfig) -> None:
         if cfg.resume_checkpoint:
             optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
-            global_step, start_update = load_checkpoint(
-                checkpoint_path, model, obs_adapter, optimizer, device
+            loaded_global_step, loaded_update = load_checkpoint(
+                checkpoint_path,
+                model,
+                obs_adapter,
+                optimizer,
+                device,
+                load_optimizer_state=(cfg.resume_mode == "continue"),
             )
-            print(
-                f"[ppo] resumed checkpoint: {checkpoint_path} "
-                f"(global_step={global_step}, update={start_update})"
-            )
+            if cfg.resume_mode == "continue":
+                global_step = loaded_global_step
+                start_update = loaded_update
+                print(
+                    f"[ppo] resumed checkpoint (continue): {checkpoint_path} "
+                    f"(global_step={global_step}, update={start_update})"
+                )
+            else:
+                global_step = 0
+                start_update = 0
+                print(
+                    f"[ppo] warm-started from checkpoint (fresh): {checkpoint_path} "
+                    f"(loaded_global_step={loaded_global_step}, loaded_update={loaded_update}, "
+                    "training clock reset to step=0/update=0)"
+                )
         elif cfg.init_artifact:
             artifact_path = Path(cfg.init_artifact).resolve()
             artifact_observation_space = load_from_artifact(
@@ -2147,8 +2290,8 @@ def train(cfg: PPOConfig) -> None:
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"batch_size={batch_size}, updates={num_updates}, "
-            f"piece_source_base={cfg.piece_source_profile}, "
-            f"alternate_sources={'y' if cfg.alternate_piece_sources else 'n'}, "
+            f"generators_cycle={list(cfg.generator_schedule)}, "
+            f"reward_blend_timesteps={cfg.reward_blend_timesteps}, "
             f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
@@ -2161,7 +2304,7 @@ def train(cfg: PPOConfig) -> None:
             f"distill_coef={cfg.distill_coef_start:.4f}->{cfg.distill_coef_end:.4f}/"
             f"{cfg.distill_coef_ramp_updates}, "
             f"distill_teacher_tau={cfg.distill_teacher_tau:.4f}, "
-            f"obs_adapter_lr_scale={PPO_OBS_ADAPTER_LR_SCALE:.3f}, "
+            f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
         )
@@ -2191,6 +2334,10 @@ def train(cfg: PPOConfig) -> None:
             "reward_final": ("rewardFinal",),
             "reward_base": ("rewardBase",),
             "top_out_penalty": ("topOutPenalty",),
+            "v1_base_raw": ("rewardLegacyBase",),
+            "v2_base_raw": ("rewardTargetBase",),
+            "v1_base": ("rewardLegacyContribution",),
+            "v2_base": ("rewardTargetContribution",),
             "term_lines": ("rewardTermLines",),
             "term_score": ("rewardTermScore",),
             "term_time": ("rewardTermTime",),
@@ -2199,6 +2346,22 @@ def train(cfg: PPOConfig) -> None:
             "term_bumpiness": ("rewardTermBumpiness",),
             "term_board_score": ("rewardTermBoardScore",),
             "term_board_quality": ("rewardTermBoardQuality",),
+            "v1_term_lines": ("rewardLegacyContributionTermLines",),
+            "v1_term_score": ("rewardLegacyContributionTermScore",),
+            "v1_term_time": ("rewardLegacyContributionTermTime",),
+            "v1_term_height": ("rewardLegacyContributionTermHeight",),
+            "v1_term_holes": ("rewardLegacyContributionTermHoles",),
+            "v1_term_bumpiness": ("rewardLegacyContributionTermBumpiness",),
+            "v1_term_board_score": ("rewardLegacyContributionTermBoardScore",),
+            "v1_term_board_quality": ("rewardLegacyContributionTermBoardQuality",),
+            "v2_term_lines": ("rewardTargetContributionTermLines",),
+            "v2_term_score": ("rewardTargetContributionTermScore",),
+            "v2_term_time": ("rewardTargetContributionTermTime",),
+            "v2_term_height": ("rewardTargetContributionTermHeight",),
+            "v2_term_holes": ("rewardTargetContributionTermHoles",),
+            "v2_term_bumpiness": ("rewardTargetContributionTermBumpiness",),
+            "v2_term_board_score": ("rewardTargetContributionTermBoardScore",),
+            "v2_term_board_quality": ("rewardTargetContributionTermBoardQuality",),
         }
         ep_reward_component_sums = {
             key: np.zeros(cfg.num_envs, dtype=np.float64)
@@ -2409,18 +2572,9 @@ def train(cfg: PPOConfig) -> None:
                             ep_reward_component_sums["reward_final"][
                                 env_idx
                             ] += reward_final
-                            for key in (
-                                "reward_base",
-                                "top_out_penalty",
-                                "term_lines",
-                                "term_score",
-                                "term_time",
-                                "term_height",
-                                "term_holes",
-                                "term_bumpiness",
-                                "term_board_score",
-                                "term_board_quality",
-                            ):
+                            for key in reward_component_aliases.keys():
+                                if key == "reward_final":
+                                    continue
                                 ep_reward_component_sums[key][env_idx] += _info_num(
                                     info,
                                     reward_component_aliases[key],
@@ -2673,7 +2827,7 @@ def train(cfg: PPOConfig) -> None:
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         scale_obs_adapter_gradients(
-                            obs_adapter, PPO_OBS_ADAPTER_LR_SCALE
+                            obs_adapter, cfg.obs_adapter_lr_scale
                         )
                         nn.utils.clip_grad_norm_(
                             trainable_parameters(model, obs_adapter), cfg.max_grad_norm
@@ -2839,6 +2993,9 @@ def train(cfg: PPOConfig) -> None:
                         for key, values in completed_reward_component_sums.items()
                     },
                 }
+                stats["ret100_hierarchy"] = _reward_hierarchy_from_terms(
+                    stats.get("ret100_terms")
+                )
                 should_log = (
                     update % cfg.log_every_updates == 0
                     or update == 1
@@ -2855,6 +3012,7 @@ def train(cfg: PPOConfig) -> None:
                             obs_adapter=obs_adapter,
                             device=device,
                             update=update,
+                            global_step=global_step,
                             piece_source_profile=current_piece_source,
                             reward_component_aliases=reward_component_aliases,
                         )
@@ -2874,6 +3032,9 @@ def train(cfg: PPOConfig) -> None:
                             "mean_length", float("nan")
                         )
                         stats["validation_terms"] = validation.get("terms", {})
+                        stats["validation_hierarchy"] = _reward_hierarchy_from_terms(
+                            stats.get("validation_terms")
+                        )
                 stats["profile_rollout_s"] = profile_rollout_s
                 stats["profile_env_step_s"] = profile_env_step_s
                 stats["profile_env_reset_s"] = profile_env_reset_s
@@ -2995,7 +3156,7 @@ def train(cfg: PPOConfig) -> None:
                         f"target_kl={target_kl_now:.5f} "
                         f"topk={curriculum_topk_now} "
                         f"bias={curriculum_bias_now:.3f} "
-                        f"src={'ml' if current_piece_source == 'active_generator' else 'bag7'} "
+                        f"src={'ml' if current_piece_source == 'active_generator' else current_piece_source} "
                         f"warmup={'y' if warmup_active else 'n'} "
                         f"teacher("
                         f"ent={stats['teacher_entropy']:.3f},"
@@ -3007,7 +3168,34 @@ def train(cfg: PPOConfig) -> None:
                         f") "
                         f"ev={stats['explained_variance']:.3f} "
                         f"ret100={stats['mean_episode_return_recent']:.3f} "
-                        f"ret100_terms("
+                        f"ret100_parts("
+                        f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))},"
+                        f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
+                        f"v1={_fmt_float(stats['ret100_terms'].get('v1_base'))},"
+                        f"v2={_fmt_float(stats['ret100_terms'].get('v2_base'))},"
+                        f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))}"
+                        f") "
+                        f"ret100_v1_terms("
+                        f"lines={_fmt_float(stats['ret100_terms'].get('v1_term_lines'))},"
+                        f"score={_fmt_float(stats['ret100_terms'].get('v1_term_score'))},"
+                        f"time={_fmt_float(stats['ret100_terms'].get('v1_term_time'))},"
+                        f"height={_fmt_float(stats['ret100_terms'].get('v1_term_height'))},"
+                        f"holes={_fmt_float(stats['ret100_terms'].get('v1_term_holes'))},"
+                        f"bump={_fmt_float(stats['ret100_terms'].get('v1_term_bumpiness'))},"
+                        f"board={_fmt_float(stats['ret100_terms'].get('v1_term_board_score'))},"
+                        f"q={_fmt_float(stats['ret100_terms'].get('v1_term_board_quality'))}"
+                        f") "
+                        f"ret100_v2_terms("
+                        f"lines={_fmt_float(stats['ret100_terms'].get('v2_term_lines'))},"
+                        f"score={_fmt_float(stats['ret100_terms'].get('v2_term_score'))},"
+                        f"time={_fmt_float(stats['ret100_terms'].get('v2_term_time'))},"
+                        f"height={_fmt_float(stats['ret100_terms'].get('v2_term_height'))},"
+                        f"holes={_fmt_float(stats['ret100_terms'].get('v2_term_holes'))},"
+                        f"bump={_fmt_float(stats['ret100_terms'].get('v2_term_bumpiness'))},"
+                        f"board={_fmt_float(stats['ret100_terms'].get('v2_term_board_score'))},"
+                        f"q={_fmt_float(stats['ret100_terms'].get('v2_term_board_quality'))}"
+                        f") "
+                        f"ret100_blend_terms("
                         f"lines={_fmt_float(stats['ret100_terms'].get('term_lines'))},"
                         f"score={_fmt_float(stats['ret100_terms'].get('term_score'))},"
                         f"time={_fmt_float(stats['ret100_terms'].get('term_time'))},"
@@ -3015,24 +3203,35 @@ def train(cfg: PPOConfig) -> None:
                         f"holes={_fmt_float(stats['ret100_terms'].get('term_holes'))},"
                         f"bump={_fmt_float(stats['ret100_terms'].get('term_bumpiness'))},"
                         f"board={_fmt_float(stats['ret100_terms'].get('term_board_score'))},"
-                        f"q={_fmt_float(stats['ret100_terms'].get('term_board_quality'))},"
-                        f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))},"
-                        f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
-                        f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))}"
+                        f"q={_fmt_float(stats['ret100_terms'].get('term_board_quality'))}"
                         f") "
                         f"val={_fmt_float(stats.get('validation_mean_return'))} "
-                        f"val_terms("
-                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('term_lines'))},"
-                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('term_score'))},"
-                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('term_time'))},"
-                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('term_height'))},"
-                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('term_holes'))},"
-                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('term_bumpiness'))},"
-                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('term_board_score'))},"
-                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('term_board_quality'))},"
-                        f"topout={_fmt_float((stats.get('validation_terms') or {}).get('top_out_penalty'))},"
+                        f"val_parts("
+                        f"final={_fmt_float((stats.get('validation_terms') or {}).get('reward_final'))},"
                         f"base={_fmt_float((stats.get('validation_terms') or {}).get('reward_base'))},"
-                        f"final={_fmt_float((stats.get('validation_terms') or {}).get('reward_final'))}"
+                        f"v1={_fmt_float((stats.get('validation_terms') or {}).get('v1_base'))},"
+                        f"v2={_fmt_float((stats.get('validation_terms') or {}).get('v2_base'))},"
+                        f"topout={_fmt_float((stats.get('validation_terms') or {}).get('top_out_penalty'))}"
+                        f") "
+                        f"val_v1_terms("
+                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_lines'))},"
+                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_score'))},"
+                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_time'))},"
+                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_height'))},"
+                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_holes'))},"
+                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_bumpiness'))},"
+                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_board_score'))},"
+                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_board_quality'))}"
+                        f") "
+                        f"val_v2_terms("
+                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_lines'))},"
+                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_score'))},"
+                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_time'))},"
+                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_height'))},"
+                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_holes'))},"
+                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_bumpiness'))},"
+                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_board_score'))},"
+                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_board_quality'))}"
                         f") "
                         f"sps={stats['sps']} "
                         f"t_upd={update_seconds:.2f}s "

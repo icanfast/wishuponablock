@@ -1,4 +1,4 @@
-export type PieceSourceProfile = 'bag7' | 'active_generator';
+export type PieceSourceProfile = 'bag7' | 'active_generator' | 'random';
 export type BotObservationSpace = 'model_head_v1' | 'raw_v1';
 export type PlacementExecutionMode = 'commands' | 'teleport';
 
@@ -41,6 +41,8 @@ export type InitPayload = {
   pieceSourceProfile?: PieceSourceProfile;
   queuePolicyId?: string;
   maxPiecesPerEpisode?: number;
+  rewardBlendTimesteps?: number;
+  rewardBlendStartStep?: number;
   seed?: number;
 };
 

@@ -56,6 +56,7 @@ const STEP_MAX_TICKS = 120;
 const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
 const OFFLINE_SOFT_DROP_MS = 0;
 const TOP_OUT_PENALTY = 100;
+const DEFAULT_REWARD_BLEND_TIMESTEPS = 10_000_000;
 const TRAJECTORY_SCHEMA = 'wishuponablock.trajectory_session.v1';
 const TRAJECTORY_BUILD_VERSION = 'offline_ppo_py';
 const TRAJECTORY_PIECES = [...PIECES];
@@ -96,7 +97,11 @@ const clampInt = (
 };
 
 const normalizePieceSource = (value: unknown): PieceSourceProfile =>
-  value === 'active_generator' ? 'active_generator' : 'bag7';
+  value === 'active_generator'
+    ? 'active_generator'
+    : value === 'random'
+      ? 'random'
+      : 'bag7';
 
 const normalizeObservationSpace = (value: unknown): BotObservationSpace =>
   normalizeBotObservationSpace(typeof value === 'string' ? value : null);
@@ -278,7 +283,7 @@ type PieceRewardBreakdown = {
   boardQualityDeltaTerm: number;
 };
 
-const computePieceReward = (options: {
+type PieceRewardInputs = {
   modeId: string;
   linesDelta: number;
   scoreDelta: number;
@@ -288,10 +293,89 @@ const computePieceReward = (options: {
   bumpinessDelta: number;
   boardScoreDelta: number;
   boardQualityDelta: number;
-}): {
+};
+
+type PieceRewardResult = {
   reward: number;
   breakdown: PieceRewardBreakdown;
-} => {
+};
+
+type RewardBlendWeights = {
+  legacyWeight: number;
+  targetWeight: number;
+  t: number;
+  transitionStep: number;
+  transitionTotalSteps: number;
+};
+
+const normalizeRewardBlendWeights = (
+  input: RewardBlendWeights | null | undefined,
+): RewardBlendWeights => {
+  const rawLegacy =
+    typeof input?.legacyWeight === 'number' &&
+    Number.isFinite(input.legacyWeight)
+      ? input.legacyWeight
+      : 1;
+  const rawTarget =
+    typeof input?.targetWeight === 'number' &&
+    Number.isFinite(input.targetWeight)
+      ? input.targetWeight
+      : 0;
+  const sum = rawLegacy + rawTarget;
+  const legacyRatio =
+    !Number.isFinite(sum) || sum <= 1e-9 ? 1 : rawLegacy / sum;
+  const t = Math.max(0, Math.min(1, legacyRatio));
+  return {
+    legacyWeight: t,
+    targetWeight: 1 - t,
+    t,
+    transitionStep: Math.max(0, Math.trunc(input?.transitionStep ?? 0)),
+    transitionTotalSteps: Math.max(
+      1,
+      Math.trunc(input?.transitionTotalSteps ?? DEFAULT_REWARD_BLEND_TIMESTEPS),
+    ),
+  };
+};
+
+const blendPieceReward = (options: {
+  legacy: PieceRewardResult;
+  target: PieceRewardResult;
+  weights: RewardBlendWeights;
+}): PieceRewardResult => {
+  const { legacy, target, weights } = options;
+  const legacyW = weights.legacyWeight;
+  const targetW = weights.targetWeight;
+  const mix = (a: number, b: number): number => a * legacyW + b * targetW;
+  return {
+    reward: mix(legacy.reward, target.reward),
+    breakdown: {
+      linesTerm: mix(legacy.breakdown.linesTerm, target.breakdown.linesTerm),
+      scoreTerm: mix(legacy.breakdown.scoreTerm, target.breakdown.scoreTerm),
+      timeTerm: mix(legacy.breakdown.timeTerm, target.breakdown.timeTerm),
+      heightTerm: mix(legacy.breakdown.heightTerm, target.breakdown.heightTerm),
+      holeDeltaTerm: mix(
+        legacy.breakdown.holeDeltaTerm,
+        target.breakdown.holeDeltaTerm,
+      ),
+      bumpinessDeltaTerm: mix(
+        legacy.breakdown.bumpinessDeltaTerm,
+        target.breakdown.bumpinessDeltaTerm,
+      ),
+      boardScoreTerm: mix(
+        legacy.breakdown.boardScoreTerm,
+        target.breakdown.boardScoreTerm,
+      ),
+      boardQualityDeltaTerm: mix(
+        legacy.breakdown.boardQualityDeltaTerm,
+        target.breakdown.boardQualityDeltaTerm,
+      ),
+    },
+  };
+};
+
+const computePieceRewardV1 = (
+  options: PieceRewardInputs,
+): PieceRewardResult => {
   const {
     modeId,
     linesDelta,
@@ -376,10 +460,82 @@ const BOARD_QUALITY_WEIGHTS = {
 const BOARD_QUALITY_DANGER_HEIGHT = 12;
 const PLACEMENT_LINE_CLEAR_BONUS = 3.0;
 const PLACEMENT_COMPLEXITY_CMD_WEIGHT = 0.01;
-const PLACEMENT_COMPLEXITY_ROT_WEIGHT = 0.03;
+const PLACEMENT_COMPLEXITY_ROT_CW_CCW_WEIGHT = 0.03;
+const PLACEMENT_COMPLEXITY_ROT_180_WEIGHT = 0.1;
+const PLACEMENT_COMPLEXITY_SRS_KICK_WEIGHT = 0.1;
 const PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT = 0.005;
 const PLACEMENT_HOLD_COMPLEXITY_PENALTY = 0.05;
 const PLACEMENT_TOP_OUT_PENALTY = 5.0;
+const REWARD_V2_LINE_WEIGHT = 3.0;
+const REWARD_V2_COMPLEXITY_WEIGHT = 1.0;
+const REWARD_V2_BOARD_QUALITY_WEIGHT = 1.0;
+const REWARD_V2_HOLE_REMOVE_WEIGHT = 0.05;
+const REWARD_V2_HOLE_CREATE_WEIGHT = REWARD_V2_HOLE_REMOVE_WEIGHT * 5;
+
+const computePlacementComplexityPenalty = (
+  placement: Pick<
+    TrajectoryExecutorReachablePlacement,
+    'commands' | 'holdUsed' | 'srsKickCount'
+  > | null,
+): number => {
+  if (!placement) return 0;
+  let rotateCwCcwCount = 0;
+  let rotate180Count = 0;
+  let softDropCount = 0;
+  for (const command of placement.commands) {
+    if (command === 'rotate_cw' || command === 'rotate_ccw') {
+      rotateCwCcwCount += 1;
+    } else if (command === 'rotate_180') {
+      rotate180Count += 1;
+    } else if (command === 'soft_drop') {
+      softDropCount += 1;
+    }
+  }
+  const srsKickCount = Math.max(0, Math.trunc(placement.srsKickCount ?? 0));
+  return (
+    placement.commands.length * PLACEMENT_COMPLEXITY_CMD_WEIGHT +
+    rotateCwCcwCount * PLACEMENT_COMPLEXITY_ROT_CW_CCW_WEIGHT +
+    rotate180Count * PLACEMENT_COMPLEXITY_ROT_180_WEIGHT +
+    srsKickCount * PLACEMENT_COMPLEXITY_SRS_KICK_WEIGHT +
+    softDropCount * PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT +
+    (placement.holdUsed ? PLACEMENT_HOLD_COMPLEXITY_PENALTY : 0)
+  );
+};
+
+const computePieceRewardV2 = (
+  options: PieceRewardInputs & {
+    placementComplexityPenalty: number;
+  },
+): PieceRewardResult => {
+  const {
+    linesDelta,
+    boardQualityDelta,
+    holesDelta,
+    placementComplexityPenalty,
+  } = options;
+  const linesTerm = linesDelta * REWARD_V2_LINE_WEIGHT;
+  const boardQualityDeltaTerm =
+    boardQualityDelta * REWARD_V2_BOARD_QUALITY_WEIGHT;
+  const timeTerm = -placementComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
+  const holeDeltaTerm =
+    holesDelta >= 0
+      ? -holesDelta * REWARD_V2_HOLE_CREATE_WEIGHT
+      : -holesDelta * REWARD_V2_HOLE_REMOVE_WEIGHT;
+  const reward = linesTerm + boardQualityDeltaTerm + timeTerm + holeDeltaTerm;
+  return {
+    reward,
+    breakdown: {
+      linesTerm,
+      scoreTerm: 0,
+      timeTerm,
+      heightTerm: 0,
+      holeDeltaTerm,
+      bumpinessDeltaTerm: 0,
+      boardScoreTerm: 0,
+      boardQualityDeltaTerm,
+    },
+  };
+};
 
 const cloneBoard = (board: Board): Board => board.map((row) => [...row]);
 
@@ -530,25 +686,7 @@ const scorePlacementCandidate = (options: {
   if (applied.invalid) return -1e9;
   const afterMetrics = evaluateBoardQuality(applied.boardAfter);
   const improvement = beforeMetrics.quality - afterMetrics.quality;
-
-  let rotateCount = 0;
-  let softDropCount = 0;
-  for (const command of placement.commands) {
-    if (
-      command === 'rotate_cw' ||
-      command === 'rotate_ccw' ||
-      command === 'rotate_180'
-    ) {
-      rotateCount += 1;
-    } else if (command === 'soft_drop') {
-      softDropCount += 1;
-    }
-  }
-  const complexityPenalty =
-    placement.commands.length * PLACEMENT_COMPLEXITY_CMD_WEIGHT +
-    rotateCount * PLACEMENT_COMPLEXITY_ROT_WEIGHT +
-    softDropCount * PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT +
-    (placement.holdUsed ? PLACEMENT_HOLD_COMPLEXITY_PENALTY : 0);
+  const complexityPenalty = computePlacementComplexityPenalty(placement);
 
   let score =
     improvement +
@@ -647,6 +785,7 @@ const buildPlacementChoices = (
       lockX: Math.trunc(state.active.x),
       lockY: Math.trunc(fallbackLockY),
       holdUsed: false,
+      srsKickCount: 0,
       commands: ['hard_drop'],
       searchDepth: 0,
     };
@@ -902,8 +1041,12 @@ class BotEnv {
     );
   }
 
-  step(actionIndexRaw: number): BotEnvStepResult {
+  step(
+    actionIndexRaw: number,
+    rewardBlend: RewardBlendWeights | null = null,
+  ): BotEnvStepResult {
     const stepStart = performance.now();
+    const blendWeights = normalizeRewardBlendWeights(rewardBlend);
     if (this.done) {
       const doneChoicesStart = performance.now();
       const obs = encodeObservation(
@@ -929,7 +1072,15 @@ class BotEnv {
         actionScores: choices.actionScores,
         reward: 0,
         done: true,
-        info: { alreadyDone: true, piecesPlaced: this.piecesPlaced },
+        info: {
+          alreadyDone: true,
+          piecesPlaced: this.piecesPlaced,
+          rewardBlendT: blendWeights.t,
+          rewardBlendLegacyWeight: blendWeights.legacyWeight,
+          rewardBlendTargetWeight: blendWeights.targetWeight,
+          rewardBlendTransitionStep: blendWeights.transitionStep,
+          rewardBlendTransitionTotalSteps: blendWeights.transitionTotalSteps,
+        },
         completedSession: null,
         profile: {
           total_s: totalElapsedS,
@@ -1015,7 +1166,7 @@ class BotEnv {
     const holesDelta = after.holes - before.holes;
     const bumpinessDelta = after.bumpiness - before.bumpiness;
     const boardQualityDelta = before.boardQuality - after.boardQuality;
-    const rewardResult = computePieceReward({
+    const rewardLegacy = computePieceRewardV1({
       modeId: this.modeId,
       linesDelta,
       scoreDelta,
@@ -1026,6 +1177,58 @@ class BotEnv {
       boardScoreDelta: before.boardScore - after.boardScore,
       boardQualityDelta,
     });
+    const rewardTarget = computePieceRewardV2({
+      modeId: this.modeId,
+      linesDelta,
+      scoreDelta,
+      timeDeltaMs,
+      heightDelta,
+      holesDelta,
+      bumpinessDelta,
+      boardScoreDelta: before.boardScore - after.boardScore,
+      boardQualityDelta,
+      placementComplexityPenalty:
+        computePlacementComplexityPenalty(selectedPlacement),
+    });
+    const rewardResult = blendPieceReward({
+      legacy: rewardLegacy,
+      target: rewardTarget,
+      weights: blendWeights,
+    });
+    const rewardLegacyContribution =
+      rewardLegacy.reward * blendWeights.legacyWeight;
+    const rewardTargetContribution =
+      rewardTarget.reward * blendWeights.targetWeight;
+    const rewardLegacyContributionBreakdown = {
+      linesTerm: rewardLegacy.breakdown.linesTerm * blendWeights.legacyWeight,
+      scoreTerm: rewardLegacy.breakdown.scoreTerm * blendWeights.legacyWeight,
+      timeTerm: rewardLegacy.breakdown.timeTerm * blendWeights.legacyWeight,
+      heightTerm: rewardLegacy.breakdown.heightTerm * blendWeights.legacyWeight,
+      holeDeltaTerm:
+        rewardLegacy.breakdown.holeDeltaTerm * blendWeights.legacyWeight,
+      bumpinessDeltaTerm:
+        rewardLegacy.breakdown.bumpinessDeltaTerm * blendWeights.legacyWeight,
+      boardScoreTerm:
+        rewardLegacy.breakdown.boardScoreTerm * blendWeights.legacyWeight,
+      boardQualityDeltaTerm:
+        rewardLegacy.breakdown.boardQualityDeltaTerm *
+        blendWeights.legacyWeight,
+    };
+    const rewardTargetContributionBreakdown = {
+      linesTerm: rewardTarget.breakdown.linesTerm * blendWeights.targetWeight,
+      scoreTerm: rewardTarget.breakdown.scoreTerm * blendWeights.targetWeight,
+      timeTerm: rewardTarget.breakdown.timeTerm * blendWeights.targetWeight,
+      heightTerm: rewardTarget.breakdown.heightTerm * blendWeights.targetWeight,
+      holeDeltaTerm:
+        rewardTarget.breakdown.holeDeltaTerm * blendWeights.targetWeight,
+      bumpinessDeltaTerm:
+        rewardTarget.breakdown.bumpinessDeltaTerm * blendWeights.targetWeight,
+      boardScoreTerm:
+        rewardTarget.breakdown.boardScoreTerm * blendWeights.targetWeight,
+      boardQualityDeltaTerm:
+        rewardTarget.breakdown.boardQualityDeltaTerm *
+        blendWeights.targetWeight,
+    };
     const reward = rewardResult.reward;
     const topOutPenalty = this.game.state.gameOver ? TOP_OUT_PENALTY : 0;
     const finalReward = reward - topOutPenalty;
@@ -1086,8 +1289,67 @@ class BotEnv {
         scoreDelta,
         timeDeltaMs,
         boardScoreDelta: before.boardScore - after.boardScore,
+        rewardLegacyBase: rewardLegacy.reward,
+        rewardTargetBase: rewardTarget.reward,
+        rewardLegacyContribution,
+        rewardTargetContribution,
+        rewardBlendT: blendWeights.t,
+        rewardBlendLegacyWeight: blendWeights.legacyWeight,
+        rewardBlendTargetWeight: blendWeights.targetWeight,
+        rewardBlendTransitionStep: blendWeights.transitionStep,
+        rewardBlendTransitionTotalSteps: blendWeights.transitionTotalSteps,
         rewardBase: reward,
         rewardFinal: finalReward,
+        rewardLegacyTermLines: rewardLegacy.breakdown.linesTerm,
+        rewardLegacyTermScore: rewardLegacy.breakdown.scoreTerm,
+        rewardLegacyTermTime: rewardLegacy.breakdown.timeTerm,
+        rewardLegacyTermHeight: rewardLegacy.breakdown.heightTerm,
+        rewardLegacyTermHoles: rewardLegacy.breakdown.holeDeltaTerm,
+        rewardLegacyTermBumpiness: rewardLegacy.breakdown.bumpinessDeltaTerm,
+        rewardLegacyTermBoardScore: rewardLegacy.breakdown.boardScoreTerm,
+        rewardLegacyTermBoardQuality:
+          rewardLegacy.breakdown.boardQualityDeltaTerm,
+        rewardTargetTermLines: rewardTarget.breakdown.linesTerm,
+        rewardTargetTermScore: rewardTarget.breakdown.scoreTerm,
+        rewardTargetTermTime: rewardTarget.breakdown.timeTerm,
+        rewardTargetTermHeight: rewardTarget.breakdown.heightTerm,
+        rewardTargetTermHoles: rewardTarget.breakdown.holeDeltaTerm,
+        rewardTargetTermBumpiness: rewardTarget.breakdown.bumpinessDeltaTerm,
+        rewardTargetTermBoardScore: rewardTarget.breakdown.boardScoreTerm,
+        rewardTargetTermBoardQuality:
+          rewardTarget.breakdown.boardQualityDeltaTerm,
+        rewardLegacyContributionTermLines:
+          rewardLegacyContributionBreakdown.linesTerm,
+        rewardLegacyContributionTermScore:
+          rewardLegacyContributionBreakdown.scoreTerm,
+        rewardLegacyContributionTermTime:
+          rewardLegacyContributionBreakdown.timeTerm,
+        rewardLegacyContributionTermHeight:
+          rewardLegacyContributionBreakdown.heightTerm,
+        rewardLegacyContributionTermHoles:
+          rewardLegacyContributionBreakdown.holeDeltaTerm,
+        rewardLegacyContributionTermBumpiness:
+          rewardLegacyContributionBreakdown.bumpinessDeltaTerm,
+        rewardLegacyContributionTermBoardScore:
+          rewardLegacyContributionBreakdown.boardScoreTerm,
+        rewardLegacyContributionTermBoardQuality:
+          rewardLegacyContributionBreakdown.boardQualityDeltaTerm,
+        rewardTargetContributionTermLines:
+          rewardTargetContributionBreakdown.linesTerm,
+        rewardTargetContributionTermScore:
+          rewardTargetContributionBreakdown.scoreTerm,
+        rewardTargetContributionTermTime:
+          rewardTargetContributionBreakdown.timeTerm,
+        rewardTargetContributionTermHeight:
+          rewardTargetContributionBreakdown.heightTerm,
+        rewardTargetContributionTermHoles:
+          rewardTargetContributionBreakdown.holeDeltaTerm,
+        rewardTargetContributionTermBumpiness:
+          rewardTargetContributionBreakdown.bumpinessDeltaTerm,
+        rewardTargetContributionTermBoardScore:
+          rewardTargetContributionBreakdown.boardScoreTerm,
+        rewardTargetContributionTermBoardQuality:
+          rewardTargetContributionBreakdown.boardQualityDeltaTerm,
         rewardTermLines: rewardResult.breakdown.linesTerm,
         rewardTermScore: rewardResult.breakdown.scoreTerm,
         rewardTermTime: rewardResult.breakdown.timeTerm,
@@ -1198,7 +1460,15 @@ class BotEnv {
             ...merged.generator,
             type: 'bag7' as const,
           }
-        : merged.generator;
+        : this.pieceSource === 'random'
+          ? {
+              ...merged.generator,
+              type: 'random' as const,
+            }
+          : {
+              ...merged.generator,
+              type: 'ml' as const,
+            };
     const modelRunner = createModelRunner({
       preferredBackend: 'native',
     }).runner;
@@ -1350,7 +1620,12 @@ class BotEnv {
         pieceSourceProfile: this.pieceSource,
         pipelineId: 'offline_ppo_v1',
         pipelineMode: this.modeId,
-        generatorType: this.pieceSource === 'bag7' ? 'bag7' : 'ml',
+        generatorType:
+          this.pieceSource === 'bag7'
+            ? 'bag7'
+            : this.pieceSource === 'random'
+              ? 'random'
+              : 'ml',
       },
     };
     return session;
@@ -1400,6 +1675,8 @@ export class BotEnvPool {
   private actionCurriculum: ActionCurriculumConfig = {
     ...DEFAULT_ACTION_CURRICULUM,
   };
+  private rewardBlendTimesteps = DEFAULT_REWARD_BLEND_TIMESTEPS;
+  private rewardBlendTransitionStep = 0;
 
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
@@ -1420,6 +1697,18 @@ export class BotEnvPool {
       DEFAULT_MAX_PIECES,
       1,
       1_000_000,
+    );
+    const rewardBlendTimesteps = clampInt(
+      payload.rewardBlendTimesteps,
+      DEFAULT_REWARD_BLEND_TIMESTEPS,
+      1,
+      1_000_000_000,
+    );
+    const rewardBlendStartStep = clampInt(
+      payload.rewardBlendStartStep,
+      0,
+      0,
+      1_000_000_000,
     );
     const baseSeed = clampInt(payload.seed, Date.now(), 1, 0x7fffffff);
     const modelPath =
@@ -1448,6 +1737,8 @@ export class BotEnvPool {
         ),
       );
     }
+    pool.rewardBlendTimesteps = rewardBlendTimesteps;
+    pool.rewardBlendTransitionStep = rewardBlendStartStep;
     pool.setCurriculum(null);
     return pool;
   }
@@ -1517,7 +1808,7 @@ export class BotEnvPool {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
       const action = clampInt(actions[i], 0, 0, DEFAULT_ACTION_DIM - 1);
-      const out = env.step(action);
+      const out = env.step(action, this.nextRewardBlendWeights());
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);
@@ -1594,5 +1885,24 @@ export class BotEnvPool {
       throw new Error(`Unknown env id: ${id}`);
     }
     return env;
+  }
+
+  private nextRewardBlendWeights(): RewardBlendWeights {
+    const transitionTotalSteps = Math.max(1, this.rewardBlendTimesteps);
+    const transitionStep = Math.max(0, this.rewardBlendTransitionStep);
+    const progress = Math.max(
+      0,
+      Math.min(1, transitionStep / transitionTotalSteps),
+    );
+    const legacyWeight = 1 - progress;
+    const targetWeight = progress;
+    this.rewardBlendTransitionStep = transitionStep + 1;
+    return {
+      legacyWeight,
+      targetWeight,
+      t: legacyWeight,
+      transitionStep,
+      transitionTotalSteps,
+    };
   }
 }

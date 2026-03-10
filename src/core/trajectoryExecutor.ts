@@ -1,16 +1,14 @@
 import { SPAWN_X, SPAWN_Y } from './constants';
-import {
-  collides,
-  dropDistance,
-  tryRotate180PreferDirect,
-  tryRotateSRS,
-} from './piece';
+import { collides, dropDistance } from './piece';
+import { getSrsKickTests } from './srs';
+import { rotAdd } from './tetromino';
 import {
   PIECES,
   type ActivePiece,
   type Board,
   type InputFrame,
   type PieceKind,
+  type Rotation,
 } from './types';
 import type { TrajectoryReplayStepV1 } from './trajectoryProtocol';
 
@@ -77,6 +75,7 @@ export type TrajectoryExecutorReachablePlacement = {
   lockX: number;
   lockY: number;
   holdUsed: boolean;
+  srsKickCount?: number;
   commands: TrajectoryExecutorCommand[];
   searchDepth: number;
 };
@@ -105,6 +104,16 @@ export type TrajectoryExecutorSimulationResult = {
 type SearchNode = {
   piece: ActivePiece;
   commands: SearchAction[];
+  srsKickCount: number;
+};
+
+type AppliedSearchAction = {
+  piece: ActivePiece;
+  srsKicksUsed: number;
+};
+
+type ApplySearchActionOptions = {
+  onlyWhenTwoQuarterTurnsFail?: boolean;
 };
 
 const clonePiece = (piece: ActivePiece): ActivePiece => ({ ...piece });
@@ -176,6 +185,72 @@ const toInputFrame = (command: TrajectoryExecutorCommand): InputFrame => {
   }
 };
 
+const tryRotateSrsAction = (
+  board: Board,
+  piece: ActivePiece,
+  dir: -1 | 1,
+): AppliedSearchAction | null => {
+  const from = piece.r;
+  const to = rotAdd(from, dir);
+  const tests = getSrsKickTests(piece.k, from, to);
+  for (const [dx, dy] of tests) {
+    if (!collides(board, piece, to, dx, dy)) {
+      const next = clonePiece(piece);
+      next.r = to;
+      next.x += dx;
+      next.y += dy;
+      return {
+        piece: next,
+        srsKicksUsed: dx === 0 && dy === 0 ? 0 : 1,
+      };
+    }
+  }
+  return null;
+};
+
+const tryRotate180ViaTwoQuarterTurnsAction = (
+  board: Board,
+  piece: ActivePiece,
+): AppliedSearchAction | null => {
+  const attemptViaDir = (dir: -1 | 1): AppliedSearchAction | null => {
+    const first = tryRotateSrsAction(board, piece, dir);
+    if (!first) return null;
+    const second = tryRotateSrsAction(board, first.piece, dir);
+    if (!second) return null;
+    return {
+      piece: second.piece,
+      srsKicksUsed: first.srsKicksUsed + second.srsKicksUsed,
+    };
+  };
+
+  return attemptViaDir(1) ?? attemptViaDir(-1);
+};
+
+const tryRotate180Action = (
+  board: Board,
+  piece: ActivePiece,
+  options: ApplySearchActionOptions = {},
+): AppliedSearchAction | null => {
+  const viaTwoQuarterTurns = tryRotate180ViaTwoQuarterTurnsAction(board, piece);
+  if (options.onlyWhenTwoQuarterTurnsFail === true && viaTwoQuarterTurns) {
+    // In planning/enumeration, emit rotate_180 only when both two-step SRS
+    // variants fail, so the executor keeps richer quarter-turn signal.
+    return null;
+  }
+
+  const to = ((piece.r + 2) % 4) as Rotation;
+  if (!collides(board, piece, to, 0, 0)) {
+    const next = clonePiece(piece);
+    next.r = to;
+    return {
+      piece: next,
+      srsKicksUsed: 0,
+    };
+  }
+
+  return viaTwoQuarterTurns;
+};
+
 export const trajectoryExecutorCommandToInputFrame = (
   command: TrajectoryExecutorCommand,
 ): InputFrame => toInputFrame(command);
@@ -184,30 +259,37 @@ const applySearchAction = (
   board: Board,
   piece: ActivePiece,
   action: SearchAction,
-): ActivePiece | null => {
+  options: ApplySearchActionOptions = {},
+): AppliedSearchAction | null => {
   const next = clonePiece(piece);
   switch (action) {
     case 'left':
       if (collides(board, next, next.r, -1, 0)) return null;
       next.x -= 1;
-      return next;
+      return {
+        piece: next,
+        srsKicksUsed: 0,
+      };
     case 'right':
       if (collides(board, next, next.r, 1, 0)) return null;
       next.x += 1;
-      return next;
+      return {
+        piece: next,
+        srsKicksUsed: 0,
+      };
     case 'soft_drop':
       if (collides(board, next, next.r, 0, 1)) return null;
       next.y += 1;
-      return next;
+      return {
+        piece: next,
+        srsKicksUsed: 0,
+      };
     case 'rotate_cw':
-      if (!tryRotateSRS(board, next, 1)) return null;
-      return next;
+      return tryRotateSrsAction(board, next, 1);
     case 'rotate_ccw':
-      if (!tryRotateSRS(board, next, -1)) return null;
-      return next;
+      return tryRotateSrsAction(board, next, -1);
     case 'rotate_180':
-      if (!tryRotate180PreferDirect(board, next)) return null;
-      return next;
+      return tryRotate180Action(board, next, options);
     default:
       return null;
   }
@@ -330,6 +412,7 @@ export const planTrajectoryLockExecution = (
     {
       piece: startResolved.piece,
       commands: [],
+      srsKickCount: 0,
     },
   ];
   const visited = new Set<string>([stateKey(startResolved.piece)]);
@@ -350,14 +433,17 @@ export const planTrajectoryLockExecution = (
       break;
     }
     for (const action of actionOrder) {
-      const nextPiece = applySearchAction(input.board, node.piece, action);
-      if (!nextPiece) continue;
-      const key = stateKey(nextPiece);
+      const next = applySearchAction(input.board, node.piece, action, {
+        onlyWhenTwoQuarterTurnsFail: true,
+      });
+      if (!next) continue;
+      const key = stateKey(next.piece);
       if (visited.has(key)) continue;
       visited.add(key);
       queue.push({
-        piece: nextPiece,
+        piece: next.piece,
         commands: [...node.commands, action],
+        srsKickCount: node.srsKickCount + next.srsKicksUsed,
       });
     }
   }
@@ -389,6 +475,7 @@ const enumerateReachableLockPlacementsForStart = (input: {
     {
       piece: clonePiece(input.startPiece),
       commands: [],
+      srsKickCount: 0,
     },
   ];
   const visited = new Set<string>([stateKey(input.startPiece)]);
@@ -411,6 +498,7 @@ const enumerateReachableLockPlacementsForStart = (input: {
         lockX: node.piece.x,
         lockY,
         holdUsed: input.holdUsed,
+        srsKickCount: node.srsKickCount,
         commands: [...input.prefix, ...node.commands, 'hard_drop'],
         searchDepth: node.commands.length,
       });
@@ -419,14 +507,17 @@ const enumerateReachableLockPlacementsForStart = (input: {
       break;
     }
     for (const action of actionOrder) {
-      const nextPiece = applySearchAction(input.board, node.piece, action);
-      if (!nextPiece) continue;
-      const key = stateKey(nextPiece);
+      const next = applySearchAction(input.board, node.piece, action, {
+        onlyWhenTwoQuarterTurnsFail: true,
+      });
+      if (!next) continue;
+      const key = stateKey(next.piece);
       if (visited.has(key)) continue;
       visited.add(key);
       queue.push({
-        piece: nextPiece,
+        piece: next.piece,
         commands: [...node.commands, action],
+        srsKickCount: node.srsKickCount + next.srsKicksUsed,
       });
     }
   }
@@ -557,7 +648,7 @@ export const simulateTrajectoryExecutorCommands = (input: {
         failedAt: i,
       };
     }
-    piece = next;
+    piece = next.piece;
   }
   return {
     ok: true,
