@@ -71,6 +71,7 @@ class PPOConfig:
     distill_coef_start: float
     distill_coef_end: float
     distill_coef_ramp_updates: int
+    distill_teacher_alpha: float
     distill_teacher_tau: float
     distill_teacher_top_m: int
     validation_episodes_per_env: int
@@ -671,6 +672,15 @@ def parse_args() -> PPOConfig:
         help="Teacher temperature for distillation softmax(teacher_logits / tau).",
     )
     parser.add_argument(
+        "--distill-teacher-alpha",
+        type=float,
+        default=0.25,
+        help=(
+            "Heuristic prior strength for teacher construction. "
+            "Independent from rollout curriculum bias."
+        ),
+    )
+    parser.add_argument(
         "--distill-teacher-top-m",
         type=int,
         default=0,
@@ -853,6 +863,7 @@ def parse_args() -> PPOConfig:
         distill_coef_start=max(0.0, float(args.distill_coef_start)),
         distill_coef_end=max(0.0, float(args.distill_coef_end)),
         distill_coef_ramp_updates=max(0, int(args.distill_coef_ramp_updates)),
+        distill_teacher_alpha=max(0.0, float(args.distill_teacher_alpha)),
         distill_teacher_tau=max(1e-4, float(args.distill_teacher_tau)),
         distill_teacher_top_m=max(0, int(args.distill_teacher_top_m)),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
@@ -1039,7 +1050,7 @@ def build_teacher_probs(
     student_logits: torch.Tensor,
     action_scores: torch.Tensor,
     tau: float,
-    bias_alpha: float,
+    teacher_alpha: float,
     top_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Distill toward the policy that would result from adding a heuristic prior
@@ -1057,9 +1068,8 @@ def build_teacher_probs(
     safe_tau = max(1e-4, float(tau))
     large_neg = torch.full_like(student_logits, -1e9)
     teacher_logits = torch.where(valid, student_logits.detach(), large_neg)
-    # Use current curriculum bias magnitude as distillation prior strength so the
-    # teacher reflects the same steering used during rollout action selection.
-    prior_alpha = float(max(0.0, min(1.0, bias_alpha)))
+    # Distillation prior strength is independent from rollout policy steering.
+    prior_alpha = float(max(0.0, min(1.0, teacher_alpha)))
     if prior_alpha <= 0.0:
         row_prior_inactive = torch.ones_like(row_prior_inactive)
     if prior_alpha > 0.0:
@@ -2612,6 +2622,7 @@ def train(cfg: PPOConfig) -> None:
             f"curriculum_danger_height={cfg.curriculum_danger_height}, "
             f"distill_coef={cfg.distill_coef_start:.4f}->{cfg.distill_coef_end:.4f}/"
             f"{cfg.distill_coef_ramp_updates}, "
+            f"distill_teacher_alpha={cfg.distill_teacher_alpha:.3f}, "
             f"distill_teacher_tau={cfg.distill_teacher_tau:.4f}, "
             f"distill_teacher_top_m={cfg.distill_teacher_top_m}, "
             f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
@@ -3129,7 +3140,7 @@ def train(cfg: PPOConfig) -> None:
                                 student_logits,
                                 mb_action_scores,
                                 cfg.distill_teacher_tau,
-                                curriculum_bias_now,
+                                cfg.distill_teacher_alpha,
                                 cfg.distill_teacher_top_m,
                             )
                         )
@@ -3337,6 +3348,7 @@ def train(cfg: PPOConfig) -> None:
                     ),
                     "adapter_checks": list(adapter_state_now.get("checks", [])),
                     "distill_coef_used": distill_coef_now,
+                    "distill_teacher_alpha_used": cfg.distill_teacher_alpha,
                     "distill_teacher_tau_used": cfg.distill_teacher_tau,
                     "distill_teacher_top_m_used": cfg.distill_teacher_top_m,
                     "curriculum_topk_used": curriculum_topk_now,
@@ -3551,6 +3563,7 @@ def train(cfg: PPOConfig) -> None:
                             "  schedule: "
                             f"ent_coef={ent_coef_now:.5f} "
                             f"distill_coef={distill_coef_now:.5f} "
+                            f"teacher_alpha={cfg.distill_teacher_alpha:.3f} "
                             f"tau={cfg.distill_teacher_tau:.3f} "
                             f"teacher_topm={cfg.distill_teacher_top_m} "
                             f"pclip={cfg.policy_clip_coef:.4f} "
