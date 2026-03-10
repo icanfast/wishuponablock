@@ -1815,6 +1815,13 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "base": data.get("reward_base"),
             "top_out_penalty": data.get("top_out_penalty"),
         },
+        "blend": {
+            "t": data.get("blend_t"),
+            "legacy_weight": data.get("blend_legacy_weight"),
+            "target_weight": data.get("blend_target_weight"),
+            "transition_step": data.get("blend_transition_step"),
+            "transition_total_steps": data.get("blend_transition_total_steps"),
+        },
         "v1": {
             "base": data.get("v1_base"),
             "base_raw": data.get("v1_base_raw"),
@@ -2467,6 +2474,11 @@ def train(cfg: PPOConfig) -> None:
             "reward_final": ("rewardFinal",),
             "reward_base": ("rewardBase",),
             "top_out_penalty": ("topOutPenalty",),
+            "blend_t": ("rewardBlendT",),
+            "blend_legacy_weight": ("rewardBlendLegacyWeight",),
+            "blend_target_weight": ("rewardBlendTargetWeight",),
+            "blend_transition_step": ("rewardBlendTransitionStep",),
+            "blend_transition_total_steps": ("rewardBlendTransitionTotalSteps",),
             "v1_base_raw": ("rewardLegacyBase",),
             "v2_base_raw": ("rewardTargetBase",),
             "v1_base": ("rewardLegacyContribution",),
@@ -3295,134 +3307,175 @@ def train(cfg: PPOConfig) -> None:
                         + profile_io_s
                     )
                     profile_overhead_s = max(0.0, update_seconds - profile_accounted_s)
-                    print(
-                        "[ppo] "
-                        f"update={update}/{num_updates} "
-                        f"step={global_step} "
-                        f"ploss={stats['policy_loss']:.4f} "
-                        f"vloss={stats['value_loss']:.4f} "
-                        f"dloss={stats['distill_loss']:.4f} "
-                        f"loss={stats['loss_total']:.4f} "
-                        f"loss_terms("
-                        f"p={stats['loss_policy_term']:.4f},"
-                        f"v={stats['loss_value_term']:.4f},"
-                        f"ent={stats['loss_entropy_term']:.4f},"
-                        f"dist={stats['loss_distill_term']:.4f}"
-                        f") "
-                        f"ent={stats['entropy']:.4f} "
-                        f"kl={stats['approx_kl']:.5f} "
-                        f"clip={stats['clip_fraction']:.3f} "
-                        f"ent_coef={ent_coef_now:.5f} "
-                        f"distill_coef={distill_coef_now:.5f} "
-                        f"tau={cfg.distill_teacher_tau:.3f} "
-                        f"pclip={cfg.policy_clip_coef:.4f} "
-                        f"vclip={cfg.value_clip_coef:.4f} "
-                        f"p_lr={policy_lr_now:.6g} "
-                        f"v_lr={value_lr_now:.6g} "
-                        f"adapter(status={stats['adapter_status']},"
-                        f"conv={stats['adapter_conv_status']},"
-                        f"lr_scale={stats['adapter_lr_scale_used']:.3f},"
-                        f"eff_lr={stats['adapter_effective_lr_used']:.6g},"
-                        f"checks={'ok' if stats['adapter_checks_ok'] else 'warn'}) "
-                        f"target_kl={target_kl_now:.5f} "
-                        f"topk={curriculum_topk_now} "
-                        f"bias={curriculum_bias_now:.3f} "
-                        f"src={'ml' if current_piece_source == 'active_generator' else current_piece_source} "
-                        f"warmup={'y' if warmup_active else 'n'} "
-                        f"teacher("
-                        f"ent={stats['teacher_entropy']:.3f},"
-                        f"maxp={stats['teacher_max_prob']:.3f},"
-                        f"uniform={stats['teacher_uniform_row_frac']:.3f},"
-                        f"bias_rows={stats['teacher_bias_row_frac']:.3f},"
-                        f"psum={stats['teacher_prob_sum']:.3f},"
-                        f"valid={stats['teacher_valid_actions']:.1f}"
-                        f") "
-                        f"ev={stats['explained_variance']:.3f} "
-                        f"ret100={stats['mean_episode_return_recent']:.3f} "
-                        f"ret100_parts("
-                        f"final={_fmt_float(stats['ret100_terms'].get('reward_final'))},"
-                        f"base={_fmt_float(stats['ret100_terms'].get('reward_base'))},"
-                        f"v1={_fmt_float(stats['ret100_terms'].get('v1_base'))},"
-                        f"v2={_fmt_float(stats['ret100_terms'].get('v2_base'))},"
-                        f"topout={_fmt_float(stats['ret100_terms'].get('top_out_penalty'))}"
-                        f") "
-                        f"ret100_v1_terms("
-                        f"lines={_fmt_float(stats['ret100_terms'].get('v1_term_lines'))},"
-                        f"score={_fmt_float(stats['ret100_terms'].get('v1_term_score'))},"
-                        f"time={_fmt_float(stats['ret100_terms'].get('v1_term_time'))},"
-                        f"height={_fmt_float(stats['ret100_terms'].get('v1_term_height'))},"
-                        f"holes={_fmt_float(stats['ret100_terms'].get('v1_term_holes'))},"
-                        f"bump={_fmt_float(stats['ret100_terms'].get('v1_term_bumpiness'))},"
-                        f"board={_fmt_float(stats['ret100_terms'].get('v1_term_board_score'))},"
-                        f"q={_fmt_float(stats['ret100_terms'].get('v1_term_board_quality'))}"
-                        f") "
-                        f"ret100_v2_terms("
-                        f"lines={_fmt_float(stats['ret100_terms'].get('v2_term_lines'))},"
-                        f"score={_fmt_float(stats['ret100_terms'].get('v2_term_score'))},"
-                        f"time={_fmt_float(stats['ret100_terms'].get('v2_term_time'))},"
-                        f"height={_fmt_float(stats['ret100_terms'].get('v2_term_height'))},"
-                        f"holes={_fmt_float(stats['ret100_terms'].get('v2_term_holes'))},"
-                        f"bump={_fmt_float(stats['ret100_terms'].get('v2_term_bumpiness'))},"
-                        f"board={_fmt_float(stats['ret100_terms'].get('v2_term_board_score'))},"
-                        f"q={_fmt_float(stats['ret100_terms'].get('v2_term_board_quality'))}"
-                        f") "
-                        f"ret100_blend_terms("
-                        f"lines={_fmt_float(stats['ret100_terms'].get('term_lines'))},"
-                        f"score={_fmt_float(stats['ret100_terms'].get('term_score'))},"
-                        f"time={_fmt_float(stats['ret100_terms'].get('term_time'))},"
-                        f"height={_fmt_float(stats['ret100_terms'].get('term_height'))},"
-                        f"holes={_fmt_float(stats['ret100_terms'].get('term_holes'))},"
-                        f"bump={_fmt_float(stats['ret100_terms'].get('term_bumpiness'))},"
-                        f"board={_fmt_float(stats['ret100_terms'].get('term_board_score'))},"
-                        f"q={_fmt_float(stats['ret100_terms'].get('term_board_quality'))}"
-                        f") "
-                        f"val={_fmt_float(stats.get('validation_mean_return'))} "
-                        f"val_parts("
-                        f"final={_fmt_float((stats.get('validation_terms') or {}).get('reward_final'))},"
-                        f"base={_fmt_float((stats.get('validation_terms') or {}).get('reward_base'))},"
-                        f"v1={_fmt_float((stats.get('validation_terms') or {}).get('v1_base'))},"
-                        f"v2={_fmt_float((stats.get('validation_terms') or {}).get('v2_base'))},"
-                        f"topout={_fmt_float((stats.get('validation_terms') or {}).get('top_out_penalty'))}"
-                        f") "
-                        f"val_v1_terms("
-                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_lines'))},"
-                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_score'))},"
-                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_time'))},"
-                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_height'))},"
-                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_holes'))},"
-                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_bumpiness'))},"
-                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_board_score'))},"
-                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('v1_term_board_quality'))}"
-                        f") "
-                        f"val_v2_terms("
-                        f"lines={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_lines'))},"
-                        f"score={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_score'))},"
-                        f"time={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_time'))},"
-                        f"height={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_height'))},"
-                        f"holes={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_holes'))},"
-                        f"bump={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_bumpiness'))},"
-                        f"board={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_board_score'))},"
-                        f"q={_fmt_float((stats.get('validation_terms') or {}).get('v2_term_board_quality'))}"
-                        f") "
-                        f"sps={stats['sps']} "
-                        f"t_upd={update_seconds:.2f}s "
-                        f"t_roll={profile_rollout_s:.2f}s "
-                        f"t_env={profile_env_total_s:.2f}s "
-                        f"t_env_batch={profile_env_batch_s:.2f}s "
-                        f"t_env_core={profile_env_core_s:.2f}s "
-                        f"t_env_ipc={profile_env_ipc_s:.2f}s "
-                        f"t_env_runner={profile_env_step_runner_s:.2f}s "
-                        f"t_env_choices={profile_env_choices_s:.2f}s "
-                        f"t_env_obs={profile_env_obs_s:.2f}s "
-                        f"t_env_reward={profile_env_step_reward_s:.2f}s "
-                        f"t_fwd={profile_policy_forward_s:.2f}s "
-                        f"t_gae={profile_gae_s:.2f}s "
-                        f"t_opt={profile_opt_s:.2f}s "
-                        f"t_io={profile_io_s:.2f}s "
-                        f"t_ovh={profile_overhead_s:.2f}s "
-                        f"mask_fix_rows={mask_repair_update['rows']} "
-                        f"mask_fix_rows_total={mask_repair_total['rows']}"
+                    ret_terms = stats["ret100_terms"]
+                    val_terms = stats.get("validation_terms") or {}
+                    source_label = (
+                        "ml"
+                        if current_piece_source == "active_generator"
+                        else current_piece_source
                     )
+                    adapter_checks_label = (
+                        "ok" if stats["adapter_checks_ok"] else "warn"
+                    )
+                    log_lines = [
+                        (
+                            f"[ppo] update={update}/{num_updates} "
+                            f"step={global_step} src={source_label} "
+                            f"warmup={'y' if warmup_active else 'n'} "
+                            f"sps={stats['sps']}"
+                        ),
+                        (
+                            "  losses: "
+                            f"ploss={stats['policy_loss']:.4f} "
+                            f"vloss={stats['value_loss']:.4f} "
+                            f"dloss={stats['distill_loss']:.4f} "
+                            f"total={stats['loss_total']:.4f} "
+                            f"| terms(p={stats['loss_policy_term']:.4f},"
+                            f"v={stats['loss_value_term']:.4f},"
+                            f"ent={stats['loss_entropy_term']:.4f},"
+                            f"dist={stats['loss_distill_term']:.4f}) "
+                            f"| ent={stats['entropy']:.4f} "
+                            f"kl={stats['approx_kl']:.5f} "
+                            f"clip={stats['clip_fraction']:.3f} "
+                            f"ev={stats['explained_variance']:.3f}"
+                        ),
+                        (
+                            "  schedule: "
+                            f"ent_coef={ent_coef_now:.5f} "
+                            f"distill_coef={distill_coef_now:.5f} "
+                            f"tau={cfg.distill_teacher_tau:.3f} "
+                            f"pclip={cfg.policy_clip_coef:.4f} "
+                            f"vclip={cfg.value_clip_coef:.4f} "
+                            f"p_lr={policy_lr_now:.6g} "
+                            f"v_lr={value_lr_now:.6g} "
+                            f"target_kl={target_kl_now:.5f}"
+                        ),
+                        (
+                            "  adapter: "
+                            f"status={stats['adapter_status']} "
+                            f"conv={stats['adapter_conv_status']} "
+                            f"lr_scale={stats['adapter_lr_scale_used']:.3f} "
+                            f"eff_lr={stats['adapter_effective_lr_used']:.6g} "
+                            f"checks={adapter_checks_label}"
+                        ),
+                        (
+                            "  curriculum: "
+                            f"topk={curriculum_topk_now} "
+                            f"bias={curriculum_bias_now:.3f} "
+                            f"teacher(ent={stats['teacher_entropy']:.3f},"
+                            f"maxp={stats['teacher_max_prob']:.3f},"
+                            f"uniform={stats['teacher_uniform_row_frac']:.3f},"
+                            f"bias_rows={stats['teacher_bias_row_frac']:.3f},"
+                            f"psum={stats['teacher_prob_sum']:.3f},"
+                            f"valid={stats['teacher_valid_actions']:.1f})"
+                        ),
+                        (
+                            "  ret100: "
+                            f"final={_fmt_float(ret_terms.get('reward_final'))} "
+                            f"base={_fmt_float(ret_terms.get('reward_base'))} "
+                            f"v1={_fmt_float(ret_terms.get('v1_base'))} "
+                            f"v2={_fmt_float(ret_terms.get('v2_base'))} "
+                            f"v1_raw={_fmt_float(ret_terms.get('v1_base_raw'))} "
+                            f"v2_raw={_fmt_float(ret_terms.get('v2_base_raw'))} "
+                            f"w1={_fmt_float(ret_terms.get('blend_legacy_weight'))} "
+                            f"w2={_fmt_float(ret_terms.get('blend_target_weight'))} "
+                            f"t={_fmt_float(ret_terms.get('blend_t'))} "
+                            f"topout={_fmt_float(ret_terms.get('top_out_penalty'))}"
+                        ),
+                        (
+                            "    v1_terms: "
+                            f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
+                            f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
+                            f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
+                            f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
+                            f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
+                            f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
+                            f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
+                            f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))}"
+                        ),
+                        (
+                            "    v2_terms: "
+                            f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
+                            f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
+                            f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
+                            f"height={_fmt_float(ret_terms.get('v2_term_height'))} "
+                            f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
+                            f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
+                            f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
+                            f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))}"
+                        ),
+                        (
+                            "    blend_terms: "
+                            f"lines={_fmt_float(ret_terms.get('term_lines'))} "
+                            f"score={_fmt_float(ret_terms.get('term_score'))} "
+                            f"time={_fmt_float(ret_terms.get('term_time'))} "
+                            f"height={_fmt_float(ret_terms.get('term_height'))} "
+                            f"holes={_fmt_float(ret_terms.get('term_holes'))} "
+                            f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
+                            f"board={_fmt_float(ret_terms.get('term_board_score'))} "
+                            f"q={_fmt_float(ret_terms.get('term_board_quality'))}"
+                        ),
+                        (
+                            "  validation: "
+                            f"ret={_fmt_float(stats.get('validation_mean_return'))} "
+                            f"final={_fmt_float(val_terms.get('reward_final'))} "
+                            f"base={_fmt_float(val_terms.get('reward_base'))} "
+                            f"v1={_fmt_float(val_terms.get('v1_base'))} "
+                            f"v2={_fmt_float(val_terms.get('v2_base'))} "
+                            f"v1_raw={_fmt_float(val_terms.get('v1_base_raw'))} "
+                            f"v2_raw={_fmt_float(val_terms.get('v2_base_raw'))} "
+                            f"w1={_fmt_float(val_terms.get('blend_legacy_weight'))} "
+                            f"w2={_fmt_float(val_terms.get('blend_target_weight'))} "
+                            f"t={_fmt_float(val_terms.get('blend_t'))} "
+                            f"topout={_fmt_float(val_terms.get('top_out_penalty'))}"
+                        ),
+                        (
+                            "    val_v1_terms: "
+                            f"lines={_fmt_float(val_terms.get('v1_term_lines'))} "
+                            f"score={_fmt_float(val_terms.get('v1_term_score'))} "
+                            f"time={_fmt_float(val_terms.get('v1_term_time'))} "
+                            f"height={_fmt_float(val_terms.get('v1_term_height'))} "
+                            f"holes={_fmt_float(val_terms.get('v1_term_holes'))} "
+                            f"bump={_fmt_float(val_terms.get('v1_term_bumpiness'))} "
+                            f"board={_fmt_float(val_terms.get('v1_term_board_score'))} "
+                            f"q={_fmt_float(val_terms.get('v1_term_board_quality'))}"
+                        ),
+                        (
+                            "    val_v2_terms: "
+                            f"lines={_fmt_float(val_terms.get('v2_term_lines'))} "
+                            f"score={_fmt_float(val_terms.get('v2_term_score'))} "
+                            f"time={_fmt_float(val_terms.get('v2_term_time'))} "
+                            f"height={_fmt_float(val_terms.get('v2_term_height'))} "
+                            f"holes={_fmt_float(val_terms.get('v2_term_holes'))} "
+                            f"bump={_fmt_float(val_terms.get('v2_term_bumpiness'))} "
+                            f"board={_fmt_float(val_terms.get('v2_term_board_score'))} "
+                            f"q={_fmt_float(val_terms.get('v2_term_board_quality'))}"
+                        ),
+                        (
+                            "  timing: "
+                            f"t_upd={update_seconds:.2f}s "
+                            f"t_roll={profile_rollout_s:.2f}s "
+                            f"t_env={profile_env_total_s:.2f}s "
+                            f"t_env_batch={profile_env_batch_s:.2f}s "
+                            f"t_env_core={profile_env_core_s:.2f}s "
+                            f"t_env_ipc={profile_env_ipc_s:.2f}s "
+                            f"t_env_runner={profile_env_step_runner_s:.2f}s "
+                            f"t_env_choices={profile_env_choices_s:.2f}s "
+                            f"t_env_obs={profile_env_obs_s:.2f}s "
+                            f"t_env_reward={profile_env_step_reward_s:.2f}s "
+                            f"t_fwd={profile_policy_forward_s:.2f}s "
+                            f"t_gae={profile_gae_s:.2f}s "
+                            f"t_opt={profile_opt_s:.2f}s "
+                            f"t_io={profile_io_s:.2f}s "
+                            f"t_ovh={profile_overhead_s:.2f}s"
+                        ),
+                        (
+                            "  mask_fix: "
+                            f"rows={mask_repair_update['rows']} "
+                            f"rows_total={mask_repair_total['rows']}"
+                        ),
+                    ]
+                    print("\n".join(log_lines))
                     if not stats["adapter_checks_ok"]:
                         print(
                             "[ppo] adapter integrity warning "
