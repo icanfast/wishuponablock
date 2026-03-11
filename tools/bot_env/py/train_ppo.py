@@ -2161,6 +2161,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "bumpiness": data.get("v1_term_bumpiness"),
                 "board_score": data.get("v1_term_board_score"),
                 "board_quality": data.get("v1_term_board_quality"),
+                "board_quality_absolute": data.get("v1_term_board_quality_abs"),
+                "full_clear": data.get("v1_term_full_clear"),
                 "top_out": data.get("v1_term_top_out"),
             },
         },
@@ -2176,6 +2178,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "bumpiness": data.get("v2_term_bumpiness"),
                 "board_score": data.get("v2_term_board_score"),
                 "board_quality": data.get("v2_term_board_quality"),
+                "board_quality_absolute": data.get("v2_term_board_quality_abs"),
+                "full_clear": data.get("v2_term_full_clear"),
                 "top_out": data.get("v2_term_top_out"),
             },
         },
@@ -2188,6 +2192,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "bumpiness": data.get("term_bumpiness"),
             "board_score": data.get("term_board_score"),
             "board_quality": data.get("term_board_quality"),
+            "board_quality_absolute": data.get("term_board_quality_abs"),
+            "full_clear": data.get("term_full_clear"),
             "top_out": data.get("term_top_out"),
         },
     }
@@ -2876,6 +2882,8 @@ def train(cfg: PPOConfig) -> None:
             "term_bumpiness": ("rewardTermBumpiness",),
             "term_board_score": ("rewardTermBoardScore",),
             "term_board_quality": ("rewardTermBoardQuality",),
+            "term_board_quality_abs": ("rewardTermBoardQualityAbsolute",),
+            "term_full_clear": ("rewardTermFullClear",),
             "term_top_out": ("rewardTermTopOut",),
             "v1_term_lines": ("rewardLegacyContributionTermLines",),
             "v1_term_score": ("rewardLegacyContributionTermScore",),
@@ -2885,6 +2893,10 @@ def train(cfg: PPOConfig) -> None:
             "v1_term_bumpiness": ("rewardLegacyContributionTermBumpiness",),
             "v1_term_board_score": ("rewardLegacyContributionTermBoardScore",),
             "v1_term_board_quality": ("rewardLegacyContributionTermBoardQuality",),
+            "v1_term_board_quality_abs": (
+                "rewardLegacyContributionTermBoardQualityAbsolute",
+            ),
+            "v1_term_full_clear": ("rewardLegacyContributionTermFullClear",),
             "v1_term_top_out": ("rewardLegacyContributionTermTopOut",),
             "v2_term_lines": ("rewardTargetContributionTermLines",),
             "v2_term_score": ("rewardTargetContributionTermScore",),
@@ -2894,6 +2906,10 @@ def train(cfg: PPOConfig) -> None:
             "v2_term_bumpiness": ("rewardTargetContributionTermBumpiness",),
             "v2_term_board_score": ("rewardTargetContributionTermBoardScore",),
             "v2_term_board_quality": ("rewardTargetContributionTermBoardQuality",),
+            "v2_term_board_quality_abs": (
+                "rewardTargetContributionTermBoardQualityAbsolute",
+            ),
+            "v2_term_full_clear": ("rewardTargetContributionTermFullClear",),
             "v2_term_top_out": ("rewardTargetContributionTermTopOut",),
         }
         episode_reward_term_keys = [
@@ -3824,6 +3840,8 @@ def train(cfg: PPOConfig) -> None:
                             f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
                             f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
+                            f"q_abs={_fmt_float(ret_terms.get('v1_term_board_quality_abs'))} "
+                            f"full_clear={_fmt_float(ret_terms.get('v1_term_full_clear'))} "
                             f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
                         ),
                         (
@@ -3836,6 +3854,8 @@ def train(cfg: PPOConfig) -> None:
                             f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
                             f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))} "
+                            f"q_abs={_fmt_float(ret_terms.get('v2_term_board_quality_abs'))} "
+                            f"full_clear={_fmt_float(ret_terms.get('v2_term_full_clear'))} "
                             f"topout={_fmt_float(ret_terms.get('v2_term_top_out'))}"
                         ),
                         (
@@ -3848,6 +3868,8 @@ def train(cfg: PPOConfig) -> None:
                             f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
                             f"board={_fmt_float(ret_terms.get('term_board_score'))} "
                             f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
+                            f"q_abs={_fmt_float(ret_terms.get('term_board_quality_abs'))} "
+                            f"full_clear={_fmt_float(ret_terms.get('term_full_clear'))} "
                             f"topout={_fmt_float(ret_terms.get('term_top_out'))}"
                         ),
                         (
@@ -3925,6 +3947,8 @@ def train(cfg: PPOConfig) -> None:
                                     + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
                                     + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
                                     + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
+                                    + f"q_abs={_fmt_float(source_terms_dict.get('v1_term_board_quality_abs'))} "
+                                    + f"full_clear={_fmt_float(source_terms_dict.get('v1_term_full_clear'))} "
                                     + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
                                 )
                                 log_lines.append(
@@ -3939,6 +3963,8 @@ def train(cfg: PPOConfig) -> None:
                                     + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
                                     + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
                                     + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
+                                    + f"q_abs={_fmt_float(source_terms_dict.get('v2_term_board_quality_abs'))} "
+                                    + f"full_clear={_fmt_float(source_terms_dict.get('v2_term_full_clear'))} "
                                     + f"topout={_fmt_float(source_terms_dict.get('v2_term_top_out'))}"
                                 )
                                 log_lines.append(

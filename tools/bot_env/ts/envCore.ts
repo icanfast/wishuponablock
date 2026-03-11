@@ -290,6 +290,8 @@ type PieceRewardBreakdown = {
   bumpinessDeltaTerm: number;
   boardScoreTerm: number;
   boardQualityDeltaTerm: number;
+  boardQualityAbsoluteTerm: number;
+  fullClearTerm: number;
   topOutTerm: number;
 };
 
@@ -382,6 +384,14 @@ const blendPieceReward = (options: {
         legacy.breakdown.boardQualityDeltaTerm,
         target.breakdown.boardQualityDeltaTerm,
       ),
+      boardQualityAbsoluteTerm: mix(
+        legacy.breakdown.boardQualityAbsoluteTerm,
+        target.breakdown.boardQualityAbsoluteTerm,
+      ),
+      fullClearTerm: mix(
+        legacy.breakdown.fullClearTerm,
+        target.breakdown.fullClearTerm,
+      ),
       topOutTerm: mix(legacy.breakdown.topOutTerm, target.breakdown.topOutTerm),
     },
   };
@@ -451,6 +461,8 @@ const computePieceRewardV1 = (
       bumpinessDeltaTerm,
       boardScoreTerm,
       boardQualityDeltaTerm,
+      boardQualityAbsoluteTerm: 0,
+      fullClearTerm: 0,
       topOutTerm,
     },
   };
@@ -498,6 +510,7 @@ const REWARD_V3_HOLE_CREATE_WEIGHT = 0.3;
 const REWARD_V3_HOLE_REMOVE_WEIGHT = 0.0;
 const REWARD_V3_DANGER_HEIGHT = 14;
 const REWARD_V3_DANGER_WEIGHT = 0.04;
+const REWARD_V3_FULL_CLEAR_BONUS = 20.0;
 
 const computePlacementComplexityPenalty = (
   placement: Pick<
@@ -564,6 +577,8 @@ const computePieceRewardV2 = (
       bumpinessDeltaTerm: 0,
       boardScoreTerm: 0,
       boardQualityDeltaTerm,
+      boardQualityAbsoluteTerm: 0,
+      fullClearTerm: 0,
       topOutTerm,
     },
   };
@@ -574,6 +589,7 @@ const computePieceRewardV3 = (
     placementComplexityPenalty: number;
     afterMaxHeight: number;
     afterBoardQuality: number;
+    isFullClear: boolean;
   },
 ): PieceRewardResult => {
   const {
@@ -583,6 +599,7 @@ const computePieceRewardV3 = (
     placementComplexityPenalty,
     afterMaxHeight,
     afterBoardQuality,
+    isFullClear,
     topOut,
   } = options;
   const clampedLines = Math.max(0, linesDelta);
@@ -598,6 +615,7 @@ const computePieceRewardV3 = (
   const danger = Math.max(0, afterMaxHeight - REWARD_V3_DANGER_HEIGHT);
   const heightTerm = -(danger * danger) * REWARD_V3_DANGER_WEIGHT;
   const timeTerm = -placementComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
+  const fullClearTerm = isFullClear ? REWARD_V3_FULL_CLEAR_BONUS : 0;
   const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
   const reward =
     linesTerm +
@@ -606,6 +624,7 @@ const computePieceRewardV3 = (
     holeDeltaTerm +
     heightTerm +
     timeTerm +
+    fullClearTerm +
     topOutTerm;
   return {
     reward,
@@ -616,8 +635,10 @@ const computePieceRewardV3 = (
       heightTerm,
       holeDeltaTerm,
       bumpinessDeltaTerm: 0,
-      boardScoreTerm: boardQualityAbsoluteTerm,
+      boardScoreTerm: 0,
       boardQualityDeltaTerm,
+      boardQualityAbsoluteTerm,
+      fullClearTerm,
       topOutTerm,
     },
   };
@@ -1256,6 +1277,7 @@ class BotEnv {
     const holesDelta = after.holes - before.holes;
     const bumpinessDelta = after.bumpiness - before.bumpiness;
     const boardQualityDelta = before.boardQuality - after.boardQuality;
+    const isFullClear = after.blocks === 0 && before.blocks > 0;
     const placementComplexityPenalty =
       computePlacementComplexityPenalty(selectedPlacement);
     const rewardV1 = computePieceRewardV1({
@@ -1297,6 +1319,7 @@ class BotEnv {
       placementComplexityPenalty,
       afterMaxHeight: after.height,
       afterBoardQuality: after.boardQuality,
+      isFullClear,
     });
     const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
       v1: rewardV1,
@@ -1328,6 +1351,11 @@ class BotEnv {
       boardQualityDeltaTerm:
         rewardLegacy.breakdown.boardQualityDeltaTerm *
         blendWeights.legacyWeight,
+      boardQualityAbsoluteTerm:
+        rewardLegacy.breakdown.boardQualityAbsoluteTerm *
+        blendWeights.legacyWeight,
+      fullClearTerm:
+        rewardLegacy.breakdown.fullClearTerm * blendWeights.legacyWeight,
       topOutTerm: rewardLegacy.breakdown.topOutTerm * blendWeights.legacyWeight,
     };
     const rewardTargetContributionBreakdown = {
@@ -1344,6 +1372,11 @@ class BotEnv {
       boardQualityDeltaTerm:
         rewardTarget.breakdown.boardQualityDeltaTerm *
         blendWeights.targetWeight,
+      boardQualityAbsoluteTerm:
+        rewardTarget.breakdown.boardQualityAbsoluteTerm *
+        blendWeights.targetWeight,
+      fullClearTerm:
+        rewardTarget.breakdown.fullClearTerm * blendWeights.targetWeight,
       topOutTerm: rewardTarget.breakdown.topOutTerm * blendWeights.targetWeight,
     };
     const reward = rewardResult.reward;
@@ -1429,6 +1462,9 @@ class BotEnv {
         rewardLegacyTermBoardScore: rewardLegacy.breakdown.boardScoreTerm,
         rewardLegacyTermBoardQuality:
           rewardLegacy.breakdown.boardQualityDeltaTerm,
+        rewardLegacyTermBoardQualityAbsolute:
+          rewardLegacy.breakdown.boardQualityAbsoluteTerm,
+        rewardLegacyTermFullClear: rewardLegacy.breakdown.fullClearTerm,
         rewardLegacyTermTopOut: rewardLegacy.breakdown.topOutTerm,
         rewardTargetTermLines: rewardTarget.breakdown.linesTerm,
         rewardTargetTermScore: rewardTarget.breakdown.scoreTerm,
@@ -1439,6 +1475,9 @@ class BotEnv {
         rewardTargetTermBoardScore: rewardTarget.breakdown.boardScoreTerm,
         rewardTargetTermBoardQuality:
           rewardTarget.breakdown.boardQualityDeltaTerm,
+        rewardTargetTermBoardQualityAbsolute:
+          rewardTarget.breakdown.boardQualityAbsoluteTerm,
+        rewardTargetTermFullClear: rewardTarget.breakdown.fullClearTerm,
         rewardTargetTermTopOut: rewardTarget.breakdown.topOutTerm,
         rewardLegacyContributionTermLines:
           rewardLegacyContributionBreakdown.linesTerm,
@@ -1456,6 +1495,10 @@ class BotEnv {
           rewardLegacyContributionBreakdown.boardScoreTerm,
         rewardLegacyContributionTermBoardQuality:
           rewardLegacyContributionBreakdown.boardQualityDeltaTerm,
+        rewardLegacyContributionTermBoardQualityAbsolute:
+          rewardLegacyContributionBreakdown.boardQualityAbsoluteTerm,
+        rewardLegacyContributionTermFullClear:
+          rewardLegacyContributionBreakdown.fullClearTerm,
         rewardLegacyContributionTermTopOut:
           rewardLegacyContributionBreakdown.topOutTerm,
         rewardTargetContributionTermLines:
@@ -1474,6 +1517,10 @@ class BotEnv {
           rewardTargetContributionBreakdown.boardScoreTerm,
         rewardTargetContributionTermBoardQuality:
           rewardTargetContributionBreakdown.boardQualityDeltaTerm,
+        rewardTargetContributionTermBoardQualityAbsolute:
+          rewardTargetContributionBreakdown.boardQualityAbsoluteTerm,
+        rewardTargetContributionTermFullClear:
+          rewardTargetContributionBreakdown.fullClearTerm,
         rewardTargetContributionTermTopOut:
           rewardTargetContributionBreakdown.topOutTerm,
         rewardTermLines: rewardResult.breakdown.linesTerm,
@@ -1484,6 +1531,9 @@ class BotEnv {
         rewardTermBumpiness: rewardResult.breakdown.bumpinessDeltaTerm,
         rewardTermBoardScore: rewardResult.breakdown.boardScoreTerm,
         rewardTermBoardQuality: rewardResult.breakdown.boardQualityDeltaTerm,
+        rewardTermBoardQualityAbsolute:
+          rewardResult.breakdown.boardQualityAbsoluteTerm,
+        rewardTermFullClear: rewardResult.breakdown.fullClearTerm,
         rewardTermTopOut: rewardResult.breakdown.topOutTerm,
         placementHoldUsed: selectedPlacement?.holdUsed ? 1 : 0,
         placementSrsKickCount: Math.max(
@@ -1769,6 +1819,7 @@ class BotEnv {
     height: number;
     holes: number;
     bumpiness: number;
+    blocks: number;
     boardScore: number;
     boardQuality: number;
   } {
@@ -1781,6 +1832,7 @@ class BotEnv {
       height: getStackHeight(state.board),
       holes: countBoardHoles(state.board),
       bumpiness: computeBoardBumpiness(state.board),
+      blocks: countBoardBlocks(state.board),
       boardScore: scoreCharcuterieBoard(
         state.board,
         state.gameOver,
