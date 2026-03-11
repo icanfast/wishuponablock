@@ -2727,7 +2727,6 @@ export const createGuiInspectBotInputSource = (
   const debugTrace = config.debugTrace !== false;
   const log = (line: string): void => config.onLog?.(`[bot-gui] ${line}`);
   let rng = new XorShift32(seed ^ 0x517cc1b7);
-  let activeRef: GameState['active'] | null = null;
   let queue: InputFrame[] = [];
   let debugCommandQueue: string[] = [];
   let cooldownMs = 0;
@@ -2830,8 +2829,7 @@ export const createGuiInspectBotInputSource = (
   return {
     sample: (state, dtMs) => {
       cooldownMs = Math.max(0, cooldownMs - Math.max(0, dtMs));
-      if (state.active !== activeRef) {
-        activeRef = state.active;
+      if (queue.length === 0) {
         planIndex += 1;
         const observation = encodeObservation(
           params.observationSpace,
@@ -2963,7 +2961,6 @@ export const createGuiInspectBotInputSource = (
     reset: (nextSeed) => {
       const seeded = Math.max(1, Math.trunc(nextSeed));
       rng = new XorShift32(seeded ^ 0x517cc1b7);
-      activeRef = null;
       queue = [];
       debugCommandQueue = [];
       cooldownMs = 0;

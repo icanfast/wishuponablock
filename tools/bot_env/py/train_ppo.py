@@ -35,6 +35,7 @@ class PPOConfig:
     placement_execution_mode: str
     queue_policy_id: str
     generator_schedule: tuple[str, ...]
+    reward_functions: tuple[str, ...]
     max_pieces_per_episode: int
     reward_blend_span: int
     reward_blend_unit: str
@@ -532,12 +533,23 @@ def parse_args() -> PPOConfig:
     )
     parser.add_argument("--max-pieces-per-episode", type=int, default=512)
     parser.add_argument(
+        "--reward-functions",
+        nargs="+",
+        default=None,
+        help=(
+            "Reward schedule definition. Accepts one or two items (space/comma-separated). "
+            "One item ('v1' or 'v2') uses that reward only. "
+            "Two items ('v1 v2') blends from first to second using --reward-blend-updates."
+        ),
+    )
+    parser.add_argument(
         "--reward-blend-updates",
         type=int,
         default=10,
         help=(
-            "Number of PPO updates used to linearly blend reward_v1 -> reward_v2. "
-            "Blend weight t goes 1.0 -> 0.0 over this many updates."
+            "Number of PPO updates used to linearly blend first->second reward "
+            "when --reward-functions has two items (e.g. v1 v2). "
+            "Ignored in single-reward mode."
         ),
     )
     parser.add_argument(
@@ -802,8 +814,45 @@ def parse_args() -> PPOConfig:
             return ("bag7", "bag7", "bag7", "bag7", "active_generator")
         return (base,)
 
+    def _normalize_reward_function(value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in ("v1", "v2"):
+            raise ValueError(
+                f"Unsupported reward function '{value}'. Allowed: v1, v2."
+            )
+        return normalized
+
+    def _parse_reward_functions() -> tuple[str, ...]:
+        raw_values = args.reward_functions
+        expanded: list[str] = []
+        if isinstance(raw_values, list):
+            for token in raw_values:
+                for part in str(token).split(","):
+                    stripped = part.strip()
+                    if stripped:
+                        expanded.append(stripped)
+        if not expanded:
+            expanded = ["v1", "v2"]
+        parsed = tuple(_normalize_reward_function(v) for v in expanded)
+        if len(parsed) == 1:
+            return parsed
+        if len(parsed) == 2:
+            if parsed[0] == parsed[1]:
+                raise ValueError(
+                    "When two reward functions are provided, they must be different."
+                )
+            if parsed != ("v1", "v2"):
+                raise ValueError(
+                    "Two-function reward schedules currently support only: v1,v2"
+                )
+            return parsed
+        raise ValueError(
+            "Reward schedule must contain one function (v1 or v2) or two functions (v1,v2)."
+        )
+
     try:
         generator_schedule = _parse_generator_schedule()
+        reward_functions = _parse_reward_functions()
     except ValueError as error:
         parser.error(str(error))
 
@@ -827,6 +876,7 @@ def parse_args() -> PPOConfig:
         ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
         generator_schedule=generator_schedule,
+        reward_functions=reward_functions,
         max_pieces_per_episode=max(1, int(args.max_pieces_per_episode)),
         reward_blend_span=reward_blend_span,
         reward_blend_unit=reward_blend_unit,
@@ -945,6 +995,23 @@ def reward_blend_total_for_env(cfg: PPOConfig) -> int:
     if cfg.reward_blend_unit == "updates":
         return max(1, int(cfg.reward_blend_span) - 1)
     return max(1, int(cfg.reward_blend_span))
+
+
+def fixed_reward_blend_step_for_cfg(cfg: PPOConfig) -> int | None:
+    reward_functions = tuple(str(v).strip().lower() for v in cfg.reward_functions)
+    if len(reward_functions) != 1:
+        return None
+    if reward_functions[0] == "v1":
+        return 0
+    if reward_functions[0] == "v2":
+        # Force fully-target reward from the first training step.
+        return 1_000_000_000
+    return None
+
+
+def effective_reward_blend_unit(cfg: PPOConfig) -> str:
+    # Single-reward mode is fixed, so we keep blend progression disabled.
+    return "updates" if fixed_reward_blend_step_for_cfg(cfg) is not None else cfg.reward_blend_unit
 
 
 def curriculum_schedule_value(
@@ -1715,6 +1782,7 @@ def run_validation_eval(
     device: torch.device,
     update: int,
     reward_blend_step: int,
+    reward_blend_unit: str,
     piece_source_profile: str,
     reward_component_aliases: dict[str, tuple[str, ...]],
 ) -> dict[str, Any]:
@@ -1738,7 +1806,7 @@ def run_validation_eval(
                 queue_policy_id=cfg.queue_policy_id,
                 max_pieces_per_episode=cfg.max_pieces_per_episode,
                 reward_blend_timesteps=reward_blend_total_for_env(cfg),
-                reward_blend_unit=cfg.reward_blend_unit,
+                reward_blend_unit=reward_blend_unit,
                 reward_blend_start_step=max(0, int(reward_blend_step)),
                 seed=cfg.seed + update * 1777 + 31,
             )
@@ -2296,6 +2364,11 @@ def train(cfg: PPOConfig) -> None:
     )
 
     with WubEnvBridge(server_cmd=server_cmd, cwd=repo_root) as env:
+        fixed_blend_step = fixed_reward_blend_step_for_cfg(cfg)
+        blend_unit_effective = effective_reward_blend_unit(cfg)
+        blend_start_step = (
+            int(fixed_blend_step) if fixed_blend_step is not None else 0
+        )
         init_result = env.init(
             mode_id=cfg.mode_id,
             num_envs=cfg.num_envs,
@@ -2306,8 +2379,8 @@ def train(cfg: PPOConfig) -> None:
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
             reward_blend_timesteps=reward_blend_total_for_env(cfg),
-            reward_blend_unit=cfg.reward_blend_unit,
-            reward_blend_start_step=0,
+            reward_blend_unit=blend_unit_effective,
+            reward_blend_start_step=blend_start_step,
             seed=cfg.seed,
         )
         env_ids: list[int] = [int(v) for v in init_result.get("env_ids", [])]
@@ -2385,7 +2458,13 @@ def train(cfg: PPOConfig) -> None:
                 global_step = loaded_global_step
                 start_update = loaded_update
                 blend_resume_step = (
-                    start_update if cfg.reward_blend_unit == "updates" else global_step
+                    int(fixed_blend_step)
+                    if fixed_blend_step is not None
+                    else (
+                        start_update
+                        if blend_unit_effective == "updates"
+                        else global_step
+                    )
                 )
                 blend_result = env.set_reward_blend_step(blend_resume_step)
                 blend_step = int(
@@ -2608,9 +2687,10 @@ def train(cfg: PPOConfig) -> None:
             f"batch_size={batch_size}, updates={num_updates}, "
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
+            f"reward_functions={list(cfg.reward_functions)}, "
             f"validation_sources={validation_sources}, "
             f"validate_every_updates={cfg.validate_every_updates}, "
-            f"reward_blend={cfg.reward_blend_span}({cfg.reward_blend_unit},env_total={reward_blend_total_for_env(cfg)}), "
+            f"reward_blend={cfg.reward_blend_span}({blend_unit_effective},env_total={reward_blend_total_for_env(cfg)},fixed_step={fixed_blend_step}), "
             f"policy_clip_coef={cfg.policy_clip_coef:.4f}, "
             f"value_clip_coef={cfg.value_clip_coef:.4f}, "
             f"warmup_policy_lr_scale={cfg.warmup_policy_lr_scale:.3f}, "
@@ -2646,6 +2726,8 @@ def train(cfg: PPOConfig) -> None:
                 "generator_mix_by_env": env_piece_source_counts,
                 "validation_sources": validation_sources,
                 "reward_blend_env_total": reward_blend_total_for_env(cfg),
+                "reward_blend_unit_effective": blend_unit_effective,
+                "reward_blend_fixed_step": fixed_blend_step,
             },
         )
 
@@ -2772,13 +2854,16 @@ def train(cfg: PPOConfig) -> None:
                     bias_strength=curriculum_bias_now,
                     danger_height=cfg.curriculum_danger_height,
                 )
-                blend_step_now = (
-                    max(0, int(update - 1))
-                    if cfg.reward_blend_unit == "updates"
-                    else max(0, int(global_step))
-                )
-                if cfg.reward_blend_unit == "updates":
-                    env.set_reward_blend_step(blend_step_now)
+                if fixed_blend_step is not None:
+                    blend_step_now = int(fixed_blend_step)
+                else:
+                    blend_step_now = (
+                        max(0, int(update - 1))
+                        if blend_unit_effective == "updates"
+                        else max(0, int(global_step))
+                    )
+                    if blend_unit_effective == "updates":
+                        env.set_reward_blend_step(blend_step_now)
 
                 rollout_start_perf = time.perf_counter()
                 raw_obs_buf = torch.zeros(
@@ -3296,9 +3381,12 @@ def train(cfg: PPOConfig) -> None:
                     "global_step": global_step,
                     "piece_source_profile": "mixed",
                     "piece_source_mix": dict(env_piece_source_counts),
+                    "reward_functions": list(cfg.reward_functions),
                     "reward_blend_unit": cfg.reward_blend_unit,
+                    "reward_blend_unit_effective": blend_unit_effective,
                     "reward_blend_span": cfg.reward_blend_span,
                     "reward_blend_step_used": blend_step_now,
+                    "reward_blend_fixed_step": fixed_blend_step,
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
@@ -3406,6 +3494,7 @@ def train(cfg: PPOConfig) -> None:
                             device=device,
                             update=update,
                             reward_blend_step=blend_step_now,
+                            reward_blend_unit=blend_unit_effective,
                             piece_source_profile=validation_source,
                             reward_component_aliases=reward_component_aliases,
                         )
