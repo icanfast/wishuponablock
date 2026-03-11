@@ -83,6 +83,8 @@ class WubEnvBridge:
         piece_source_profile: str = "bag7",
         queue_policy_id: str = "next_piece_v1",
         max_pieces_per_episode: int = 512,
+        reward_function_from: str = "v1",
+        reward_function_to: str = "v2",
         reward_blend_timesteps: int = 10_000_000,
         reward_blend_unit: str = "updates",
         reward_blend_start_step: int = 0,
@@ -97,6 +99,8 @@ class WubEnvBridge:
             "pieceSourceProfile": piece_source_profile,
             "queuePolicyId": queue_policy_id,
             "maxPiecesPerEpisode": max_pieces_per_episode,
+            "rewardFunctionFrom": str(reward_function_from).strip().lower(),
+            "rewardFunctionTo": str(reward_function_to).strip().lower(),
             "rewardBlendTimesteps": int(reward_blend_timesteps),
             "rewardBlendUnit": (
                 "timesteps"

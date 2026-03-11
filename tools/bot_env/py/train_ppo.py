@@ -538,8 +538,8 @@ def parse_args() -> PPOConfig:
         default=None,
         help=(
             "Reward schedule definition. Accepts one or two items (space/comma-separated). "
-            "One item ('v1' or 'v2') uses that reward only. "
-            "Two items ('v1 v2') blends from first to second using --reward-blend-updates."
+            "One item ('v1' / 'v2' / 'v3') uses that reward only. "
+            "Two items (for example: 'v1 v3') blend first->second using --reward-blend-updates."
         ),
     )
     parser.add_argument(
@@ -816,9 +816,9 @@ def parse_args() -> PPOConfig:
 
     def _normalize_reward_function(value: str) -> str:
         normalized = str(value).strip().lower()
-        if normalized not in ("v1", "v2"):
+        if normalized not in ("v1", "v2", "v3"):
             raise ValueError(
-                f"Unsupported reward function '{value}'. Allowed: v1, v2."
+                f"Unsupported reward function '{value}'. Allowed: v1, v2, v3."
             )
         return normalized
 
@@ -841,13 +841,9 @@ def parse_args() -> PPOConfig:
                 raise ValueError(
                     "When two reward functions are provided, they must be different."
                 )
-            if parsed != ("v1", "v2"):
-                raise ValueError(
-                    "Two-function reward schedules currently support only: v1,v2"
-                )
             return parsed
         raise ValueError(
-            "Reward schedule must contain one function (v1 or v2) or two functions (v1,v2)."
+            "Reward schedule must contain one function (v1/v2/v3) or two distinct functions."
         )
 
     try:
@@ -1003,7 +999,7 @@ def fixed_reward_blend_step_for_cfg(cfg: PPOConfig) -> int | None:
         return None
     if reward_functions[0] == "v1":
         return 0
-    if reward_functions[0] == "v2":
+    if reward_functions[0] in ("v2", "v3"):
         # Force fully-target reward from the first training step.
         return 1_000_000_000
     return None
@@ -1795,6 +1791,16 @@ def run_validation_eval(
     model.eval()
     obs_adapter.eval()
     try:
+        reward_fn_from = (
+            cfg.reward_functions[0]
+            if len(cfg.reward_functions) >= 1
+            else "v1"
+        )
+        reward_fn_to = (
+            cfg.reward_functions[1]
+            if len(cfg.reward_functions) >= 2
+            else reward_fn_from
+        )
         with WubEnvBridge(server_cmd=server_cmd, cwd=repo_root) as val_env:
             init_result = val_env.init(
                 mode_id=cfg.mode_id,
@@ -1805,6 +1811,8 @@ def run_validation_eval(
                 piece_source_profile=piece_source_profile,
                 queue_policy_id=cfg.queue_policy_id,
                 max_pieces_per_episode=cfg.max_pieces_per_episode,
+                reward_function_from=reward_fn_from,
+                reward_function_to=reward_fn_to,
                 reward_blend_timesteps=reward_blend_total_for_env(cfg),
                 reward_blend_unit=reward_blend_unit,
                 reward_blend_start_step=max(0, int(reward_blend_step)),
@@ -1826,6 +1834,11 @@ def run_validation_eval(
             term_values: dict[str, list[float]] = {
                 key: [] for key in reward_component_aliases
             }
+            diag_holes_created_values: list[float] = []
+            diag_max_height_values: list[float] = []
+            diag_kick_assisted_locks_values: list[float] = []
+            diag_hold_uses_values: list[float] = []
+            diag_avg_reachable_next_values: list[float] = []
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -1863,6 +1876,12 @@ def run_validation_eval(
                     key: np.zeros(env_count, dtype=np.float64)
                     for key in episode_term_keys
                 }
+                ep_holes_created = np.zeros(env_count, dtype=np.float64)
+                ep_max_height = np.zeros(env_count, dtype=np.float64)
+                ep_kick_assisted_locks = np.zeros(env_count, dtype=np.float64)
+                ep_hold_uses = np.zeros(env_count, dtype=np.float64)
+                ep_reachable_next_sum = np.zeros(env_count, dtype=np.float64)
+                ep_reachable_next_count = np.zeros(env_count, dtype=np.float64)
                 done_mask = np.zeros(env_count, dtype=np.bool_)
 
                 for _ in range(max_steps):
@@ -1887,10 +1906,24 @@ def run_validation_eval(
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
                     dones_np = np.asarray(step_result["dones"], dtype=np.float32)
                     infos_raw = step_result.get("infos", [])
+                    next_action_masks_np = np.asarray(
+                        step_result["action_masks"], dtype=np.float32
+                    )
 
                     active_mask = ~done_mask
                     ep_return[active_mask] += rewards_np[active_mask].astype(np.float64)
                     ep_length[active_mask] += 1
+                    if (
+                        next_action_masks_np.ndim == 2
+                        and next_action_masks_np.shape[0] == env_count
+                    ):
+                        reachable_next_counts = (
+                            (next_action_masks_np > 0.5).sum(axis=1).astype(np.float64)
+                        )
+                        ep_reachable_next_sum[active_mask] += reachable_next_counts[
+                            active_mask
+                        ]
+                        ep_reachable_next_count[active_mask] += 1.0
 
                     if isinstance(infos_raw, list):
                         max_info = min(len(infos_raw), env_count)
@@ -1924,6 +1957,44 @@ def run_validation_eval(
                                 default=float(rewards_np[env_idx]),
                             )
                             ep_terms["reward_final"][env_idx] += reward_final
+                            holes_delta = _info_num(
+                                info,
+                                ("holesDelta",),
+                                default=0.0,
+                            )
+                            if holes_delta > 0:
+                                ep_holes_created[env_idx] += holes_delta
+                            stack_height_after = _info_num(
+                                info,
+                                ("stackHeightAfter",),
+                                default=float("nan"),
+                            )
+                            if math.isfinite(stack_height_after):
+                                ep_max_height[env_idx] = max(
+                                    ep_max_height[env_idx], stack_height_after
+                                )
+                            lock_observed = (
+                                _info_num(info, ("lockObserved",), default=0.0) > 0.5
+                            )
+                            if lock_observed:
+                                if (
+                                    _info_num(
+                                        info,
+                                        ("placementSrsKickCount",),
+                                        default=0.0,
+                                    )
+                                    > 0.0
+                                ):
+                                    ep_kick_assisted_locks[env_idx] += 1.0
+                                if (
+                                    _info_num(
+                                        info,
+                                        ("placementHoldUsed",),
+                                        default=0.0,
+                                    )
+                                    > 0.5
+                                ):
+                                    ep_hold_uses[env_idx] += 1.0
                             for key in episode_term_keys:
                                 if key == "reward_final":
                                     continue
@@ -1943,7 +2014,7 @@ def run_validation_eval(
 
                     obs_np = np.asarray(step_result["obs"], dtype=np.float32)
                     mask_np = ensure_action_masks(
-                        np.asarray(step_result["action_masks"], dtype=np.float32)
+                        next_action_masks_np
                     )
                     action_bias_np = ensure_action_biases(
                         mask_np,
@@ -1956,6 +2027,17 @@ def run_validation_eval(
                 lengths.extend(ep_length.tolist())
                 for key, arr in ep_terms.items():
                     term_values[key].extend(arr.tolist())
+                avg_reachable_next = np.divide(
+                    ep_reachable_next_sum,
+                    np.maximum(ep_reachable_next_count, 1.0),
+                )
+                diag_holes_created_values.extend(ep_holes_created.tolist())
+                diag_max_height_values.extend(ep_max_height.tolist())
+                diag_kick_assisted_locks_values.extend(
+                    ep_kick_assisted_locks.tolist()
+                )
+                diag_hold_uses_values.extend(ep_hold_uses.tolist())
+                diag_avg_reachable_next_values.extend(avg_reachable_next.tolist())
 
             terms = {
                 key: _safe_recent_mean(values, window=len(values))
@@ -1974,6 +2056,28 @@ def run_validation_eval(
                 "mean_return": _safe_recent_mean(returns, window=len(returns)),
                 "mean_length": _safe_recent_mean(lengths, window=len(lengths)),
                 "terms": terms,
+                "diagnostics": {
+                    "holes_created_total": _safe_recent_mean(
+                        diag_holes_created_values,
+                        window=len(diag_holes_created_values),
+                    ),
+                    "max_height_reached": _safe_recent_mean(
+                        diag_max_height_values,
+                        window=len(diag_max_height_values),
+                    ),
+                    "kick_assisted_locks": _safe_recent_mean(
+                        diag_kick_assisted_locks_values,
+                        window=len(diag_kick_assisted_locks_values),
+                    ),
+                    "hold_uses": _safe_recent_mean(
+                        diag_hold_uses_values,
+                        window=len(diag_hold_uses_values),
+                    ),
+                    "avg_reachable_placements_next": _safe_recent_mean(
+                        diag_avg_reachable_next_values,
+                        window=len(diag_avg_reachable_next_values),
+                    ),
+                },
             }
     finally:
         if was_model_training:
@@ -2369,6 +2473,16 @@ def train(cfg: PPOConfig) -> None:
         blend_start_step = (
             int(fixed_blend_step) if fixed_blend_step is not None else 0
         )
+        reward_fn_from = (
+            cfg.reward_functions[0]
+            if len(cfg.reward_functions) >= 1
+            else "v1"
+        )
+        reward_fn_to = (
+            cfg.reward_functions[1]
+            if len(cfg.reward_functions) >= 2
+            else reward_fn_from
+        )
         init_result = env.init(
             mode_id=cfg.mode_id,
             num_envs=cfg.num_envs,
@@ -2378,6 +2492,8 @@ def train(cfg: PPOConfig) -> None:
             piece_source_profile=cfg.generator_schedule[0],
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode,
+            reward_function_from=reward_fn_from,
+            reward_function_to=reward_fn_to,
             reward_blend_timesteps=reward_blend_total_for_env(cfg),
             reward_blend_unit=blend_unit_effective,
             reward_blend_start_step=blend_start_step,
@@ -2688,6 +2804,7 @@ def train(cfg: PPOConfig) -> None:
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
             f"reward_functions={list(cfg.reward_functions)}, "
+            f"reward_from={reward_fn_from}, reward_to={reward_fn_to}, "
             f"validation_sources={validation_sources}, "
             f"validate_every_updates={cfg.validate_every_updates}, "
             f"reward_blend={cfg.reward_blend_span}({blend_unit_effective},env_total={reward_blend_total_for_env(cfg)},fixed_step={fixed_blend_step}), "
@@ -2725,6 +2842,8 @@ def train(cfg: PPOConfig) -> None:
                 "num_updates": num_updates,
                 "generator_mix_by_env": env_piece_source_counts,
                 "validation_sources": validation_sources,
+                "reward_function_from": reward_fn_from,
+                "reward_function_to": reward_fn_to,
                 "reward_blend_env_total": reward_blend_total_for_env(cfg),
                 "reward_blend_unit_effective": blend_unit_effective,
                 "reward_blend_fixed_step": fixed_blend_step,
@@ -3686,17 +3805,17 @@ def train(cfg: PPOConfig) -> None:
                             "  ret100: "
                             f"final={_fmt_float(ret_terms.get('reward_final'))} "
                             f"base={_fmt_float(ret_terms.get('reward_base'))} "
-                            f"v1={_fmt_float(ret_terms.get('v1_base'))} "
-                            f"v2={_fmt_float(ret_terms.get('v2_base'))} "
-                            f"v1_raw={_fmt_float(ret_terms.get('v1_base_raw'))} "
-                            f"v2_raw={_fmt_float(ret_terms.get('v2_base_raw'))} "
+                            f"{reward_fn_from}={_fmt_float(ret_terms.get('v1_base'))} "
+                            f"{reward_fn_to}={_fmt_float(ret_terms.get('v2_base'))} "
+                            f"{reward_fn_from}_raw={_fmt_float(ret_terms.get('v1_base_raw'))} "
+                            f"{reward_fn_to}_raw={_fmt_float(ret_terms.get('v2_base_raw'))} "
                             f"w1={_fmt_float(ret_terms.get('blend_legacy_weight'))} "
                             f"w2={_fmt_float(ret_terms.get('blend_target_weight'))} "
                             f"t={_fmt_float(ret_terms.get('blend_t'))} "
                             f"topout={_fmt_float(ret_terms.get('top_out_term'))}"
                         ),
                         (
-                            "    v1_terms: "
+                            f"    {reward_fn_from}_terms: "
                             f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
                             f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
                             f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
@@ -3708,7 +3827,7 @@ def train(cfg: PPOConfig) -> None:
                             f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
                         ),
                         (
-                            "    v2_terms: "
+                            f"    {reward_fn_to}_terms: "
                             f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
                             f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
                             f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
@@ -3771,6 +3890,12 @@ def train(cfg: PPOConfig) -> None:
                             source_terms_dict = (
                                 source_terms if isinstance(source_terms, dict) else {}
                             )
+                            source_diagnostics = source_dict.get("diagnostics")
+                            source_diag_dict = (
+                                source_diagnostics
+                                if isinstance(source_diagnostics, dict)
+                                else {}
+                            )
                             if bool(source_dict.get("enabled", False)):
                                 log_lines.append(
                                     "  validation["
@@ -3779,17 +3904,17 @@ def train(cfg: PPOConfig) -> None:
                                     + f"ret={_fmt_float(source_dict.get('mean_return'))} "
                                     + f"final={_fmt_float(source_terms_dict.get('reward_final'))} "
                                     + f"base={_fmt_float(source_terms_dict.get('reward_base'))} "
-                                    + f"v1={_fmt_float(source_terms_dict.get('v1_base'))} "
-                                    + f"v2={_fmt_float(source_terms_dict.get('v2_base'))} "
-                                    + f"v1_raw={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
-                                    + f"v2_raw={_fmt_float(source_terms_dict.get('v2_base_raw'))} "
+                                    + f"{reward_fn_from}={_fmt_float(source_terms_dict.get('v1_base'))} "
+                                    + f"{reward_fn_to}={_fmt_float(source_terms_dict.get('v2_base'))} "
+                                    + f"{reward_fn_from}_raw={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
+                                    + f"{reward_fn_to}_raw={_fmt_float(source_terms_dict.get('v2_base_raw'))} "
                                     + f"w1={_fmt_float(source_terms_dict.get('blend_legacy_weight'))} "
                                     + f"w2={_fmt_float(source_terms_dict.get('blend_target_weight'))} "
                                     + f"t={_fmt_float(source_terms_dict.get('blend_t'))} "
                                     + f"topout={_fmt_float(source_terms_dict.get('top_out_term'))}"
                                 )
                                 log_lines.append(
-                                    "    val_v1_terms["
+                                    f"    val_{reward_fn_from}_terms["
                                     + source
                                     + "]: "
                                     + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
@@ -3803,7 +3928,7 @@ def train(cfg: PPOConfig) -> None:
                                     + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
                                 )
                                 log_lines.append(
-                                    "    val_v2_terms["
+                                    f"    val_{reward_fn_to}_terms["
                                     + source
                                     + "]: "
                                     + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
@@ -3815,6 +3940,16 @@ def train(cfg: PPOConfig) -> None:
                                     + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
                                     + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
                                     + f"topout={_fmt_float(source_terms_dict.get('v2_term_top_out'))}"
+                                )
+                                log_lines.append(
+                                    "    val_diag["
+                                    + source
+                                    + "]: "
+                                    + f"holes_created={_fmt_float(source_diag_dict.get('holes_created_total'))} "
+                                    + f"max_height={_fmt_float(source_diag_dict.get('max_height_reached'))} "
+                                    + f"kick_locks={_fmt_float(source_diag_dict.get('kick_assisted_locks'))} "
+                                    + f"hold_uses={_fmt_float(source_diag_dict.get('hold_uses'))} "
+                                    + f"avg_reach_next={_fmt_float(source_diag_dict.get('avg_reachable_placements_next'))}"
                                 )
                             else:
                                 log_lines.append(

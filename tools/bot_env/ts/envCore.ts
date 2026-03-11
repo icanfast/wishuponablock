@@ -45,6 +45,7 @@ import type {
   JsonObject,
   PlacementExecutionMode,
   PieceSourceProfile,
+  RewardFunctionId,
   SetCurriculumPayload,
   StepBatchResult,
 } from './protocol.ts';
@@ -146,6 +147,14 @@ const normalizeModeId = (value: unknown): string => {
     return v;
   }
   return 'practice';
+};
+
+const normalizeRewardFunctionId = (
+  value: unknown,
+  fallback: RewardFunctionId,
+): RewardFunctionId => {
+  if (value === 'v1' || value === 'v2' || value === 'v3') return value;
+  return fallback;
 };
 
 const countBoardHoles = (board: Board): number => {
@@ -473,13 +482,22 @@ const PLACEMENT_COMPLEXITY_ROT_CW_CCW_WEIGHT = 0.03;
 const PLACEMENT_COMPLEXITY_ROT_180_WEIGHT = 0.1;
 const PLACEMENT_COMPLEXITY_SRS_KICK_WEIGHT = 0.1;
 const PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT = 0.005;
-const PLACEMENT_HOLD_COMPLEXITY_PENALTY = 0.05;
+const PLACEMENT_HOLD_COMPLEXITY_PENALTY = 0.03;
 const PLACEMENT_TOP_OUT_PENALTY = 5.0;
 const REWARD_V2_LINE_WEIGHT = 0.5;
 const REWARD_V2_COMPLEXITY_WEIGHT = 0.5;
 const REWARD_V2_BOARD_QUALITY_WEIGHT = 0.2;
 const REWARD_V2_HOLE_REMOVE_WEIGHT = 0.05;
 const REWARD_V2_HOLE_CREATE_WEIGHT = REWARD_V2_HOLE_REMOVE_WEIGHT * 5;
+
+const REWARD_V3_LINE_WEIGHT = 0.45;
+const REWARD_V3_COMPLEXITY_WEIGHT = 0.35;
+const REWARD_V3_BOARD_DELTA_WEIGHT = 0.15;
+const REWARD_V3_BOARD_ABSOLUTE_WEIGHT = 0.01;
+const REWARD_V3_HOLE_CREATE_WEIGHT = 0.3;
+const REWARD_V3_HOLE_REMOVE_WEIGHT = 0.0;
+const REWARD_V3_DANGER_HEIGHT = 14;
+const REWARD_V3_DANGER_WEIGHT = 0.04;
 
 const computePlacementComplexityPenalty = (
   placement: Pick<
@@ -545,6 +563,60 @@ const computePieceRewardV2 = (
       holeDeltaTerm,
       bumpinessDeltaTerm: 0,
       boardScoreTerm: 0,
+      boardQualityDeltaTerm,
+      topOutTerm,
+    },
+  };
+};
+
+const computePieceRewardV3 = (
+  options: PieceRewardInputs & {
+    placementComplexityPenalty: number;
+    afterMaxHeight: number;
+    afterBoardQuality: number;
+  },
+): PieceRewardResult => {
+  const {
+    linesDelta,
+    boardQualityDelta,
+    holesDelta,
+    placementComplexityPenalty,
+    afterMaxHeight,
+    afterBoardQuality,
+    topOut,
+  } = options;
+  const clampedLines = Math.max(0, linesDelta);
+  const linesTerm = Math.pow(clampedLines, 1.5) * REWARD_V3_LINE_WEIGHT;
+  const boardQualityDeltaTerm =
+    boardQualityDelta * REWARD_V3_BOARD_DELTA_WEIGHT;
+  const boardQualityAbsoluteTerm =
+    -Math.max(0, afterBoardQuality) * REWARD_V3_BOARD_ABSOLUTE_WEIGHT;
+  const holeDeltaTerm =
+    holesDelta > 0
+      ? -holesDelta * REWARD_V3_HOLE_CREATE_WEIGHT
+      : -Math.min(-holesDelta, 1) * REWARD_V3_HOLE_REMOVE_WEIGHT;
+  const danger = Math.max(0, afterMaxHeight - REWARD_V3_DANGER_HEIGHT);
+  const heightTerm = -(danger * danger) * REWARD_V3_DANGER_WEIGHT;
+  const timeTerm = -placementComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
+  const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
+  const reward =
+    linesTerm +
+    boardQualityDeltaTerm +
+    boardQualityAbsoluteTerm +
+    holeDeltaTerm +
+    heightTerm +
+    timeTerm +
+    topOutTerm;
+  return {
+    reward,
+    breakdown: {
+      linesTerm,
+      scoreTerm: 0,
+      timeTerm,
+      heightTerm,
+      holeDeltaTerm,
+      bumpinessDeltaTerm: 0,
+      boardScoreTerm: boardQualityAbsoluteTerm,
       boardQualityDeltaTerm,
       topOutTerm,
     },
@@ -1058,6 +1130,8 @@ class BotEnv {
   step(
     actionIndexRaw: number,
     rewardBlend: RewardBlendWeights | null = null,
+    rewardFunctionFrom: RewardFunctionId = 'v1',
+    rewardFunctionTo: RewardFunctionId = 'v2',
   ): BotEnvStepResult {
     const stepStart = performance.now();
     const blendWeights = normalizeRewardBlendWeights(rewardBlend);
@@ -1089,6 +1163,8 @@ class BotEnv {
         info: {
           alreadyDone: true,
           piecesPlaced: this.piecesPlaced,
+          rewardLegacyFunctionId: rewardFunctionFrom,
+          rewardTargetFunctionId: rewardFunctionTo,
           rewardBlendT: blendWeights.t,
           rewardBlendLegacyWeight: blendWeights.legacyWeight,
           rewardBlendTargetWeight: blendWeights.targetWeight,
@@ -1180,7 +1256,9 @@ class BotEnv {
     const holesDelta = after.holes - before.holes;
     const bumpinessDelta = after.bumpiness - before.bumpiness;
     const boardQualityDelta = before.boardQuality - after.boardQuality;
-    const rewardLegacy = computePieceRewardV1({
+    const placementComplexityPenalty =
+      computePlacementComplexityPenalty(selectedPlacement);
+    const rewardV1 = computePieceRewardV1({
       modeId: this.modeId,
       linesDelta,
       scoreDelta,
@@ -1192,7 +1270,7 @@ class BotEnv {
       boardQualityDelta,
       topOut: this.game.state.gameOver,
     });
-    const rewardTarget = computePieceRewardV2({
+    const rewardV2 = computePieceRewardV2({
       modeId: this.modeId,
       linesDelta,
       scoreDelta,
@@ -1203,9 +1281,30 @@ class BotEnv {
       boardScoreDelta: before.boardScore - after.boardScore,
       boardQualityDelta,
       topOut: this.game.state.gameOver,
-      placementComplexityPenalty:
-        computePlacementComplexityPenalty(selectedPlacement),
+      placementComplexityPenalty,
     });
+    const rewardV3 = computePieceRewardV3({
+      modeId: this.modeId,
+      linesDelta,
+      scoreDelta,
+      timeDeltaMs,
+      heightDelta,
+      holesDelta,
+      bumpinessDelta,
+      boardScoreDelta: before.boardScore - after.boardScore,
+      boardQualityDelta,
+      topOut: this.game.state.gameOver,
+      placementComplexityPenalty,
+      afterMaxHeight: after.height,
+      afterBoardQuality: after.boardQuality,
+    });
+    const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
+      v1: rewardV1,
+      v2: rewardV2,
+      v3: rewardV3,
+    };
+    const rewardLegacy = rewardById[rewardFunctionFrom];
+    const rewardTarget = rewardById[rewardFunctionTo];
     const rewardResult = blendPieceReward({
       legacy: rewardLegacy,
       target: rewardTarget,
@@ -1306,6 +1405,9 @@ class BotEnv {
         scoreDelta,
         timeDeltaMs,
         boardScoreDelta: before.boardScore - after.boardScore,
+        stackHeightAfter: after.height,
+        rewardLegacyFunctionId: rewardFunctionFrom,
+        rewardTargetFunctionId: rewardFunctionTo,
         rewardLegacyBase: rewardLegacy.reward,
         rewardTargetBase: rewardTarget.reward,
         rewardLegacyContribution,
@@ -1383,6 +1485,11 @@ class BotEnv {
         rewardTermBoardScore: rewardResult.breakdown.boardScoreTerm,
         rewardTermBoardQuality: rewardResult.breakdown.boardQualityDeltaTerm,
         rewardTermTopOut: rewardResult.breakdown.topOutTerm,
+        placementHoldUsed: selectedPlacement?.holdUsed ? 1 : 0,
+        placementSrsKickCount: Math.max(
+          0,
+          Math.trunc(selectedPlacement?.srsKickCount ?? 0),
+        ),
         gameWon: this.game.state.gameWon,
         gameOver: this.game.state.gameOver,
       },
@@ -1702,6 +1809,8 @@ export class BotEnvPool {
   private rewardBlendTimesteps = DEFAULT_REWARD_BLEND_TIMESTEPS;
   private rewardBlendTransitionStep = 0;
   private rewardBlendUnit: RewardBlendUnit = 'updates';
+  private rewardFunctionFrom: RewardFunctionId = 'v1';
+  private rewardFunctionTo: RewardFunctionId = 'v2';
 
   static async create(payload: InitPayload): Promise<BotEnvPool> {
     const modeId = normalizeModeId(payload.modeId);
@@ -1737,6 +1846,18 @@ export class BotEnvPool {
       0,
       1_000_000_000,
     );
+    const rewardFunctionFrom = normalizeRewardFunctionId(
+      payload.rewardFunctionFrom,
+      'v1',
+    );
+    const rewardFunctionTo = normalizeRewardFunctionId(
+      payload.rewardFunctionTo,
+      payload.rewardFunctionTo == null
+        ? payload.rewardFunctionFrom == null
+          ? 'v2'
+          : rewardFunctionFrom
+        : 'v2',
+    );
     const baseSeed = clampInt(payload.seed, Date.now(), 1, 0x7fffffff);
     const modelPath =
       typeof payload.modelPath === 'string' &&
@@ -1767,6 +1888,8 @@ export class BotEnvPool {
     pool.rewardBlendTimesteps = rewardBlendTimesteps;
     pool.rewardBlendTransitionStep = rewardBlendStartStep;
     pool.rewardBlendUnit = rewardBlendUnit;
+    pool.rewardFunctionFrom = rewardFunctionFrom;
+    pool.rewardFunctionTo = rewardFunctionTo;
     pool.setCurriculum(null);
     return pool;
   }
@@ -1839,7 +1962,12 @@ export class BotEnvPool {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
       const action = clampInt(actions[i], 0, 0, DEFAULT_ACTION_DIM - 1);
-      const out = env.step(action, batchBlendWeights);
+      const out = env.step(
+        action,
+        batchBlendWeights,
+        this.rewardFunctionFrom,
+        this.rewardFunctionTo,
+      );
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);

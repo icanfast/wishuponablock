@@ -1,6 +1,7 @@
 export type PieceSourceProfile = 'bag7' | 'active_generator' | 'random';
 export type BotObservationSpace = 'model_head_v1' | 'raw_v1';
 export type PlacementExecutionMode = 'commands' | 'teleport';
+export type RewardFunctionId = 'v1' | 'v2' | 'v3';
 
 export type JsonValue =
   | null
@@ -43,6 +44,8 @@ export type InitPayload = {
   pieceSourceProfile?: PieceSourceProfile;
   queuePolicyId?: string;
   maxPiecesPerEpisode?: number;
+  rewardFunctionFrom?: RewardFunctionId;
+  rewardFunctionTo?: RewardFunctionId;
   rewardBlendTimesteps?: number;
   rewardBlendUnit?: 'timesteps' | 'updates';
   rewardBlendStartStep?: number;
