@@ -734,6 +734,13 @@ async function boot() {
     force?: boolean;
     interactive?: boolean;
   }): Promise<{ source: 'global' | 'personal'; message: string }> => {
+    const rebuildSessionIfGameScreenActive = (): void => {
+      if (screenManager.getActive() !== 'game') {
+        return;
+      }
+      sessionController.rebuildSession();
+    };
+
     const { mode, reason, force = false, interactive = false } = options;
     const userId =
       authState.authenticated && authState.user ? authState.user.id : null;
@@ -759,7 +766,7 @@ async function boot() {
           };
         }
         setActiveModelSource({ kind: 'global' });
-        sessionController.rebuildSession();
+        rebuildSessionIfGameScreenActive();
       }
       activeModelContextKey = contextKey;
       return {
@@ -797,7 +804,7 @@ async function boot() {
         version: result.version,
       });
       activeModelContextKey = contextKey;
-      sessionController.rebuildSession();
+      rebuildSessionIfGameScreenActive();
       const versionLabel =
         result.version != null ? `v${result.version}` : 'latest';
       return {
@@ -829,7 +836,7 @@ async function boot() {
 
       setActiveModelSource({ kind: 'global' });
       activeModelContextKey = contextKey;
-      sessionController.rebuildSession();
+      rebuildSessionIfGameScreenActive();
 
       if (status === 404) {
         if (interactive) {
