@@ -20,10 +20,21 @@ from torch.distributions import Categorical
 from wub_env import WubEnvBridge
 
 RAW_PIECES_ORDER = ("I", "O", "T", "S", "Z", "J", "L")
-RAW_CONTEXT_DIM = len(RAW_PIECES_ORDER) + (len(RAW_PIECES_ORDER) + 1) + len(RAW_PIECES_ORDER) + 5
+RAW_ACTIVE_DIM = len(RAW_PIECES_ORDER)
+RAW_HOLD_DIM = len(RAW_PIECES_ORDER) + 1
+RAW_NEXT_DIM = len(RAW_PIECES_ORDER)
+RAW_SCALAR_CONTEXT_DIM = 5
+RAW_CONTEXT_DIM = RAW_ACTIVE_DIM + RAW_HOLD_DIM + RAW_NEXT_DIM + RAW_SCALAR_CONTEXT_DIM
 DEFAULT_BOARD_ROWS = 20
 DEFAULT_BOARD_COLS = 10
+RAW_BOARD_SIZE = DEFAULT_BOARD_ROWS * DEFAULT_BOARD_COLS
+RAW_LEGACY_OBS_DIM = RAW_BOARD_SIZE + RAW_CONTEXT_DIM
+RAW_VISIBLE_QUEUE_SLOTS = 5
+RAW_QUEUE_INPUT_DIM = RAW_VISIBLE_QUEUE_SLOTS * len(RAW_PIECES_ORDER)
+RAW_EXTENDED_OBS_DIM = RAW_LEGACY_OBS_DIM + RAW_QUEUE_INPUT_DIM
 DEFAULT_OBS_ADAPTER_LR_SCALE = 0.1
+DEFAULT_QUEUE_ENCODER_HIDDEN_DIM = 32
+DEFAULT_QUEUE_ENCODER_LR_SCALE = 5.0
 VALID_GENERATOR_SOURCES = ("bag7", "active_generator", "random")
 
 
@@ -46,6 +57,8 @@ class PPOConfig:
     hidden_dim: int
     learning_rate: float
     obs_adapter_lr_scale: float
+    queue_encoder_hidden_dim: int
+    queue_encoder_lr_scale: float
     gamma: float
     gae_lambda: float
     policy_clip_coef: float
@@ -151,6 +164,31 @@ class ObservationAdapter(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:  # pragma: no cover - interface
         raise NotImplementedError
+
+
+def split_raw_v1_board_and_queue_tensor(
+    obs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if obs.ndim != 2:
+        raise ValueError(f"Expected rank-2 observation batch, got shape={tuple(obs.shape)}")
+    if obs.shape[1] < RAW_LEGACY_OBS_DIM:
+        raise ValueError(
+            "raw_v1 observation is too short. "
+            f"expected_at_least={RAW_LEGACY_OBS_DIM} got={int(obs.shape[1])}"
+        )
+    legacy = obs[:, :RAW_LEGACY_OBS_DIM]
+    queue = torch.zeros(
+        (obs.shape[0], RAW_QUEUE_INPUT_DIM),
+        dtype=obs.dtype,
+        device=obs.device,
+    )
+    available = min(RAW_QUEUE_INPUT_DIM, max(0, int(obs.shape[1]) - RAW_LEGACY_OBS_DIM))
+    if available > 0:
+        queue[:, :available] = obs[
+            :,
+            RAW_LEGACY_OBS_DIM : RAW_LEGACY_OBS_DIM + available,
+        ]
+    return legacy, queue
 
 
 class IdentityObservationAdapter(ObservationAdapter):
@@ -489,6 +527,36 @@ class WubHeadFromRawObservationAdapter(ObservationAdapter):
                 conv.bias.copy_(bias_tensor)
 
 
+class RawV1BoardQueueObservationAdapter(ObservationAdapter):
+    def __init__(
+        self,
+        raw_obs_dim: int,
+        model_path: str,
+        queue_hidden_dim: int,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.board_adapter = WubHeadFromRawObservationAdapter(
+            raw_obs_dim=RAW_LEGACY_OBS_DIM,
+            model_path=model_path,
+        )
+        self.queue_input_dim = RAW_QUEUE_INPUT_DIM
+        self.queue_hidden_dim = max(1, int(queue_hidden_dim))
+        queue_policy_obs_dim = self.board_adapter.policy_obs_dim + self.queue_hidden_dim
+        self.raw_obs_dim = int(raw_obs_dim)
+        self.policy_obs_dim = int(queue_policy_obs_dim)
+        self.policy_observation_space = "raw_v1"
+        self.queue_fc1 = nn.Linear(self.queue_input_dim, self.queue_hidden_dim)
+        nn.init.orthogonal_(self.queue_fc1.weight, math.sqrt(2.0))
+        nn.init.constant_(self.queue_fc1.bias, 0.0)
+        self.board_obs_dim = int(self.board_adapter.policy_obs_dim)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        legacy_obs, queue_obs = split_raw_v1_board_and_queue_tensor(obs)
+        board_features = self.board_adapter(legacy_obs)
+        queue_features = torch.relu(self.queue_fc1(queue_obs))
+        return torch.cat([board_features, queue_features], dim=1)
+
+
 def parse_args() -> PPOConfig:
     parser = argparse.ArgumentParser(
         description="Train WUB headless bot with full PPO in local PyTorch."
@@ -573,6 +641,20 @@ def parse_args() -> PPOConfig:
         help=(
             "Gradient scale for observation adapter (conv stack in raw_v1). "
             "Effective adapter LR ~= learning_rate * obs_adapter_lr_scale."
+        ),
+    )
+    parser.add_argument(
+        "--queue-encoder-hidden-dim",
+        type=int,
+        default=DEFAULT_QUEUE_ENCODER_HIDDEN_DIM,
+        help="Hidden/output width of the visible-queue encoder branch.",
+    )
+    parser.add_argument(
+        "--queue-encoder-lr-scale",
+        type=float,
+        default=DEFAULT_QUEUE_ENCODER_LR_SCALE,
+        help=(
+            "Learning-rate scale for the new visible-queue encoder branch during PPO."
         ),
     )
     parser.add_argument("--gamma", type=float, default=0.995)
@@ -883,6 +965,8 @@ def parse_args() -> PPOConfig:
         hidden_dim=max(8, int(args.hidden_dim)),
         learning_rate=float(args.learning_rate),
         obs_adapter_lr_scale=max(0.0, float(args.obs_adapter_lr_scale)),
+        queue_encoder_hidden_dim=max(1, int(args.queue_encoder_hidden_dim)),
+        queue_encoder_lr_scale=max(0.0, float(args.queue_encoder_lr_scale)),
         gamma=float(args.gamma),
         gae_lambda=float(args.gae_lambda),
         policy_clip_coef=float(args.policy_clip_coef),
@@ -1231,20 +1315,14 @@ def build_ppo_optimizer(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
     learning_rate: float,
+    queue_encoder_lr_scale: float,
 ) -> torch.optim.Optimizer:
     # Split optimizer groups so we can slow policy/trunk updates during PPO warmup
     # while keeping value-head updates at full speed.
     policy_params: list[nn.Parameter] = []
-    policy_params.extend(
-        [p for p in model.policy_fc1.parameters() if p.requires_grad]
-    )
-    policy_params.extend(
-        [p for p in model.policy_fc2.parameters() if p.requires_grad]
-    )
-    policy_params.extend(
-        [p for p in model.policy_head.parameters() if p.requires_grad]
-    )
-    policy_params.extend([p for p in obs_adapter.parameters() if p.requires_grad])
+    policy_params.extend([p for p in model.policy_fc1.parameters() if p.requires_grad])
+    policy_params.extend([p for p in model.policy_fc2.parameters() if p.requires_grad])
+    policy_params.extend([p for p in model.policy_head.parameters() if p.requires_grad])
 
     value_params: list[nn.Parameter] = []
     value_params.extend(
@@ -1272,6 +1350,37 @@ def build_ppo_optimizer(
                 "group_name": "value",
             }
         )
+    if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        board_adapter_params = [
+            p for p in obs_adapter.board_adapter.parameters() if p.requires_grad
+        ]
+        queue_params = [p for p in obs_adapter.queue_fc1.parameters() if p.requires_grad]
+        if board_adapter_params:
+            param_groups.append(
+                {
+                    "params": board_adapter_params,
+                    "lr": learning_rate,
+                    "group_name": "adapter_board",
+                }
+            )
+        if queue_params:
+            param_groups.append(
+                {
+                    "params": queue_params,
+                    "lr": learning_rate * max(0.0, float(queue_encoder_lr_scale)),
+                    "group_name": "queue",
+                }
+            )
+    else:
+        adapter_params = [p for p in obs_adapter.parameters() if p.requires_grad]
+        if adapter_params:
+            param_groups.append(
+                {
+                    "params": adapter_params,
+                    "lr": learning_rate,
+                    "group_name": "adapter",
+                }
+            )
     if not param_groups:
         raise ValueError("No trainable parameters found for PPO optimizer.")
     return torch.optim.Adam(param_groups, lr=learning_rate, eps=1e-5)
@@ -1283,16 +1392,29 @@ def apply_warmup_lr_schedule(
     warmup_active: bool,
     warmup_policy_lr_scale: float,
     warmup_value_lr_scale: float,
-) -> tuple[float, float]:
+    obs_adapter_lr_scale: float,
+    queue_encoder_lr_scale: float,
+) -> tuple[float, float, float, float]:
     policy_lr = base_lr * (warmup_policy_lr_scale if warmup_active else 1.0)
     value_lr = base_lr * (warmup_value_lr_scale if warmup_active else 1.0)
+    board_adapter_lr = policy_lr * max(0.0, float(obs_adapter_lr_scale))
+    queue_lr = base_lr * max(0.0, float(queue_encoder_lr_scale))
     for group in optimizer.param_groups:
         group_name = str(group.get("group_name", "policy"))
         if group_name == "value":
             group["lr"] = value_lr
+        elif group_name == "queue":
+            group["lr"] = queue_lr
+        elif group_name in ("adapter_board", "adapter"):
+            group["lr"] = board_adapter_lr
         else:
             group["lr"] = policy_lr
-    return float(policy_lr), float(value_lr)
+    return (
+        float(policy_lr),
+        float(value_lr),
+        float(board_adapter_lr),
+        float(queue_lr),
+    )
 
 
 def summarize_adapter_state(
@@ -1300,6 +1422,7 @@ def summarize_adapter_state(
     optimizer: torch.optim.Optimizer,
     policy_lr: float,
     obs_adapter_lr_scale: float,
+    queue_lr: float = 0.0,
 ) -> dict[str, Any]:
     adapter_params = list(obs_adapter.parameters())
     adapter_total = int(sum(int(p.numel()) for p in adapter_params))
@@ -1318,13 +1441,26 @@ def summarize_adapter_state(
 
     conv_total = 0
     conv_trainable = 0
-    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
-        for conv in obs_adapter.conv_layers:
+    queue_total = 0
+    queue_trainable = 0
+    board_adapter = (
+        obs_adapter.board_adapter
+        if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
+        else obs_adapter
+    )
+    if isinstance(board_adapter, WubHeadFromRawObservationAdapter):
+        for conv in board_adapter.conv_layers:
             for param in conv.parameters():
                 count = int(param.numel())
                 conv_total += count
                 if param.requires_grad:
                     conv_trainable += count
+    if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        for param in obs_adapter.queue_fc1.parameters():
+            count = int(param.numel())
+            queue_total += count
+            if param.requires_grad:
+                queue_trainable += count
 
     adapter_frozen = adapter_trainable <= 0
     in_optimizer = optimizer_adapter_params > 0
@@ -1345,7 +1481,7 @@ def summarize_adapter_state(
         status = "trainable_not_in_optimizer"
 
     conv_status = "n/a"
-    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+    if isinstance(board_adapter, WubHeadFromRawObservationAdapter):
         if conv_total <= 0:
             conv_status = "none"
         elif conv_trainable <= 0:
@@ -1354,6 +1490,14 @@ def summarize_adapter_state(
             conv_status = "trainable"
         else:
             conv_status = "partial"
+    if queue_total <= 0:
+        queue_status = "absent"
+    elif queue_trainable <= 0:
+        queue_status = "frozen"
+    elif queue_trainable >= queue_total:
+        queue_status = "trainable"
+    else:
+        queue_status = "partial"
 
     checks: list[str] = []
     if adapter_trainable > 0 and optimizer_adapter_params <= 0:
@@ -1378,8 +1522,12 @@ def summarize_adapter_state(
         "effective_lr": float(effective_lr),
         "conv_total": conv_total,
         "conv_trainable": conv_trainable,
-        "has_conv": isinstance(obs_adapter, WubHeadFromRawObservationAdapter),
+        "has_conv": isinstance(board_adapter, WubHeadFromRawObservationAdapter),
         "conv_status": conv_status,
+        "queue_total": queue_total,
+        "queue_trainable": queue_trainable,
+        "queue_status": queue_status,
+        "queue_lr": float(queue_lr),
         "checks_ok": len(checks) == 0,
         "checks": checks,
     }
@@ -1403,15 +1551,90 @@ def format_adapter_state_log(summary: dict[str, Any]) -> str:
         "adapter("
         f"status={summary.get('status')},"
         f"conv={summary.get('conv_status')},"
+        f"queue={summary.get('queue_status')},"
         f"trainable={summary.get('adapter_trainable')}/{summary.get('adapter_total')},"
         f"in_opt={'y' if summary.get('adapter_in_optimizer') else 'n'},"
         f"opt_params={summary.get('optimizer_adapter_params')},"
         f"groups={groups_str},"
         f"lr_scale={float(summary.get('obs_adapter_lr_scale', 0.0)):.3f},"
         f"eff_lr={float(summary.get('effective_lr', 0.0)):.6g},"
+        f"queue_lr={float(summary.get('queue_lr', 0.0)):.6g},"
         f"checks={checks_str}"
         ")"
     )
+
+
+def adapt_widened_input_weight(
+    target_weight: torch.Tensor,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor | None:
+    if target_weight.ndim != 2 or loaded_weight.ndim != 2:
+        return None
+    if int(target_weight.shape[0]) != int(loaded_weight.shape[0]):
+        return None
+    target_in = int(target_weight.shape[1])
+    loaded_in = int(loaded_weight.shape[1])
+    if loaded_in > target_in:
+        return None
+    expanded = target_weight.detach().clone()
+    expanded.zero_()
+    expanded[:, :loaded_in] = loaded_weight.to(
+        device=expanded.device,
+        dtype=expanded.dtype,
+    )
+    return expanded
+
+
+def prepare_model_state_for_load(
+    model: PolicyValueNet,
+    model_state: dict[str, Any],
+    *,
+    source_label: str,
+) -> dict[str, torch.Tensor]:
+    current_state = model.state_dict()
+    prepared: dict[str, torch.Tensor] = {}
+    for key, value in model_state.items():
+        target_tensor = current_state.get(key)
+        if target_tensor is None:
+            continue
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+        value_tensor = value.detach().to(dtype=target_tensor.dtype)
+        if tuple(value_tensor.shape) == tuple(target_tensor.shape):
+            prepared[key] = value_tensor
+            continue
+        if key in ("policy_fc1.weight", "value_fc1.weight"):
+            expanded = adapt_widened_input_weight(target_tensor, value_tensor)
+            if expanded is not None:
+                prepared[key] = expanded
+                print(
+                    "[ppo] "
+                    f"adapted widened {key} from {source_label} "
+                    f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
+                )
+                continue
+        print(
+            "[ppo] warning: skipped incompatible tensor from "
+            f"{source_label} for key={key} "
+            f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
+        )
+    return prepared
+
+
+def remap_adapter_state_for_queue_transfer(
+    obs_adapter: ObservationAdapter,
+    adapter_state: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        return adapter_state
+    has_board_prefix = any(str(key).startswith("board_adapter.") for key in adapter_state)
+    has_queue_prefix = any(str(key).startswith("queue_fc1.") for key in adapter_state)
+    if has_board_prefix or has_queue_prefix:
+        return adapter_state
+    return {
+        f"board_adapter.{key}": value
+        for key, value in adapter_state.items()
+    }
 
 
 def export_bot_policy_artifact(
@@ -1473,7 +1696,21 @@ def export_bot_policy_artifact(
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
     }
-    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+    if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        artifact["encoderModel"] = obs_adapter.board_adapter.to_exported_encoder_model()
+        queue_w = (
+            obs_adapter.queue_fc1.weight.detach().cpu().numpy().astype(np.float32)
+        )
+        queue_b = (
+            obs_adapter.queue_fc1.bias.detach().cpu().numpy().astype(np.float32)
+        )
+        artifact["queueEncoder"] = {
+            "inputDim": int(obs_adapter.queue_input_dim),
+            "hiddenDim": int(obs_adapter.queue_hidden_dim),
+            "w1": queue_w.T.reshape(-1).tolist(),  # [I, H]
+            "b1": queue_b.reshape(-1).tolist(),
+        }
+    elif isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
         artifact["encoderModel"] = obs_adapter.to_exported_encoder_model()
     return artifact
 
@@ -1492,13 +1729,15 @@ def load_from_artifact(
     input_dim = int(raw.get("inputDim", 0))
     hidden_dim = int(raw.get("hiddenDim", 0))
     action_dim = int(raw.get("actionDim", 0))
+    queue_encoder_payload = raw.get("queueEncoder")
 
     if input_dim <= 0 or hidden_dim <= 0 or action_dim <= 0:
         raise ValueError("Invalid artifact dims.")
 
-    if model.policy_fc1.in_features != input_dim:
+    target_input_dim = int(model.policy_fc1.in_features)
+    if input_dim > target_input_dim:
         raise ValueError(
-            f"Artifact inputDim mismatch. artifact={input_dim} model={model.policy_fc1.in_features}"
+            f"Artifact inputDim mismatch. artifact={input_dim} model={target_input_dim}"
         )
     if model.policy_fc1.out_features != hidden_dim:
         raise ValueError(
@@ -1550,24 +1789,56 @@ def load_from_artifact(
     wv = np.asarray(weights.get("wv", []), dtype=np.float32).reshape(hidden_dim)
     bv = np.asarray(weights.get("bv", []), dtype=np.float32).reshape(1)
 
+    expanded_w1 = np.zeros((target_input_dim, hidden_dim), dtype=np.float32)
+    expanded_w1[:input_dim, :] = w1
+    expanded_wv1 = np.zeros((target_input_dim, hidden_dim), dtype=np.float32)
+    expanded_wv1[:input_dim, :] = wv1
+
     with torch.no_grad():
-        model.policy_fc1.weight.copy_(torch.from_numpy(w1.T))
+        model.policy_fc1.weight.copy_(torch.from_numpy(expanded_w1.T))
         model.policy_fc1.bias.copy_(torch.from_numpy(b1))
         model.policy_fc2.weight.copy_(torch.from_numpy(w2.T))
         model.policy_fc2.bias.copy_(torch.from_numpy(b2))
         model.policy_head.weight.copy_(torch.from_numpy(wp.T))
         model.policy_head.bias.copy_(torch.from_numpy(bp))
-        model.value_fc1.weight.copy_(torch.from_numpy(wv1.T))
+        model.value_fc1.weight.copy_(torch.from_numpy(expanded_wv1.T))
         model.value_fc1.bias.copy_(torch.from_numpy(bv1))
         model.value_fc2.weight.copy_(torch.from_numpy(wv2.T))
         model.value_fc2.bias.copy_(torch.from_numpy(bv2))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
         model.value_head.bias.copy_(torch.from_numpy(bv))
     encoder_payload = raw.get("encoderModel")
-    if isinstance(obs_adapter, WubHeadFromRawObservationAdapter) and isinstance(
-        encoder_payload, dict
+    if isinstance(encoder_payload, dict):
+        if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+            obs_adapter.board_adapter.load_from_exported_encoder_model(encoder_payload)
+        elif isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+            obs_adapter.load_from_exported_encoder_model(encoder_payload)
+    if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter) and isinstance(
+        queue_encoder_payload, dict
     ):
-        obs_adapter.load_from_exported_encoder_model(encoder_payload)
+        queue_input_dim = int(queue_encoder_payload.get("inputDim", 0))
+        queue_hidden_dim = int(queue_encoder_payload.get("hiddenDim", 0))
+        if queue_input_dim != obs_adapter.queue_input_dim:
+            raise ValueError(
+                "Artifact queueEncoder inputDim mismatch. "
+                f"artifact={queue_input_dim} runtime={obs_adapter.queue_input_dim}"
+            )
+        if queue_hidden_dim != obs_adapter.queue_hidden_dim:
+            raise ValueError(
+                "Artifact queueEncoder hiddenDim mismatch. "
+                f"artifact={queue_hidden_dim} runtime={obs_adapter.queue_hidden_dim}"
+            )
+        queue_w = np.asarray(
+            queue_encoder_payload.get("w1", []),
+            dtype=np.float32,
+        ).reshape(queue_input_dim, queue_hidden_dim)
+        queue_b = np.asarray(
+            queue_encoder_payload.get("b1", []),
+            dtype=np.float32,
+        ).reshape(queue_hidden_dim)
+        with torch.no_grad():
+            obs_adapter.queue_fc1.weight.copy_(torch.from_numpy(queue_w.T))
+            obs_adapter.queue_fc1.bias.copy_(torch.from_numpy(queue_b))
     return observation_space
 
 
@@ -1646,10 +1917,19 @@ def load_checkpoint(
                 )
                 model.value_fc2.weight.copy_(eye)
                 model.value_fc2.bias.zero_()
-    model.load_state_dict(model_state, strict=False)
+    prepared_model_state = prepare_model_state_for_load(
+        model,
+        model_state,
+        source_label=f"checkpoint:{checkpoint_path.name}",
+    )
+    model.load_state_dict(prepared_model_state, strict=False)
     adapter_state = checkpoint.get("obs_adapter_state_dict")
     if isinstance(adapter_state, dict):
-        obs_adapter.load_state_dict(adapter_state, strict=False)
+        prepared_adapter_state = remap_adapter_state_for_queue_transfer(
+            obs_adapter,
+            adapter_state,
+        )
+        obs_adapter.load_state_dict(prepared_adapter_state, strict=False)
     optimizer_state = checkpoint.get("optimizer_state_dict")
     if load_optimizer_state and isinstance(optimizer_state, dict):
         try:
@@ -2235,11 +2515,16 @@ def load_bc_dataset(
         action_index = rec.get("actionIndex")
         return_to_go = rec.get("returnToGo")
 
-        if (
-            not isinstance(obs, list)
-            or len(obs) != obs_dim
-            or any(not _is_finite_number(v) for v in obs)
-        ):
+        if not isinstance(obs, list) or any(not _is_finite_number(v) for v in obs):
+            skipped["invalid_obs"] += 1
+            continue
+        obs_values = [float(v) for v in obs]
+        if len(obs_values) < obs_dim:
+            if len(obs_values) < RAW_LEGACY_OBS_DIM:
+                skipped["invalid_obs"] += 1
+                continue
+            obs_values = obs_values + [0.0] * (obs_dim - len(obs_values))
+        elif len(obs_values) > obs_dim:
             skipped["invalid_obs"] += 1
             continue
         if (
@@ -2261,7 +2546,7 @@ def load_bc_dataset(
             skipped["invalid_action"] += 1
             continue
 
-        obs_rows.append([float(v) for v in obs])
+        obs_rows.append(obs_values)
         mask_rows.append(mask)
         action_rows.append(action_index)
         if _is_finite_number(return_to_go):
@@ -2547,9 +2832,10 @@ def train(cfg: PPOConfig) -> None:
         action_dim = infer_action_dim(reset_result["action_masks"])
 
         if cfg.observation_space == "raw_v1":
-            obs_adapter: ObservationAdapter = WubHeadFromRawObservationAdapter(
+            obs_adapter: ObservationAdapter = RawV1BoardQueueObservationAdapter(
                 raw_obs_dim=raw_obs_dim,
                 model_path=cfg.model_path,
+                queue_hidden_dim=cfg.queue_encoder_hidden_dim,
             ).to(device)
         else:
             obs_adapter = IdentityObservationAdapter(
@@ -2566,7 +2852,12 @@ def train(cfg: PPOConfig) -> None:
         global_step = 0
         start_update = 0
         if cfg.resume_checkpoint:
-            optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
+            optimizer = build_ppo_optimizer(
+                model,
+                obs_adapter,
+                cfg.learning_rate,
+                cfg.queue_encoder_lr_scale,
+            )
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
             loaded_global_step, loaded_update = load_checkpoint(
                 checkpoint_path,
@@ -2610,7 +2901,12 @@ def train(cfg: PPOConfig) -> None:
             artifact_observation_space = load_from_artifact(
                 model, obs_adapter, artifact_path
             )
-            if artifact_observation_space != policy_observation_space:
+            artifact_obs_compatible = artifact_observation_space == policy_observation_space or (
+                isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
+                and artifact_observation_space == "model_head_v1"
+                and policy_observation_space == "raw_v1"
+            )
+            if not artifact_obs_compatible:
                 raise ValueError(
                     "Init artifact observationSpace mismatch. "
                     f"artifact={artifact_observation_space} policy={policy_observation_space}"
@@ -2718,10 +3014,15 @@ def train(cfg: PPOConfig) -> None:
                                 "but no trainable encoder params were found."
                             )
                     elif cfg.freeze_conv_after_bc:
-                        if isinstance(obs_adapter, WubHeadFromRawObservationAdapter):
+                        board_adapter = (
+                            obs_adapter.board_adapter
+                            if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
+                            else obs_adapter
+                        )
+                        if isinstance(board_adapter, WubHeadFromRawObservationAdapter):
                             conv_param_total = 0
                             conv_param_trainable = 0
-                            for conv in obs_adapter.conv_layers:
+                            for conv in board_adapter.conv_layers:
                                 for param in conv.parameters():
                                     param_count = int(param.numel())
                                     conv_param_total += param_count
@@ -2755,7 +3056,12 @@ def train(cfg: PPOConfig) -> None:
                         f"[ppo] {freeze_label} freeze requested after BC, "
                         "but BC was skipped/disabled."
                     )
-            optimizer = build_ppo_optimizer(model, obs_adapter, cfg.learning_rate)
+            optimizer = build_ppo_optimizer(
+                model,
+                obs_adapter,
+                cfg.learning_rate,
+                cfg.queue_encoder_lr_scale,
+            )
 
             # Reinitialize env batch after post-BC snapshot capture so PPO
             # always starts from a clean synchronized state.
@@ -2792,11 +3098,13 @@ def train(cfg: PPOConfig) -> None:
         first_update_policy_lr = cfg.learning_rate * (
             cfg.warmup_policy_lr_scale if first_update_warmup_active else 1.0
         )
+        first_update_queue_lr = cfg.learning_rate * cfg.queue_encoder_lr_scale
         startup_adapter_state = summarize_adapter_state(
             obs_adapter=obs_adapter,
             optimizer=optimizer,
             policy_lr=first_update_policy_lr,
             obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
+            queue_lr=first_update_queue_lr,
         )
         print("[ppo] " + format_adapter_state_log(startup_adapter_state))
 
@@ -2806,6 +3114,8 @@ def train(cfg: PPOConfig) -> None:
             f"placement_exec={cfg.placement_execution_mode}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
+            f"queue_hidden_dim={cfg.queue_encoder_hidden_dim}, "
+            f"queue_lr_scale={cfg.queue_encoder_lr_scale:.3f}, "
             f"batch_size={batch_size}, updates={num_updates}, "
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
@@ -2945,18 +3255,26 @@ def train(cfg: PPOConfig) -> None:
                 target_kl_now = (
                     cfg.warmup_target_kl if warmup_active else cfg.target_kl
                 )
-                policy_lr_now, value_lr_now = apply_warmup_lr_schedule(
+                (
+                    policy_lr_now,
+                    value_lr_now,
+                    _adapter_lr_now,
+                    queue_lr_now,
+                ) = apply_warmup_lr_schedule(
                     optimizer=optimizer,
                     base_lr=cfg.learning_rate,
                     warmup_active=warmup_active,
                     warmup_policy_lr_scale=cfg.warmup_policy_lr_scale,
                     warmup_value_lr_scale=cfg.warmup_value_lr_scale,
+                    obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
+                    queue_encoder_lr_scale=cfg.queue_encoder_lr_scale,
                 )
                 adapter_state_now = summarize_adapter_state(
                     obs_adapter=obs_adapter,
                     optimizer=optimizer,
                     policy_lr=policy_lr_now,
                     obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
+                    queue_lr=queue_lr_now,
                 )
                 update_start_wall = time.time()
                 update_start_perf = time.perf_counter()
@@ -3381,9 +3699,6 @@ def train(cfg: PPOConfig) -> None:
 
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
-                        scale_obs_adapter_gradients(
-                            obs_adapter, cfg.obs_adapter_lr_scale
-                        )
                         nn.utils.clip_grad_norm_(
                             trainable_parameters(model, obs_adapter), cfg.max_grad_norm
                         )

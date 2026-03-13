@@ -14,6 +14,7 @@ export type BotObservationParts = {
   hold: PieceKind | null;
   active: PieceKind;
   next: PieceKind | null;
+  nextQueue?: Array<PieceKind | null> | null;
   canHold: boolean;
   totalLinesCleared: number;
   timeMs: number;
@@ -21,6 +22,8 @@ export type BotObservationParts = {
   score: number;
   lineGoal: number | null;
 };
+
+const RAW_VISIBLE_QUEUE_SLOTS = 5;
 
 const encodeModelHeadObservationFromParts = (
   model: LoadedModel,
@@ -61,8 +64,14 @@ const encodeRawObservationFromParts = (
   const cols = parts.board[0]?.length ?? 0;
   const boardSize = rows * cols;
   // board + active one-hot + hold one-hot(+none) + next one-hot + scalar context
+  // + visible queue (up to 5 next pieces as 5 * 7 one-hots)
   const out = new Float32Array(
-    boardSize + PIECES.length + (PIECES.length + 1) + PIECES.length + 5,
+    boardSize +
+      PIECES.length +
+      (PIECES.length + 1) +
+      PIECES.length +
+      5 +
+      RAW_VISIBLE_QUEUE_SLOTS * PIECES.length,
   );
 
   let offset = 0;
@@ -100,6 +109,14 @@ const encodeRawObservationFromParts = (
   out[offset++] = clamp(parts.level / 20, 0, 2);
   out[offset++] = clamp(parts.score / 200_000, 0, 2);
   out[offset++] = parts.canHold ? 1 : 0;
+
+  const queueSource = Array.isArray(parts.nextQueue) ? parts.nextQueue : [];
+  for (let slot = 0; slot < RAW_VISIBLE_QUEUE_SLOTS; slot += 1) {
+    const piece = queueSource[slot] ?? null;
+    const pieceIdx = piece == null ? null : PIECE_INDEX.get(piece);
+    if (pieceIdx != null) out[offset + pieceIdx] = 1;
+    offset += PIECES.length;
+  }
   return out;
 };
 
@@ -136,6 +153,7 @@ export const encodeBotObservation = (options: {
       hold: options.state.hold,
       active: options.state.active.k,
       next: options.state.next[0] ?? null,
+      nextQueue: options.state.next.slice(0, RAW_VISIBLE_QUEUE_SLOTS),
       canHold: options.state.canHold,
       totalLinesCleared: Math.max(
         0,

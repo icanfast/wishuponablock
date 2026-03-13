@@ -6,12 +6,13 @@ import { getMode } from '../core/modes';
 import { XorShift32 } from '../core/rng';
 import { GameRunner, type InputSource } from '../core/runner';
 import type { Settings } from '../core/settings';
-import type {
-  ActivePiece,
-  Board,
-  GameState,
-  InputFrame,
-  PieceKind,
+import {
+  PIECES,
+  type ActivePiece,
+  type Board,
+  type GameState,
+  type InputFrame,
+  type PieceKind,
 } from '../core/types';
 import {
   buildModelHeadInput,
@@ -61,6 +62,21 @@ const BOT_PPO_CLIP_EPSILON = 0.2;
 const BOT_PLACEMENT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_BOT_ACTION_SPACE_KIND: BotActionSpaceKind = 'placement_full_v1';
 const DEFAULT_BOT_OBSERVATION_SPACE: BotObservationSpace = 'raw_v1';
+const BOT_RAW_SCALAR_CONTEXT_DIM = 5;
+
+type QueueEncoderArtifact = {
+  inputDim: number;
+  hiddenDim: number;
+  w1: number[];
+  b1: number[];
+};
+
+type QueueEncoderParams = {
+  inputDim: number;
+  hiddenDim: number;
+  w1: Float32Array;
+  b1: Float32Array;
+};
 
 export type BotActionSpaceKind =
   | 'macro_v1'
@@ -153,6 +169,7 @@ export type BotPolicyArtifact = {
   actions?: BotMacroAction[];
   placementActionDim?: number;
   encoderModel?: ExportedModel;
+  queueEncoder?: QueueEncoderArtifact;
   weights: {
     w1: number[];
     b1: number[];
@@ -314,6 +331,7 @@ type PolicyParams = {
   actionSpaceKind: BotActionSpaceKind;
   macroActions: BotMacroAction[] | null;
   encoderModel: LoadedModel | null;
+  queueEncoder: QueueEncoderParams | null;
   w1: Float32Array;
   b1: Float32Array;
   w2: Float32Array;
@@ -342,6 +360,14 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
     ? params.macroActions.map((action) => ({ ...action }))
     : null,
   encoderModel: params.encoderModel,
+  queueEncoder: params.queueEncoder
+    ? {
+        inputDim: params.queueEncoder.inputDim,
+        hiddenDim: params.queueEncoder.hiddenDim,
+        w1: new Float32Array(params.queueEncoder.w1),
+        b1: new Float32Array(params.queueEncoder.b1),
+      }
+    : null,
   w1: new Float32Array(params.w1),
   b1: new Float32Array(params.b1),
   w2: new Float32Array(params.w2),
@@ -364,6 +390,18 @@ const encoderOutputDim = (model: LoadedModel): number => {
     Math.trunc(Number(model.config.extra_features ?? 0)),
   );
   return finalChannels * poolH * poolW + extraFeatures;
+};
+
+const rawLegacyObservationDim = (state: GameState): number => {
+  const rows = state.board.length;
+  const cols = state.board[0]?.length ?? 0;
+  return (
+    rows * cols +
+    PIECES.length +
+    (PIECES.length + 1) +
+    PIECES.length +
+    BOT_RAW_SCALAR_CONTEXT_DIM
+  );
 };
 
 type RolloutResult = {
@@ -724,6 +762,7 @@ const randomizeParams = (
     actionSpaceKind,
     macroActions,
     encoderModel: null,
+    queueEncoder: null,
     w1,
     b1,
     w2,
@@ -868,6 +907,51 @@ const encodeObservation = (
   state: GameState,
   params?: PolicyParams,
 ): Float32Array => {
+  if (params?.queueEncoder) {
+    const rawObservation = encodeBotObservation({
+      observationSpace: 'raw_v1',
+      model,
+      state,
+    });
+    if (rawObservation.length < params.queueEncoder.inputDim) {
+      throw new Error(
+        'Queue-enabled policy received raw observation shorter than queue input.',
+      );
+    }
+    const boardObservation =
+      params.encoderModel != null
+        ? buildModelHeadInput(params.encoderModel, state.board, state.hold)
+        : rawObservation.subarray(
+            0,
+            Math.min(
+              rawLegacyObservationDim(state),
+              rawObservation.length - params.queueEncoder.inputDim,
+            ),
+          );
+    const queueOffset = rawObservation.length - params.queueEncoder.inputDim;
+    const queueObservation = rawObservation.subarray(queueOffset);
+    const queueHidden = new Float32Array(params.queueEncoder.hiddenDim);
+    for (let h = 0; h < params.queueEncoder.hiddenDim; h += 1) {
+      let sum = params.queueEncoder.b1[h];
+      for (let i = 0; i < params.queueEncoder.inputDim; i += 1) {
+        sum +=
+          queueObservation[i] *
+          params.queueEncoder.w1[i * params.queueEncoder.hiddenDim + h];
+      }
+      queueHidden[h] = sum > 0 ? sum : 0;
+    }
+    const merged = new Float32Array(
+      boardObservation.length + params.queueEncoder.hiddenDim,
+    );
+    if (merged.length !== params.inputDim) {
+      throw new Error(
+        `Queue-enabled policy input mismatch. merged=${merged.length}, expected=${params.inputDim}.`,
+      );
+    }
+    merged.set(boardObservation, 0);
+    merged.set(queueHidden, boardObservation.length);
+    return merged;
+  }
   if (params?.encoderModel) {
     return buildModelHeadInput(params.encoderModel, state.board, state.hold);
   }
@@ -1373,6 +1457,14 @@ const trainWithTfjsReinforce = async (options: {
       ? options.params.macroActions.map((action) => ({ ...action }))
       : null,
     encoderModel: options.params.encoderModel,
+    queueEncoder: options.params.queueEncoder
+      ? {
+          inputDim: options.params.queueEncoder.inputDim,
+          hiddenDim: options.params.queueEncoder.hiddenDim,
+          w1: new Float32Array(options.params.queueEncoder.w1),
+          b1: new Float32Array(options.params.queueEncoder.b1),
+        }
+      : null,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     w2: new Float32Array(w2.dataSync() as Float32Array),
@@ -1581,6 +1673,14 @@ const trainWithTfjsPpo = async (options: {
       ? options.params.macroActions.map((action) => ({ ...action }))
       : null,
     encoderModel: options.params.encoderModel,
+    queueEncoder: options.params.queueEncoder
+      ? {
+          inputDim: options.params.queueEncoder.inputDim,
+          hiddenDim: options.params.queueEncoder.hiddenDim,
+          w1: new Float32Array(options.params.queueEncoder.w1),
+          b1: new Float32Array(options.params.queueEncoder.b1),
+        }
+      : null,
     w1: new Float32Array(w1.dataSync() as Float32Array),
     b1: new Float32Array(b1.dataSync() as Float32Array),
     w2: new Float32Array(w2.dataSync() as Float32Array),
@@ -1842,6 +1942,14 @@ const toArtifact = (
   encoderModel: params.encoderModel
     ? serializeWubModel(params.encoderModel)
     : undefined,
+  queueEncoder: params.queueEncoder
+    ? {
+        inputDim: params.queueEncoder.inputDim,
+        hiddenDim: params.queueEncoder.hiddenDim,
+        w1: Array.from(params.queueEncoder.w1),
+        b1: Array.from(params.queueEncoder.b1),
+      }
+    : undefined,
   weights: {
     w1: Array.from(params.w1),
     b1: Array.from(params.b1),
@@ -1875,6 +1983,28 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     } catch {
       throw new Error('Invalid bot policy encoder model payload.');
     }
+  }
+  const queueEncoderRaw = policy.queueEncoder;
+  let queueEncoder: QueueEncoderParams | null = null;
+  if (queueEncoderRaw != null) {
+    const queueInputDim = Math.max(1, Math.trunc(queueEncoderRaw.inputDim));
+    const queueHiddenDim = Math.max(1, Math.trunc(queueEncoderRaw.hiddenDim));
+    const queueW1 = new Float32Array(queueEncoderRaw.w1 ?? []);
+    const queueB1 = new Float32Array(queueEncoderRaw.b1 ?? []);
+    if (
+      queueW1.length !== queueInputDim * queueHiddenDim ||
+      queueB1.length !== queueHiddenDim ||
+      !isFiniteArray(queueW1) ||
+      !isFiniteArray(queueB1)
+    ) {
+      throw new Error('Invalid bot policy queue encoder dimensions.');
+    }
+    queueEncoder = {
+      inputDim: queueInputDim,
+      hiddenDim: queueHiddenDim,
+      w1: queueW1,
+      b1: queueB1,
+    };
   }
   const macroActions =
     actionSpaceKind === 'macro_v1'
@@ -1941,17 +2071,20 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     throw new Error('Invalid bot policy artifact dimensions.');
   }
   if (encoderModel) {
-    if (observationSpace !== 'model_head_v1') {
-      throw new Error(
-        'Bot policy artifact encoder model requires observationSpace=model_head_v1.',
-      );
-    }
     const encoderDim = encoderOutputDim(encoderModel);
-    if (encoderDim !== inputDim) {
+    const expectedInputDim = queueEncoder
+      ? encoderDim + queueEncoder.hiddenDim
+      : encoderDim;
+    if (expectedInputDim !== inputDim) {
       throw new Error(
-        `Bot policy artifact encoder output mismatch. encoder=${encoderDim}, inputDim=${inputDim}.`,
+        `Bot policy artifact encoder output mismatch. encoder=${encoderDim}, inputDim=${inputDim}, queueHidden=${queueEncoder?.hiddenDim ?? 0}.`,
       );
     }
+  }
+  if (queueEncoder && !encoderModel) {
+    throw new Error(
+      'Queue-enabled bot policy artifact requires encoderModel payload.',
+    );
   }
   if (
     !isFiniteArray(w1) ||
@@ -1978,6 +2111,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
           : actionSpace.map((action) => ({ ...action }))
         : null,
     encoderModel,
+    queueEncoder,
     w1,
     b1,
     w2,
@@ -2060,6 +2194,24 @@ export const parseBotPolicyArtifactFromUnknown = (
       : undefined,
     encoderModel: isRecord(value.encoderModel)
       ? (value.encoderModel as ExportedModel)
+      : undefined,
+    queueEncoder: isRecord(value.queueEncoder)
+      ? {
+          inputDim: Math.max(
+            1,
+            Math.trunc(Number(value.queueEncoder.inputDim)),
+          ),
+          hiddenDim: Math.max(
+            1,
+            Math.trunc(Number(value.queueEncoder.hiddenDim)),
+          ),
+          w1: Array.isArray(value.queueEncoder.w1)
+            ? value.queueEncoder.w1.map((item) => Number(item))
+            : [],
+          b1: Array.isArray(value.queueEncoder.b1)
+            ? value.queueEncoder.b1.map((item) => Number(item))
+            : [],
+        }
       : undefined,
     weights: {
       w1: asArray('w1'),
