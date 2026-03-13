@@ -12,6 +12,7 @@ import {
   type CharcuterieHoleWeights,
   type CharcuterieScoreWeights,
 } from './charcuterieService';
+import type { BotPolicyArtifact } from './headlessBotService';
 import type { ModelService } from './modelService';
 import type { ModelGeneratorDecisionEvent } from '../core/modelGenerator';
 
@@ -29,8 +30,11 @@ export type GameFactoryOptions = {
   charcuterie: {
     rows: number;
     defaultSimCount: number;
+    defaultTargetFilledCells: number;
+    defaultTemperature: number;
     scoreWeights: CharcuterieScoreWeights;
     holeWeights: CharcuterieHoleWeights;
+    resolveBotPolicy?: () => BotPolicyArtifact | null;
     onDebug?: (message: string) => void;
   };
   runnerOptions?: {
@@ -103,8 +107,11 @@ export function createGameSessionFactory(
         return createCharcuterieGame(cfg, mode, options, {
           rows: charcuterie.rows,
           defaultSimCount: charcuterie.defaultSimCount,
+          defaultTargetFilledCells: charcuterie.defaultTargetFilledCells,
+          defaultTemperature: charcuterie.defaultTemperature,
           scoreWeights: charcuterie.scoreWeights,
           holeWeights: charcuterie.holeWeights,
+          resolveBotPolicy: charcuterie.resolveBotPolicy,
           buildGame: (nextCfg, nextMode, seed) =>
             buildGame(
               {

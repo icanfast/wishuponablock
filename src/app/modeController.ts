@@ -17,7 +17,12 @@ export type ModeController = {
   startCheese: (lines: number) => ModeState;
   startCharcuterie: (
     pieces: number,
-    options: { simCount: number; seed?: number },
+    options: {
+      simCount?: number;
+      seed?: number;
+      targetFilledCells?: number;
+      temperature?: number;
+    },
   ) => ModeState;
 };
 
@@ -54,8 +59,14 @@ export function createModeController(
     startCharcuterie: (pieces, next) =>
       apply('charcuterie', {
         pieces,
-        simCount: next.simCount,
+        ...(next.simCount !== undefined ? { simCount: next.simCount } : {}),
         ...(next.seed !== undefined ? { seed: next.seed } : {}),
+        ...(next.targetFilledCells !== undefined
+          ? { targetFilledCells: next.targetFilledCells }
+          : {}),
+        ...(next.temperature !== undefined
+          ? { temperature: next.temperature }
+          : {}),
       }),
   };
 }

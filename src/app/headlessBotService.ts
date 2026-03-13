@@ -25,7 +25,9 @@ import {
 import type { ModelAxes } from '../core/modelAxes';
 import {
   encodeBotObservation,
+  encodeBotObservationFromParts,
   normalizeBotObservationSpace,
+  type BotObservationParts,
   type BotObservationSpace,
 } from '../core/botObservation';
 import {
@@ -403,6 +405,23 @@ const rawLegacyObservationDim = (state: GameState): number => {
     BOT_RAW_SCALAR_CONTEXT_DIM
   );
 };
+
+const toBotObservationParts = (state: GameState): BotObservationParts => ({
+  board: state.board,
+  hold: state.hold,
+  active: state.active.k,
+  next: state.next[0] ?? null,
+  nextQueue: state.next.slice(0, 5),
+  canHold: state.canHold,
+  totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+  timeMs: Math.max(0, Math.trunc(state.timeMs)),
+  level: Math.max(1, Math.trunc(state.level)),
+  score: Math.max(0, Math.trunc(state.score)),
+  lineGoal:
+    state.lineGoal != null && state.lineGoal > 0
+      ? Math.trunc(state.lineGoal)
+      : null,
+});
 
 type RolloutResult = {
   transitions: Transition[];
@@ -903,15 +922,14 @@ const forwardPolicy = (
 
 const encodeObservation = (
   observationSpace: BotObservationSpace,
-  model: LoadedModel,
+  model: LoadedModel | null,
   state: GameState,
   params?: PolicyParams,
 ): Float32Array => {
   if (params?.queueEncoder) {
-    const rawObservation = encodeBotObservation({
+    const rawObservation = encodeBotObservationFromParts({
       observationSpace: 'raw_v1',
-      model,
-      state,
+      parts: toBotObservationParts(state),
     });
     if (rawObservation.length < params.queueEncoder.inputDim) {
       throw new Error(
@@ -954,6 +972,17 @@ const encodeObservation = (
   }
   if (params?.encoderModel) {
     return buildModelHeadInput(params.encoderModel, state.board, state.hold);
+  }
+  if (observationSpace === 'raw_v1') {
+    return encodeBotObservationFromParts({
+      observationSpace: 'raw_v1',
+      parts: toBotObservationParts(state),
+    });
+  }
+  if (!model) {
+    throw new Error(
+      'Model-head observation requested without a loaded reference model.',
+    );
   }
   return encodeBotObservation({
     observationSpace,
@@ -2851,12 +2880,13 @@ export const runHeadlessBotValidation = async (
 };
 
 export type BotGuiInputSourceConfig = {
-  model: LoadedModel;
+  model: LoadedModel | null;
   policy: BotPolicyArtifact;
   apmInput: number;
-  executionMode?: 'apm' | 'step';
+  executionMode?: 'apm' | 'step' | 'instant';
   seed?: number;
   greedy?: boolean;
+  samplingTemperature?: number;
   debugTrace?: boolean;
   onLog?: (line: string) => void;
   onTargetGhostChange?: (ghost: ActivePiece | null) => void;
@@ -2875,7 +2905,9 @@ export const createGuiInspectBotInputSource = (
   const greedy = config.greedy !== false;
   const clampedApm = clamp(config.apmInput, 20, 1200);
   const actionIntervalMs = 60_000 / clampedApm;
+  const instantMode = config.executionMode === 'instant';
   const stepMode = config.executionMode === 'step';
+  const samplingTemperature = clamp(config.samplingTemperature ?? 1, 0.05, 20);
   const debugTrace = config.debugTrace !== false;
   const log = (line: string): void => config.onLog?.(`[bot-gui] ${line}`);
   let rng = new XorShift32(seed ^ 0x517cc1b7);
@@ -3012,7 +3044,18 @@ export const createGuiInspectBotInputSource = (
             }
           }
         } else {
-          actionIndex = sampleIndex(forward.probabilities, rng);
+          if (Math.abs(samplingTemperature - 1) < 1e-6) {
+            actionIndex = sampleIndex(forward.probabilities, rng);
+          } else {
+            const scaledLogits = new Float32Array(forward.logits.length);
+            for (let i = 0; i < forward.logits.length; i += 1) {
+              scaledLogits[i] =
+                actionMask && actionMask[i] <= 0
+                  ? Number.NEGATIVE_INFINITY
+                  : forward.logits[i] / samplingTemperature;
+            }
+            actionIndex = sampleIndex(softmax(scaledLogits, actionMask), rng);
+          }
         }
         if (placementChoices) {
           const fallbackActionIndex = Math.max(
@@ -3097,7 +3140,7 @@ export const createGuiInspectBotInputSource = (
       if (stepMode) {
         if (manualStepBudget <= 0) return EMPTY_INPUT;
         manualStepBudget -= 1;
-      } else {
+      } else if (!instantMode) {
         if (cooldownMs > 0) return EMPTY_INPUT;
         cooldownMs = actionIntervalMs;
       }

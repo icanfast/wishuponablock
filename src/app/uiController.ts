@@ -27,7 +27,12 @@ export type UiController = {
     onStartCheese: (lines: number) => void;
     onStartCharcuterie: (
       pieces: number,
-      options: { simCount: number; seed?: number },
+      options: {
+        simCount?: number;
+        seed?: number;
+        targetFilledCells?: number;
+        temperature?: number;
+      },
     ) => void;
     onOpenTool: (id: string) => void;
     onSendFeedback: (feedback: string, contact: string | null) => Promise<void>;
@@ -172,7 +177,12 @@ export function createUiController(options: UiControllerOptions): UiController {
     },
     onStartCharcuterie: (
       pieces: number,
-      options: { simCount: number; seed?: number },
+      options: {
+        simCount?: number;
+        seed?: number;
+        targetFilledCells?: number;
+        temperature?: number;
+      },
     ) => {
       modeController.startCharcuterie(pieces, options);
       menuScreen?.setCharcuterieSpinnerVisible(true);

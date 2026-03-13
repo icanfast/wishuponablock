@@ -218,6 +218,8 @@ export type MenuScreenOptions = {
   showLegacyDataTools: boolean;
   version: string;
   charcuterieDefaultSimCount?: number;
+  charcuterieDefaultTargetFilledCells?: number;
+  charcuterieDefaultTemperature?: number;
   tools: Array<{ id: string; label: string }>;
   labelingProgress?: LabelingProgressState | null;
   authState: MenuAuthState;
@@ -242,7 +244,12 @@ export type MenuScreenOptions = {
   onStartCheese: (lines: number) => void;
   onStartCharcuterie: (
     pieces: number,
-    options: { simCount: number; seed?: number },
+    options: {
+      simCount?: number;
+      seed?: number;
+      targetFilledCells?: number;
+      temperature?: number;
+    },
   ) => void;
   onOpenTool: (id: string) => void;
   onSendFeedback: (feedback: string, contact: string | null) => Promise<void>;
@@ -389,6 +396,8 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     showLegacyDataTools,
     version,
     charcuterieDefaultSimCount = 10000,
+    charcuterieDefaultTargetFilledCells = 120,
+    charcuterieDefaultTemperature = 1,
     tools,
     labelingProgress = null,
     authState,
@@ -2100,15 +2109,32 @@ input[type=number] {
     marginBottom: '4px',
   });
 
-  const charcuterie8Button = makeMenuButton('8 PIECES');
-  const charcuterie14Button = makeMenuButton('14 PIECES');
-  const charcuterie20Button = makeMenuButton('20 PIECES');
-  const charcuterieSimInput = document.createElement('input');
-  charcuterieSimInput.type = 'number';
-  charcuterieSimInput.min = '1';
-  charcuterieSimInput.step = '1';
-  charcuterieSimInput.value = String(charcuterieDefaultSimCount);
-  Object.assign(charcuterieSimInput.style, {
+  const charcuterieStartButton = makeMenuButton('START');
+  const charcuterieTargetCellsInput = document.createElement('input');
+  charcuterieTargetCellsInput.type = 'number';
+  charcuterieTargetCellsInput.min = '1';
+  charcuterieTargetCellsInput.max = '400';
+  charcuterieTargetCellsInput.step = '1';
+  charcuterieTargetCellsInput.value = String(
+    charcuterieDefaultTargetFilledCells,
+  );
+  Object.assign(charcuterieTargetCellsInput.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#0b0f14',
+    color: '#e2e8f0',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    padding: '6px 8px',
+    fontSize: '12px',
+  });
+
+  const charcuterieTemperatureInput = document.createElement('input');
+  charcuterieTemperatureInput.type = 'number';
+  charcuterieTemperatureInput.min = '0.05';
+  charcuterieTemperatureInput.step = '0.05';
+  charcuterieTemperatureInput.value = String(charcuterieDefaultTemperature);
+  Object.assign(charcuterieTemperatureInput.style, {
     width: '100%',
     boxSizing: 'border-box',
     background: '#0b0f14',
@@ -2154,17 +2180,23 @@ input[type=number] {
     return field;
   };
 
-  const charcuterieSimField = makeMenuField('SIMULATIONS', charcuterieSimInput);
+  const charcuterieTargetCellsField = makeMenuField(
+    'TARGET FILLED CELLS',
+    charcuterieTargetCellsInput,
+  );
+  const charcuterieTemperatureField = makeMenuField(
+    'TEMPERATURE',
+    charcuterieTemperatureInput,
+  );
   const charcuterieSeedField = makeMenuField('SEED', charcuterieSeedInput);
   const charcuterieBackButton = makeMenuButton('BACK');
   Object.assign(charcuterieBackButton.style, { marginTop: 'auto' });
 
   charcuteriePanel.appendChild(charcuterieTitle);
-  charcuteriePanel.appendChild(charcuterie8Button);
-  charcuteriePanel.appendChild(charcuterie14Button);
-  charcuteriePanel.appendChild(charcuterie20Button);
+  charcuteriePanel.appendChild(charcuterieStartButton);
+  charcuteriePanel.appendChild(charcuterieTargetCellsField);
+  charcuteriePanel.appendChild(charcuterieTemperatureField);
   if (showExperimentalGameplayControls) {
-    charcuteriePanel.appendChild(charcuterieSimField);
     charcuteriePanel.appendChild(charcuterieSeedField);
   }
   charcuteriePanel.appendChild(charcuterieBackButton);
@@ -6219,10 +6251,16 @@ input[type=number] {
   footer.appendChild(versionLabel);
   root.appendChild(footer);
 
-  const readCharcuterieSimCount = (): number => {
-    const raw = Number(charcuterieSimInput.value);
-    if (!Number.isFinite(raw)) return charcuterieDefaultSimCount;
-    return Math.max(1, Math.trunc(raw));
+  const readCharcuterieTargetFilledCells = (): number => {
+    const raw = Number(charcuterieTargetCellsInput.value);
+    if (!Number.isFinite(raw)) return charcuterieDefaultTargetFilledCells;
+    return Math.max(1, Math.min(400, Math.trunc(raw)));
+  };
+
+  const readCharcuterieTemperature = (): number => {
+    const raw = Number(charcuterieTemperatureInput.value);
+    if (!Number.isFinite(raw)) return charcuterieDefaultTemperature;
+    return Math.max(0.05, raw);
   };
 
   const readCharcuterieSeed = (): number | undefined => {
@@ -6300,25 +6338,11 @@ input[type=number] {
   cheese8Button.addEventListener('click', () => onStartCheese(8));
   cheese12Button.addEventListener('click', () => onStartCheese(12));
 
-  charcuterie8Button.addEventListener('click', () =>
-    onStartCharcuterie(8, {
-      simCount: readCharcuterieSimCount(),
-      ...(readCharcuterieSeed() !== undefined
-        ? { seed: readCharcuterieSeed() }
-        : {}),
-    }),
-  );
-  charcuterie14Button.addEventListener('click', () =>
-    onStartCharcuterie(14, {
-      simCount: readCharcuterieSimCount(),
-      ...(readCharcuterieSeed() !== undefined
-        ? { seed: readCharcuterieSeed() }
-        : {}),
-    }),
-  );
-  charcuterie20Button.addEventListener('click', () =>
-    onStartCharcuterie(20, {
-      simCount: readCharcuterieSimCount(),
+  charcuterieStartButton.addEventListener('click', () =>
+    onStartCharcuterie(0, {
+      simCount: charcuterieDefaultSimCount,
+      targetFilledCells: readCharcuterieTargetFilledCells(),
+      temperature: readCharcuterieTemperature(),
       ...(readCharcuterieSeed() !== undefined
         ? { seed: readCharcuterieSeed() }
         : {}),

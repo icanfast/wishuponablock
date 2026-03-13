@@ -7,6 +7,8 @@ export interface ModeOptions {
   pieces?: number;
   simCount?: number;
   seed?: number;
+  targetFilledCells?: number;
+  temperature?: number;
 }
 
 export interface GameMode {

@@ -582,6 +582,8 @@ async function boot() {
   let menuUi: MenuScreen | null = null;
   let replayUi: ReturnType<typeof createReplayScreen> | null = null;
   const charcuterieDefaultSimCount = 10000;
+  const charcuterieDefaultTargetFilledCells = 120;
+  const charcuterieDefaultTemperature = 1.0;
   const charcuterieScoreWeights: CharcuterieScoreWeights = {
     height: 10,
     holes: 20,
@@ -2106,7 +2108,9 @@ async function boot() {
     botGuiStepMode = stepMode;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
     if (selectedModeId === 'charcuterie') {
-      modeController.startCharcuterie(Math.max(1, options?.pieces ?? 20), {
+      modeController.startCharcuterie(0, {
+        targetFilledCells: charcuterieDefaultTargetFilledCells,
+        temperature: charcuterieDefaultTemperature,
         simCount: charcuterieDefaultSimCount,
         ...(Number.isFinite(seed) ? { seed: Math.trunc(seed) } : {}),
       });
@@ -3451,8 +3455,11 @@ async function boot() {
     charcuterie: {
       rows: ROWS,
       defaultSimCount: charcuterieDefaultSimCount,
+      defaultTargetFilledCells: charcuterieDefaultTargetFilledCells,
+      defaultTemperature: charcuterieDefaultTemperature,
       scoreWeights: charcuterieScoreWeights,
       holeWeights: charcuterieHoleWeights,
+      resolveBotPolicy: () => adminBotPolicy,
       onDebug: (message) => console.info(message),
     },
   });
@@ -3876,6 +3883,8 @@ async function boot() {
     showLegacyDataTools: ENABLE_LEGACY_DATA_TOOLS,
     version: APP_VERSION,
     charcuterieDefaultSimCount,
+    charcuterieDefaultTargetFilledCells,
+    charcuterieDefaultTemperature,
     tools: ENABLE_LEGACY_DATA_TOOLS ? toolHost.list() : [],
     labelingProgress: ENABLE_LEGACY_DATA_TOOLS
       ? {
