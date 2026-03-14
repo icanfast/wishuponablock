@@ -582,8 +582,8 @@ async function boot() {
   let menuUi: MenuScreen | null = null;
   let replayUi: ReturnType<typeof createReplayScreen> | null = null;
   const charcuterieDefaultSimCount = 10000;
-  const charcuterieDefaultTargetFilledCells = 120;
-  const charcuterieDefaultTemperature = 1.0;
+  const charcuterieDefaultTargetFilledCells = 80;
+  const charcuterieDefaultTemperature = 5.0;
   const charcuterieScoreWeights: CharcuterieScoreWeights = {
     height: 10,
     holes: 20,

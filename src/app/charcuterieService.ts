@@ -38,6 +38,9 @@ const defaultOnDebug = (message: string) => {
   console.info(message);
 };
 
+const BOT_CHARCUTERIE_HEIGHT_LIMIT = 15;
+const BOT_CHARCUTERIE_MAX_HEIGHT_RESTARTS = 2;
+
 export function createCharcuterieGame(
   cfg: Settings,
   mode: GameMode,
@@ -82,29 +85,65 @@ export function createCharcuterieGame(
 
   if (policy) {
     try {
-      const game = buildGame(cfg, mode, baseSeed);
-      const bot = createGuiInspectBotInputSource({
-        model: null,
-        policy,
-        apmInput: 1200,
-        executionMode: 'instant',
-        seed: baseSeed ^ 0x9e3779b9,
-        greedy: false,
-        samplingTemperature: temperature,
-        debugTrace: false,
-      });
-      const result = runBotUntilFilledCells(game, bot, targetFilledCells);
-      const finalBoard = result.board ?? game.state.board;
+      let acceptedResult: ReturnType<typeof runBotUntilFilledCells> | null =
+        null;
+      let acceptedSeed = baseSeed;
+      let heightRestarts = 0;
+      let attempts = 0;
+      for (
+        let attempt = 0;
+        attempt <= BOT_CHARCUTERIE_MAX_HEIGHT_RESTARTS;
+        attempt += 1
+      ) {
+        attempts = attempt + 1;
+        const attemptSeed = baseSeed + attempt * 977;
+        const game = buildGame(cfg, mode, attemptSeed);
+        const bot = createGuiInspectBotInputSource({
+          model: null,
+          policy,
+          apmInput: 1200,
+          executionMode: 'instant',
+          seed: attemptSeed ^ 0x9e3779b9,
+          greedy: false,
+          samplingTemperature: temperature,
+          debugTrace: false,
+        });
+        const result = runBotUntilFilledCells(
+          game,
+          bot,
+          targetFilledCells,
+          1000 / 120,
+          BOT_CHARCUTERIE_HEIGHT_LIMIT,
+        );
+        acceptedResult = result;
+        acceptedSeed = attemptSeed;
+        if (
+          result.heightExceeded &&
+          attempt < BOT_CHARCUTERIE_MAX_HEIGHT_RESTARTS
+        ) {
+          heightRestarts += 1;
+          continue;
+        }
+        break;
+      }
+      const result = acceptedResult;
+      if (!result) {
+        throw new Error('Bot policy generation returned no rollout result.');
+      }
+      const finalBoard = result.board;
       const filledCells = result.filledCells;
       const simElapsedMs = performance.now() - simStart;
       onDebug(
         `[Charcuterie] bot policy=${policy.id} targetFilled=${targetFilledCells} ` +
           `filled=${filledCells} pieces=${result.placed} temp=${temperature.toFixed(
             2,
-          )} outcome=${result.outcome} ` +
-          `seed=${baseSeed} elapsedMs=${simElapsedMs.toFixed(1)}`,
+          )} lines=${result.linesCleared} outcome=${result.outcome} ` +
+          `maxHeight=${result.maxHeightReached} heightLimit=${BOT_CHARCUTERIE_HEIGHT_LIMIT} ` +
+          `heightRestarts=${heightRestarts}/${BOT_CHARCUTERIE_MAX_HEIGHT_RESTARTS} ` +
+          `heightExceeded=${result.heightExceeded ? 'y' : 'n'} attempts=${attempts} ` +
+          `seed=${acceptedSeed} elapsedMs=${simElapsedMs.toFixed(1)}`,
       );
-      const finalGame = createFinalGame(cfg, mode, baseSeed);
+      const finalGame = createFinalGame(cfg, mode, acceptedSeed);
       finalGame.applyInitialBoard(finalBoard);
       finalGame.markInitialBlocks();
       return finalGame;
@@ -205,11 +244,15 @@ function runBotUntilFilledCells(
   bot: InputSource,
   targetFilledCells: number,
   fixedStepMs = 1000 / 120,
+  heightLimit = BOT_CHARCUTERIE_HEIGHT_LIMIT,
 ): {
   placed: number;
-  board: Board | null;
+  board: Board;
   filledCells: number;
-  outcome: 'target' | 'game_over' | 'piece_cap' | 'step_cap';
+  linesCleared: number;
+  maxHeightReached: number;
+  heightExceeded: boolean;
+  outcome: 'target' | 'game_over' | 'piece_cap' | 'step_cap' | 'height_cap';
 } {
   const runner = new GameRunner(game, { fixedStepMs });
   let placed = 0;
@@ -218,10 +261,20 @@ function runBotUntilFilledCells(
   let previousLines = game.state.totalLinesCleared;
   const maxPieces = Math.max(32, targetFilledCells * 2);
   const maxSteps = maxPieces * 32;
-  let bestBoard: Board | null = null;
+  let bestBoard: Board = cloneBoard(game.state.board);
   let bestFilledCells = countBlocks(game.state.board);
   let bestDistance = Number.POSITIVE_INFINITY;
-  let outcome: 'target' | 'game_over' | 'piece_cap' | 'step_cap' = 'step_cap';
+  let maxHeightReached = getStackHeight(
+    game.state.board,
+    game.state.board.length,
+  );
+  let heightExceeded = false;
+  let outcome:
+    | 'target'
+    | 'game_over'
+    | 'piece_cap'
+    | 'step_cap'
+    | 'height_cap' = 'step_cap';
 
   for (let step = 0; step < maxSteps; step += 1) {
     if (game.state.gameOver) {
@@ -240,13 +293,22 @@ function runBotUntilFilledCells(
         const filledCells = countBlocks(game.state.board);
         const distance = Math.abs(filledCells - targetFilledCells);
         if (
-          bestBoard == null ||
           distance < bestDistance ||
           (distance === bestDistance && filledCells >= targetFilledCells)
         ) {
           bestBoard = cloneBoard(game.state.board);
           bestFilledCells = filledCells;
           bestDistance = distance;
+        }
+        const stackHeight = getStackHeight(
+          game.state.board,
+          game.state.board.length,
+        );
+        maxHeightReached = Math.max(maxHeightReached, stackHeight);
+        if (stackHeight > heightLimit) {
+          heightExceeded = true;
+          outcome = 'height_cap';
+          break;
         }
         if (filledCells >= targetFilledCells) {
           outcome = 'target';
@@ -260,20 +322,13 @@ function runBotUntilFilledCells(
     }
   }
 
-  if (bestBoard) {
-    return {
-      placed,
-      board: bestBoard,
-      filledCells: bestFilledCells,
-      outcome,
-    };
-  }
-
-  const fallbackBoard = cloneBoard(game.state.board);
   return {
     placed,
-    board: fallbackBoard,
-    filledCells: countBlocks(fallbackBoard),
+    board: bestBoard,
+    filledCells: bestFilledCells,
+    linesCleared: Math.max(0, Math.trunc(game.totalLinesCleared)),
+    maxHeightReached,
+    heightExceeded,
     outcome,
   };
 }
