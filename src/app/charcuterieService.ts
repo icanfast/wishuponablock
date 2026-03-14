@@ -40,6 +40,7 @@ const defaultOnDebug = (message: string) => {
 
 const BOT_CHARCUTERIE_HEIGHT_LIMIT = 15;
 const BOT_CHARCUTERIE_MAX_HEIGHT_RESTARTS = 2;
+let charcuterieBuildDebugId = 0;
 
 export function createCharcuterieGame(
   cfg: Settings,
@@ -82,6 +83,14 @@ export function createCharcuterieGame(
     seedOverride !== undefined ? Math.trunc(seedOverride) : Date.now();
   const simStart = performance.now();
   const policy = resolveBotPolicy?.() ?? null;
+  const buildId = ++charcuterieBuildDebugId;
+
+  onDebug(
+    `[Charcuterie] build=${buildId} start seed=${baseSeed} ` +
+      `targetFilled=${targetFilledCells} temp=${temperature.toFixed(2)} ` +
+      `pieces=${pieces} legacyPieces=${legacyPieces} sims=${sims} ` +
+      `policy=${policy?.id ?? 'none'}`,
+  );
 
   if (policy) {
     try {
@@ -134,7 +143,7 @@ export function createCharcuterieGame(
       const filledCells = result.filledCells;
       const simElapsedMs = performance.now() - simStart;
       onDebug(
-        `[Charcuterie] bot policy=${policy.id} targetFilled=${targetFilledCells} ` +
+        `[Charcuterie] build=${buildId} bot policy=${policy.id} targetFilled=${targetFilledCells} ` +
           `filled=${filledCells} pieces=${result.placed} temp=${temperature.toFixed(
             2,
           )} lines=${result.linesCleared} outcome=${result.outcome} ` +
@@ -150,7 +159,7 @@ export function createCharcuterieGame(
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       onDebug(
-        `[Charcuterie] bot policy generation failed (${detail}); falling back to legacy random simulation.`,
+        `[Charcuterie] build=${buildId} bot policy generation failed (${detail}); falling back to legacy random simulation.`,
       );
     }
   }
@@ -170,7 +179,7 @@ export function createCharcuterieGame(
   }
 
   onDebug(
-    '[Charcuterie] no bot policy available; falling back to legacy random simulation.',
+    `[Charcuterie] build=${buildId} no bot policy available; falling back to legacy random simulation.`,
   );
   let bestGame: Game | null = null;
   let bestScore = Number.POSITIVE_INFINITY;
@@ -220,7 +229,7 @@ export function createCharcuterieGame(
 
   const simElapsedMs = performance.now() - simStart;
   onDebug(
-    `[Charcuterie] sims=${sims} pieces=${pieces} ` +
+    `[Charcuterie] build=${buildId} sims=${sims} pieces=${pieces} ` +
       `(legacyPieces=${legacyPieces}) ` +
       `bestScore=${bestScore.toFixed(2)} ` +
       `height=${bestHeight} holes=${bestHoles} blocks=${bestBlocks.toFixed(

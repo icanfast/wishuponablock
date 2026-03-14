@@ -728,20 +728,37 @@ async function boot() {
     return { model: parsed, modelId: globalModel.id };
   };
 
+  let startGameDebugRequestId = 0;
   const syncActiveModelForContext = async (options: {
     mode: string;
     reason: string;
     force?: boolean;
     interactive?: boolean;
+    allowDeferredGameRebuild?: boolean;
   }): Promise<{ source: 'global' | 'personal'; message: string }> => {
     const rebuildSessionIfGameScreenActive = (): void => {
-      if (screenManager.getActive() !== 'game') {
+      const activeScreen = screenManager.getActive();
+      const shouldRebuild =
+        activeScreen === 'game' && allowDeferredGameRebuild === true;
+      console.info(
+        `[session-debug] model_sync_complete reason=${reason} mode=${mode} ` +
+          `screen=${activeScreen ?? 'none'} allowDeferredGameRebuild=${
+            allowDeferredGameRebuild ? 'y' : 'n'
+          } rebuild=${shouldRebuild ? 'y' : 'n'}`,
+      );
+      if (!shouldRebuild) {
         return;
       }
       sessionController.rebuildSession();
     };
 
-    const { mode, reason, force = false, interactive = false } = options;
+    const {
+      mode,
+      reason,
+      force = false,
+      interactive = false,
+      allowDeferredGameRebuild = true,
+    } = options;
     const userId =
       authState.authenticated && authState.user ? authState.user.id : null;
     const contextKey = buildModelContextKey(userId, mode);
@@ -3846,6 +3863,7 @@ async function boot() {
       await syncActiveModelForContext({
         mode: mode.id,
         reason: 'mode_change',
+        allowDeferredGameRebuild: screenManager.getActive() === 'game',
       });
     })();
   });
@@ -4099,7 +4117,13 @@ async function boot() {
   const startGameWithModelReady = async (): Promise<void> => {
     if (startingGame) return;
     startingGame = true;
+    const requestId = ++startGameDebugRequestId;
     try {
+      console.info(
+        `[start-debug] begin request=${requestId} mode=${modeController
+          .getState()
+          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+      );
       if (!botGuiInspectEnabled && botGuiInspectGeneratorBackup) {
         applyBotGuiPieceSourceProfile('active_generator');
       }
@@ -4132,12 +4156,31 @@ async function boot() {
         'start_game',
       );
       runtime?.setInputSource(activeInputSource);
+      console.info(
+        `[start-debug] entering_game_screen request=${requestId} mode=${modeController
+          .getState()
+          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+      );
       await screenManager.setActive('game');
+      console.info(
+        `[start-debug] entered_game_screen request=${requestId} mode=${modeController
+          .getState()
+          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+      );
     } finally {
+      console.info(
+        `[start-debug] end request=${requestId} mode=${modeController
+          .getState()
+          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+      );
       startingGame = false;
     }
   };
   requestStartGame = () => {
+    console.info(
+      `[start-debug] request_start mode=${modeController.getState().mode.id} ` +
+        `screen=${screenManager.getActive() ?? 'none'}`,
+    );
     if (replayGuiInspectEnabled || replayDirectRunning) {
       stopAdminReplayMode();
     }

@@ -63,6 +63,7 @@ export function createScreenFlowController(
     makeGameScreen: (root) => ({
       root,
       enter: () => {
+        console.info('[session-debug] rebuild reason=game_screen_enter');
         runtime.setPausedByMenu(false);
         gameGfx.visible = true;
         toolGfx.visible = false;
