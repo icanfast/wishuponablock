@@ -2164,7 +2164,6 @@ def run_validation_eval(
             diag_max_height_values: list[float] = []
             diag_kick_assisted_locks_values: list[float] = []
             diag_hold_uses_values: list[float] = []
-            diag_avg_reachable_next_values: list[float] = []
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -2206,8 +2205,6 @@ def run_validation_eval(
                 ep_max_height = np.zeros(env_count, dtype=np.float64)
                 ep_kick_assisted_locks = np.zeros(env_count, dtype=np.float64)
                 ep_hold_uses = np.zeros(env_count, dtype=np.float64)
-                ep_reachable_next_sum = np.zeros(env_count, dtype=np.float64)
-                ep_reachable_next_count = np.zeros(env_count, dtype=np.float64)
                 done_mask = np.zeros(env_count, dtype=np.bool_)
 
                 for _ in range(max_steps):
@@ -2239,17 +2236,6 @@ def run_validation_eval(
                     active_mask = ~done_mask
                     ep_return[active_mask] += rewards_np[active_mask].astype(np.float64)
                     ep_length[active_mask] += 1
-                    if (
-                        next_action_masks_np.ndim == 2
-                        and next_action_masks_np.shape[0] == env_count
-                    ):
-                        reachable_next_counts = (
-                            (next_action_masks_np > 0.5).sum(axis=1).astype(np.float64)
-                        )
-                        ep_reachable_next_sum[active_mask] += reachable_next_counts[
-                            active_mask
-                        ]
-                        ep_reachable_next_count[active_mask] += 1.0
 
                     if isinstance(infos_raw, list):
                         max_info = min(len(infos_raw), env_count)
@@ -2353,17 +2339,12 @@ def run_validation_eval(
                 lengths.extend(ep_length.tolist())
                 for key, arr in ep_terms.items():
                     term_values[key].extend(arr.tolist())
-                avg_reachable_next = np.divide(
-                    ep_reachable_next_sum,
-                    np.maximum(ep_reachable_next_count, 1.0),
-                )
                 diag_holes_created_values.extend(ep_holes_created.tolist())
                 diag_max_height_values.extend(ep_max_height.tolist())
                 diag_kick_assisted_locks_values.extend(
                     ep_kick_assisted_locks.tolist()
                 )
                 diag_hold_uses_values.extend(ep_hold_uses.tolist())
-                diag_avg_reachable_next_values.extend(avg_reachable_next.tolist())
 
             terms = {
                 key: _safe_recent_mean(values, window=len(values))
@@ -2398,10 +2379,6 @@ def run_validation_eval(
                     "hold_uses": _safe_recent_mean(
                         diag_hold_uses_values,
                         window=len(diag_hold_uses_values),
-                    ),
-                    "avg_reachable_placements_next": _safe_recent_mean(
-                        diag_avg_reachable_next_values,
-                        window=len(diag_avg_reachable_next_values),
                     ),
                 },
             }
@@ -4347,8 +4324,7 @@ def train(cfg: PPOConfig) -> None:
                                     + f"holes_created={_fmt_float(source_diag_dict.get('holes_created_total'))} "
                                     + f"max_height={_fmt_float(source_diag_dict.get('max_height_reached'))} "
                                     + f"kick_locks={_fmt_float(source_diag_dict.get('kick_assisted_locks'))} "
-                                    + f"hold_uses={_fmt_float(source_diag_dict.get('hold_uses'))} "
-                                    + f"avg_reach_next={_fmt_float(source_diag_dict.get('avg_reachable_placements_next'))}"
+                                    + f"hold_uses={_fmt_float(source_diag_dict.get('hold_uses'))}"
                                 )
                             else:
                                 log_lines.append(
