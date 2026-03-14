@@ -21,6 +21,7 @@ export type BridgeRequest = {
     | 'set_piece_sources'
     | 'set_curriculum'
     | 'set_reward_blend_step'
+    | 'evaluate_hold_candidates_many'
     | 'reset_many'
     | 'step_many'
     | 'pop_trajectory'
@@ -80,6 +81,22 @@ export type SetRewardBlendStepPayload = {
 export type StepManyPayload = {
   envIds?: number[];
   actions?: number[];
+};
+
+export type EvaluateHoldCandidatesManyPayload = {
+  envIds?: number[];
+};
+
+export type HoldCandidateEvaluation = {
+  action_index: number;
+  hold_used: boolean;
+  immediate_reward_no_hold_tax: number;
+  done: boolean;
+  obs: number[];
+};
+
+export type EvaluateHoldCandidatesBatchResult = {
+  candidates: HoldCandidateEvaluation[][];
 };
 
 export type StepBatchResult = {

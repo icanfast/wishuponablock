@@ -90,6 +90,11 @@ class PPOConfig:
     distill_teacher_alpha: float
     distill_teacher_tau: float
     distill_teacher_top_m: int
+    hold_margin_probe: bool
+    hold_margin_eps: float
+    hold_margin_good_threshold: float
+    hold_margin_penalty_base: float
+    hold_margin_penalty_threshold: float
     validation_episodes_per_env: int
     validate_every_updates: int
     device: str
@@ -802,6 +807,36 @@ def parse_args() -> PPOConfig:
         ),
     )
     parser.add_argument(
+        "--hold-margin-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Probe hold justification using immediate reward(no hold tax)+gamma*V(next).",
+    )
+    parser.add_argument(
+        "--hold-margin-eps",
+        type=float,
+        default=0.1,
+        help="Threshold for counting hold margins as near-zero / unnecessary.",
+    )
+    parser.add_argument(
+        "--hold-margin-good-threshold",
+        type=float,
+        default=1.0,
+        help="Threshold for counting hold margins as clearly justified.",
+    )
+    parser.add_argument(
+        "--hold-margin-penalty-base",
+        type=float,
+        default=0.0,
+        help="Optional margin-based penalty base for chosen hold actions (0 disables shaping).",
+    )
+    parser.add_argument(
+        "--hold-margin-penalty-threshold",
+        type=float,
+        default=1.0,
+        help="Margin threshold at/above which hold penalty becomes zero.",
+    )
+    parser.add_argument(
         "--validation-episodes-per-env",
         type=int,
         default=2,
@@ -1023,6 +1058,13 @@ def parse_args() -> PPOConfig:
         distill_teacher_alpha=max(0.0, float(args.distill_teacher_alpha)),
         distill_teacher_tau=max(1e-4, float(args.distill_teacher_tau)),
         distill_teacher_top_m=max(0, int(args.distill_teacher_top_m)),
+        hold_margin_probe=bool(args.hold_margin_probe),
+        hold_margin_eps=max(0.0, float(args.hold_margin_eps)),
+        hold_margin_good_threshold=max(0.0, float(args.hold_margin_good_threshold)),
+        hold_margin_penalty_base=max(0.0, float(args.hold_margin_penalty_base)),
+        hold_margin_penalty_threshold=max(
+            1e-6, float(args.hold_margin_penalty_threshold)
+        ),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
         validate_every_updates=max(1, int(args.validate_every_updates)),
         device=args.device,
@@ -1295,6 +1337,408 @@ def masked_categorical(
             large_neg,
         )
     return Categorical(logits=masked_logits)
+
+
+def action_index_uses_hold(action_index: int, action_dim: int) -> bool:
+    if action_dim <= 0:
+        return False
+    hold_stride = max(1, action_dim // 2)
+    return int(action_index) >= hold_stride
+
+
+def compute_hold_margin_penalty(
+    margin: float | None,
+    base_penalty: float,
+    margin_threshold: float,
+) -> float:
+    if margin is None or not math.isfinite(margin):
+        return 0.0
+    if base_penalty <= 0.0:
+        return 0.0
+    threshold = max(1e-6, float(margin_threshold))
+    scaled = 1.0 - (float(margin) / threshold)
+    return float(base_penalty) * max(0.0, min(1.0, scaled))
+
+
+def _hold_probe_summary(
+    values: list[float],
+    eps: float,
+    good_threshold: float,
+) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "median": float("nan"),
+            "p10": float("nan"),
+            "p25": float("nan"),
+            "p75": float("nan"),
+            "p90": float("nan"),
+            "frac_negative": float("nan"),
+            "frac_below_eps": float("nan"),
+            "frac_above_good": float("nan"),
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p25": float(np.percentile(arr, 25)),
+        "p75": float(np.percentile(arr, 75)),
+        "p90": float(np.percentile(arr, 90)),
+        "frac_negative": float(np.mean(arr < 0.0)),
+        "frac_below_eps": float(np.mean(arr < float(eps))),
+        "frac_above_good": float(np.mean(arr > float(good_threshold))),
+    }
+
+
+def evaluate_hold_margin_for_actions(
+    *,
+    env: WubEnvBridge,
+    env_ids: list[int],
+    actions: list[int],
+    env_piece_sources: list[str],
+    obs_adapter: ObservationAdapter,
+    model: PolicyValueNet,
+    device: torch.device,
+    gamma: float,
+    action_dim: int,
+    eps: float,
+    good_threshold: float,
+) -> tuple[dict[int, dict[str, float | None]], dict[str, Any]]:
+    by_source: dict[str, dict[str, Any]] = {}
+    probe_env_ids: list[int] = []
+    probe_env_sources: list[str] = []
+    chosen_actions_by_env_id: dict[int, int] = {}
+
+    for env_id, action, source in zip(env_ids, actions, env_piece_sources):
+        source_stats = by_source.setdefault(
+            source,
+            {
+                "hold_actions": 0,
+                "non_hold_actions": 0,
+                "unavailable": 0,
+                "margins": [],
+                "best_hold_scores": [],
+                "best_no_hold_scores": [],
+                "best_hold_immediate": [],
+                "best_no_hold_immediate": [],
+                "best_hold_value": [],
+                "best_no_hold_value": [],
+                "chosen_hold_scores": [],
+                "chosen_hold_immediate": [],
+                "chosen_hold_value": [],
+            },
+        )
+        if action_index_uses_hold(int(action), action_dim):
+            source_stats["hold_actions"] += 1
+            probe_env_ids.append(int(env_id))
+            probe_env_sources.append(source)
+            chosen_actions_by_env_id[int(env_id)] = int(action)
+        else:
+            source_stats["non_hold_actions"] += 1
+
+    if not probe_env_ids:
+        return {}, {
+            source: {
+                "hold_actions": int(stats["hold_actions"]),
+                "non_hold_actions": int(stats["non_hold_actions"]),
+                "unavailable": int(stats["unavailable"]),
+                "margin": _hold_probe_summary([], eps, good_threshold),
+                "mean_best_hold_score": float("nan"),
+                "mean_best_no_hold_score": float("nan"),
+                "mean_best_hold_immediate": float("nan"),
+                "mean_best_no_hold_immediate": float("nan"),
+                "mean_best_hold_value": float("nan"),
+                "mean_best_no_hold_value": float("nan"),
+                "mean_chosen_hold_score": float("nan"),
+                "mean_chosen_hold_immediate": float("nan"),
+                "mean_chosen_hold_value": float("nan"),
+            }
+            for source, stats in by_source.items()
+        }
+
+    probe_result = env.evaluate_hold_candidates_many(env_ids=probe_env_ids)
+    candidate_batches = probe_result.get("candidates", [])
+    flat_obs: list[list[float]] = []
+    flat_mapping: list[tuple[int, int]] = []
+    for batch_idx, candidates in enumerate(candidate_batches):
+        if not isinstance(candidates, list):
+            continue
+        for cand_idx, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            if bool(candidate.get("done", False)):
+                continue
+            obs = candidate.get("obs")
+            if not isinstance(obs, list) or not obs:
+                continue
+            flat_obs.append(obs)
+            flat_mapping.append((batch_idx, cand_idx))
+
+    continuation_values: dict[tuple[int, int], float] = {}
+    if flat_obs:
+        raw_obs = torch.as_tensor(np.asarray(flat_obs, dtype=np.float32), device=device)
+        with torch.no_grad():
+            probe_features = obs_adapter(raw_obs)
+            _probe_logits, probe_values = model(probe_features)
+        probe_values_np = probe_values.detach().cpu().numpy().astype(np.float64)
+        for mapping, value in zip(flat_mapping, probe_values_np.tolist()):
+            continuation_values[mapping] = float(value)
+
+    per_env: dict[int, dict[str, float | None]] = {}
+    for batch_idx, env_id in enumerate(probe_env_ids):
+        source = probe_env_sources[batch_idx]
+        source_stats = by_source[source]
+        candidates_raw = (
+            candidate_batches[batch_idx]
+            if batch_idx < len(candidate_batches) and isinstance(candidate_batches[batch_idx], list)
+            else []
+        )
+        scored_hold: list[dict[str, float]] = []
+        scored_no_hold: list[dict[str, float]] = []
+        chosen_action = chosen_actions_by_env_id[int(env_id)]
+        chosen_score: float | None = None
+        chosen_immediate: float | None = None
+        chosen_value: float | None = None
+        for cand_idx, candidate in enumerate(candidates_raw):
+            if not isinstance(candidate, dict):
+                continue
+            action_index = int(candidate.get("action_index", -1))
+            immediate = float(candidate.get("immediate_reward_no_hold_tax", 0.0))
+            done = bool(candidate.get("done", False))
+            value_term = 0.0 if done else float(continuation_values.get((batch_idx, cand_idx), 0.0))
+            score = immediate + (0.0 if done else float(gamma) * value_term)
+            scored = {
+                "score": score,
+                "immediate": immediate,
+                "value": value_term,
+            }
+            if bool(candidate.get("hold_used", False)):
+                scored_hold.append(scored)
+            else:
+                scored_no_hold.append(scored)
+            if action_index == chosen_action:
+                chosen_score = score
+                chosen_immediate = immediate
+                chosen_value = value_term
+
+        if not scored_hold or not scored_no_hold:
+            source_stats["unavailable"] += 1
+            per_env[int(env_id)] = {
+                "margin": None,
+                "penalty": None,
+                "chosen_score": chosen_score,
+                "chosen_immediate": chosen_immediate,
+                "chosen_value": chosen_value,
+                "best_hold_score": None,
+                "best_no_hold_score": None,
+                "best_hold_immediate": None,
+                "best_no_hold_immediate": None,
+                "best_hold_value": None,
+                "best_no_hold_value": None,
+            }
+            continue
+
+        best_hold = max(scored_hold, key=lambda item: item["score"])
+        best_no_hold = max(scored_no_hold, key=lambda item: item["score"])
+        margin = float(best_hold["score"] - best_no_hold["score"])
+        source_stats["margins"].append(margin)
+        source_stats["best_hold_scores"].append(float(best_hold["score"]))
+        source_stats["best_no_hold_scores"].append(float(best_no_hold["score"]))
+        source_stats["best_hold_immediate"].append(float(best_hold["immediate"]))
+        source_stats["best_no_hold_immediate"].append(float(best_no_hold["immediate"]))
+        source_stats["best_hold_value"].append(float(best_hold["value"]))
+        source_stats["best_no_hold_value"].append(float(best_no_hold["value"]))
+        if chosen_score is not None:
+            source_stats["chosen_hold_scores"].append(float(chosen_score))
+        if chosen_immediate is not None:
+            source_stats["chosen_hold_immediate"].append(float(chosen_immediate))
+        if chosen_value is not None:
+            source_stats["chosen_hold_value"].append(float(chosen_value))
+        per_env[int(env_id)] = {
+            "margin": margin,
+            "penalty": None,
+            "chosen_score": chosen_score,
+            "chosen_immediate": chosen_immediate,
+            "chosen_value": chosen_value,
+            "best_hold_score": float(best_hold["score"]),
+            "best_no_hold_score": float(best_no_hold["score"]),
+            "best_hold_immediate": float(best_hold["immediate"]),
+            "best_no_hold_immediate": float(best_no_hold["immediate"]),
+            "best_hold_value": float(best_hold["value"]),
+            "best_no_hold_value": float(best_no_hold["value"]),
+        }
+
+    summary_by_source: dict[str, Any] = {}
+    for source, stats in by_source.items():
+        summary_by_source[source] = {
+            "hold_actions": int(stats["hold_actions"]),
+            "non_hold_actions": int(stats["non_hold_actions"]),
+            "unavailable": int(stats["unavailable"]),
+            "margin": _hold_probe_summary(stats["margins"], eps, good_threshold),
+            "mean_best_hold_score": _safe_recent_mean(
+                stats["best_hold_scores"], window=len(stats["best_hold_scores"])
+            ),
+            "mean_best_no_hold_score": _safe_recent_mean(
+                stats["best_no_hold_scores"], window=len(stats["best_no_hold_scores"])
+            ),
+            "mean_best_hold_immediate": _safe_recent_mean(
+                stats["best_hold_immediate"], window=len(stats["best_hold_immediate"])
+            ),
+            "mean_best_no_hold_immediate": _safe_recent_mean(
+                stats["best_no_hold_immediate"], window=len(stats["best_no_hold_immediate"])
+            ),
+            "mean_best_hold_value": _safe_recent_mean(
+                stats["best_hold_value"], window=len(stats["best_hold_value"])
+            ),
+            "mean_best_no_hold_value": _safe_recent_mean(
+                stats["best_no_hold_value"], window=len(stats["best_no_hold_value"])
+            ),
+            "mean_chosen_hold_score": _safe_recent_mean(
+                stats["chosen_hold_scores"], window=len(stats["chosen_hold_scores"])
+            ),
+            "mean_chosen_hold_immediate": _safe_recent_mean(
+                stats["chosen_hold_immediate"], window=len(stats["chosen_hold_immediate"])
+            ),
+            "mean_chosen_hold_value": _safe_recent_mean(
+                stats["chosen_hold_value"], window=len(stats["chosen_hold_value"])
+            ),
+        }
+    return per_env, summary_by_source
+
+
+def new_hold_probe_accumulator() -> dict[str, Any]:
+    return {
+        "hold_actions": 0,
+        "non_hold_actions": 0,
+        "unavailable": 0,
+        "margins": [],
+        "best_hold_scores": [],
+        "best_no_hold_scores": [],
+        "chosen_hold_scores": [],
+        "chosen_hold_immediate": [],
+        "chosen_hold_value": [],
+        "best_hold_immediate": [],
+        "best_no_hold_immediate": [],
+        "best_hold_value": [],
+        "best_no_hold_value": [],
+        "penalties": [],
+    }
+
+
+def accumulate_hold_probe_metrics(
+    accumulator: dict[str, dict[str, Any]],
+    *,
+    env_ids: list[int],
+    env_piece_sources: list[str],
+    actions: list[int],
+    action_dim: int,
+    per_env: dict[int, dict[str, float | None]],
+    penalty_base: float,
+    penalty_threshold: float,
+) -> dict[int, float]:
+    penalties_by_env_id: dict[int, float] = {}
+    for env_id, source, action in zip(env_ids, env_piece_sources, actions):
+        source_acc = accumulator.setdefault(source, new_hold_probe_accumulator())
+        if action_index_uses_hold(int(action), action_dim):
+            source_acc["hold_actions"] += 1
+            env_result = per_env.get(int(env_id))
+            if not env_result or env_result.get("margin") is None:
+                source_acc["unavailable"] += 1
+                continue
+            margin = float(env_result["margin"])
+            penalty = compute_hold_margin_penalty(
+                margin,
+                base_penalty=penalty_base,
+                margin_threshold=penalty_threshold,
+            )
+            penalties_by_env_id[int(env_id)] = penalty
+            source_acc["margins"].append(margin)
+            source_acc["penalties"].append(penalty)
+            for key in (
+                "best_hold_score",
+                "best_no_hold_score",
+                "best_hold_immediate",
+                "best_no_hold_immediate",
+                "best_hold_value",
+                "best_no_hold_value",
+                "chosen_score",
+                "chosen_immediate",
+                "chosen_value",
+            ):
+                value = env_result.get(key)
+                if value is None or not math.isfinite(float(value)):
+                    continue
+                if key == "best_hold_score":
+                    source_acc["best_hold_scores"].append(float(value))
+                elif key == "best_no_hold_score":
+                    source_acc["best_no_hold_scores"].append(float(value))
+                elif key == "best_hold_immediate":
+                    source_acc["best_hold_immediate"].append(float(value))
+                elif key == "best_no_hold_immediate":
+                    source_acc["best_no_hold_immediate"].append(float(value))
+                elif key == "best_hold_value":
+                    source_acc["best_hold_value"].append(float(value))
+                elif key == "best_no_hold_value":
+                    source_acc["best_no_hold_value"].append(float(value))
+                elif key == "chosen_score":
+                    source_acc["chosen_hold_scores"].append(float(value))
+                elif key == "chosen_immediate":
+                    source_acc["chosen_hold_immediate"].append(float(value))
+                elif key == "chosen_value":
+                    source_acc["chosen_hold_value"].append(float(value))
+        else:
+            source_acc["non_hold_actions"] += 1
+    return penalties_by_env_id
+
+
+def summarize_hold_probe_accumulator(
+    accumulator: dict[str, dict[str, Any]],
+    *,
+    eps: float,
+    good_threshold: float,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for source, stats in accumulator.items():
+        summary[source] = {
+            "hold_actions": int(stats["hold_actions"]),
+            "non_hold_actions": int(stats["non_hold_actions"]),
+            "unavailable": int(stats["unavailable"]),
+            "margin": _hold_probe_summary(stats["margins"], eps, good_threshold),
+            "mean_best_hold_score": _safe_recent_mean(
+                stats["best_hold_scores"], window=len(stats["best_hold_scores"])
+            ),
+            "mean_best_no_hold_score": _safe_recent_mean(
+                stats["best_no_hold_scores"], window=len(stats["best_no_hold_scores"])
+            ),
+            "mean_best_hold_immediate": _safe_recent_mean(
+                stats["best_hold_immediate"], window=len(stats["best_hold_immediate"])
+            ),
+            "mean_best_no_hold_immediate": _safe_recent_mean(
+                stats["best_no_hold_immediate"], window=len(stats["best_no_hold_immediate"])
+            ),
+            "mean_best_hold_value": _safe_recent_mean(
+                stats["best_hold_value"], window=len(stats["best_hold_value"])
+            ),
+            "mean_best_no_hold_value": _safe_recent_mean(
+                stats["best_no_hold_value"], window=len(stats["best_no_hold_value"])
+            ),
+            "mean_chosen_hold_score": _safe_recent_mean(
+                stats["chosen_hold_scores"], window=len(stats["chosen_hold_scores"])
+            ),
+            "mean_chosen_hold_immediate": _safe_recent_mean(
+                stats["chosen_hold_immediate"], window=len(stats["chosen_hold_immediate"])
+            ),
+            "mean_chosen_hold_value": _safe_recent_mean(
+                stats["chosen_hold_value"], window=len(stats["chosen_hold_value"])
+            ),
+            "mean_penalty": _safe_recent_mean(
+                stats["penalties"], window=len(stats["penalties"])
+            ),
+        }
+    return summary
 
 
 def infer_action_dim(mask_batch: list[list[float]]) -> int:
@@ -2164,6 +2608,7 @@ def run_validation_eval(
             diag_max_height_values: list[float] = []
             diag_kick_assisted_locks_values: list[float] = []
             diag_hold_uses_values: list[float] = []
+            hold_probe_accumulator: dict[str, dict[str, Any]] = {}
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -2224,6 +2669,32 @@ def run_validation_eval(
                     actions_np = (
                         actions_t.detach().cpu().numpy().astype(np.int64).tolist()
                     )
+                    if cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0:
+                        per_env_hold_probe, _hold_probe_summary_unused = (
+                            evaluate_hold_margin_for_actions(
+                                env=val_env,
+                                env_ids=env_ids,
+                                actions=actions_np,
+                                env_piece_sources=[piece_source_profile] * env_count,
+                                obs_adapter=obs_adapter,
+                                model=model,
+                                device=device,
+                                gamma=cfg.gamma,
+                                action_dim=int(mask_np.shape[1]),
+                                eps=cfg.hold_margin_eps,
+                                good_threshold=cfg.hold_margin_good_threshold,
+                            )
+                        )
+                        accumulate_hold_probe_metrics(
+                            hold_probe_accumulator,
+                            env_ids=env_ids,
+                            env_piece_sources=[piece_source_profile] * env_count,
+                            actions=actions_np,
+                            action_dim=int(mask_np.shape[1]),
+                            per_env=per_env_hold_probe,
+                            penalty_base=0.0,
+                            penalty_threshold=cfg.hold_margin_penalty_threshold,
+                        )
 
                     step_result = val_env.step_many(env_ids=env_ids, actions=actions_np)
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
@@ -2380,6 +2851,11 @@ def run_validation_eval(
                         diag_hold_uses_values,
                         window=len(diag_hold_uses_values),
                     ),
+                    "hold_probe": summarize_hold_probe_accumulator(
+                        hold_probe_accumulator,
+                        eps=cfg.hold_margin_eps,
+                        good_threshold=cfg.hold_margin_good_threshold,
+                    ).get(piece_source_profile),
                 },
             }
     finally:
@@ -2422,6 +2898,44 @@ def _fmt_float(value: Any, precision: int = 3) -> str:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return f"{float(value):.{precision}f}"
     return "nan"
+
+
+def _format_hold_probe_log_lines(prefix: str, probe: Any) -> list[str]:
+    if not isinstance(probe, dict):
+        return []
+    margin = probe.get("margin")
+    margin_dict = margin if isinstance(margin, dict) else {}
+    return [
+        (
+            f"{prefix}: "
+            f"hold={int(probe.get('hold_actions', 0))} "
+            f"non_hold={int(probe.get('non_hold_actions', 0))} "
+            f"unavail={int(probe.get('unavailable', 0))} "
+            f"penalty={_fmt_float(probe.get('mean_penalty'))}"
+        ),
+        (
+            "      margin: "
+            f"mean={_fmt_float(margin_dict.get('mean'))} "
+            f"med={_fmt_float(margin_dict.get('median'))} "
+            f"p25={_fmt_float(margin_dict.get('p25'))} "
+            f"p75={_fmt_float(margin_dict.get('p75'))} "
+            f"neg={_fmt_float(margin_dict.get('frac_negative'))} "
+            f"lt_eps={_fmt_float(margin_dict.get('frac_below_eps'))} "
+            f"gt_good={_fmt_float(margin_dict.get('frac_above_good'))}"
+        ),
+        (
+            "      scores: "
+            f"chosen={_fmt_float(probe.get('mean_chosen_hold_score'))} "
+            f"best_hold={_fmt_float(probe.get('mean_best_hold_score'))} "
+            f"best_no_hold={_fmt_float(probe.get('mean_best_no_hold_score'))} "
+            f"| imm(chosen={_fmt_float(probe.get('mean_chosen_hold_immediate'))},"
+            f"hold={_fmt_float(probe.get('mean_best_hold_immediate'))},"
+            f"no_hold={_fmt_float(probe.get('mean_best_no_hold_immediate'))}) "
+            f"| v(chosen={_fmt_float(probe.get('mean_chosen_hold_value'))},"
+            f"hold={_fmt_float(probe.get('mean_best_hold_value'))},"
+            f"no_hold={_fmt_float(probe.get('mean_best_no_hold_value'))})"
+        ),
+    ]
 
 
 BLEND_STEP_TERM_KEYS: tuple[str, ...] = (
@@ -3172,6 +3686,9 @@ def train(cfg: PPOConfig) -> None:
             f"distill_teacher_alpha={cfg.distill_teacher_alpha:.3f}, "
             f"distill_teacher_tau={cfg.distill_teacher_tau:.4f}, "
             f"distill_teacher_top_m={cfg.distill_teacher_top_m}, "
+            f"hold_margin_probe={'y' if cfg.hold_margin_probe else 'n'}, "
+            f"hold_margin_penalty_base={cfg.hold_margin_penalty_base:.4f}, "
+            f"hold_margin_penalty_threshold={cfg.hold_margin_penalty_threshold:.4f}, "
             f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -3334,6 +3851,7 @@ def train(cfg: PPOConfig) -> None:
                 profile_opt_s = 0.0
                 profile_io_s = 0.0
                 mask_repair_update = {"rows": 0, "batches": 0}
+                hold_probe_update_accumulator: dict[str, dict[str, Any]] = {}
                 curriculum_topk_now = curriculum_topk_for_update(cfg, update)
                 curriculum_bias_now = curriculum_bias_for_update(cfg, update)
                 distill_coef_now = distill_coef_for_update(cfg, update)
@@ -3402,6 +3920,33 @@ def train(cfg: PPOConfig) -> None:
                     value_buf[step] = values
 
                     actions_np = actions_t.detach().cpu().numpy().astype(np.int64).tolist()
+                    hold_penalties_by_env_id: dict[int, float] = {}
+                    if cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0:
+                        per_env_hold_probe, _hold_probe_summary_unused = (
+                            evaluate_hold_margin_for_actions(
+                                env=env,
+                                env_ids=env_ids,
+                                actions=actions_np,
+                                env_piece_sources=env_piece_sources,
+                                obs_adapter=obs_adapter,
+                                model=model,
+                                device=device,
+                                gamma=cfg.gamma,
+                                action_dim=action_dim,
+                                eps=cfg.hold_margin_eps,
+                                good_threshold=cfg.hold_margin_good_threshold,
+                            )
+                        )
+                        hold_penalties_by_env_id = accumulate_hold_probe_metrics(
+                            hold_probe_update_accumulator,
+                            env_ids=env_ids,
+                            env_piece_sources=env_piece_sources,
+                            actions=actions_np,
+                            action_dim=action_dim,
+                            per_env=per_env_hold_probe,
+                            penalty_base=cfg.hold_margin_penalty_base,
+                            penalty_threshold=cfg.hold_margin_penalty_threshold,
+                        )
                     env_step_start = time.perf_counter()
                     step_result = env.step_many(env_ids=env_ids, actions=actions_np)
                     profile_env_step_s += time.perf_counter() - env_step_start
@@ -3437,6 +3982,11 @@ def train(cfg: PPOConfig) -> None:
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
                     infos_raw = step_result.get("infos", [])
                     dones_np = np.asarray(step_result["dones"], dtype=np.float32)
+                    if hold_penalties_by_env_id:
+                        for env_idx, env_id in enumerate(env_ids):
+                            penalty = hold_penalties_by_env_id.get(int(env_id))
+                            if penalty and penalty > 0.0:
+                                rewards_np[env_idx] -= np.float32(penalty)
 
                     reward_buf[step] = as_tensor(rewards_np, device)
                     done_buf[step] = as_tensor(dones_np, device)
@@ -3861,6 +4411,11 @@ def train(cfg: PPOConfig) -> None:
                         step_reward_component_values.get(key, []),
                         window=100,
                     )
+                hold_probe_summary = summarize_hold_probe_accumulator(
+                    hold_probe_update_accumulator,
+                    eps=cfg.hold_margin_eps,
+                    good_threshold=cfg.hold_margin_good_threshold,
+                )
                 stats = {
                     "update": update,
                     "global_step": global_step,
@@ -3948,6 +4503,7 @@ def train(cfg: PPOConfig) -> None:
                         else float("nan")
                     ),
                     "ret100_terms": ret100_terms,
+                    "hold_probe_by_source": hold_probe_summary,
                 }
                 stats["ret100_hierarchy"] = _reward_hierarchy_from_terms(
                     stats.get("ret100_terms")
@@ -4246,6 +4802,16 @@ def train(cfg: PPOConfig) -> None:
                             f"rows_total={mask_repair_total['rows']}"
                         ),
                     ]
+                    for source in validation_sources:
+                        probe_item = hold_probe_summary.get(source)
+                        if probe_item is None:
+                            continue
+                        log_lines.extend(
+                            _format_hold_probe_log_lines(
+                                f"  hold_probe[{source}]",
+                                probe_item,
+                            )
+                        )
                     if not validation_by_source:
                         log_lines.append("  validation: skipped")
                     else:
@@ -4325,6 +4891,12 @@ def train(cfg: PPOConfig) -> None:
                                     + f"max_height={_fmt_float(source_diag_dict.get('max_height_reached'))} "
                                     + f"kick_locks={_fmt_float(source_diag_dict.get('kick_assisted_locks'))} "
                                     + f"hold_uses={_fmt_float(source_diag_dict.get('hold_uses'))}"
+                                )
+                                log_lines.extend(
+                                    _format_hold_probe_log_lines(
+                                        f"    val_hold_probe[{source}]",
+                                        source_diag_dict.get("hold_probe"),
+                                    )
                                 )
                             else:
                                 log_lines.append(

@@ -4,6 +4,7 @@ import { BotEnvPool } from './envCore.ts';
 import type {
   BridgeRequest,
   BridgeResponse,
+  EvaluateHoldCandidatesManyPayload,
   InitPayload,
   JsonObject,
   ResetManyPayload,
@@ -138,6 +139,13 @@ const handleStepMany = (id: number, payload: unknown): void => {
   writeResponse({ id, ok: true, result });
 };
 
+const handleEvaluateHoldCandidatesMany = (id: number, payload: unknown): void => {
+  const data = asObject(payload) as unknown as EvaluateHoldCandidatesManyPayload;
+  const envIds = parseNumberArray(data.envIds);
+  const result = ensurePool().evaluateHoldCandidatesMany(envIds);
+  writeResponse({ id, ok: true, result });
+};
+
 const handlePopTrajectory = (id: number): void => {
   const trajectory = ensurePool().popTrajectorySession();
   writeResponse({
@@ -181,6 +189,9 @@ const handleRequest = async (line: string): Promise<void> => {
       return;
     case 'step_many':
       handleStepMany(id, parsed.payload);
+      return;
+    case 'evaluate_hold_candidates_many':
+      handleEvaluateHoldCandidatesMany(id, parsed.payload);
       return;
     case 'pop_trajectory':
       handlePopTrajectory(id);

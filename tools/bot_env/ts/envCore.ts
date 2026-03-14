@@ -10,6 +10,7 @@ import { Game } from '../../../src/core/game.ts';
 import { getMode } from '../../../src/core/modes.ts';
 import { createModelRunner } from '../../../src/core/modelRunner.ts';
 import { clearLines } from '../../../src/core/board.ts';
+import { SPAWN_X, SPAWN_Y } from '../../../src/core/constants.ts';
 import { collides, dropDistance } from '../../../src/core/piece.ts';
 import {
   PLACEMENT_ACTION_DIM,
@@ -20,6 +21,7 @@ import { GameRunner, type InputSource } from '../../../src/core/runner.ts';
 import { DEFAULT_SETTINGS } from '../../../src/core/settings.ts';
 import {
   PIECES,
+  type ActivePiece,
   type Board,
   type GameState,
   type InputFrame,
@@ -542,6 +544,38 @@ const computePlacementComplexityPenalty = (
   );
 };
 
+const computePlacementComplexityPenaltyWithoutHoldTax = (
+  placement: Pick<
+    TrajectoryExecutorReachablePlacement,
+    'commands' | 'holdUsed' | 'srsKickCount'
+  > | null,
+): number => {
+  const penalty = computePlacementComplexityPenalty(placement);
+  if (!placement?.holdUsed) return penalty;
+  return Math.max(0, penalty - PLACEMENT_HOLD_COMPLEXITY_PENALTY);
+};
+
+const computeLineClearScoreDelta = (
+  linesCleared: number,
+  level: number,
+  scoringEnabled: boolean,
+): number => {
+  if (!scoringEnabled || linesCleared <= 0) return 0;
+  const multiplier = Math.max(0, Math.trunc(level)) + 1;
+  switch (linesCleared) {
+    case 1:
+      return 40 * multiplier;
+    case 2:
+      return 100 * multiplier;
+    case 3:
+      return 300 * multiplier;
+    case 4:
+      return 1200 * multiplier;
+    default:
+      return 0;
+  }
+};
+
 const computePieceRewardV2 = (
   options: PieceRewardInputs & {
     placementComplexityPenalty: number;
@@ -804,6 +838,124 @@ const scorePlacementCandidate = (options: {
   return score;
 };
 
+const padVisibleQueue = (
+  pieces: Array<PieceKind | null>,
+  length: number = 5,
+): Array<PieceKind | null> => {
+  const out = pieces.slice(0, length);
+  while (out.length < length) out.push(null);
+  return out;
+};
+
+const buildPostLockStateForPlacement = (options: {
+  state: GameState;
+  boardAfter: Board;
+  placement: TrajectoryExecutorReachablePlacement;
+  linesCleared: number;
+  topOut: boolean;
+}): {
+  done: boolean;
+  topOut: boolean;
+  state: GameState | null;
+  scoreDelta: number;
+  totalLinesClearedAfter: number;
+} => {
+  const { state, boardAfter, placement, linesCleared } = options;
+  let topOut = options.topOut;
+  const totalLinesClearedAfter = Math.max(
+    0,
+    Math.trunc(state.totalLinesCleared) + Math.max(0, Math.trunc(linesCleared)),
+  );
+  const scoreDelta = computeLineClearScoreDelta(
+    linesCleared,
+    Math.max(0, Math.trunc(state.level)),
+    Boolean(state.scoringEnabled),
+  );
+  const lineGoal = state.lineGoal != null ? Math.max(1, Math.trunc(state.lineGoal)) : null;
+  const gameWon = lineGoal != null && totalLinesClearedAfter >= lineGoal;
+  if (topOut || gameWon) {
+    return {
+      done: true,
+      topOut,
+      state: null,
+      scoreDelta,
+      totalLinesClearedAfter,
+    };
+  }
+
+  let holdAfter = state.hold;
+  let activeAfter: PieceKind | null = null;
+  let previewAfter: Array<PieceKind | null> = [];
+  if (placement.holdUsed) {
+    holdAfter = state.active.k;
+    if (state.hold == null) {
+      activeAfter = state.next[1] ?? null;
+      previewAfter = padVisibleQueue(state.next.slice(2, 7));
+    } else {
+      activeAfter = state.next[0] ?? null;
+      previewAfter = padVisibleQueue(state.next.slice(1, 6));
+    }
+  } else {
+    holdAfter = state.hold;
+    activeAfter = state.next[0] ?? null;
+    previewAfter = padVisibleQueue(state.next.slice(1, 6));
+  }
+
+  if (activeAfter == null) {
+    return {
+      done: true,
+      topOut,
+      state: null,
+      scoreDelta,
+      totalLinesClearedAfter,
+    };
+  }
+
+  const spawnedActive: ActivePiece = {
+    k: activeAfter,
+    r: 0,
+    x: SPAWN_X,
+    y: SPAWN_Y,
+  };
+  if (collides(boardAfter, spawnedActive)) {
+    topOut = true;
+    return {
+      done: true,
+      topOut,
+      state: null,
+      scoreDelta,
+      totalLinesClearedAfter,
+    };
+  }
+
+  return {
+    done: false,
+    topOut,
+    scoreDelta,
+    totalLinesClearedAfter,
+    state: {
+      board: cloneBoard(boardAfter),
+      active: spawnedActive,
+      ghostY: spawnedActive.y + dropDistance(boardAfter, spawnedActive),
+      hold: holdAfter,
+      canHold: true,
+      next: previewAfter
+        .filter((piece): piece is PieceKind => piece != null)
+        .slice(0, 5),
+      mlQueueProbabilities: [],
+      gameOver: false,
+      gameWon: false,
+      combo: linesCleared > 0 ? state.combo + 1 : 0,
+      timeMs: Math.max(0, Math.trunc(state.timeMs)),
+      totalLinesCleared: totalLinesClearedAfter,
+      lineGoal,
+      level: Math.max(1, Math.trunc(state.level)),
+      score: Math.max(0, Math.trunc(state.score) + scoreDelta),
+      scoringEnabled: Boolean(state.scoringEnabled),
+    },
+  };
+};
+
 const encodeObservation = (
   observationSpace: BotObservationSpace,
   model: LoadedModel,
@@ -1032,6 +1184,14 @@ type BotEnvStepResult = {
   completedSession: JsonObject | null;
 };
 
+type HoldCandidateEvaluation = {
+  action_index: number;
+  hold_used: boolean;
+  immediate_reward_no_hold_tax: number;
+  done: boolean;
+  obs: number[];
+};
+
 class BotEnv {
   private game: Game;
   private runner: GameRunner;
@@ -1150,6 +1310,135 @@ class BotEnv {
       this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
+  }
+
+  evaluateHoldCandidates(
+    rewardBlend: RewardBlendWeights,
+    rewardFunctionFrom: RewardFunctionId,
+    rewardFunctionTo: RewardFunctionId,
+  ): HoldCandidateEvaluation[] {
+    if (this.done) {
+      return [];
+    }
+    const choices =
+      this.cachedChoices ??
+      buildPlacementChoices(
+        this.game.state,
+        DEFAULT_ACTION_DIM,
+        this.actionCurriculum,
+        () => nextFloat(this.planningRng),
+      );
+    this.cachedChoices = choices;
+    const blendWeights = normalizeRewardBlendWeights(rewardBlend);
+    const before = this.snapshotMetrics();
+    const candidates: HoldCandidateEvaluation[] = [];
+    for (let actionIndex = 0; actionIndex < choices.actionMask.length; actionIndex += 1) {
+      if (choices.actionMask[actionIndex] <= 0) continue;
+      const placement = choices.placementsBySlot[actionIndex];
+      if (!placement) continue;
+      const applied = applyPlacementToBoard(this.game.state.board, placement);
+      if (applied.invalid) continue;
+      const postLock = buildPostLockStateForPlacement({
+        state: this.game.state,
+        boardAfter: applied.boardAfter,
+        placement,
+        linesCleared: applied.linesCleared,
+        topOut: applied.hasAboveTop,
+      });
+      const afterQuality = evaluateBoardQuality(applied.boardAfter);
+      const afterHeight = getStackHeight(applied.boardAfter);
+      const afterHoles = countBoardHoles(applied.boardAfter);
+      const afterBumpiness = computeBoardBumpiness(applied.boardAfter);
+      const afterBlocks = countBoardBlocks(applied.boardAfter);
+      const placementComplexityPenalty =
+        computePlacementComplexityPenaltyWithoutHoldTax(placement);
+      const timeDeltaMs = Math.max(
+        0,
+        Math.trunc(placement.commands.length * FIXED_STEP_MS),
+      );
+      const linesDelta = applied.linesCleared;
+      const scoreDelta = postLock.scoreDelta;
+      const heightDelta = afterHeight - before.height;
+      const holesDelta = afterHoles - before.holes;
+      const bumpinessDelta = afterBumpiness - before.bumpiness;
+      const boardQualityDelta = before.boardQuality - afterQuality.quality;
+      const boardScoreDelta =
+        before.boardScore -
+        scoreCharcuterieBoard(
+          applied.boardAfter,
+          postLock.topOut,
+          postLock.totalLinesClearedAfter,
+        );
+      const isFullClear = afterBlocks === 0 && before.blocks > 0;
+      const rewardV1 = computePieceRewardV1({
+        modeId: this.modeId,
+        linesDelta,
+        scoreDelta,
+        timeDeltaMs,
+        heightDelta,
+        holesDelta,
+        bumpinessDelta,
+        boardScoreDelta,
+        boardQualityDelta,
+        topOut: postLock.topOut,
+      });
+      const rewardV2 = computePieceRewardV2({
+        modeId: this.modeId,
+        linesDelta,
+        scoreDelta,
+        timeDeltaMs,
+        heightDelta,
+        holesDelta,
+        bumpinessDelta,
+        boardScoreDelta,
+        boardQualityDelta,
+        topOut: postLock.topOut,
+        placementComplexityPenalty,
+      });
+      const rewardV3 = computePieceRewardV3({
+        modeId: this.modeId,
+        linesDelta,
+        scoreDelta,
+        timeDeltaMs,
+        heightDelta,
+        holesDelta,
+        bumpinessDelta,
+        boardScoreDelta,
+        boardQualityDelta,
+        topOut: postLock.topOut,
+        placementComplexityPenalty,
+        afterMaxHeight: afterHeight,
+        afterBoardQuality: afterQuality.quality,
+        isFullClear,
+      });
+      const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
+        v1: rewardV1,
+        v2: rewardV2,
+        v3: rewardV3,
+      };
+      const rewardResult = blendPieceReward({
+        legacy: rewardById[rewardFunctionFrom],
+        target: rewardById[rewardFunctionTo],
+        weights: blendWeights,
+      });
+      candidates.push({
+        action_index: actionIndex,
+        hold_used: placement.holdUsed,
+        immediate_reward_no_hold_tax: Number.isFinite(rewardResult.reward)
+          ? rewardResult.reward
+          : 0,
+        done: postLock.done,
+        obs: postLock.state
+          ? encodeObservation(
+              this.observationSpace,
+              this.model,
+              postLock.state,
+              this.includePhaseContext,
+            )
+          : [],
+      });
+    }
+    return candidates;
   }
 
   step(
@@ -1997,6 +2286,26 @@ export class BotEnvPool {
         reset_obs_s: resetObsS,
         reset_choices_s: resetChoicesS,
       },
+    };
+  }
+
+  evaluateHoldCandidatesMany(envIds: number[]): {
+    candidates: HoldCandidateEvaluation[][];
+  } {
+    const batchBlendWeights = this.nextRewardBlendWeights(0);
+    const candidates: HoldCandidateEvaluation[][] = [];
+    for (let i = 0; i < envIds.length; i += 1) {
+      const env = this.requireEnv(envIds[i]);
+      candidates.push(
+        env.evaluateHoldCandidates(
+          batchBlendWeights,
+          this.rewardFunctionFrom,
+          this.rewardFunctionTo,
+        ),
+      );
+    }
+    return {
+      candidates,
     };
   }
 
