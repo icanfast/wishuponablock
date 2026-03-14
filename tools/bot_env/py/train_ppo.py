@@ -43,11 +43,13 @@ class PPOConfig:
     mode_id: str
     model_path: str
     observation_space: str
+    phase_context_enabled: bool
     placement_execution_mode: str
     queue_policy_id: str
     generator_schedule: tuple[str, ...]
     reward_functions: tuple[str, ...]
-    max_pieces_per_episode: int
+    max_pieces_per_episode_train: int
+    max_pieces_per_episode_val: int
     reward_blend_span: int
     reward_blend_unit: str
     seed: int
@@ -569,6 +571,15 @@ def parse_args() -> PPOConfig:
         choices=["model_head_v1", "raw_v1"],
     )
     parser.add_argument(
+        "--phase-context",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Whether raw/model-head observations include phase scalars "
+            "(progress, time, level, score). Default off for generalist policies."
+        ),
+    )
+    parser.add_argument(
         "--placement-execution-mode",
         default="teleport",
         choices=["commands", "teleport"],
@@ -599,7 +610,14 @@ def parse_args() -> PPOConfig:
         default=True,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--max-pieces-per-episode", type=int, default=512)
+    parser.add_argument("--max-pieces-per-episode-train", type=int, default=1024)
+    parser.add_argument("--max-pieces-per-episode-val", type=int, default=512)
+    parser.add_argument(
+        "--max-pieces-per-episode",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--reward-functions",
         nargs="+",
@@ -940,6 +958,13 @@ def parse_args() -> PPOConfig:
         reward_blend_unit = "timesteps"
         reward_blend_span = max(1, int(args.reward_blend_timesteps))
 
+    max_pieces_train = max(1, int(args.max_pieces_per_episode_train))
+    max_pieces_val = max(1, int(args.max_pieces_per_episode_val))
+    if args.max_pieces_per_episode is not None:
+        legacy_cap = max(1, int(args.max_pieces_per_episode))
+        max_pieces_train = legacy_cap
+        max_pieces_val = legacy_cap
+
     run_name = args.run_name.strip() or f"ppo_baseline_{int(time.time())}"
     return PPOConfig(
         mode_id=args.mode_id.strip().lower(),
@@ -947,6 +972,7 @@ def parse_args() -> PPOConfig:
         observation_space=(
             "raw_v1" if args.observation_space == "raw_v1" else "model_head_v1"
         ),
+        phase_context_enabled=bool(args.phase_context),
         placement_execution_mode=(
             "commands"
             if args.placement_execution_mode == "commands"
@@ -955,7 +981,8 @@ def parse_args() -> PPOConfig:
         queue_policy_id=args.queue_policy_id.strip().lower(),
         generator_schedule=generator_schedule,
         reward_functions=reward_functions,
-        max_pieces_per_episode=max(1, int(args.max_pieces_per_episode)),
+        max_pieces_per_episode_train=max_pieces_train,
+        max_pieces_per_episode_val=max_pieces_val,
         reward_blend_span=reward_blend_span,
         reward_blend_unit=reward_blend_unit,
         seed=max(1, int(args.seed)),
@@ -1675,6 +1702,7 @@ def export_bot_policy_artifact(
         "pieceSourceProfile": cfg.generator_schedule[0],
         "pieceSourceSchedule": list(cfg.generator_schedule),
         "observationSpace": policy_observation_space,
+        "phaseContextEnabled": bool(cfg.phase_context_enabled),
         "createdAtMs": now_ms,
         "inputDim": int(obs_dim),
         "hiddenDim": int(cfg.hidden_dim),
@@ -1719,12 +1747,13 @@ def load_from_artifact(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
     artifact_path: Path,
-) -> str:
+) -> tuple[str, bool]:
     raw = json.loads(artifact_path.read_text(encoding="utf-8"))
     observation_space_raw = raw.get("observationSpace")
     observation_space = (
         "raw_v1" if observation_space_raw == "raw_v1" else "model_head_v1"
     )
+    phase_context_enabled = bool(raw.get("phaseContextEnabled", True))
     weights = raw.get("weights", {})
     input_dim = int(raw.get("inputDim", 0))
     hidden_dim = int(raw.get("hiddenDim", 0))
@@ -1839,7 +1868,7 @@ def load_from_artifact(
         with torch.no_grad():
             obs_adapter.queue_fc1.weight.copy_(torch.from_numpy(queue_w.T))
             obs_adapter.queue_fc1.bias.copy_(torch.from_numpy(queue_b))
-    return observation_space
+    return observation_space, phase_context_enabled
 
 
 def save_checkpoint(
@@ -1875,6 +1904,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     map_device: torch.device,
     load_optimizer_state: bool = True,
+    expected_phase_context_enabled: bool | None = None,
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
     model_state = checkpoint["model_state_dict"]
@@ -1938,6 +1968,21 @@ def load_checkpoint(
             print(
                 "[ppo] warning: optimizer state was not loaded from checkpoint "
                 f"(param-group mismatch). Using fresh optimizer state. detail={error}"
+            )
+    checkpoint_config = checkpoint.get("config")
+    if (
+        expected_phase_context_enabled is not None
+        and isinstance(checkpoint_config, dict)
+        and "phase_context_enabled" in checkpoint_config
+    ):
+        checkpoint_phase_context_enabled = bool(
+            checkpoint_config.get("phase_context_enabled")
+        )
+        if checkpoint_phase_context_enabled != expected_phase_context_enabled:
+            print(
+                "[ppo] warning: checkpoint phase-context mismatch "
+                f"(checkpoint={'on' if checkpoint_phase_context_enabled else 'off'}, "
+                f"run={'on' if expected_phase_context_enabled else 'off'})."
             )
     global_step = int(checkpoint.get("global_step", 0))
     update = int(checkpoint.get("update", 0))
@@ -2087,10 +2132,11 @@ def run_validation_eval(
                 num_envs=cfg.num_envs,
                 model_path=cfg.model_path,
                 observation_space=cfg.observation_space,
+                phase_context_enabled=cfg.phase_context_enabled,
                 placement_execution_mode=cfg.placement_execution_mode,
                 piece_source_profile=piece_source_profile,
                 queue_policy_id=cfg.queue_policy_id,
-                max_pieces_per_episode=cfg.max_pieces_per_episode,
+                max_pieces_per_episode=cfg.max_pieces_per_episode_val,
                 reward_function_from=reward_fn_from,
                 reward_function_to=reward_fn_to,
                 reward_blend_timesteps=reward_blend_total_for_env(cfg),
@@ -2127,7 +2173,7 @@ def run_validation_eval(
                 for key in reward_component_aliases.keys()
                 if key not in BLEND_STEP_TERM_KEYS
             ]
-            max_steps = max(8, int(cfg.max_pieces_per_episode) * 2)
+            max_steps = max(8, int(cfg.max_pieces_per_episode_val) * 2)
 
             for episode_round in range(episodes_per_env):
                 seeds = [
@@ -2779,10 +2825,11 @@ def train(cfg: PPOConfig) -> None:
             num_envs=cfg.num_envs,
             model_path=cfg.model_path,
             observation_space=cfg.observation_space,
+            phase_context_enabled=cfg.phase_context_enabled,
             placement_execution_mode=cfg.placement_execution_mode,
             piece_source_profile=cfg.generator_schedule[0],
             queue_policy_id=cfg.queue_policy_id,
-            max_pieces_per_episode=cfg.max_pieces_per_episode,
+            max_pieces_per_episode=cfg.max_pieces_per_episode_train,
             reward_function_from=reward_fn_from,
             reward_function_to=reward_fn_to,
             reward_blend_timesteps=reward_blend_total_for_env(cfg),
@@ -2866,6 +2913,7 @@ def train(cfg: PPOConfig) -> None:
                 optimizer,
                 device,
                 load_optimizer_state=(cfg.resume_mode == "continue"),
+                expected_phase_context_enabled=cfg.phase_context_enabled,
             )
             if cfg.resume_mode == "continue":
                 global_step = loaded_global_step
@@ -2898,7 +2946,7 @@ def train(cfg: PPOConfig) -> None:
                 )
         elif cfg.init_artifact:
             artifact_path = Path(cfg.init_artifact).resolve()
-            artifact_observation_space = load_from_artifact(
+            artifact_observation_space, artifact_phase_context_enabled = load_from_artifact(
                 model, obs_adapter, artifact_path
             )
             artifact_obs_compatible = artifact_observation_space == policy_observation_space or (
@@ -2910,6 +2958,12 @@ def train(cfg: PPOConfig) -> None:
                 raise ValueError(
                     "Init artifact observationSpace mismatch. "
                     f"artifact={artifact_observation_space} policy={policy_observation_space}"
+                )
+            if artifact_phase_context_enabled != cfg.phase_context_enabled:
+                print(
+                    "[ppo] init artifact phase-context mismatch: "
+                    f"artifact={'on' if artifact_phase_context_enabled else 'off'} "
+                    f"run={'on' if cfg.phase_context_enabled else 'off'}"
                 )
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
 
@@ -2947,7 +3001,7 @@ def train(cfg: PPOConfig) -> None:
                     model=model,
                     obs_adapter=obs_adapter,
                     device=device,
-                    max_steps=max(1, cfg.max_pieces_per_episode * 4),
+                    max_steps=max(1, cfg.max_pieces_per_episode_val * 4),
                     deterministic=True,
                 )
                 post_bc_trajectory_path: Path | None = None
@@ -3111,12 +3165,15 @@ def train(cfg: PPOConfig) -> None:
         print(
             "[ppo] starting training "
             f"(device={device.type}, env_obs_space={cfg.observation_space}, "
+            f"phase_context={'on' if cfg.phase_context_enabled else 'off'}, "
             f"placement_exec={cfg.placement_execution_mode}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"queue_hidden_dim={cfg.queue_encoder_hidden_dim}, "
             f"queue_lr_scale={cfg.queue_encoder_lr_scale:.3f}, "
             f"batch_size={batch_size}, updates={num_updates}, "
+            f"max_pieces_train={cfg.max_pieces_per_episode_train}, "
+            f"max_pieces_val={cfg.max_pieces_per_episode_val}, "
             f"generators_spec={list(cfg.generator_schedule)}, "
             f"generators_mix={source_mix_label}, "
             f"reward_functions={list(cfg.reward_functions)}, "
@@ -3158,6 +3215,7 @@ def train(cfg: PPOConfig) -> None:
                 "num_updates": num_updates,
                 "generator_mix_by_env": env_piece_source_counts,
                 "validation_sources": validation_sources,
+                "phase_context_enabled": cfg.phase_context_enabled,
                 "reward_function_from": reward_fn_from,
                 "reward_function_to": reward_fn_to,
                 "reward_blend_env_total": reward_blend_total_for_env(cfg),

@@ -40,6 +40,7 @@ export type InitPayload = {
   numEnvs?: number;
   modelPath?: string;
   observationSpace?: BotObservationSpace;
+  phaseContextEnabled?: boolean;
   placementExecutionMode?: PlacementExecutionMode;
   pieceSourceProfile?: PieceSourceProfile;
   queuePolicyId?: string;

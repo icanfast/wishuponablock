@@ -808,12 +808,14 @@ const encodeObservation = (
   observationSpace: BotObservationSpace,
   model: LoadedModel,
   state: GameState,
+  includePhaseContext: boolean,
 ): number[] =>
   Array.from(
     encodeBotObservation({
       observationSpace,
       model,
       state,
+      includePhaseContext,
     }),
   );
 
@@ -1059,6 +1061,7 @@ class BotEnv {
     private readonly modeId: string,
     private readonly model: LoadedModel,
     private readonly observationSpace: BotObservationSpace,
+    private readonly includePhaseContext: boolean,
     pieceSource: PieceSourceProfile,
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
@@ -1111,6 +1114,7 @@ class BotEnv {
       this.observationSpace,
       this.model,
       this.game.state,
+      this.includePhaseContext,
     );
     const obsElapsedS = (performance.now() - obsStart) / 1000;
     const choices = this.cachedChoices;
@@ -1162,6 +1166,7 @@ class BotEnv {
         this.observationSpace,
         this.model,
         this.game.state,
+        this.includePhaseContext,
       );
       const choices =
         this.cachedChoices ??
@@ -1405,6 +1410,7 @@ class BotEnv {
       this.observationSpace,
       this.model,
       this.game.state,
+      this.includePhaseContext,
     );
     const obsElapsedS = (performance.now() - obsStart) / 1000;
     const choicesNextStart = performance.now();
@@ -1870,6 +1876,7 @@ export class BotEnvPool {
     const observationSpace = normalizeObservationSpace(
       payload.observationSpace,
     );
+    const includePhaseContext = payload.phaseContextEnabled === true;
     const placementExecutionMode = normalizePlacementExecutionMode(
       payload.placementExecutionMode,
     );
@@ -1929,6 +1936,7 @@ export class BotEnvPool {
           modeId,
           model,
           observationSpace,
+          includePhaseContext,
           pieceSourceProfile,
           queuePolicyId,
           maxPiecesPerEpisode,

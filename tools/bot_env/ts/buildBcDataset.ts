@@ -47,6 +47,7 @@ type CliOptions = {
   outputPath: string;
   modelPath: string;
   observationSpace: BotObservationSpace;
+  phaseContextEnabled: boolean;
   modeFilter: string | null;
   actionDim: number;
   maxNodesPerBranch: number;
@@ -74,6 +75,7 @@ type BcDataset = {
   createdAtMs: number;
   modelPath: string;
   observationSpace: BotObservationSpace;
+  phaseContextEnabled: boolean;
   modeFilter: string | null;
   obsDim: number;
   actionDim: number;
@@ -116,6 +118,7 @@ const printUsage = (): void => {
     [--output ${DEFAULT_OUTPUT_PATH}] \\
     [--model-path ${DEFAULT_MODEL_PATH}] \\
     [--observation-space raw_v1] \\
+    [--phase-context | --no-phase-context] \\
     [--mode <mode_id> | --all-modes] \\
     [--action-dim ${DEFAULT_ACTION_DIM}] \\
     [--max-nodes ${DEFAULT_MAX_NODES}] \\
@@ -129,6 +132,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
   let outputPath = DEFAULT_OUTPUT_PATH;
   let modelPath = DEFAULT_MODEL_PATH;
   let observationSpace: BotObservationSpace = 'raw_v1';
+  let phaseContextEnabled = false;
   let modeFilter: string | null = null;
   let actionDim = DEFAULT_ACTION_DIM;
   let maxNodesPerBranch = DEFAULT_MAX_NODES;
@@ -182,6 +186,14 @@ const parseArgs = (argv: string[]): CliOptions | null => {
       modeFilter = null;
       continue;
     }
+    if (arg === '--phase-context') {
+      phaseContextEnabled = true;
+      continue;
+    }
+    if (arg === '--no-phase-context') {
+      phaseContextEnabled = false;
+      continue;
+    }
     if (arg === '--action-dim') {
       actionDim = asInt(argv[i + 1], DEFAULT_ACTION_DIM);
       i += 1;
@@ -220,6 +232,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
     outputPath,
     modelPath,
     observationSpace,
+    phaseContextEnabled,
     modeFilter,
     actionDim,
     maxNodesPerBranch,
@@ -293,6 +306,7 @@ const clamp = (value: number, min: number, max: number): number =>
 const buildObservation = (input: {
   model: LoadedModel | null;
   observationSpace: BotObservationSpace;
+  phaseContextEnabled: boolean;
   board: Board;
   hold: PieceKind | null;
   active: PieceKind;
@@ -308,6 +322,7 @@ const buildObservation = (input: {
     encodeBotObservationFromParts({
       observationSpace: input.observationSpace,
       model: input.model,
+      includePhaseContext: input.phaseContextEnabled,
       parts: {
         board: input.board,
         hold: input.hold,
@@ -676,6 +691,7 @@ const main = async (): Promise<void> => {
         const obs = buildObservation({
           model,
           observationSpace: options.observationSpace,
+          phaseContextEnabled: options.phaseContextEnabled,
           board: boardBefore,
           hold: holdBefore,
           active: activeBefore,
@@ -763,6 +779,7 @@ const main = async (): Promise<void> => {
     createdAtMs: Date.now(),
     modelPath: options.modelPath,
     observationSpace: options.observationSpace,
+    phaseContextEnabled: options.phaseContextEnabled,
     modeFilter: options.modeFilter,
     obsDim: records[0].obs.length,
     actionDim: options.actionDim,

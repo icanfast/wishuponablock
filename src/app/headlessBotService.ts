@@ -160,6 +160,7 @@ export type BotPolicyArtifact = {
   modeId: string;
   archId?: string;
   queuePolicyId?: string;
+  phaseContextEnabled?: boolean;
   pipelineId?: string;
   pieceSourceProfile?: BotPieceSourceProfile;
   createdAtMs: number;
@@ -330,6 +331,7 @@ type PolicyParams = {
   hiddenDim: number;
   actionDim: number;
   observationSpace: BotObservationSpace;
+  includePhaseContext: boolean;
   actionSpaceKind: BotActionSpaceKind;
   macroActions: BotMacroAction[] | null;
   encoderModel: LoadedModel | null;
@@ -357,6 +359,7 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
   observationSpace: params.observationSpace,
+  includePhaseContext: params.includePhaseContext,
   actionSpaceKind: params.actionSpaceKind,
   macroActions: params.macroActions
     ? params.macroActions.map((action) => ({ ...action }))
@@ -778,6 +781,7 @@ const randomizeParams = (
     hiddenDim,
     actionDim,
     observationSpace,
+    includePhaseContext: false,
     actionSpaceKind,
     macroActions,
     encoderModel: null,
@@ -929,6 +933,7 @@ const encodeObservation = (
   if (params?.queueEncoder) {
     const rawObservation = encodeBotObservationFromParts({
       observationSpace: 'raw_v1',
+      includePhaseContext: params.includePhaseContext,
       parts: toBotObservationParts(state),
     });
     if (rawObservation.length < params.queueEncoder.inputDim) {
@@ -976,6 +981,7 @@ const encodeObservation = (
   if (observationSpace === 'raw_v1') {
     return encodeBotObservationFromParts({
       observationSpace: 'raw_v1',
+      includePhaseContext: params?.includePhaseContext,
       parts: toBotObservationParts(state),
     });
   }
@@ -988,6 +994,7 @@ const encodeObservation = (
     observationSpace,
     model,
     state,
+    includePhaseContext: params?.includePhaseContext,
   });
 };
 
@@ -1481,6 +1488,7 @@ const trainWithTfjsReinforce = async (options: {
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
     observationSpace: options.params.observationSpace,
+    includePhaseContext: options.params.includePhaseContext,
     actionSpaceKind: options.params.actionSpaceKind,
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
@@ -1697,6 +1705,7 @@ const trainWithTfjsPpo = async (options: {
     hiddenDim: options.params.hiddenDim,
     actionDim: options.params.actionDim,
     observationSpace: options.params.observationSpace,
+    includePhaseContext: options.params.includePhaseContext,
     actionSpaceKind: options.params.actionSpaceKind,
     macroActions: options.params.macroActions
       ? options.params.macroActions.map((action) => ({ ...action }))
@@ -1958,6 +1967,7 @@ const toArtifact = (
   hiddenDim: params.hiddenDim,
   actionDim: params.actionDim,
   observationSpace: params.observationSpace,
+  phaseContextEnabled: params.includePhaseContext,
   actionSpaceKind: params.actionSpaceKind,
   actions:
     params.actionSpaceKind === 'macro_v1' && params.macroActions
@@ -1998,6 +2008,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   const observationSpace = normalizeBotObservationSpace(
     policy.observationSpace,
   );
+  const includePhaseContext = false;
   const actionSpaceKind: BotActionSpaceKind =
     policy.actionSpaceKind === 'placement_full_v1'
       ? 'placement_full_v1'
@@ -2132,6 +2143,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     hiddenDim,
     actionDim,
     observationSpace,
+    includePhaseContext,
     actionSpaceKind,
     macroActions:
       actionSpaceKind === 'macro_v1'
@@ -2191,6 +2203,10 @@ export const parseBotPolicyArtifactFromUnknown = (
       typeof value.queuePolicyId === 'string' &&
       value.queuePolicyId.trim().length > 0
         ? value.queuePolicyId.trim().toLowerCase()
+        : undefined,
+    phaseContextEnabled:
+      typeof value.phaseContextEnabled === 'boolean'
+        ? value.phaseContextEnabled
         : undefined,
     pipelineId:
       typeof value.pipelineId === 'string' && value.pipelineId.trim().length > 0
@@ -2259,6 +2275,8 @@ export const parseBotPolicyArtifactFromUnknown = (
   normalized.createdAtMs = createdAtMs;
   normalized.archId = candidate.archId;
   normalized.queuePolicyId = candidate.queuePolicyId;
+  normalized.phaseContextEnabled =
+    candidate.phaseContextEnabled ?? params.includePhaseContext;
   normalized.pipelineId = candidate.pipelineId;
   normalized.pieceSourceProfile = candidate.pieceSourceProfile;
   return normalized;

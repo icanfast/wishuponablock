@@ -25,9 +25,44 @@ export type BotObservationParts = {
 
 const RAW_VISIBLE_QUEUE_SLOTS = 5;
 
+type ObservationEncodingOptions = {
+  includePhaseContext?: boolean;
+};
+
+const getScalarContext = (
+  parts: BotObservationParts,
+  options?: ObservationEncodingOptions,
+): {
+  progress: number;
+  time: number;
+  level: number;
+  score: number;
+  canHold: number;
+} => {
+  const includePhaseContext = options?.includePhaseContext !== false;
+  const lineGoal =
+    parts.lineGoal != null && parts.lineGoal > 0 ? parts.lineGoal : null;
+  const progress = includePhaseContext
+    ? lineGoal != null
+      ? clamp(parts.totalLinesCleared / lineGoal, 0, 2)
+      : clamp(parts.totalLinesCleared / 80, 0, 2)
+    : 0;
+  const time = includePhaseContext ? clamp(parts.timeMs / 180_000, 0, 2) : 0;
+  const level = includePhaseContext ? clamp(parts.level / 20, 0, 2) : 0;
+  const score = includePhaseContext ? clamp(parts.score / 200_000, 0, 2) : 0;
+  return {
+    progress,
+    time,
+    level,
+    score,
+    canHold: parts.canHold ? 1 : 0,
+  };
+};
+
 const encodeModelHeadObservationFromParts = (
   model: LoadedModel,
   parts: BotObservationParts,
+  options?: ObservationEncodingOptions,
 ): Float32Array => {
   const headInput = buildModelHeadInput(model, parts.board, parts.hold);
   const contextDim = PIECES.length + PIECES.length + 5;
@@ -43,22 +78,18 @@ const encodeModelHeadObservationFromParts = (
   if (nextIdx != null) out[offset + nextIdx] = 1;
   offset += PIECES.length;
 
-  const lineGoal =
-    parts.lineGoal != null && parts.lineGoal > 0 ? parts.lineGoal : null;
-  const progress =
-    lineGoal != null
-      ? clamp(parts.totalLinesCleared / lineGoal, 0, 2)
-      : clamp(parts.totalLinesCleared / 80, 0, 2);
-  out[offset++] = progress;
-  out[offset++] = clamp(parts.timeMs / 180_000, 0, 2);
-  out[offset++] = clamp(parts.level / 20, 0, 2);
-  out[offset++] = clamp(parts.score / 200_000, 0, 2);
-  out[offset++] = parts.canHold ? 1 : 0;
+  const scalarContext = getScalarContext(parts, options);
+  out[offset++] = scalarContext.progress;
+  out[offset++] = scalarContext.time;
+  out[offset++] = scalarContext.level;
+  out[offset++] = scalarContext.score;
+  out[offset++] = scalarContext.canHold;
   return out;
 };
 
 const encodeRawObservationFromParts = (
   parts: BotObservationParts,
+  options?: ObservationEncodingOptions,
 ): Float32Array => {
   const rows = parts.board.length;
   const cols = parts.board[0]?.length ?? 0;
@@ -98,17 +129,12 @@ const encodeRawObservationFromParts = (
   if (nextIdx != null) out[offset + nextIdx] = 1;
   offset += PIECES.length;
 
-  const lineGoal =
-    parts.lineGoal != null && parts.lineGoal > 0 ? parts.lineGoal : null;
-  const progress =
-    lineGoal != null
-      ? clamp(parts.totalLinesCleared / lineGoal, 0, 2)
-      : clamp(parts.totalLinesCleared / 80, 0, 2);
-  out[offset++] = progress;
-  out[offset++] = clamp(parts.timeMs / 180_000, 0, 2);
-  out[offset++] = clamp(parts.level / 20, 0, 2);
-  out[offset++] = clamp(parts.score / 200_000, 0, 2);
-  out[offset++] = parts.canHold ? 1 : 0;
+  const scalarContext = getScalarContext(parts, options);
+  out[offset++] = scalarContext.progress;
+  out[offset++] = scalarContext.time;
+  out[offset++] = scalarContext.level;
+  out[offset++] = scalarContext.score;
+  out[offset++] = scalarContext.canHold;
 
   const queueSource = Array.isArray(parts.nextQueue) ? parts.nextQueue : [];
   for (let slot = 0; slot < RAW_VISIBLE_QUEUE_SLOTS; slot += 1) {
@@ -128,26 +154,33 @@ export const encodeBotObservationFromParts = (options: {
   observationSpace: BotObservationSpace;
   model?: LoadedModel | null;
   parts: BotObservationParts;
+  includePhaseContext?: boolean;
 }): Float32Array => {
   if (options.observationSpace === 'raw_v1') {
-    return encodeRawObservationFromParts(options.parts);
+    return encodeRawObservationFromParts(options.parts, options);
   }
   if (!options.model) {
     throw new Error(
       'encodeBotObservationFromParts: model is required for model_head_v1.',
     );
   }
-  return encodeModelHeadObservationFromParts(options.model, options.parts);
+  return encodeModelHeadObservationFromParts(
+    options.model,
+    options.parts,
+    options,
+  );
 };
 
 export const encodeBotObservation = (options: {
   observationSpace: BotObservationSpace;
   model: LoadedModel;
   state: GameState;
+  includePhaseContext?: boolean;
 }): Float32Array =>
   encodeBotObservationFromParts({
     observationSpace: options.observationSpace,
     model: options.model,
+    includePhaseContext: options.includePhaseContext,
     parts: {
       board: options.state.board,
       hold: options.state.hold,
