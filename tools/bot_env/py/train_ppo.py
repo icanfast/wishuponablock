@@ -2953,6 +2953,7 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
         "overall": {
             "final": data.get("reward_final"),
             "base": data.get("reward_base"),
+            "hold_margin_penalty": data.get("term_hold_margin_penalty"),
             "top_out_term": (
                 data.get("top_out_term")
                 if data.get("top_out_term") is not None
@@ -3011,6 +3012,7 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "board_quality": data.get("term_board_quality"),
             "board_quality_absolute": data.get("term_board_quality_abs"),
             "full_clear": data.get("term_full_clear"),
+            "hold_margin_penalty": data.get("term_hold_margin_penalty"),
             "top_out": data.get("term_top_out"),
         },
     }
@@ -3727,6 +3729,7 @@ def train(cfg: PPOConfig) -> None:
             "reward_final": ("rewardFinal",),
             "reward_base": ("rewardBase",),
             "top_out_term": ("topOutTerm", "topOutPenalty"),
+            "term_hold_margin_penalty": (),
             "blend_t": ("rewardBlendT",),
             "blend_legacy_weight": ("rewardBlendLegacyWeight",),
             "blend_target_weight": ("rewardBlendTargetWeight",),
@@ -4015,6 +4018,9 @@ def train(cfg: PPOConfig) -> None:
                                 )
                         for env_idx in range(max_info):
                             info = infos_raw[env_idx]
+                            hold_penalty = float(
+                                hold_penalties_by_env_id.get(int(env_ids[env_idx]), 0.0)
+                            )
                             reward_final = _info_num(
                                 info,
                                 reward_component_aliases["reward_final"],
@@ -4022,9 +4028,12 @@ def train(cfg: PPOConfig) -> None:
                             )
                             ep_reward_component_sums["reward_final"][
                                 env_idx
-                            ] += reward_final
+                            ] += reward_final - hold_penalty
+                            ep_reward_component_sums["term_hold_margin_penalty"][
+                                env_idx
+                            ] += -hold_penalty
                             for key in episode_reward_term_keys:
-                                if key == "reward_final":
+                                if key in ("reward_final", "term_hold_margin_penalty"):
                                     continue
                                 ep_reward_component_sums[key][env_idx] += _info_num(
                                     info,
@@ -4035,10 +4044,28 @@ def train(cfg: PPOConfig) -> None:
                             ep_reward_component_sums["reward_final"][
                                 max_info:cfg.num_envs
                             ] += rewards_np[max_info:cfg.num_envs].astype(np.float64)
+                            if hold_penalties_by_env_id:
+                                for env_idx in range(max_info, cfg.num_envs):
+                                    hold_penalty = float(
+                                        hold_penalties_by_env_id.get(
+                                            int(env_ids[env_idx]), 0.0
+                                        )
+                                    )
+                                    ep_reward_component_sums[
+                                        "term_hold_margin_penalty"
+                                    ][env_idx] += -hold_penalty
                     else:
                         ep_reward_component_sums["reward_final"] += rewards_np.astype(
                             np.float64
                         )
+                        if hold_penalties_by_env_id:
+                            for env_idx, env_id in enumerate(env_ids):
+                                hold_penalty = float(
+                                    hold_penalties_by_env_id.get(int(env_id), 0.0)
+                                )
+                                ep_reward_component_sums["term_hold_margin_penalty"][
+                                    env_idx
+                                ] += -hold_penalty
 
                     done_indices = np.where(dones_np > 0.5)[0]
                     if done_indices.size > 0:
@@ -4664,9 +4691,97 @@ def train(cfg: PPOConfig) -> None:
                     ret_terms = stats["ret100_terms"]
                     validation_by_source = stats.get("validation_by_source") or {}
                     source_label = source_mix_label
+                    reward_blend_active = reward_fn_from != reward_fn_to
                     adapter_checks_label = (
                         "ok" if stats["adapter_checks_ok"] else "warn"
                     )
+                    if reward_blend_active:
+                        ret100_lines = [
+                            (
+                                "  ret100: "
+                                f"final={_fmt_float(ret_terms.get('reward_final'))} "
+                                f"base={_fmt_float(ret_terms.get('reward_base'))} "
+                                f"{reward_fn_from}={_fmt_float(ret_terms.get('v1_base'))} "
+                                f"{reward_fn_to}={_fmt_float(ret_terms.get('v2_base'))} "
+                                f"{reward_fn_from}_raw={_fmt_float(ret_terms.get('v1_base_raw'))} "
+                                f"{reward_fn_to}_raw={_fmt_float(ret_terms.get('v2_base_raw'))} "
+                                f"hold_pen={_fmt_float(ret_terms.get('term_hold_margin_penalty'))} "
+                                f"w1={_fmt_float(ret_terms.get('blend_legacy_weight'))} "
+                                f"w2={_fmt_float(ret_terms.get('blend_target_weight'))} "
+                                f"t={_fmt_float(ret_terms.get('blend_t'))} "
+                                f"topout={_fmt_float(ret_terms.get('top_out_term'))}"
+                            ),
+                            (
+                                f"    {reward_fn_from}_terms: "
+                                f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
+                                f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
+                                f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
+                                f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
+                                f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
+                                f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
+                                f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
+                                f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
+                                f"q_abs={_fmt_float(ret_terms.get('v1_term_board_quality_abs'))} "
+                                f"full_clear={_fmt_float(ret_terms.get('v1_term_full_clear'))} "
+                                f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
+                            ),
+                            (
+                                f"    {reward_fn_to}_terms: "
+                                f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
+                                f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
+                                f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
+                                f"height={_fmt_float(ret_terms.get('v2_term_height'))} "
+                                f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
+                                f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
+                                f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
+                                f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))} "
+                                f"q_abs={_fmt_float(ret_terms.get('v2_term_board_quality_abs'))} "
+                                f"full_clear={_fmt_float(ret_terms.get('v2_term_full_clear'))} "
+                                f"topout={_fmt_float(ret_terms.get('v2_term_top_out'))}"
+                            ),
+                            (
+                                "    blend_terms: "
+                                f"lines={_fmt_float(ret_terms.get('term_lines'))} "
+                                f"score={_fmt_float(ret_terms.get('term_score'))} "
+                                f"time={_fmt_float(ret_terms.get('term_time'))} "
+                                f"height={_fmt_float(ret_terms.get('term_height'))} "
+                                f"holes={_fmt_float(ret_terms.get('term_holes'))} "
+                                f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
+                                f"board={_fmt_float(ret_terms.get('term_board_score'))} "
+                                f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
+                                f"q_abs={_fmt_float(ret_terms.get('term_board_quality_abs'))} "
+                                f"full_clear={_fmt_float(ret_terms.get('term_full_clear'))} "
+                                f"hold_pen={_fmt_float(ret_terms.get('term_hold_margin_penalty'))} "
+                                f"topout={_fmt_float(ret_terms.get('term_top_out'))}"
+                            ),
+                        ]
+                    else:
+                        active_reward_fn = reward_fn_from
+                        ret100_lines = [
+                            (
+                                "  ret100: "
+                                f"final={_fmt_float(ret_terms.get('reward_final'))} "
+                                f"base={_fmt_float(ret_terms.get('reward_base'))} "
+                                f"{active_reward_fn}={_fmt_float(ret_terms.get('v1_base_raw'))} "
+                                f"hold_pen={_fmt_float(ret_terms.get('term_hold_margin_penalty'))} "
+                                f"topout={_fmt_float(ret_terms.get('top_out_term'))}"
+                            ),
+                            (
+                                f"    {active_reward_fn}_terms: "
+                                f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
+                                f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
+                                f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
+                                f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
+                                f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
+                                f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
+                                f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
+                                f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
+                                f"q_abs={_fmt_float(ret_terms.get('v1_term_board_quality_abs'))} "
+                                f"full_clear={_fmt_float(ret_terms.get('v1_term_full_clear'))} "
+                                f"hold_pen={_fmt_float(ret_terms.get('term_hold_margin_penalty'))} "
+                                f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
+                            ),
+                        ]
                     log_lines = [
                         (
                             f"[ppo] update={update}/{num_updates} "
@@ -4723,85 +4838,35 @@ def train(cfg: PPOConfig) -> None:
                             f"psum={stats['teacher_prob_sum']:.3f},"
                             f"valid={stats['teacher_valid_actions']:.1f})"
                         ),
-                        (
-                            "  ret100: "
-                            f"final={_fmt_float(ret_terms.get('reward_final'))} "
-                            f"base={_fmt_float(ret_terms.get('reward_base'))} "
-                            f"{reward_fn_from}={_fmt_float(ret_terms.get('v1_base'))} "
-                            f"{reward_fn_to}={_fmt_float(ret_terms.get('v2_base'))} "
-                            f"{reward_fn_from}_raw={_fmt_float(ret_terms.get('v1_base_raw'))} "
-                            f"{reward_fn_to}_raw={_fmt_float(ret_terms.get('v2_base_raw'))} "
-                            f"w1={_fmt_float(ret_terms.get('blend_legacy_weight'))} "
-                            f"w2={_fmt_float(ret_terms.get('blend_target_weight'))} "
-                            f"t={_fmt_float(ret_terms.get('blend_t'))} "
-                            f"topout={_fmt_float(ret_terms.get('top_out_term'))}"
-                        ),
-                        (
-                            f"    {reward_fn_from}_terms: "
-                            f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
-                            f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
-                            f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
-                            f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
-                            f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
-                            f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
-                            f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
-                            f"q_abs={_fmt_float(ret_terms.get('v1_term_board_quality_abs'))} "
-                            f"full_clear={_fmt_float(ret_terms.get('v1_term_full_clear'))} "
-                            f"topout={_fmt_float(ret_terms.get('v1_term_top_out'))}"
-                        ),
-                        (
-                            f"    {reward_fn_to}_terms: "
-                            f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
-                            f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
-                            f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
-                            f"height={_fmt_float(ret_terms.get('v2_term_height'))} "
-                            f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
-                            f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
-                            f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))} "
-                            f"q_abs={_fmt_float(ret_terms.get('v2_term_board_quality_abs'))} "
-                            f"full_clear={_fmt_float(ret_terms.get('v2_term_full_clear'))} "
-                            f"topout={_fmt_float(ret_terms.get('v2_term_top_out'))}"
-                        ),
-                        (
-                            "    blend_terms: "
-                            f"lines={_fmt_float(ret_terms.get('term_lines'))} "
-                            f"score={_fmt_float(ret_terms.get('term_score'))} "
-                            f"time={_fmt_float(ret_terms.get('term_time'))} "
-                            f"height={_fmt_float(ret_terms.get('term_height'))} "
-                            f"holes={_fmt_float(ret_terms.get('term_holes'))} "
-                            f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
-                            f"board={_fmt_float(ret_terms.get('term_board_score'))} "
-                            f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
-                            f"q_abs={_fmt_float(ret_terms.get('term_board_quality_abs'))} "
-                            f"full_clear={_fmt_float(ret_terms.get('term_full_clear'))} "
-                            f"topout={_fmt_float(ret_terms.get('term_top_out'))}"
-                        ),
-                        (
-                            "  timing: "
-                            f"t_upd_core={update_core_seconds:.2f}s "
-                            f"t_roll={profile_rollout_s:.2f}s "
-                            f"t_env={profile_env_total_s:.2f}s "
-                            f"t_env_batch={profile_env_batch_s:.2f}s "
-                            f"t_env_core={profile_env_core_s:.2f}s "
-                            f"t_env_ipc={profile_env_ipc_s:.2f}s "
-                            f"t_env_runner={profile_env_step_runner_s:.2f}s "
-                            f"t_env_choices={profile_env_choices_s:.2f}s "
-                            f"t_env_obs={profile_env_obs_s:.2f}s "
-                            f"t_env_reward={profile_env_step_reward_s:.2f}s "
-                            f"t_fwd={profile_policy_forward_s:.2f}s "
-                            f"t_gae={profile_gae_s:.2f}s "
-                            f"t_opt={profile_opt_s:.2f}s "
-                            f"t_io={profile_io_s:.2f}s "
-                            f"t_ovh={profile_overhead_s:.2f}s"
-                        ),
-                        (
-                            "  mask_fix: "
-                            f"rows={mask_repair_update['rows']} "
-                            f"rows_total={mask_repair_total['rows']}"
-                        ),
                     ]
+                    log_lines.extend(ret100_lines)
+                    log_lines.extend(
+                        [
+                            (
+                                "  timing: "
+                                f"t_upd_core={update_core_seconds:.2f}s "
+                                f"t_roll={profile_rollout_s:.2f}s "
+                                f"t_env={profile_env_total_s:.2f}s "
+                                f"t_env_batch={profile_env_batch_s:.2f}s "
+                                f"t_env_core={profile_env_core_s:.2f}s "
+                                f"t_env_ipc={profile_env_ipc_s:.2f}s "
+                                f"t_env_runner={profile_env_step_runner_s:.2f}s "
+                                f"t_env_choices={profile_env_choices_s:.2f}s "
+                                f"t_env_obs={profile_env_obs_s:.2f}s "
+                                f"t_env_reward={profile_env_step_reward_s:.2f}s "
+                                f"t_fwd={profile_policy_forward_s:.2f}s "
+                                f"t_gae={profile_gae_s:.2f}s "
+                                f"t_opt={profile_opt_s:.2f}s "
+                                f"t_io={profile_io_s:.2f}s "
+                                f"t_ovh={profile_overhead_s:.2f}s"
+                            ),
+                            (
+                                "  mask_fix: "
+                                f"rows={mask_repair_update['rows']} "
+                                f"rows_total={mask_repair_total['rows']}"
+                            ),
+                        ]
+                    )
                     for source in validation_sources:
                         probe_item = hold_probe_summary.get(source)
                         if probe_item is None:
@@ -4835,54 +4900,86 @@ def train(cfg: PPOConfig) -> None:
                                 else {}
                             )
                             if bool(source_dict.get("enabled", False)):
-                                log_lines.append(
-                                    "  validation["
-                                    + source
-                                    + "]: "
-                                    + f"ret={_fmt_float(source_dict.get('mean_return'))} "
-                                    + f"final={_fmt_float(source_terms_dict.get('reward_final'))} "
-                                    + f"base={_fmt_float(source_terms_dict.get('reward_base'))} "
-                                    + f"{reward_fn_from}={_fmt_float(source_terms_dict.get('v1_base'))} "
-                                    + f"{reward_fn_to}={_fmt_float(source_terms_dict.get('v2_base'))} "
-                                    + f"{reward_fn_from}_raw={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
-                                    + f"{reward_fn_to}_raw={_fmt_float(source_terms_dict.get('v2_base_raw'))} "
-                                    + f"w1={_fmt_float(source_terms_dict.get('blend_legacy_weight'))} "
-                                    + f"w2={_fmt_float(source_terms_dict.get('blend_target_weight'))} "
-                                    + f"t={_fmt_float(source_terms_dict.get('blend_t'))} "
-                                    + f"topout={_fmt_float(source_terms_dict.get('top_out_term'))}"
-                                )
-                                log_lines.append(
-                                    f"    val_{reward_fn_from}_terms["
-                                    + source
-                                    + "]: "
-                                    + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
-                                    + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
-                                    + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
-                                    + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
-                                    + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
-                                    + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
-                                    + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
-                                    + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
-                                    + f"q_abs={_fmt_float(source_terms_dict.get('v1_term_board_quality_abs'))} "
-                                    + f"full_clear={_fmt_float(source_terms_dict.get('v1_term_full_clear'))} "
-                                    + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
-                                )
-                                log_lines.append(
-                                    f"    val_{reward_fn_to}_terms["
-                                    + source
-                                    + "]: "
-                                    + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
-                                    + f"score={_fmt_float(source_terms_dict.get('v2_term_score'))} "
-                                    + f"time={_fmt_float(source_terms_dict.get('v2_term_time'))} "
-                                    + f"height={_fmt_float(source_terms_dict.get('v2_term_height'))} "
-                                    + f"holes={_fmt_float(source_terms_dict.get('v2_term_holes'))} "
-                                    + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
-                                    + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
-                                    + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
-                                    + f"q_abs={_fmt_float(source_terms_dict.get('v2_term_board_quality_abs'))} "
-                                    + f"full_clear={_fmt_float(source_terms_dict.get('v2_term_full_clear'))} "
-                                    + f"topout={_fmt_float(source_terms_dict.get('v2_term_top_out'))}"
-                                )
+                                if reward_blend_active:
+                                    log_lines.append(
+                                        "  validation["
+                                        + source
+                                        + "]: "
+                                        + f"ret={_fmt_float(source_dict.get('mean_return'))} "
+                                        + f"final={_fmt_float(source_terms_dict.get('reward_final'))} "
+                                        + f"base={_fmt_float(source_terms_dict.get('reward_base'))} "
+                                        + f"{reward_fn_from}={_fmt_float(source_terms_dict.get('v1_base'))} "
+                                        + f"{reward_fn_to}={_fmt_float(source_terms_dict.get('v2_base'))} "
+                                        + f"{reward_fn_from}_raw={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
+                                        + f"{reward_fn_to}_raw={_fmt_float(source_terms_dict.get('v2_base_raw'))} "
+                                        + f"hold_pen={_fmt_float(source_terms_dict.get('term_hold_margin_penalty'))} "
+                                        + f"w1={_fmt_float(source_terms_dict.get('blend_legacy_weight'))} "
+                                        + f"w2={_fmt_float(source_terms_dict.get('blend_target_weight'))} "
+                                        + f"t={_fmt_float(source_terms_dict.get('blend_t'))} "
+                                        + f"topout={_fmt_float(source_terms_dict.get('top_out_term'))}"
+                                    )
+                                    log_lines.append(
+                                        f"    val_{reward_fn_from}_terms["
+                                        + source
+                                        + "]: "
+                                        + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
+                                        + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
+                                        + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
+                                        + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
+                                        + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
+                                        + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
+                                        + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
+                                        + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
+                                        + f"q_abs={_fmt_float(source_terms_dict.get('v1_term_board_quality_abs'))} "
+                                        + f"full_clear={_fmt_float(source_terms_dict.get('v1_term_full_clear'))} "
+                                        + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
+                                    )
+                                    log_lines.append(
+                                        f"    val_{reward_fn_to}_terms["
+                                        + source
+                                        + "]: "
+                                        + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
+                                        + f"score={_fmt_float(source_terms_dict.get('v2_term_score'))} "
+                                        + f"time={_fmt_float(source_terms_dict.get('v2_term_time'))} "
+                                        + f"height={_fmt_float(source_terms_dict.get('v2_term_height'))} "
+                                        + f"holes={_fmt_float(source_terms_dict.get('v2_term_holes'))} "
+                                        + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
+                                        + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
+                                        + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
+                                        + f"q_abs={_fmt_float(source_terms_dict.get('v2_term_board_quality_abs'))} "
+                                        + f"full_clear={_fmt_float(source_terms_dict.get('v2_term_full_clear'))} "
+                                        + f"topout={_fmt_float(source_terms_dict.get('v2_term_top_out'))}"
+                                    )
+                                else:
+                                    active_reward_fn = reward_fn_from
+                                    log_lines.append(
+                                        "  validation["
+                                        + source
+                                        + "]: "
+                                        + f"ret={_fmt_float(source_dict.get('mean_return'))} "
+                                        + f"final={_fmt_float(source_terms_dict.get('reward_final'))} "
+                                        + f"base={_fmt_float(source_terms_dict.get('reward_base'))} "
+                                        + f"{active_reward_fn}={_fmt_float(source_terms_dict.get('v1_base_raw'))} "
+                                        + f"hold_pen={_fmt_float(source_terms_dict.get('term_hold_margin_penalty'))} "
+                                        + f"topout={_fmt_float(source_terms_dict.get('top_out_term'))}"
+                                    )
+                                    log_lines.append(
+                                        f"    val_{active_reward_fn}_terms["
+                                        + source
+                                        + "]: "
+                                        + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
+                                        + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
+                                        + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
+                                        + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
+                                        + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
+                                        + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
+                                        + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
+                                        + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
+                                        + f"q_abs={_fmt_float(source_terms_dict.get('v1_term_board_quality_abs'))} "
+                                        + f"full_clear={_fmt_float(source_terms_dict.get('v1_term_full_clear'))} "
+                                        + f"hold_pen={_fmt_float(source_terms_dict.get('term_hold_margin_penalty'))} "
+                                        + f"topout={_fmt_float(source_terms_dict.get('v1_term_top_out'))}"
+                                    )
                                 log_lines.append(
                                     "    val_diag["
                                     + source
