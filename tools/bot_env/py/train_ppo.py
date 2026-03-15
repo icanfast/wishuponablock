@@ -36,6 +36,7 @@ DEFAULT_OBS_ADAPTER_LR_SCALE = 0.1
 DEFAULT_QUEUE_ENCODER_HIDDEN_DIM = 32
 DEFAULT_QUEUE_ENCODER_LR_SCALE = 5.0
 VALID_GENERATOR_SOURCES = ("bag7", "active_generator", "random")
+VALID_ACTION_SPACE_KINDS = ("placement_full_v1", "placement_hold_step_v2")
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class PPOConfig:
     observation_space: str
     phase_context_enabled: bool
     placement_execution_mode: str
+    action_space_kind: str
     queue_policy_id: str
     generator_schedule: tuple[str, ...]
     reward_functions: tuple[str, ...]
@@ -590,6 +592,16 @@ def parse_args() -> PPOConfig:
         choices=["commands", "teleport"],
         help="How env executes placement actions: deterministic command playback or direct teleport+harddrop.",
     )
+    parser.add_argument(
+        "--action-space-kind",
+        default="placement_full_v1",
+        choices=list(VALID_ACTION_SPACE_KINDS),
+        help=(
+            "Policy output/action-space variant. "
+            "placement_full_v1 = flat no-hold + hold-placement actions. "
+            "placement_hold_step_v2 = no-hold placements + one explicit HOLD action."
+        ),
+    )
     parser.add_argument("--queue-policy-id", default="next_piece_v1")
     parser.add_argument(
         "--generators",
@@ -1013,6 +1025,11 @@ def parse_args() -> PPOConfig:
             if args.placement_execution_mode == "commands"
             else "teleport"
         ),
+        action_space_kind=(
+            "placement_hold_step_v2"
+            if args.action_space_kind == "placement_hold_step_v2"
+            else "placement_full_v1"
+        ),
         queue_policy_id=args.queue_policy_id.strip().lower(),
         generator_schedule=generator_schedule,
         reward_functions=reward_functions,
@@ -1339,9 +1356,19 @@ def masked_categorical(
     return Categorical(logits=masked_logits)
 
 
-def action_index_uses_hold(action_index: int, action_dim: int) -> bool:
+def is_hold_probe_supported(action_space_kind: str) -> bool:
+    return str(action_space_kind).strip().lower() == "placement_full_v1"
+
+
+def action_index_uses_hold(
+    action_index: int,
+    action_dim: int,
+    action_space_kind: str = "placement_full_v1",
+) -> bool:
     if action_dim <= 0:
         return False
+    if str(action_space_kind).strip().lower() == "placement_hold_step_v2":
+        return int(action_index) == max(0, int(action_dim) - 1)
     hold_stride = max(1, action_dim // 2)
     return int(action_index) >= hold_stride
 
@@ -1404,6 +1431,7 @@ def evaluate_hold_margin_for_actions(
     device: torch.device,
     gamma: float,
     action_dim: int,
+    action_space_kind: str,
     eps: float,
     good_threshold: float,
 ) -> tuple[dict[int, dict[str, float | None]], dict[str, Any]]:
@@ -1431,7 +1459,7 @@ def evaluate_hold_margin_for_actions(
                 "chosen_hold_value": [],
             },
         )
-        if action_index_uses_hold(int(action), action_dim):
+        if action_index_uses_hold(int(action), action_dim, action_space_kind):
             source_stats["hold_actions"] += 1
             probe_env_ids.append(int(env_id))
             probe_env_sources.append(source)
@@ -1628,6 +1656,22 @@ def new_hold_probe_accumulator() -> dict[str, Any]:
     }
 
 
+def accumulate_hold_action_counts(
+    accumulator: dict[str, dict[str, Any]],
+    *,
+    env_piece_sources: list[str],
+    actions: list[int],
+    action_dim: int,
+    action_space_kind: str,
+) -> None:
+    for source, action in zip(env_piece_sources, actions):
+        source_acc = accumulator.setdefault(source, new_hold_probe_accumulator())
+        if action_index_uses_hold(int(action), action_dim, action_space_kind):
+            source_acc["hold_actions"] += 1
+        else:
+            source_acc["non_hold_actions"] += 1
+
+
 def accumulate_hold_probe_metrics(
     accumulator: dict[str, dict[str, Any]],
     *,
@@ -1635,6 +1679,7 @@ def accumulate_hold_probe_metrics(
     env_piece_sources: list[str],
     actions: list[int],
     action_dim: int,
+    action_space_kind: str,
     per_env: dict[int, dict[str, float | None]],
     penalty_base: float,
     penalty_threshold: float,
@@ -1642,7 +1687,7 @@ def accumulate_hold_probe_metrics(
     penalties_by_env_id: dict[int, float] = {}
     for env_id, source, action in zip(env_ids, env_piece_sources, actions):
         source_acc = accumulator.setdefault(source, new_hold_probe_accumulator())
-        if action_index_uses_hold(int(action), action_dim):
+        if action_index_uses_hold(int(action), action_dim, action_space_kind):
             source_acc["hold_actions"] += 1
             env_result = per_env.get(int(env_id))
             if not env_result or env_result.get("margin") is None:
@@ -1702,9 +1747,18 @@ def summarize_hold_probe_accumulator(
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for source, stats in accumulator.items():
+        hold_actions = int(stats["hold_actions"])
+        non_hold_actions = int(stats["non_hold_actions"])
+        total_actions = hold_actions + non_hold_actions
         summary[source] = {
-            "hold_actions": int(stats["hold_actions"]),
-            "non_hold_actions": int(stats["non_hold_actions"]),
+            "hold_actions": hold_actions,
+            "non_hold_actions": non_hold_actions,
+            "total_actions": total_actions,
+            "hold_rate": (
+                float(hold_actions / total_actions)
+                if total_actions > 0
+                else float("nan")
+            ),
             "unavailable": int(stats["unavailable"]),
             "margin": _hold_probe_summary(stats["margins"], eps, good_threshold),
             "mean_best_hold_score": _safe_recent_mean(
@@ -2084,6 +2138,26 @@ def prepare_model_state_for_load(
                     f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
                 )
                 continue
+        if key == "policy_head.weight":
+            adapted = adapt_hold_step_policy_head_weight(target_tensor, value_tensor)
+            if adapted is not None:
+                prepared[key] = adapted
+                print(
+                    "[ppo] "
+                    f"adapted hold-step {key} from {source_label} "
+                    f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
+                )
+                continue
+        if key == "policy_head.bias":
+            adapted = adapt_hold_step_policy_head_bias(target_tensor, value_tensor)
+            if adapted is not None:
+                prepared[key] = adapted
+                print(
+                    "[ppo] "
+                    f"adapted hold-step {key} from {source_label} "
+                    f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
+                )
+                continue
         print(
             "[ppo] warning: skipped incompatible tensor from "
             f"{source_label} for key={key} "
@@ -2106,6 +2180,72 @@ def remap_adapter_state_for_queue_transfer(
         f"board_adapter.{key}": value
         for key, value in adapter_state.items()
     }
+
+
+def adapt_hold_step_policy_head_weight(
+    target_weight: torch.Tensor,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor | None:
+    if target_weight.ndim != 2 or loaded_weight.ndim != 2:
+        return None
+    loaded_out, loaded_in = loaded_weight.shape
+    target_out, target_in = target_weight.shape
+    if loaded_in != target_in or loaded_out <= 0 or loaded_out % 2 != 0:
+        return None
+    loaded_no_hold = loaded_out // 2
+    if target_out != loaded_no_hold + 1:
+        return None
+    adapted = target_weight.detach().clone()
+    adapted.zero_()
+    adapted[:loaded_no_hold, :] = loaded_weight[:loaded_no_hold, :].to(
+        device=adapted.device,
+        dtype=adapted.dtype,
+    )
+    return adapted
+
+
+def adapt_hold_step_policy_head_bias(
+    target_bias: torch.Tensor,
+    loaded_bias: torch.Tensor,
+) -> torch.Tensor | None:
+    if target_bias.ndim != 1 or loaded_bias.ndim != 1:
+        return None
+    loaded_out = int(loaded_bias.shape[0])
+    target_out = int(target_bias.shape[0])
+    if loaded_out <= 0 or loaded_out % 2 != 0:
+        return None
+    loaded_no_hold = loaded_out // 2
+    if target_out != loaded_no_hold + 1:
+        return None
+    adapted = target_bias.detach().clone()
+    adapted.zero_()
+    adapted[:loaded_no_hold] = loaded_bias[:loaded_no_hold].to(
+        device=adapted.device,
+        dtype=adapted.dtype,
+    )
+    adapted[-1] = -0.5
+    return adapted
+
+
+def adapt_artifact_policy_head_for_hold_step_transfer(
+    wp: np.ndarray,
+    bp: np.ndarray,
+    target_action_dim: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if wp.ndim != 2 or bp.ndim != 1:
+        return None
+    loaded_action_dim = int(wp.shape[1])
+    if loaded_action_dim <= 0 or loaded_action_dim % 2 != 0:
+        return None
+    loaded_no_hold = loaded_action_dim // 2
+    if int(target_action_dim) != loaded_no_hold + 1:
+        return None
+    adapted_wp = np.zeros((wp.shape[0], int(target_action_dim)), dtype=np.float32)
+    adapted_bp = np.zeros((int(target_action_dim),), dtype=np.float32)
+    adapted_wp[:, :loaded_no_hold] = wp[:, :loaded_no_hold]
+    adapted_bp[:loaded_no_hold] = bp[:loaded_no_hold]
+    adapted_bp[-1] = -0.5
+    return adapted_wp, adapted_bp
 
 
 def export_bot_policy_artifact(
@@ -2140,7 +2280,11 @@ def export_bot_policy_artifact(
     artifact = {
         "id": f"bot_policy_baseline_{now_ms}",
         "modeId": cfg.mode_id,
-        "archId": "full",
+        "archId": (
+            "hold_step"
+            if cfg.action_space_kind == "placement_hold_step_v2"
+            else "full"
+        ),
         "queuePolicyId": cfg.queue_policy_id,
         "pipelineId": pipeline_id,
         "pieceSourceProfile": cfg.generator_schedule[0],
@@ -2151,7 +2295,7 @@ def export_bot_policy_artifact(
         "inputDim": int(obs_dim),
         "hiddenDim": int(cfg.hidden_dim),
         "actionDim": int(action_dim),
-        "actionSpaceKind": "placement_full_v1",
+        "actionSpaceKind": str(cfg.action_space_kind),
         "placementActionDim": int(action_dim),
         "weights": {
             "w1": w1.T.reshape(-1).tolist(),  # [I, H]
@@ -2191,13 +2335,19 @@ def load_from_artifact(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
     artifact_path: Path,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str]:
     raw = json.loads(artifact_path.read_text(encoding="utf-8"))
     observation_space_raw = raw.get("observationSpace")
     observation_space = (
         "raw_v1" if observation_space_raw == "raw_v1" else "model_head_v1"
     )
     phase_context_enabled = bool(raw.get("phaseContextEnabled", True))
+    action_space_kind_raw = raw.get("actionSpaceKind")
+    action_space_kind = (
+        "placement_hold_step_v2"
+        if action_space_kind_raw == "placement_hold_step_v2"
+        else "placement_full_v1"
+    )
     weights = raw.get("weights", {})
     input_dim = int(raw.get("inputDim", 0))
     hidden_dim = int(raw.get("hiddenDim", 0))
@@ -2216,9 +2366,23 @@ def load_from_artifact(
         raise ValueError(
             f"Artifact hiddenDim mismatch. artifact={hidden_dim} model={model.policy_fc1.out_features}"
         )
-    if model.policy_head.out_features != action_dim:
+    target_action_dim = int(model.policy_head.out_features)
+    if target_action_dim != action_dim:
+        if not (
+            action_space_kind == "placement_full_v1"
+            and adapt_artifact_policy_head_for_hold_step_transfer(
+                np.zeros((hidden_dim, action_dim), dtype=np.float32),
+                np.zeros((action_dim,), dtype=np.float32),
+                target_action_dim,
+            )
+            is not None
+        ):
+            raise ValueError(
+                f"Artifact actionDim mismatch. artifact={action_dim} model={target_action_dim}"
+            )
+    if model.value_head.out_features != 1:
         raise ValueError(
-            f"Artifact actionDim mismatch. artifact={action_dim} model={model.policy_head.out_features}"
+            "Invalid model value head shape."
         )
 
     w1 = np.asarray(weights.get("w1", []), dtype=np.float32).reshape(input_dim, hidden_dim)
@@ -2235,6 +2399,22 @@ def load_from_artifact(
         b2 = np.zeros((hidden_dim,), dtype=np.float32)
     wp = np.asarray(weights.get("wp", []), dtype=np.float32).reshape(hidden_dim, action_dim)
     bp = np.asarray(weights.get("bp", []), dtype=np.float32).reshape(action_dim)
+    if target_action_dim != action_dim:
+        adapted_policy_head = adapt_artifact_policy_head_for_hold_step_transfer(
+            wp,
+            bp,
+            target_action_dim,
+        )
+        if adapted_policy_head is None:
+            raise ValueError(
+                f"Artifact actionDim mismatch. artifact={action_dim} model={target_action_dim}"
+            )
+        wp, bp = adapted_policy_head
+        print(
+            "[ppo] adapted hold-step policy head from artifact "
+            f"{artifact_path.name} (artifact_action_dim={action_dim}, target_action_dim={target_action_dim})"
+        )
+        action_dim = target_action_dim
 
     wv1_payload = weights.get("wv1")
     bv1_payload = weights.get("bv1")
@@ -2312,7 +2492,7 @@ def load_from_artifact(
         with torch.no_grad():
             obs_adapter.queue_fc1.weight.copy_(torch.from_numpy(queue_w.T))
             obs_adapter.queue_fc1.bias.copy_(torch.from_numpy(queue_b))
-    return observation_space, phase_context_enabled
+    return observation_space, phase_context_enabled, action_space_kind
 
 
 def save_checkpoint(
@@ -2349,9 +2529,18 @@ def load_checkpoint(
     map_device: torch.device,
     load_optimizer_state: bool = True,
     expected_phase_context_enabled: bool | None = None,
+    expected_action_space_kind: str | None = None,
 ) -> tuple[int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=map_device, weights_only=False)
     model_state = checkpoint["model_state_dict"]
+    checkpoint_config = checkpoint.get("config")
+    checkpoint_policy_head_shape_mismatch = False
+    if isinstance(model_state, dict):
+        loaded_policy_head_weight = model_state.get("policy_head.weight")
+        if torch.is_tensor(loaded_policy_head_weight):
+            checkpoint_policy_head_shape_mismatch = tuple(
+                loaded_policy_head_weight.shape
+            ) != tuple(model.policy_head.weight.shape)
     if isinstance(model_state, dict):
         # Backward compatibility for checkpoints from shared-torso models.
         if "policy_fc1.weight" not in model_state and "fc1.weight" in model_state:
@@ -2405,15 +2594,37 @@ def load_checkpoint(
         )
         obs_adapter.load_state_dict(prepared_adapter_state, strict=False)
     optimizer_state = checkpoint.get("optimizer_state_dict")
+    allow_optimizer_state = load_optimizer_state
+    if allow_optimizer_state and checkpoint_policy_head_shape_mismatch:
+        allow_optimizer_state = False
+        print(
+            "[ppo] warning: optimizer state was not loaded from checkpoint "
+            "(policy head shape mismatch requires fresh optimizer state)."
+        )
+    if (
+        allow_optimizer_state
+        and expected_action_space_kind is not None
+        and isinstance(checkpoint_config, dict)
+        and "action_space_kind" in checkpoint_config
+    ):
+        checkpoint_action_space_kind = str(
+            checkpoint_config.get("action_space_kind")
+        ).strip()
+        if checkpoint_action_space_kind != str(expected_action_space_kind).strip():
+            allow_optimizer_state = False
+            print(
+                "[ppo] warning: optimizer state was not loaded from checkpoint "
+                "(action-space mismatch requires fresh optimizer state)."
+            )
     if load_optimizer_state and isinstance(optimizer_state, dict):
         try:
-            optimizer.load_state_dict(optimizer_state)
+            if allow_optimizer_state:
+                optimizer.load_state_dict(optimizer_state)
         except ValueError as error:
             print(
                 "[ppo] warning: optimizer state was not loaded from checkpoint "
                 f"(param-group mismatch). Using fresh optimizer state. detail={error}"
             )
-    checkpoint_config = checkpoint.get("config")
     if (
         expected_phase_context_enabled is not None
         and isinstance(checkpoint_config, dict)
@@ -2427,6 +2638,20 @@ def load_checkpoint(
                 "[ppo] warning: checkpoint phase-context mismatch "
                 f"(checkpoint={'on' if checkpoint_phase_context_enabled else 'off'}, "
                 f"run={'on' if expected_phase_context_enabled else 'off'})."
+            )
+    if (
+        expected_action_space_kind is not None
+        and isinstance(checkpoint_config, dict)
+        and "action_space_kind" in checkpoint_config
+    ):
+        checkpoint_action_space_kind = str(
+            checkpoint_config.get("action_space_kind")
+        ).strip()
+        if checkpoint_action_space_kind != str(expected_action_space_kind).strip():
+            print(
+                "[ppo] warning: checkpoint action-space mismatch "
+                f"(checkpoint={checkpoint_action_space_kind}, "
+                f"run={expected_action_space_kind})."
             )
     global_step = int(checkpoint.get("global_step", 0))
     update = int(checkpoint.get("update", 0))
@@ -2578,6 +2803,7 @@ def run_validation_eval(
                 observation_space=cfg.observation_space,
                 phase_context_enabled=cfg.phase_context_enabled,
                 placement_execution_mode=cfg.placement_execution_mode,
+                action_space_kind=cfg.action_space_kind,
                 piece_source_profile=piece_source_profile,
                 queue_policy_id=cfg.queue_policy_id,
                 max_pieces_per_episode=cfg.max_pieces_per_episode_val,
@@ -2670,6 +2896,17 @@ def run_validation_eval(
                         actions_t.detach().cpu().numpy().astype(np.int64).tolist()
                     )
                     if cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0:
+                        if not is_hold_probe_supported(cfg.action_space_kind):
+                            accumulate_hold_action_counts(
+                                hold_probe_accumulator,
+                                env_piece_sources=[piece_source_profile] * env_count,
+                                actions=actions_np,
+                                action_dim=int(mask_np.shape[1]),
+                                action_space_kind=cfg.action_space_kind,
+                            )
+                    if is_hold_probe_supported(cfg.action_space_kind) and (
+                        cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0
+                    ):
                         per_env_hold_probe, _hold_probe_summary_unused = (
                             evaluate_hold_margin_for_actions(
                                 env=val_env,
@@ -2681,6 +2918,7 @@ def run_validation_eval(
                                 device=device,
                                 gamma=cfg.gamma,
                                 action_dim=int(mask_np.shape[1]),
+                                action_space_kind=cfg.action_space_kind,
                                 eps=cfg.hold_margin_eps,
                                 good_threshold=cfg.hold_margin_good_threshold,
                             )
@@ -2691,6 +2929,7 @@ def run_validation_eval(
                             env_piece_sources=[piece_source_profile] * env_count,
                             actions=actions_np,
                             action_dim=int(mask_np.shape[1]),
+                            action_space_kind=cfg.action_space_kind,
                             per_env=per_env_hold_probe,
                             penalty_base=0.0,
                             penalty_threshold=cfg.hold_margin_penalty_threshold,
@@ -2905,37 +3144,46 @@ def _format_hold_probe_log_lines(prefix: str, probe: Any) -> list[str]:
         return []
     margin = probe.get("margin")
     margin_dict = margin if isinstance(margin, dict) else {}
-    return [
+    lines = [
         (
             f"{prefix}: "
             f"hold={int(probe.get('hold_actions', 0))} "
             f"non_hold={int(probe.get('non_hold_actions', 0))} "
+            f"rate={_fmt_float(probe.get('hold_rate'))} "
             f"unavail={int(probe.get('unavailable', 0))} "
             f"penalty={_fmt_float(probe.get('mean_penalty'))}"
-        ),
-        (
-            "      margin: "
-            f"mean={_fmt_float(margin_dict.get('mean'))} "
-            f"med={_fmt_float(margin_dict.get('median'))} "
-            f"p25={_fmt_float(margin_dict.get('p25'))} "
-            f"p75={_fmt_float(margin_dict.get('p75'))} "
-            f"neg={_fmt_float(margin_dict.get('frac_negative'))} "
-            f"lt_eps={_fmt_float(margin_dict.get('frac_below_eps'))} "
-            f"gt_good={_fmt_float(margin_dict.get('frac_above_good'))}"
-        ),
-        (
-            "      scores: "
-            f"chosen={_fmt_float(probe.get('mean_chosen_hold_score'))} "
-            f"best_hold={_fmt_float(probe.get('mean_best_hold_score'))} "
-            f"best_no_hold={_fmt_float(probe.get('mean_best_no_hold_score'))} "
-            f"| imm(chosen={_fmt_float(probe.get('mean_chosen_hold_immediate'))},"
-            f"hold={_fmt_float(probe.get('mean_best_hold_immediate'))},"
-            f"no_hold={_fmt_float(probe.get('mean_best_no_hold_immediate'))}) "
-            f"| v(chosen={_fmt_float(probe.get('mean_chosen_hold_value'))},"
-            f"hold={_fmt_float(probe.get('mean_best_hold_value'))},"
-            f"no_hold={_fmt_float(probe.get('mean_best_no_hold_value'))})"
-        ),
+        )
     ]
+    margin_count = int(margin_dict.get("count", 0)) if isinstance(margin_dict, dict) else 0
+    if margin_count <= 0:
+        return lines
+    lines.extend(
+        [
+            (
+                "      margin: "
+                f"mean={_fmt_float(margin_dict.get('mean'))} "
+                f"med={_fmt_float(margin_dict.get('median'))} "
+                f"p25={_fmt_float(margin_dict.get('p25'))} "
+                f"p75={_fmt_float(margin_dict.get('p75'))} "
+                f"neg={_fmt_float(margin_dict.get('frac_negative'))} "
+                f"lt_eps={_fmt_float(margin_dict.get('frac_below_eps'))} "
+                f"gt_good={_fmt_float(margin_dict.get('frac_above_good'))}"
+            ),
+            (
+                "      scores: "
+                f"chosen={_fmt_float(probe.get('mean_chosen_hold_score'))} "
+                f"best_hold={_fmt_float(probe.get('mean_best_hold_score'))} "
+                f"best_no_hold={_fmt_float(probe.get('mean_best_no_hold_score'))} "
+                f"| imm(chosen={_fmt_float(probe.get('mean_chosen_hold_immediate'))},"
+                f"hold={_fmt_float(probe.get('mean_best_hold_immediate'))},"
+                f"no_hold={_fmt_float(probe.get('mean_best_no_hold_immediate'))}) "
+                f"| v(chosen={_fmt_float(probe.get('mean_chosen_hold_value'))},"
+                f"hold={_fmt_float(probe.get('mean_best_hold_value'))},"
+                f"no_hold={_fmt_float(probe.get('mean_best_no_hold_value'))})"
+            ),
+        ]
+    )
+    return lines
 
 
 BLEND_STEP_TERM_KEYS: tuple[str, ...] = (
@@ -3320,6 +3568,7 @@ def train(cfg: PPOConfig) -> None:
             observation_space=cfg.observation_space,
             phase_context_enabled=cfg.phase_context_enabled,
             placement_execution_mode=cfg.placement_execution_mode,
+            action_space_kind=cfg.action_space_kind,
             piece_source_profile=cfg.generator_schedule[0],
             queue_policy_id=cfg.queue_policy_id,
             max_pieces_per_episode=cfg.max_pieces_per_episode_train,
@@ -3407,6 +3656,7 @@ def train(cfg: PPOConfig) -> None:
                 device,
                 load_optimizer_state=(cfg.resume_mode == "continue"),
                 expected_phase_context_enabled=cfg.phase_context_enabled,
+                expected_action_space_kind=cfg.action_space_kind,
             )
             if cfg.resume_mode == "continue":
                 global_step = loaded_global_step
@@ -3439,7 +3689,11 @@ def train(cfg: PPOConfig) -> None:
                 )
         elif cfg.init_artifact:
             artifact_path = Path(cfg.init_artifact).resolve()
-            artifact_observation_space, artifact_phase_context_enabled = load_from_artifact(
+            (
+                artifact_observation_space,
+                artifact_phase_context_enabled,
+                artifact_action_space_kind,
+            ) = load_from_artifact(
                 model, obs_adapter, artifact_path
             )
             artifact_obs_compatible = artifact_observation_space == policy_observation_space or (
@@ -3457,6 +3711,11 @@ def train(cfg: PPOConfig) -> None:
                     "[ppo] init artifact phase-context mismatch: "
                     f"artifact={'on' if artifact_phase_context_enabled else 'off'} "
                     f"run={'on' if cfg.phase_context_enabled else 'off'}"
+                )
+            if artifact_action_space_kind != cfg.action_space_kind:
+                print(
+                    "[ppo] init artifact action-space mismatch: "
+                    f"artifact={artifact_action_space_kind} run={cfg.action_space_kind}"
                 )
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
 
@@ -3660,6 +3919,7 @@ def train(cfg: PPOConfig) -> None:
             f"(device={device.type}, env_obs_space={cfg.observation_space}, "
             f"phase_context={'on' if cfg.phase_context_enabled else 'off'}, "
             f"placement_exec={cfg.placement_execution_mode}, "
+            f"action_space={cfg.action_space_kind}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
             f"queue_hidden_dim={cfg.queue_encoder_hidden_dim}, "
@@ -3695,6 +3955,14 @@ def train(cfg: PPOConfig) -> None:
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
         )
+        if not is_hold_probe_supported(cfg.action_space_kind) and (
+            cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0
+        ):
+            print(
+                "[ppo] note: hold-margin probe/shaping is ignored for "
+                f"action_space={cfg.action_space_kind}. "
+                "The old flat-action hold probe does not apply to explicit HOLD steps."
+            )
         write_json(
             out_dir / "config.json",
             {
@@ -3706,6 +3974,7 @@ def train(cfg: PPOConfig) -> None:
                 "observation_adapter": obs_adapter.__class__.__name__,
                 "encoder_frozen_after_bc_applied": encoder_frozen_for_ppo,
                 "encoder_freeze_mode_applied": encoder_freeze_mode_applied,
+                "action_space_kind": cfg.action_space_kind,
                 "action_dim": action_dim,
                 "batch_size": batch_size,
                 "num_updates": num_updates,
@@ -3925,6 +4194,17 @@ def train(cfg: PPOConfig) -> None:
                     actions_np = actions_t.detach().cpu().numpy().astype(np.int64).tolist()
                     hold_penalties_by_env_id: dict[int, float] = {}
                     if cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0:
+                        if not is_hold_probe_supported(cfg.action_space_kind):
+                            accumulate_hold_action_counts(
+                                hold_probe_update_accumulator,
+                                env_piece_sources=env_piece_sources,
+                                actions=actions_np,
+                                action_dim=action_dim,
+                                action_space_kind=cfg.action_space_kind,
+                            )
+                    if is_hold_probe_supported(cfg.action_space_kind) and (
+                        cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0
+                    ):
                         per_env_hold_probe, _hold_probe_summary_unused = (
                             evaluate_hold_margin_for_actions(
                                 env=env,
@@ -3936,6 +4216,7 @@ def train(cfg: PPOConfig) -> None:
                                 device=device,
                                 gamma=cfg.gamma,
                                 action_dim=action_dim,
+                                action_space_kind=cfg.action_space_kind,
                                 eps=cfg.hold_margin_eps,
                                 good_threshold=cfg.hold_margin_good_threshold,
                             )
@@ -3946,6 +4227,7 @@ def train(cfg: PPOConfig) -> None:
                             env_piece_sources=env_piece_sources,
                             actions=actions_np,
                             action_dim=action_dim,
+                            action_space_kind=cfg.action_space_kind,
                             per_env=per_env_hold_probe,
                             penalty_base=cfg.hold_margin_penalty_base,
                             penalty_threshold=cfg.hold_margin_penalty_threshold,

@@ -14,6 +14,10 @@ import { SPAWN_X, SPAWN_Y } from '../../../src/core/constants.ts';
 import { collides, dropDistance } from '../../../src/core/piece.ts';
 import {
   PLACEMENT_ACTION_DIM,
+  PLACEMENT_ACTION_HOLD_STEP_DIM,
+  PLACEMENT_ACTION_HOLD_STEP_INDEX,
+  placementActionIndexFromFields,
+  placementActionIndexFromNoHoldPlacement,
   placementActionIndexFromPlacement,
 } from '../../../src/core/placementActionSpace.ts';
 import { XorShift32 } from '../../../src/core/rng.ts';
@@ -43,6 +47,7 @@ import {
   type LoadedModel,
 } from '../../../src/core/wubModel.ts';
 import type {
+  BotActionSpaceKind,
   InitPayload,
   JsonObject,
   PlacementExecutionMode,
@@ -53,7 +58,6 @@ import type {
 } from './protocol.ts';
 
 const FIXED_STEP_MS = 1000 / 120;
-const DEFAULT_ACTION_DIM = PLACEMENT_ACTION_DIM;
 const DEFAULT_MAX_PIECES = 512;
 const STEP_MAX_TICKS = 120;
 const OFFLINE_GRAVITY_MS = Number.POSITIVE_INFINITY;
@@ -113,10 +117,20 @@ const normalizePlacementExecutionMode = (
   value: unknown,
 ): PlacementExecutionMode => (value === 'commands' ? 'commands' : 'teleport');
 
+const normalizeActionSpaceKind = (value: unknown): BotActionSpaceKind =>
+  value === 'placement_hold_step_v2'
+    ? 'placement_hold_step_v2'
+    : 'placement_full_v1';
+
+const actionDimForActionSpaceKind = (kind: BotActionSpaceKind): number =>
+  kind === 'placement_hold_step_v2'
+    ? PLACEMENT_ACTION_HOLD_STEP_DIM
+    : PLACEMENT_ACTION_DIM;
+
 const normalizeActionCurriculum = (
   payload: SetCurriculumPayload | null | undefined,
 ): ActionCurriculumConfig => {
-  const topK = clampInt(payload?.topK, 0, 0, DEFAULT_ACTION_DIM);
+  const topK = clampInt(payload?.topK, 0, 0, PLACEMENT_ACTION_DIM);
   const biasStrengthRaw =
     typeof payload?.biasStrength === 'number' &&
     Number.isFinite(payload.biasStrength)
@@ -576,6 +590,65 @@ const computeLineClearScoreDelta = (
   }
 };
 
+const zeroRewardBreakdown = (): PieceRewardResult['breakdown'] => ({
+  linesTerm: 0,
+  scoreTerm: 0,
+  timeTerm: 0,
+  heightTerm: 0,
+  holeDeltaTerm: 0,
+  bumpinessDeltaTerm: 0,
+  boardScoreTerm: 0,
+  boardQualityDeltaTerm: 0,
+  boardQualityAbsoluteTerm: 0,
+  fullClearTerm: 0,
+  topOutTerm: 0,
+});
+
+const computeHoldStepRewardV1 = (
+  modeId: string,
+  timeDeltaMs: number,
+): PieceRewardResult => {
+  let timeTerm = 0;
+  if (modeId === 'sprint') {
+    timeTerm = -(timeDeltaMs / 4000);
+  } else if (modeId === 'charcuterie') {
+    timeTerm = -(timeDeltaMs / 25000);
+  } else if (modeId === 'practice') {
+    timeTerm = -(timeDeltaMs * PRACTICE_TIME_DELTA_REWARD_WEIGHT);
+  }
+  return {
+    reward: timeTerm,
+    breakdown: {
+      ...zeroRewardBreakdown(),
+      timeTerm,
+    },
+  };
+};
+
+const computeHoldStepRewardV2 = (): PieceRewardResult => {
+  const timeTerm =
+    -PLACEMENT_HOLD_COMPLEXITY_PENALTY * REWARD_V2_COMPLEXITY_WEIGHT;
+  return {
+    reward: timeTerm,
+    breakdown: {
+      ...zeroRewardBreakdown(),
+      timeTerm,
+    },
+  };
+};
+
+const computeHoldStepRewardV3 = (): PieceRewardResult => {
+  const timeTerm =
+    -PLACEMENT_HOLD_COMPLEXITY_PENALTY * REWARD_V3_COMPLEXITY_WEIGHT;
+  return {
+    reward: timeTerm,
+    breakdown: {
+      ...zeroRewardBreakdown(),
+      timeTerm,
+    },
+  };
+};
+
 const computePieceRewardV2 = (
   options: PieceRewardInputs & {
     placementComplexityPenalty: number;
@@ -974,6 +1047,7 @@ const encodeObservation = (
 const buildPlacementChoices = (
   state: GameState,
   actionDim: number,
+  actionSpaceKind: BotActionSpaceKind,
   curriculum: ActionCurriculumConfig,
   random: (() => number) | null = null,
 ): {
@@ -1006,9 +1080,25 @@ const buildPlacementChoices = (
   );
   const actionScores = new Array<number>(actionDim).fill(0);
   const beforeMetrics = evaluateBoardQuality(state.board);
+  let bestHoldActionScore = Number.NEGATIVE_INFINITY;
   for (const placement of placements) {
-    const actionIndex = placementActionIndexFromPlacement(placement);
+    const actionIndex =
+      actionSpaceKind === 'placement_hold_step_v2'
+        ? placement.holdUsed
+          ? null
+          : placementActionIndexFromNoHoldPlacement(placement)
+        : placementActionIndexFromPlacement(placement);
     if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
+      if (actionSpaceKind === 'placement_hold_step_v2' && placement.holdUsed) {
+        const score = scorePlacementCandidate({
+          beforeMetrics,
+          placement,
+          board: state.board,
+        });
+        if (score > bestHoldActionScore) {
+          bestHoldActionScore = score;
+        }
+      }
       continue;
     }
     const score = scorePlacementCandidate({
@@ -1034,13 +1124,40 @@ const buildPlacementChoices = (
       trajectoryExecutorCommandToInputFrame(command),
     );
   }
+  if (
+    actionSpaceKind === 'placement_hold_step_v2' &&
+    state.canHold &&
+    actionDim > PLACEMENT_ACTION_HOLD_STEP_INDEX &&
+    Number.isFinite(bestHoldActionScore)
+  ) {
+    actionMask[PLACEMENT_ACTION_HOLD_STEP_INDEX] = 1;
+    scoresBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = bestHoldActionScore;
+    actionScores[PLACEMENT_ACTION_HOLD_STEP_INDEX] = bestHoldActionScore;
+    placementsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = null;
+    commandsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = [
+      trajectoryExecutorCommandToInputFrame('hold'),
+    ];
+  }
   if (actionMask.every((value) => value <= 0)) {
     const fallbackLockY =
       state.active.y + dropDistance(state.board, state.active);
-    actionMask[0] = 1;
-    scoresBySlot[0] = 0;
-    actionScores[0] = 0;
-    placementsBySlot[0] = {
+    const fallbackIndex =
+      actionSpaceKind === 'placement_hold_step_v2'
+        ? (placementActionIndexFromFields({
+            holdUsed: false,
+            lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
+            lockX: Math.trunc(state.active.x),
+            lockY: Math.trunc(fallbackLockY),
+          }) ?? 0)
+        : 0;
+    const clampedFallbackIndex = Math.max(
+      0,
+      Math.min(actionDim - 1, fallbackIndex),
+    );
+    actionMask[clampedFallbackIndex] = 1;
+    scoresBySlot[clampedFallbackIndex] = 0;
+    actionScores[clampedFallbackIndex] = 0;
+    placementsBySlot[clampedFallbackIndex] = {
       lockPiece: state.active.k,
       lockRotation: Math.max(0, Math.min(3, Math.trunc(state.active.r))),
       lockX: Math.trunc(state.active.x),
@@ -1050,7 +1167,9 @@ const buildPlacementChoices = (
       commands: ['hard_drop'],
       searchDepth: 0,
     };
-    commandsBySlot[0] = [trajectoryExecutorCommandToInputFrame('hard_drop')];
+    commandsBySlot[clampedFallbackIndex] = [
+      trajectoryExecutorCommandToInputFrame('hard_drop'),
+    ];
   }
 
   const legalIndices: number[] = [];
@@ -1199,6 +1318,7 @@ class BotEnv {
   private done = false;
   private piecesPlaced = 0;
   private lockCount = 0;
+  private pendingHoldUsedForCurrentPiece = false;
   private episodeStartWallMs = 0;
   private episodeSampleSerial = 0;
   private episodeSessionSerial = 0;
@@ -1222,6 +1342,7 @@ class BotEnv {
     private readonly model: LoadedModel,
     private readonly observationSpace: BotObservationSpace,
     private readonly includePhaseContext: boolean,
+    private readonly actionSpaceKind: BotActionSpaceKind,
     pieceSource: PieceSourceProfile,
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
@@ -1235,7 +1356,8 @@ class BotEnv {
     this.runner = built.runner;
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
-      DEFAULT_ACTION_DIM,
+      this.actionDim,
+      this.actionSpaceKind,
       this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
@@ -1258,12 +1380,14 @@ class BotEnv {
     this.done = false;
     this.piecesPlaced = 0;
     this.lockCount = 0;
+    this.pendingHoldUsedForCurrentPiece = false;
     this.planningRng = new XorShift32(seed ^ 0x71e9135b);
     this.startEpisodeCapture();
     const choicesStart = performance.now();
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
-      DEFAULT_ACTION_DIM,
+      this.actionDim,
+      this.actionSpaceKind,
       this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
@@ -1306,10 +1430,15 @@ class BotEnv {
     };
     this.cachedChoices = buildPlacementChoices(
       this.game.state,
-      DEFAULT_ACTION_DIM,
+      this.actionDim,
+      this.actionSpaceKind,
       this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
+  }
+
+  private get actionDim(): number {
+    return actionDimForActionSpaceKind(this.actionSpaceKind);
   }
 
   evaluateHoldCandidates(
@@ -1320,15 +1449,13 @@ class BotEnv {
     if (this.done) {
       return [];
     }
-    const choices =
-      this.cachedChoices ??
-      buildPlacementChoices(
-        this.game.state,
-        DEFAULT_ACTION_DIM,
-        this.actionCurriculum,
-        () => nextFloat(this.planningRng),
-      );
-    this.cachedChoices = choices;
+    const choices = buildPlacementChoices(
+      this.game.state,
+      PLACEMENT_ACTION_DIM,
+      'placement_full_v1',
+      this.actionCurriculum,
+      () => nextFloat(this.planningRng),
+    );
     const blendWeights = normalizeRewardBlendWeights(rewardBlend);
     const before = this.snapshotMetrics();
     const candidates: HoldCandidateEvaluation[] = [];
@@ -1461,7 +1588,8 @@ class BotEnv {
         this.cachedChoices ??
         buildPlacementChoices(
           this.game.state,
-          DEFAULT_ACTION_DIM,
+          this.actionDim,
+          this.actionSpaceKind,
           this.actionCurriculum,
           () => nextFloat(this.planningRng),
         );
@@ -1505,14 +1633,15 @@ class BotEnv {
       this.cachedChoices ??
       buildPlacementChoices(
         this.game.state,
-        DEFAULT_ACTION_DIM,
+        this.actionDim,
+        this.actionSpaceKind,
         this.actionCurriculum,
         () => nextFloat(this.planningRng),
       );
     this.cachedChoices = choices;
     const choicesCurrentElapsedS =
       (performance.now() - choicesCurrentStart) / 1000;
-    const actionIndex = clampInt(actionIndexRaw, 0, 0, DEFAULT_ACTION_DIM - 1);
+    const actionIndex = clampInt(actionIndexRaw, 0, 0, this.actionDim - 1);
     const hasAction = choices.actionMask[actionIndex] > 0;
     const resolvedActionIndex = hasAction
       ? actionIndex
@@ -1521,6 +1650,10 @@ class BotEnv {
           choices.actionMask.findIndex((x) => x > 0),
         );
     const selectedPlacement = choices.placementsBySlot[resolvedActionIndex];
+    const isHoldStepAction =
+      this.actionSpaceKind === 'placement_hold_step_v2' &&
+      resolvedActionIndex === PLACEMENT_ACTION_HOLD_STEP_INDEX &&
+      choices.actionMask[resolvedActionIndex] > 0;
     const commands = choices.commandsBySlot[resolvedActionIndex] ?? [
       trajectoryExecutorCommandToInputFrame('hard_drop'),
     ];
@@ -1540,13 +1673,25 @@ class BotEnv {
         ticks += teleport.ticks;
         executionPath = 'teleport';
       } else {
-        ticks += this.executePlacementByCommands(commands, beforeLockCount);
+        ticks += this.executePlacementByCommands(
+          commands,
+          beforeLockCount,
+          isHoldStepAction,
+        );
       }
     } else {
-      ticks += this.executePlacementByCommands(commands, beforeLockCount);
+      ticks += this.executePlacementByCommands(
+        commands,
+        beforeLockCount,
+        isHoldStepAction,
+      );
     }
 
-    if (this.lockCount === beforeLockCount && !this.isTerminal()) {
+    if (
+      !isHoldStepAction &&
+      this.lockCount === beforeLockCount &&
+      !this.isTerminal()
+    ) {
       // Emergency fallback to prevent deadlocks on invalid plans.
       this.runner.step(
         new OneFrameInputSource({
@@ -1560,6 +1705,8 @@ class BotEnv {
 
     if (this.lockCount > beforeLockCount) {
       this.piecesPlaced += 1;
+    } else if (isHoldStepAction) {
+      this.pendingHoldUsedForCurrentPiece = true;
     }
 
     const rewardStart = performance.now();
@@ -1572,49 +1719,66 @@ class BotEnv {
     const bumpinessDelta = after.bumpiness - before.bumpiness;
     const boardQualityDelta = before.boardQuality - after.boardQuality;
     const isFullClear = after.blocks === 0 && before.blocks > 0;
+    const rewardPlacement =
+      isHoldStepAction && selectedPlacement == null
+        ? ({
+            commands: ['hold'],
+            holdUsed: true,
+            srsKickCount: 0,
+          } satisfies Pick<
+            TrajectoryExecutorReachablePlacement,
+            'commands' | 'holdUsed' | 'srsKickCount'
+          >)
+        : selectedPlacement;
     const placementComplexityPenalty =
-      computePlacementComplexityPenalty(selectedPlacement);
-    const rewardV1 = computePieceRewardV1({
-      modeId: this.modeId,
-      linesDelta,
-      scoreDelta,
-      timeDeltaMs,
-      heightDelta,
-      holesDelta,
-      bumpinessDelta,
-      boardScoreDelta: before.boardScore - after.boardScore,
-      boardQualityDelta,
-      topOut: this.game.state.gameOver,
-    });
-    const rewardV2 = computePieceRewardV2({
-      modeId: this.modeId,
-      linesDelta,
-      scoreDelta,
-      timeDeltaMs,
-      heightDelta,
-      holesDelta,
-      bumpinessDelta,
-      boardScoreDelta: before.boardScore - after.boardScore,
-      boardQualityDelta,
-      topOut: this.game.state.gameOver,
-      placementComplexityPenalty,
-    });
-    const rewardV3 = computePieceRewardV3({
-      modeId: this.modeId,
-      linesDelta,
-      scoreDelta,
-      timeDeltaMs,
-      heightDelta,
-      holesDelta,
-      bumpinessDelta,
-      boardScoreDelta: before.boardScore - after.boardScore,
-      boardQualityDelta,
-      topOut: this.game.state.gameOver,
-      placementComplexityPenalty,
-      afterMaxHeight: after.height,
-      afterBoardQuality: after.boardQuality,
-      isFullClear,
-    });
+      computePlacementComplexityPenalty(rewardPlacement);
+    const rewardV1 = isHoldStepAction
+      ? computeHoldStepRewardV1(this.modeId, timeDeltaMs)
+      : computePieceRewardV1({
+          modeId: this.modeId,
+          linesDelta,
+          scoreDelta,
+          timeDeltaMs,
+          heightDelta,
+          holesDelta,
+          bumpinessDelta,
+          boardScoreDelta: before.boardScore - after.boardScore,
+          boardQualityDelta,
+          topOut: this.game.state.gameOver,
+        });
+    const rewardV2 = isHoldStepAction
+      ? computeHoldStepRewardV2()
+      : computePieceRewardV2({
+          modeId: this.modeId,
+          linesDelta,
+          scoreDelta,
+          timeDeltaMs,
+          heightDelta,
+          holesDelta,
+          bumpinessDelta,
+          boardScoreDelta: before.boardScore - after.boardScore,
+          boardQualityDelta,
+          topOut: this.game.state.gameOver,
+          placementComplexityPenalty,
+        });
+    const rewardV3 = isHoldStepAction
+      ? computeHoldStepRewardV3()
+      : computePieceRewardV3({
+          modeId: this.modeId,
+          linesDelta,
+          scoreDelta,
+          timeDeltaMs,
+          heightDelta,
+          holesDelta,
+          bumpinessDelta,
+          boardScoreDelta: before.boardScore - after.boardScore,
+          boardQualityDelta,
+          topOut: this.game.state.gameOver,
+          placementComplexityPenalty,
+          afterMaxHeight: after.height,
+          afterBoardQuality: after.boardQuality,
+          isFullClear,
+        });
     const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
       v1: rewardV1,
       v2: rewardV2,
@@ -1682,7 +1846,11 @@ class BotEnv {
         reward: finalReward,
         after,
         selectedPlacement,
+        holdUsedOnTurn:
+          this.pendingHoldUsedForCurrentPiece ||
+          Boolean(selectedPlacement?.holdUsed),
       });
+      this.pendingHoldUsedForCurrentPiece = false;
     }
 
     this.syncPrevMetrics();
@@ -1705,7 +1873,8 @@ class BotEnv {
     const choicesNextStart = performance.now();
     const nextChoices = buildPlacementChoices(
       this.game.state,
-      DEFAULT_ACTION_DIM,
+      this.actionDim,
+      this.actionSpaceKind,
       this.actionCurriculum,
       () => nextFloat(this.planningRng),
     );
@@ -1722,7 +1891,9 @@ class BotEnv {
       info: {
         modeId: this.modeId,
         piecesPlaced: this.piecesPlaced,
+        actionSpaceKind: this.actionSpaceKind,
         lockObserved: this.lockCount > beforeLockCount,
+        holdStepObserved: isHoldStepAction,
         placementExecutionMode: this.placementExecutionMode,
         executionPath,
         ticks,
@@ -1830,7 +2001,7 @@ class BotEnv {
           rewardResult.breakdown.boardQualityAbsoluteTerm,
         rewardTermFullClear: rewardResult.breakdown.fullClearTerm,
         rewardTermTopOut: rewardResult.breakdown.topOutTerm,
-        placementHoldUsed: selectedPlacement?.holdUsed ? 1 : 0,
+        placementHoldUsed: isHoldStepAction || selectedPlacement?.holdUsed ? 1 : 0,
         placementSrsKickCount: Math.max(
           0,
           Math.trunc(selectedPlacement?.srsKickCount ?? 0),
@@ -1853,12 +2024,14 @@ class BotEnv {
   private executePlacementByCommands(
     commands: InputFrame[],
     beforeLockCount: number,
+    stopAfterCommandDrain = false,
   ): number {
     let ticks = 0;
     const stepFrames = [...commands];
     while (
       !this.isTerminal() &&
       this.lockCount === beforeLockCount &&
+      (!stopAfterCommandDrain || stepFrames.length > 0) &&
       ticks < STEP_MAX_TICKS
     ) {
       const frame =
@@ -2011,6 +2184,7 @@ class BotEnv {
       boardScore: number;
     };
     selectedPlacement: TrajectoryExecutorReachablePlacement | null;
+    holdUsedOnTurn: boolean;
   }): void {
     const placement = input.selectedPlacement;
     if (!placement) return;
@@ -2051,7 +2225,7 @@ class BotEnv {
         lockRotation: clampRotation(placement.lockRotation),
         lockX: Math.trunc(placement.lockX),
         lockY: Math.trunc(placement.lockY),
-        holdUsed: placement.holdUsed,
+        holdUsed: input.holdUsedOnTurn,
         gameTimeMs: Math.max(0, Math.trunc(input.after.timeMs)),
         totalLinesCleared: Math.max(0, Math.trunc(input.after.lines)),
         score: Math.max(0, Math.trunc(input.after.score)),
@@ -2169,6 +2343,9 @@ export class BotEnvPool {
     const placementExecutionMode = normalizePlacementExecutionMode(
       payload.placementExecutionMode,
     );
+    const actionSpaceKind = normalizeActionSpaceKind(
+      payload.actionSpaceKind,
+    );
     const pieceSourceProfile = normalizePieceSource(payload.pieceSourceProfile);
     const queuePolicyId =
       typeof payload.queuePolicyId === 'string' && payload.queuePolicyId.trim()
@@ -2226,6 +2403,7 @@ export class BotEnvPool {
           model,
           observationSpace,
           includePhaseContext,
+          actionSpaceKind,
           pieceSourceProfile,
           queuePolicyId,
           maxPiecesPerEpisode,
@@ -2330,9 +2508,8 @@ export class BotEnvPool {
     for (let i = 0; i < envIds.length; i += 1) {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
-      const action = clampInt(actions[i], 0, 0, DEFAULT_ACTION_DIM - 1);
       const out = env.step(
-        action,
+        Math.trunc(actions[i] ?? 0),
         batchBlendWeights,
         this.rewardFunctionFrom,
         this.rewardFunctionTo,

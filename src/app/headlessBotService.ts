@@ -32,6 +32,8 @@ import {
 } from '../core/botObservation';
 import {
   PLACEMENT_ACTION_DIM,
+  PLACEMENT_ACTION_HOLD_STEP_INDEX,
+  placementActionIndexFromNoHoldPlacement,
   placementActionIndexFromPlacement,
 } from '../core/placementActionSpace';
 import {
@@ -83,7 +85,15 @@ type QueueEncoderParams = {
 export type BotActionSpaceKind =
   | 'macro_v1'
   | 'placement_v1'
-  | 'placement_full_v1';
+  | 'placement_full_v1'
+  | 'placement_hold_step_v2';
+
+const isPlacementActionSpaceKind = (
+  value: BotActionSpaceKind,
+): value is 'placement_v1' | 'placement_full_v1' | 'placement_hold_step_v2' =>
+  value === 'placement_v1' ||
+  value === 'placement_full_v1' ||
+  value === 'placement_hold_step_v2';
 
 type TfTensor = {
   dataSync: () => Float32Array | Int32Array | Uint8Array;
@@ -719,6 +729,35 @@ const buildPlacementChoices = (
         trajectoryExecutorCommandToInputFrame(command),
       );
     }
+  } else if (actionSpaceKind === 'placement_hold_step_v2') {
+    for (const placement of placements) {
+      if (placement.holdUsed) continue;
+      const actionIndex = placementActionIndexFromNoHoldPlacement(placement);
+      if (
+        actionIndex == null ||
+        actionIndex < 0 ||
+        actionIndex >= actionDim ||
+        actionMask[actionIndex] > 0
+      ) {
+        continue;
+      }
+      actionMask[actionIndex] = 1;
+      placementsByActionIndex[actionIndex] = placement;
+      commandsBySlot[actionIndex] = placement.commands.map((command) =>
+        trajectoryExecutorCommandToInputFrame(command),
+      );
+    }
+    if (
+      state.canHold &&
+      actionDim > PLACEMENT_ACTION_HOLD_STEP_INDEX &&
+      placements.some((placement) => placement.holdUsed)
+    ) {
+      actionMask[PLACEMENT_ACTION_HOLD_STEP_INDEX] = 1;
+      commandsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = [
+        trajectoryExecutorCommandToInputFrame('hold'),
+      ];
+      placementsByActionIndex[PLACEMENT_ACTION_HOLD_STEP_INDEX] = null;
+    }
   } else {
     for (const placement of placements) {
       const actionIndex = placementActionIndexFromPlacement(placement);
@@ -1248,16 +1287,16 @@ const runRollout = (config: {
       state,
       config.policyParams,
     );
-    const placementChoices =
-      config.policyParams.actionSpaceKind === 'placement_v1' ||
-      config.policyParams.actionSpaceKind === 'placement_full_v1'
-        ? buildPlacementChoices(
-            state,
-            config.policyParams.actionDim,
-            config.policyParams.actionSpaceKind,
-            rng,
-          )
-        : null;
+    const placementChoices = isPlacementActionSpaceKind(
+      config.policyParams.actionSpaceKind,
+    )
+      ? buildPlacementChoices(
+          state,
+          config.policyParams.actionDim,
+          config.policyParams.actionSpaceKind,
+          rng,
+        )
+      : null;
     const actionMask = placementChoices?.actionMask ?? null;
     const forward = forwardPolicy(config.policyParams, observation, actionMask);
     let actionIndex = 0;
@@ -1973,11 +2012,9 @@ const toArtifact = (
     params.actionSpaceKind === 'macro_v1' && params.macroActions
       ? params.macroActions.map((action) => ({ ...action }))
       : undefined,
-  placementActionDim:
-    params.actionSpaceKind === 'placement_v1' ||
-    params.actionSpaceKind === 'placement_full_v1'
-      ? params.actionDim
-      : undefined,
+  placementActionDim: isPlacementActionSpaceKind(params.actionSpaceKind)
+    ? params.actionDim
+    : undefined,
   encoderModel: params.encoderModel
     ? serializeWubModel(params.encoderModel)
     : undefined,
@@ -2010,11 +2047,13 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   );
   const includePhaseContext = false;
   const actionSpaceKind: BotActionSpaceKind =
-    policy.actionSpaceKind === 'placement_full_v1'
-      ? 'placement_full_v1'
-      : policy.actionSpaceKind === 'placement_v1'
-        ? 'placement_v1'
-        : 'macro_v1';
+    policy.actionSpaceKind === 'placement_hold_step_v2'
+      ? 'placement_hold_step_v2'
+      : policy.actionSpaceKind === 'placement_full_v1'
+        ? 'placement_full_v1'
+        : policy.actionSpaceKind === 'placement_v1'
+          ? 'placement_v1'
+          : 'macro_v1';
   const macroActionsRaw = Array.isArray(policy.actions) ? policy.actions : [];
   let encoderModel: LoadedModel | null = null;
   if (policy.encoderModel != null) {
@@ -2226,11 +2265,13 @@ export const parseBotPolicyArtifactFromUnknown = (
         : null,
     ),
     actionSpaceKind:
-      value.actionSpaceKind === 'placement_full_v1'
-        ? 'placement_full_v1'
-        : value.actionSpaceKind === 'placement_v1'
-          ? 'placement_v1'
-          : 'macro_v1',
+      value.actionSpaceKind === 'placement_hold_step_v2'
+        ? 'placement_hold_step_v2'
+        : value.actionSpaceKind === 'placement_full_v1'
+          ? 'placement_full_v1'
+          : value.actionSpaceKind === 'placement_v1'
+            ? 'placement_v1'
+            : 'macro_v1',
     actions: Array.isArray(value.actions)
       ? (value.actions as BotMacroAction[])
       : undefined,
@@ -3039,16 +3080,16 @@ export const createGuiInspectBotInputSource = (
           state,
           params,
         );
-        const placementChoices =
-          params.actionSpaceKind === 'placement_v1' ||
-          params.actionSpaceKind === 'placement_full_v1'
-            ? buildPlacementChoices(
-                state,
-                params.actionDim,
-                params.actionSpaceKind,
-                rng,
-              )
-            : null;
+        const placementChoices = isPlacementActionSpaceKind(
+          params.actionSpaceKind,
+        )
+          ? buildPlacementChoices(
+              state,
+              params.actionDim,
+              params.actionSpaceKind,
+              rng,
+            )
+          : null;
         const actionMask = placementChoices?.actionMask ?? null;
         const forward = forwardPolicy(params, observation, actionMask);
         let actionIndex = 0;
@@ -3081,7 +3122,7 @@ export const createGuiInspectBotInputSource = (
             placementChoices.actionMask.findIndex((value) => value > 0),
           );
           const resolvedActionIndex =
-            placementChoices.placementsByActionIndex[actionIndex] != null
+            placementChoices.actionMask[actionIndex] > 0
               ? actionIndex
               : fallbackActionIndex;
           const targetPlacement =
@@ -3127,7 +3168,10 @@ export const createGuiInspectBotInputSource = (
           if (debugTrace) {
             const targetSummary = targetPlacement
               ? `target={piece:${targetPlacement.lockPiece},rot:${targetPlacement.lockRotation},x:${targetPlacement.lockX},y:${targetPlacement.lockY},holdUsed:${targetPlacement.holdUsed}}`
-              : 'target={none}';
+              : params.actionSpaceKind === 'placement_hold_step_v2' &&
+                  resolvedActionIndex === PLACEMENT_ACTION_HOLD_STEP_INDEX
+                ? 'target={hold_step}'
+                : 'target={none}';
             log(
               `plan #${planIndex} placement: active=${state.active.k}@${state.active.x},${state.active.y},r${state.active.r} hold=${state.hold ?? 'null'} ` +
                 `action=${resolvedActionIndex}` +

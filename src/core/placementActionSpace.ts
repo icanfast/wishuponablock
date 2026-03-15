@@ -17,6 +17,13 @@ export const PLACEMENT_ACTION_DIM =
   PLACEMENT_ACTION_ROTATIONS *
   PLACEMENT_ACTION_X_COUNT *
   PLACEMENT_ACTION_Y_COUNT;
+export const PLACEMENT_ACTION_NO_HOLD_DIM =
+  PLACEMENT_ACTION_ROTATIONS *
+  PLACEMENT_ACTION_X_COUNT *
+  PLACEMENT_ACTION_Y_COUNT;
+export const PLACEMENT_ACTION_HOLD_STEP_INDEX = PLACEMENT_ACTION_NO_HOLD_DIM;
+export const PLACEMENT_ACTION_HOLD_STEP_DIM =
+  PLACEMENT_ACTION_NO_HOLD_DIM + 1;
 
 const normalizeRotation = (value: number): number => {
   const normalized = Math.trunc(value) % PLACEMENT_ACTION_ROTATIONS;
@@ -59,3 +66,27 @@ export const placementActionIndexFromPlacement = (
     lockX: placement.lockX,
     lockY: placement.lockY,
   });
+
+export const placementActionIndexFromNoHoldFields = (
+  placement: Omit<PlacementActionLike, 'holdUsed'>,
+): number | null =>
+  placementActionIndexFromFields({
+    holdUsed: false,
+    lockRotation: placement.lockRotation,
+    lockX: placement.lockX,
+    lockY: placement.lockY,
+  });
+
+export const placementActionIndexFromNoHoldPlacement = (
+  placement: TrajectoryExecutorReachablePlacement,
+): number | null =>
+  placement.holdUsed
+    ? null
+    : placementActionIndexFromNoHoldFields({
+        lockRotation: placement.lockRotation,
+        lockX: placement.lockX,
+        lockY: placement.lockY,
+      });
+
+export const isPlacementHoldStepActionIndex = (actionIndex: number): boolean =>
+  Math.trunc(actionIndex) === PLACEMENT_ACTION_HOLD_STEP_INDEX;
