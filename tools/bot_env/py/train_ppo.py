@@ -5214,6 +5214,15 @@ def train(cfg: PPOConfig) -> None:
                 f"action_space={cfg.action_space_kind}. "
                 "Swap-utility teaching only applies to explicit HOLD action spaces."
             )
+        if (
+            str(cfg.action_space_kind).strip().lower() == "placement_hold_step_v2"
+            and cfg.distill_coef_start > 0.0
+        ):
+            print(
+                "[ppo] note: generic action distillation excludes the explicit HOLD action "
+                "for action_space=placement_hold_step_v2. HOLD is supervised only by the "
+                "hold-swap teacher."
+            )
         write_json(
             out_dir / "config.json",
             {
@@ -5885,14 +5894,26 @@ def train(cfg: PPOConfig) -> None:
                         student_logits = torch.where(
                             student_valid, logits, student_large_neg
                         )
+                        distill_mask = mb_mask
+                        distill_action_scores = mb_action_scores
+                        distill_student_logits = student_logits
+                        if (
+                            str(cfg.action_space_kind).strip().lower()
+                            == "placement_hold_step_v2"
+                            and action_dim > 1
+                        ):
+                            hold_idx = action_dim - 1
+                            distill_mask = mb_mask[:, :hold_idx]
+                            distill_action_scores = mb_action_scores[:, :hold_idx]
+                            distill_student_logits = student_logits[:, :hold_idx]
                         student_log_probs = torch.log_softmax(
-                            student_logits, dim=-1
+                            distill_student_logits, dim=-1
                         )
                         teacher_probs, teacher_prior_inactive_rows, teacher_topm_rows = (
                             build_teacher_probs(
-                                mb_mask,
-                                student_logits,
-                                mb_action_scores,
+                                distill_mask,
+                                distill_student_logits,
+                                distill_action_scores,
                                 cfg.distill_teacher_tau,
                                 cfg.distill_teacher_alpha,
                                 cfg.distill_teacher_top_m,
@@ -5984,7 +6005,7 @@ def train(cfg: PPOConfig) -> None:
                         distill_term_sum += distill_term_value
                         hold_swap_distill_term_sum += hold_swap_distill_term_value
                         total_loss_sum += total_loss_value
-                        valid_f = (mb_mask > 0).to(dtype=teacher_probs.dtype)
+                        valid_f = (distill_mask > 0).to(dtype=teacher_probs.dtype)
                         teacher_uniform_row_frac_value = float(
                             teacher_prior_inactive_rows.mean().detach().cpu().item()
                         )
