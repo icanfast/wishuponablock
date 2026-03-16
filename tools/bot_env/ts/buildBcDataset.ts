@@ -5,7 +5,9 @@ import {
   open as openFile,
   readFile,
   readdir,
+  rename,
   stat,
+  unlink,
 } from 'node:fs/promises';
 import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -106,6 +108,8 @@ type BcDataset = {
     };
   };
 };
+
+type BcDatasetHeader = Omit<BcDataset, 'records' | 'summary'>;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value != null && !Array.isArray(value);
@@ -475,15 +479,12 @@ const findPlacementIndex = (
   return index;
 };
 
-const pushIfRecord = (
-  records: BcRecord[],
-  record: BcRecord,
+const hasRecordCapacity = (
+  recordsWritten: number,
+  recordsToAdd: number,
   maxRecords: number | null,
-): boolean => {
-  if (maxRecords != null && records.length >= maxRecords) return false;
-  records.push(record);
-  return true;
-};
+): boolean =>
+  maxRecords == null || recordsWritten + recordsToAdd <= maxRecords;
 
 const toSessions = (raw: unknown): unknown[] => {
   if (Array.isArray(raw)) return raw;
@@ -571,41 +572,90 @@ const createProgressReporter = () => {
   };
 };
 
-const writeDatasetStreaming = async (params: {
+const createDatasetStreamWriter = async (params: {
   outputPath: string;
-  header: Omit<BcDataset, 'records' | 'summary'>;
-  records: BcRecord[];
-  summary: BcDataset['summary'];
-}): Promise<void> => {
-  const fh = await openFile(params.outputPath, 'w');
-  try {
+  headerBase: Omit<BcDatasetHeader, 'obsDim'>;
+}) => {
+  const outputPath = path.resolve(params.outputPath);
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const tempPath = `${outputPath}.tmp`;
+  const fh = await openFile(tempPath, 'w');
+  let started = false;
+  let firstRecord = true;
+  let recordsWritten = 0;
+  let obsDim: number | null = null;
+
+  const writeHeader = async (resolvedObsDim: number): Promise<void> => {
+    const header: BcDatasetHeader = {
+      ...params.headerBase,
+      obsDim: resolvedObsDim,
+    };
     await fh.write(
-      `{"schema":${JSON.stringify(params.header.schema)},"createdAtMs":${
-        params.header.createdAtMs
+      `{"schema":${JSON.stringify(header.schema)},"createdAtMs":${
+        header.createdAtMs
       },"modelPath":${JSON.stringify(
-        params.header.modelPath,
+        header.modelPath,
       )},"observationSpace":${JSON.stringify(
-        params.header.observationSpace,
+        header.observationSpace,
       )},"phaseContextEnabled":${JSON.stringify(
-        params.header.phaseContextEnabled,
+        header.phaseContextEnabled,
       )},"actionSpaceKind":${JSON.stringify(
-        params.header.actionSpaceKind ?? DEFAULT_ACTION_SPACE_KIND,
+        header.actionSpaceKind ?? DEFAULT_ACTION_SPACE_KIND,
       )},"modeFilter":${JSON.stringify(
-        params.header.modeFilter,
-      )},"obsDim":${params.header.obsDim},"actionDim":${
-        params.header.actionDim
+        header.modeFilter,
+      )},"obsDim":${header.obsDim},"actionDim":${
+        header.actionDim
       },"records":[`,
     );
+  };
 
-    for (let i = 0; i < params.records.length; i += 1) {
-      if (i > 0) await fh.write(',');
-      await fh.write(JSON.stringify(params.records[i]));
+  const abort = async (): Promise<void> => {
+    try {
+      await fh.close();
+    } finally {
+      await unlink(tempPath).catch(() => undefined);
     }
+  };
 
-    await fh.write(`],"summary":${JSON.stringify(params.summary)}}\n`);
-  } finally {
-    await fh.close();
-  }
+  return {
+    async writeRecord(record: BcRecord): Promise<void> {
+      if (!started) {
+        obsDim = record.obs.length;
+        started = true;
+        await writeHeader(obsDim);
+      } else if (obsDim !== record.obs.length) {
+        throw new Error(
+          `Inconsistent obs length while streaming dataset. expected=${obsDim} got=${record.obs.length}`,
+        );
+      }
+      if (!firstRecord) {
+        await fh.write(',');
+      } else {
+        firstRecord = false;
+      }
+      await fh.write(JSON.stringify(record));
+      recordsWritten += 1;
+    },
+    async close(summary: BcDataset['summary']): Promise<void> {
+      if (!started || obsDim == null || recordsWritten <= 0) {
+        await abort();
+        throw new Error('No compatible BC records were produced.');
+      }
+      try {
+        await fh.write(`],"summary":${JSON.stringify(summary)}}\n`);
+      } finally {
+        await fh.close();
+      }
+      await rename(tempPath, outputPath);
+    },
+    abort,
+    get recordsWritten(): number {
+      return recordsWritten;
+    },
+    get outputPath(): string {
+      return outputPath;
+    },
+  };
 };
 
 const main = async (): Promise<void> => {
@@ -627,7 +677,20 @@ const main = async (): Promise<void> => {
   const files = [...discovered].sort();
   const progress = createProgressReporter();
 
-  const records: BcRecord[] = [];
+  const outputPath = path.resolve(options.outputPath);
+  const writer = await createDatasetStreamWriter({
+    outputPath,
+    headerBase: {
+      schema: 'wishuponablock.bot_bc_dataset.v1',
+      createdAtMs: Date.now(),
+      modelPath: options.modelPath,
+      observationSpace: options.observationSpace,
+      phaseContextEnabled: options.phaseContextEnabled,
+      modeFilter: options.modeFilter,
+      actionSpaceKind: options.actionSpaceKind,
+      actionDim: options.actionDim,
+    },
+  });
   const skipped: BcDataset['summary']['skipped'] = {
     parseFailed: 0,
     modeFiltered: 0,
@@ -651,74 +714,74 @@ const main = async (): Promise<void> => {
       filesTotal: files.length,
       sessionsParsed,
       sessionsUsed,
-      records: records.length,
+      records: writer.recordsWritten,
     },
     true,
   );
-
-  for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
-    const filePath = files[fileIndex];
-    const parsed = await loadJsonUnknown(filePath).catch(() => null);
-    if (!parsed) {
-      skipped.parseFailed += 1;
-      filesDone = fileIndex + 1;
-      progress.render({
-        filesDone,
-        filesTotal: files.length,
-        sessionsParsed,
-        sessionsUsed,
-        records: records.length,
-      });
-      continue;
-    }
-    const candidates = toSessions(parsed);
-    for (const candidate of candidates) {
-      const parsedSession = parseTrajectorySessionV1(candidate, {
-        minSamples: 1,
-      });
-      if (!parsedSession.ok) {
+  try {
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+      const filePath = files[fileIndex];
+      const parsed = await loadJsonUnknown(filePath).catch(() => null);
+      if (!parsed) {
         skipped.parseFailed += 1;
+        filesDone = fileIndex + 1;
+        progress.render({
+          filesDone,
+          filesTotal: files.length,
+          sessionsParsed,
+          sessionsUsed,
+          records: writer.recordsWritten,
+        });
         continue;
       }
-      const session = parsedSession.value;
-      sessionsParsed += 1;
-      if (options.modeFilter && session.modeId !== options.modeFilter) {
-        skipped.modeFiltered += 1;
-        continue;
-      }
-      if (options.maxSessions != null && sessionsUsed >= options.maxSessions) {
-        skipped.maxSessionsReached += 1;
-        continue;
-      }
-      const replayCount = session.samples.reduce(
-        (count, sample) => count + (sample.replay ? 1 : 0),
-        0,
-      );
-      if (replayCount <= 0) {
-        skipped.noReplaySteps += 1;
-        continue;
-      }
-      if (!session.initialState) {
-        skipped.missingInitialState += 1;
-        continue;
-      }
-
-      let sessionUsed = false;
-      const returnToGoByIndex = buildReturnToGo(
-        session.samples,
-        options.returnGamma,
-      );
-      for (let i = 0; i < session.samples.length; i += 1) {
-        const sample = session.samples[i];
-        const replay = sample.replay;
-        if (!replay) continue;
-
-        const hasPrev = i > 0;
-        const prevSample = hasPrev ? session.samples[i - 1] : null;
-        if (!hasPrev && !session.initialState) {
-          skipped.missingPreviousState += 1;
+      const candidates = toSessions(parsed);
+      for (const candidate of candidates) {
+        const parsedSession = parseTrajectorySessionV1(candidate, {
+          minSamples: 1,
+        });
+        if (!parsedSession.ok) {
+          skipped.parseFailed += 1;
           continue;
         }
+        const session = parsedSession.value;
+        sessionsParsed += 1;
+        if (options.modeFilter && session.modeId !== options.modeFilter) {
+          skipped.modeFiltered += 1;
+          continue;
+        }
+        if (options.maxSessions != null && sessionsUsed >= options.maxSessions) {
+          skipped.maxSessionsReached += 1;
+          continue;
+        }
+        const replayCount = session.samples.reduce(
+          (count, sample) => count + (sample.replay ? 1 : 0),
+          0,
+        );
+        if (replayCount <= 0) {
+          skipped.noReplaySteps += 1;
+          continue;
+        }
+        if (!session.initialState) {
+          skipped.missingInitialState += 1;
+          continue;
+        }
+
+        let sessionUsed = false;
+        const returnToGoByIndex = buildReturnToGo(
+          session.samples,
+          options.returnGamma,
+        );
+        for (let i = 0; i < session.samples.length; i += 1) {
+          const sample = session.samples[i];
+          const replay = sample.replay;
+          if (!replay) continue;
+
+          const hasPrev = i > 0;
+          const prevSample = hasPrev ? session.samples[i - 1] : null;
+          if (!hasPrev && !session.initialState) {
+            skipped.missingPreviousState += 1;
+            continue;
+          }
 
         const boardBeforeOcc = hasPrev
           ? (prevSample?.boardOccupancy ?? null)
@@ -806,10 +869,10 @@ const main = async (): Promise<void> => {
           buildVersion: session.buildVersion,
         };
 
-        if (
-          options.actionSpaceKind === 'placement_hold_step_v2' &&
-          replay.holdUsed
-        ) {
+          if (
+            options.actionSpaceKind === 'placement_hold_step_v2' &&
+            replay.holdUsed
+          ) {
           const holdActionIndex = PLACEMENT_ACTION_HOLD_STEP_INDEX;
           if (
             holdActionIndex < 0 ||
@@ -889,32 +952,29 @@ const main = async (): Promise<void> => {
             continue;
           }
 
-          const holdRecord: BcRecord = {
-            obs,
-            actionMask,
-            actionIndex: holdActionIndex,
-            returnToGo,
-            source,
-          };
-          const postHoldRecord: BcRecord = {
-            obs: postHoldObs,
-            actionMask: postHoldActionMask,
-            actionIndex: postHoldActionIndex,
-            returnToGo,
-            source,
-          };
-          if (!pushIfRecord(records, holdRecord, options.maxRecords)) {
-            skipped.maxRecordsReached += 1;
-            break;
+            const holdRecord: BcRecord = {
+              obs,
+              actionMask,
+              actionIndex: holdActionIndex,
+              returnToGo,
+              source,
+            };
+            const postHoldRecord: BcRecord = {
+              obs: postHoldObs,
+              actionMask: postHoldActionMask,
+              actionIndex: postHoldActionIndex,
+              returnToGo,
+              source,
+            };
+            if (!hasRecordCapacity(writer.recordsWritten, 2, options.maxRecords)) {
+              skipped.maxRecordsReached += 1;
+              break;
+            }
+            await writer.writeRecord(holdRecord);
+            await writer.writeRecord(postHoldRecord);
+            sessionUsed = true;
+            continue;
           }
-          if (!pushIfRecord(records, postHoldRecord, options.maxRecords)) {
-            records.pop();
-            skipped.maxRecordsReached += 1;
-            break;
-          }
-          sessionUsed = true;
-          continue;
-        }
 
         const actionIndex = findPlacementIndex(
           options.actionDim,
@@ -930,87 +990,75 @@ const main = async (): Promise<void> => {
           continue;
         }
 
-        const record: BcRecord = {
-          obs,
-          actionMask,
-          actionIndex,
-          returnToGo,
-          source,
-        };
-        if (!pushIfRecord(records, record, options.maxRecords)) {
-          skipped.maxRecordsReached += 1;
+          const record: BcRecord = {
+            obs,
+            actionMask,
+            actionIndex,
+            returnToGo,
+            source,
+          };
+          if (!hasRecordCapacity(writer.recordsWritten, 1, options.maxRecords)) {
+            skipped.maxRecordsReached += 1;
+            break;
+          }
+          await writer.writeRecord(record);
+          sessionUsed = true;
+        }
+        if (sessionUsed) {
+          sessionsUsed += 1;
+        }
+        if (
+          options.maxRecords != null &&
+          writer.recordsWritten >= options.maxRecords
+        ) {
           break;
         }
-        sessionUsed = true;
+        progress.render({
+          filesDone,
+          filesTotal: files.length,
+          sessionsParsed,
+          sessionsUsed,
+          records: writer.recordsWritten,
+        });
       }
-      if (sessionUsed) {
-        sessionsUsed += 1;
-      }
-      if (options.maxRecords != null && records.length >= options.maxRecords) {
-        break;
-      }
+      filesDone = fileIndex + 1;
       progress.render({
         filesDone,
         filesTotal: files.length,
         sessionsParsed,
         sessionsUsed,
-        records: records.length,
+        records: writer.recordsWritten,
       });
+      if (
+        options.maxRecords != null &&
+        writer.recordsWritten >= options.maxRecords
+      ) {
+        break;
+      }
     }
-    filesDone = fileIndex + 1;
-    progress.render({
+    progress.close({
       filesDone,
       filesTotal: files.length,
       sessionsParsed,
       sessionsUsed,
-      records: records.length,
+      records: writer.recordsWritten,
     });
-    if (options.maxRecords != null && records.length >= options.maxRecords) {
-      break;
-    }
+
+    const summary: BcDataset['summary'] = {
+      filesScanned: files.length,
+      sessionsParsed,
+      sessionsUsed,
+      records: writer.recordsWritten,
+      skipped,
+    };
+    await writer.close(summary);
+    console.log(
+      `[bc-dataset] wrote ${writer.recordsWritten} records from ${sessionsUsed}/${sessionsParsed} sessions -> ${writer.outputPath}`,
+    );
+  } catch (error) {
+    await writer.abort().catch(() => undefined);
+    throw error;
   }
-  progress.close({
-    filesDone,
-    filesTotal: files.length,
-    sessionsParsed,
-    sessionsUsed,
-    records: records.length,
-  });
-
-  if (records.length === 0) {
-    throw new Error('No compatible BC records were produced.');
-  }
-
-  const summary: BcDataset['summary'] = {
-    filesScanned: files.length,
-    sessionsParsed,
-    sessionsUsed,
-    records: records.length,
-    skipped,
-  };
-  const header: Omit<BcDataset, 'records' | 'summary'> = {
-    schema: 'wishuponablock.bot_bc_dataset.v1',
-    createdAtMs: Date.now(),
-    modelPath: options.modelPath,
-    observationSpace: options.observationSpace,
-    phaseContextEnabled: options.phaseContextEnabled,
-    modeFilter: options.modeFilter,
-    actionSpaceKind: options.actionSpaceKind,
-    obsDim: records[0].obs.length,
-    actionDim: options.actionDim,
-  };
-
-  const outputPath = path.resolve(options.outputPath);
-  await mkdir(path.dirname(outputPath), { recursive: true });
-  await writeDatasetStreaming({
-    outputPath,
-    header,
-    records,
-    summary,
-  });
-  console.log(
-    `[bc-dataset] wrote ${records.length} records from ${sessionsUsed}/${sessionsParsed} sessions -> ${outputPath}`,
-  );
 };
 
 void main().catch((error) => {
