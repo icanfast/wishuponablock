@@ -139,8 +139,13 @@ const handleStepMany = (id: number, payload: unknown): void => {
   writeResponse({ id, ok: true, result });
 };
 
-const handleEvaluateHoldCandidatesMany = (id: number, payload: unknown): void => {
-  const data = asObject(payload) as unknown as EvaluateHoldCandidatesManyPayload;
+const handleEvaluateHoldCandidatesMany = (
+  id: number,
+  payload: unknown,
+): void => {
+  const data = asObject(
+    payload,
+  ) as unknown as EvaluateHoldCandidatesManyPayload;
   const envIds = parseNumberArray(data.envIds);
   const result = ensurePool().evaluateHoldCandidatesMany(envIds);
   writeResponse({ id, ok: true, result });

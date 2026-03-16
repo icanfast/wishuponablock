@@ -299,8 +299,7 @@ const parseArgs = (argv: string[]): CliOptions | null => {
     modeFilter,
     actionSpaceKind,
     actionDim:
-      actionDimOverride ??
-      defaultActionDimForActionSpaceKind(actionSpaceKind),
+      actionDimOverride ?? defaultActionDimForActionSpaceKind(actionSpaceKind),
     maxNodesPerBranch,
     returnGamma,
     maxSessions,
@@ -516,8 +515,7 @@ const hasRecordCapacity = (
   recordsWritten: number,
   recordsToAdd: number,
   maxRecords: number | null,
-): boolean =>
-  maxRecords == null || recordsWritten + recordsToAdd <= maxRecords;
+): boolean => maxRecords == null || recordsWritten + recordsToAdd <= maxRecords;
 
 const toSessions = (raw: unknown): unknown[] => {
   if (Array.isArray(raw)) return raw;
@@ -644,9 +642,7 @@ const createDatasetStreamWriter = async (params: {
         header.actionSpaceKind ?? DEFAULT_ACTION_SPACE_KIND,
       )},"modeFilter":${JSON.stringify(
         header.modeFilter,
-      )},"obsDim":${header.obsDim},"actionDim":${
-        header.actionDim
-      },"records":[`,
+      )},"obsDim":${header.obsDim},"actionDim":${header.actionDim},"records":[`,
     );
   };
 
@@ -793,7 +789,10 @@ const main = async (): Promise<void> => {
           skipped.modeFiltered += 1;
           continue;
         }
-        if (options.maxSessions != null && sessionsUsed >= options.maxSessions) {
+        if (
+          options.maxSessions != null &&
+          sessionsUsed >= options.maxSessions
+        ) {
           skipped.maxSessionsReached += 1;
           continue;
         }
@@ -827,174 +826,184 @@ const main = async (): Promise<void> => {
             continue;
           }
 
-        const boardBeforeOcc = hasPrev
-          ? (prevSample?.boardOccupancy ?? null)
-          : session.initialState.boardOccupancy;
-        const holdBefore = hasPrev
-          ? (prevSample?.hold ?? null)
-          : session.initialState.hold;
-        const activeBefore = hasPrev
-          ? (prevSample?.action ?? session.initialState.active.k)
-          : session.initialState.active.k;
-        const nextBefore = sample.action;
-        if (!boardBeforeOcc) {
-          skipped.missingPreviousState += 1;
-          continue;
-        }
-
-        const boardBefore = toBoardFromOccupancy(boardBeforeOcc);
-        const activeSpawn = spawnActiveForBoard(boardBefore, activeBefore);
-        if (!activeSpawn) {
-          skipped.invalidActiveSpawn += 1;
-          continue;
-        }
-        const nextQueueBefore = buildVisibleQueueFromSamples(session.samples, i);
-        const nextPieceOnFirstHold =
-          holdBefore == null && replay.holdUsed ? replay.lockPiece : nextBefore;
-        const placements = enumerateTrajectoryExecutorPlacements({
-          board: boardBefore,
-          active: activeSpawn,
-          hold: holdBefore,
-          canHold: true,
-          nextPieceOnFirstHold,
-          maxNodesPerBranch: options.maxNodesPerBranch,
-          allowSoftDrop: true,
-        });
-        if (placements.length === 0) {
-          skipped.noPlacementChoices += 1;
-          continue;
-        }
-        const actionMask = buildActionMaskForChoices(
-          placements,
-          options.actionDim,
-          options.actionSpaceKind,
-        );
-
-        const beforeReplay = hasPrev ? prevSample?.replay : null;
-        const totalLinesCleared = beforeReplay
-          ? Math.max(0, Math.trunc(beforeReplay.totalLinesCleared))
-          : Math.max(0, Math.trunc(session.initialState.totalLinesCleared));
-        const timeMs = beforeReplay
-          ? Math.max(0, Math.trunc(beforeReplay.gameTimeMs))
-          : Math.max(0, Math.trunc(session.initialState.timeMs));
-        const score = beforeReplay
-          ? Math.max(0, Math.trunc(beforeReplay.score))
-          : Math.max(0, Math.trunc(session.initialState.score));
-
-        const obs = buildObservation({
-          model,
-          observationSpace: options.observationSpace,
-          phaseContextEnabled: options.phaseContextEnabled,
-          board: boardBefore,
-          hold: holdBefore,
-          active: activeBefore,
-          next: nextBefore,
-          nextQueue: nextQueueBefore,
-          canHold: true,
-          totalLinesCleared,
-          timeMs,
-          level: 1,
-          score,
-          lineGoal: null,
-        });
-        if (obs.some((value) => !Number.isFinite(value))) {
-          skipped.invalidRecord += 1;
-          continue;
-        }
-
-        const returnToGo = Number.isFinite(returnToGoByIndex[i])
-          ? returnToGoByIndex[i]
-          : null;
-        const source = {
-          sessionId: session.sessionId,
-          sampleId: sample.id,
-          sampleIndex: i,
-          modeId: session.modeId,
-          buildVersion: session.buildVersion,
-        };
-
-          if (
-            options.actionSpaceKind === 'placement_hold_step_v2' &&
-            replay.holdUsed
-          ) {
-          const holdActionIndex = PLACEMENT_ACTION_HOLD_STEP_INDEX;
-          if (
-            holdActionIndex < 0 ||
-            holdActionIndex >= options.actionDim ||
-            actionMask[holdActionIndex] <= 0
-          ) {
-            skipped.targetNotInActionSpace += 1;
-            continue;
-          }
-
-          const activeAfterHold = holdBefore ?? nextBefore;
-          if (activeAfterHold == null) {
+          const boardBeforeOcc = hasPrev
+            ? (prevSample?.boardOccupancy ?? null)
+            : session.initialState.boardOccupancy;
+          const holdBefore = hasPrev
+            ? (prevSample?.hold ?? null)
+            : session.initialState.hold;
+          const activeBefore = hasPrev
+            ? (prevSample?.action ?? session.initialState.active.k)
+            : session.initialState.active.k;
+          const nextBefore = sample.action;
+          if (!boardBeforeOcc) {
             skipped.missingPreviousState += 1;
             continue;
           }
-          const holdAfter = activeBefore;
-          const nextAfterHold =
-            holdBefore == null ? (session.samples[i + 1]?.action ?? null) : nextBefore;
-          const nextQueueAfterHold =
-            holdBefore == null
-              ? buildVisibleQueueFromSamples(session.samples, i + 1)
-              : nextQueueBefore;
-          const activeAfterSpawn = spawnActiveForBoard(boardBefore, activeAfterHold);
-          if (!activeAfterSpawn) {
+
+          const boardBefore = toBoardFromOccupancy(boardBeforeOcc);
+          const activeSpawn = spawnActiveForBoard(boardBefore, activeBefore);
+          if (!activeSpawn) {
             skipped.invalidActiveSpawn += 1;
             continue;
           }
-          const postHoldPlacements = enumerateTrajectoryExecutorPlacements({
+          const nextQueueBefore = buildVisibleQueueFromSamples(
+            session.samples,
+            i,
+          );
+          const nextPieceOnFirstHold =
+            holdBefore == null && replay.holdUsed
+              ? replay.lockPiece
+              : nextBefore;
+          const placements = enumerateTrajectoryExecutorPlacements({
             board: boardBefore,
-            active: activeAfterSpawn,
-            hold: holdAfter,
-            canHold: false,
-            nextPieceOnFirstHold: nextAfterHold,
+            active: activeSpawn,
+            hold: holdBefore,
+            canHold: true,
+            nextPieceOnFirstHold,
             maxNodesPerBranch: options.maxNodesPerBranch,
             allowSoftDrop: true,
           });
-          if (postHoldPlacements.length === 0) {
+          if (placements.length === 0) {
             skipped.noPlacementChoices += 1;
             continue;
           }
-          const postHoldActionMask = buildActionMaskForChoices(
-            postHoldPlacements,
+          const actionMask = buildActionMaskForChoices(
+            placements,
             options.actionDim,
             options.actionSpaceKind,
           );
-          const postHoldActionIndex = findPlacementIndex(
-            options.actionDim,
-            sample,
-            'placement_hold_step_v2',
-          );
-          if (
-            postHoldActionIndex < 0 ||
-            postHoldActionIndex >= options.actionDim ||
-            postHoldActionMask[postHoldActionIndex] <= 0
-          ) {
-            skipped.targetNotInActionSpace += 1;
-            continue;
-          }
-          const postHoldObs = buildObservation({
+
+          const beforeReplay = hasPrev ? prevSample?.replay : null;
+          const totalLinesCleared = beforeReplay
+            ? Math.max(0, Math.trunc(beforeReplay.totalLinesCleared))
+            : Math.max(0, Math.trunc(session.initialState.totalLinesCleared));
+          const timeMs = beforeReplay
+            ? Math.max(0, Math.trunc(beforeReplay.gameTimeMs))
+            : Math.max(0, Math.trunc(session.initialState.timeMs));
+          const score = beforeReplay
+            ? Math.max(0, Math.trunc(beforeReplay.score))
+            : Math.max(0, Math.trunc(session.initialState.score));
+
+          const obs = buildObservation({
             model,
             observationSpace: options.observationSpace,
             phaseContextEnabled: options.phaseContextEnabled,
             board: boardBefore,
-            hold: holdAfter,
-            active: activeAfterHold,
-            next: nextAfterHold,
-            nextQueue: nextQueueAfterHold,
-            canHold: false,
+            hold: holdBefore,
+            active: activeBefore,
+            next: nextBefore,
+            nextQueue: nextQueueBefore,
+            canHold: true,
             totalLinesCleared,
             timeMs,
             level: 1,
             score,
             lineGoal: null,
           });
-          if (postHoldObs.some((value) => !Number.isFinite(value))) {
+          if (obs.some((value) => !Number.isFinite(value))) {
             skipped.invalidRecord += 1;
             continue;
           }
+
+          const returnToGo = Number.isFinite(returnToGoByIndex[i])
+            ? returnToGoByIndex[i]
+            : null;
+          const source = {
+            sessionId: session.sessionId,
+            sampleId: sample.id,
+            sampleIndex: i,
+            modeId: session.modeId,
+            buildVersion: session.buildVersion,
+          };
+
+          if (
+            options.actionSpaceKind === 'placement_hold_step_v2' &&
+            replay.holdUsed
+          ) {
+            const holdActionIndex = PLACEMENT_ACTION_HOLD_STEP_INDEX;
+            if (
+              holdActionIndex < 0 ||
+              holdActionIndex >= options.actionDim ||
+              actionMask[holdActionIndex] <= 0
+            ) {
+              skipped.targetNotInActionSpace += 1;
+              continue;
+            }
+
+            const activeAfterHold = holdBefore ?? nextBefore;
+            if (activeAfterHold == null) {
+              skipped.missingPreviousState += 1;
+              continue;
+            }
+            const holdAfter = activeBefore;
+            const nextAfterHold =
+              holdBefore == null
+                ? (session.samples[i + 1]?.action ?? null)
+                : nextBefore;
+            const nextQueueAfterHold =
+              holdBefore == null
+                ? buildVisibleQueueFromSamples(session.samples, i + 1)
+                : nextQueueBefore;
+            const activeAfterSpawn = spawnActiveForBoard(
+              boardBefore,
+              activeAfterHold,
+            );
+            if (!activeAfterSpawn) {
+              skipped.invalidActiveSpawn += 1;
+              continue;
+            }
+            const postHoldPlacements = enumerateTrajectoryExecutorPlacements({
+              board: boardBefore,
+              active: activeAfterSpawn,
+              hold: holdAfter,
+              canHold: false,
+              nextPieceOnFirstHold: nextAfterHold,
+              maxNodesPerBranch: options.maxNodesPerBranch,
+              allowSoftDrop: true,
+            });
+            if (postHoldPlacements.length === 0) {
+              skipped.noPlacementChoices += 1;
+              continue;
+            }
+            const postHoldActionMask = buildActionMaskForChoices(
+              postHoldPlacements,
+              options.actionDim,
+              options.actionSpaceKind,
+            );
+            const postHoldActionIndex = findPlacementIndex(
+              options.actionDim,
+              sample,
+              'placement_hold_step_v2',
+            );
+            if (
+              postHoldActionIndex < 0 ||
+              postHoldActionIndex >= options.actionDim ||
+              postHoldActionMask[postHoldActionIndex] <= 0
+            ) {
+              skipped.targetNotInActionSpace += 1;
+              continue;
+            }
+            const postHoldObs = buildObservation({
+              model,
+              observationSpace: options.observationSpace,
+              phaseContextEnabled: options.phaseContextEnabled,
+              board: boardBefore,
+              hold: holdAfter,
+              active: activeAfterHold,
+              next: nextAfterHold,
+              nextQueue: nextQueueAfterHold,
+              canHold: false,
+              totalLinesCleared,
+              timeMs,
+              level: 1,
+              score,
+              lineGoal: null,
+            });
+            if (postHoldObs.some((value) => !Number.isFinite(value))) {
+              skipped.invalidRecord += 1;
+              continue;
+            }
 
             const holdRecord: BcRecord = {
               obs,
@@ -1010,7 +1019,9 @@ const main = async (): Promise<void> => {
               returnToGo,
               source,
             };
-            if (!hasRecordCapacity(writer.recordsWritten, 2, options.maxRecords)) {
+            if (
+              !hasRecordCapacity(writer.recordsWritten, 2, options.maxRecords)
+            ) {
               skipped.maxRecordsReached += 1;
               break;
             }
@@ -1020,19 +1031,19 @@ const main = async (): Promise<void> => {
             continue;
           }
 
-        const actionIndex = findPlacementIndex(
-          options.actionDim,
-          sample,
-          options.actionSpaceKind,
-        );
-        if (actionIndex < 0 || actionIndex >= options.actionDim) {
-          skipped.targetNotInActionSpace += 1;
-          continue;
-        }
-        if (actionMask[actionIndex] <= 0) {
-          skipped.targetNotInActionSpace += 1;
-          continue;
-        }
+          const actionIndex = findPlacementIndex(
+            options.actionDim,
+            sample,
+            options.actionSpaceKind,
+          );
+          if (actionIndex < 0 || actionIndex >= options.actionDim) {
+            skipped.targetNotInActionSpace += 1;
+            continue;
+          }
+          if (actionMask[actionIndex] <= 0) {
+            skipped.targetNotInActionSpace += 1;
+            continue;
+          }
 
           const record: BcRecord = {
             obs,
@@ -1041,7 +1052,9 @@ const main = async (): Promise<void> => {
             returnToGo,
             source,
           };
-          if (!hasRecordCapacity(writer.recordsWritten, 1, options.maxRecords)) {
+          if (
+            !hasRecordCapacity(writer.recordsWritten, 1, options.maxRecords)
+          ) {
             skipped.maxRecordsReached += 1;
             break;
           }

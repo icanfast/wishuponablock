@@ -4120,9 +4120,9 @@ async function boot() {
     const requestId = ++startGameDebugRequestId;
     try {
       console.info(
-        `[start-debug] begin request=${requestId} mode=${modeController
-          .getState()
-          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+        `[start-debug] begin request=${requestId} mode=${
+          modeController.getState().mode.id
+        } screen=${screenManager.getActive() ?? 'none'}`,
       );
       if (!botGuiInspectEnabled && botGuiInspectGeneratorBackup) {
         applyBotGuiPieceSourceProfile('active_generator');
@@ -4157,21 +4157,21 @@ async function boot() {
       );
       runtime?.setInputSource(activeInputSource);
       console.info(
-        `[start-debug] entering_game_screen request=${requestId} mode=${modeController
-          .getState()
-          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+        `[start-debug] entering_game_screen request=${requestId} mode=${
+          modeController.getState().mode.id
+        } screen=${screenManager.getActive() ?? 'none'}`,
       );
       await screenManager.setActive('game');
       console.info(
-        `[start-debug] entered_game_screen request=${requestId} mode=${modeController
-          .getState()
-          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+        `[start-debug] entered_game_screen request=${requestId} mode=${
+          modeController.getState().mode.id
+        } screen=${screenManager.getActive() ?? 'none'}`,
       );
     } finally {
       console.info(
-        `[start-debug] end request=${requestId} mode=${modeController
-          .getState()
-          .mode.id} screen=${screenManager.getActive() ?? 'none'}`,
+        `[start-debug] end request=${requestId} mode=${
+          modeController.getState().mode.id
+        } screen=${screenManager.getActive() ?? 'none'}`,
       );
       startingGame = false;
     }

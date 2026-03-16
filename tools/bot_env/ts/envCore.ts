@@ -944,7 +944,8 @@ const buildPostLockStateForPlacement = (options: {
     Math.max(0, Math.trunc(state.level)),
     Boolean(state.scoringEnabled),
   );
-  const lineGoal = state.lineGoal != null ? Math.max(1, Math.trunc(state.lineGoal)) : null;
+  const lineGoal =
+    state.lineGoal != null ? Math.max(1, Math.trunc(state.lineGoal)) : null;
   const gameWon = lineGoal != null && totalLinesClearedAfter >= lineGoal;
   if (topOut || gameWon) {
     return {
@@ -1459,7 +1460,11 @@ class BotEnv {
     const blendWeights = normalizeRewardBlendWeights(rewardBlend);
     const before = this.snapshotMetrics();
     const candidates: HoldCandidateEvaluation[] = [];
-    for (let actionIndex = 0; actionIndex < choices.actionMask.length; actionIndex += 1) {
+    for (
+      let actionIndex = 0;
+      actionIndex < choices.actionMask.length;
+      actionIndex += 1
+    ) {
       if (choices.actionMask[actionIndex] <= 0) continue;
       const placement = choices.placementsBySlot[actionIndex];
       if (!placement) continue;
@@ -2001,7 +2006,8 @@ class BotEnv {
           rewardResult.breakdown.boardQualityAbsoluteTerm,
         rewardTermFullClear: rewardResult.breakdown.fullClearTerm,
         rewardTermTopOut: rewardResult.breakdown.topOutTerm,
-        placementHoldUsed: isHoldStepAction || selectedPlacement?.holdUsed ? 1 : 0,
+        placementHoldUsed:
+          isHoldStepAction || selectedPlacement?.holdUsed ? 1 : 0,
         placementSrsKickCount: Math.max(
           0,
           Math.trunc(selectedPlacement?.srsKickCount ?? 0),
@@ -2343,9 +2349,7 @@ export class BotEnvPool {
     const placementExecutionMode = normalizePlacementExecutionMode(
       payload.placementExecutionMode,
     );
-    const actionSpaceKind = normalizeActionSpaceKind(
-      payload.actionSpaceKind,
-    );
+    const actionSpaceKind = normalizeActionSpaceKind(payload.actionSpaceKind);
     const pieceSourceProfile = normalizePieceSource(payload.pieceSourceProfile);
     const queuePolicyId =
       typeof payload.queuePolicyId === 'string' && payload.queuePolicyId.trim()
