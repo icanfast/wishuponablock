@@ -97,6 +97,11 @@ class PPOConfig:
     hold_margin_good_threshold: float
     hold_margin_penalty_base: float
     hold_margin_penalty_threshold: float
+    hold_swap_probe: bool
+    hold_swap_distill_coef_start: float
+    hold_swap_distill_coef_end: float
+    hold_swap_distill_coef_ramp_updates: int
+    hold_swap_teacher_tau: float
     validation_episodes_per_env: int
     validate_every_updates: int
     device: str
@@ -861,6 +866,39 @@ def parse_args() -> PPOConfig:
         help="Margin threshold at/above which hold penalty becomes zero.",
     )
     parser.add_argument(
+        "--hold-swap-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Probe explicit HOLD usefulness via swap utility: "
+            "best hold-placement score minus best no-hold placement score."
+        ),
+    )
+    parser.add_argument(
+        "--hold-swap-distill-coef-start",
+        type=float,
+        default=0.0,
+        help="Hold-swap auxiliary loss coefficient at update 1.",
+    )
+    parser.add_argument(
+        "--hold-swap-distill-coef-end",
+        type=float,
+        default=0.0,
+        help="Hold-swap auxiliary loss coefficient after ramp completes.",
+    )
+    parser.add_argument(
+        "--hold-swap-distill-coef-ramp-updates",
+        type=int,
+        default=1,
+        help="Number of updates to linearly ramp the hold-swap auxiliary loss.",
+    )
+    parser.add_argument(
+        "--hold-swap-teacher-tau",
+        type=float,
+        default=0.25,
+        help="Temperature for sigmoid(margin_swap / tau) hold teacher.",
+    )
+    parser.add_argument(
         "--validation-episodes-per-env",
         type=int,
         default=2,
@@ -1169,6 +1207,15 @@ def parse_args() -> PPOConfig:
         hold_margin_penalty_threshold=max(
             1e-6, float(args.hold_margin_penalty_threshold)
         ),
+        hold_swap_probe=bool(args.hold_swap_probe),
+        hold_swap_distill_coef_start=max(
+            0.0, float(args.hold_swap_distill_coef_start)
+        ),
+        hold_swap_distill_coef_end=max(0.0, float(args.hold_swap_distill_coef_end)),
+        hold_swap_distill_coef_ramp_updates=max(
+            0, int(args.hold_swap_distill_coef_ramp_updates)
+        ),
+        hold_swap_teacher_tau=max(1e-4, float(args.hold_swap_teacher_tau)),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
         validate_every_updates=max(1, int(args.validate_every_updates)),
         device=args.device,
@@ -1321,6 +1368,18 @@ def distill_coef_for_update(cfg: PPOConfig, update: int) -> float:
             cfg.distill_coef_start,
             cfg.distill_coef_end,
             cfg.distill_coef_ramp_updates,
+            update,
+        ),
+    )
+
+
+def hold_swap_distill_coef_for_update(cfg: PPOConfig, update: int) -> float:
+    return max(
+        0.0,
+        curriculum_schedule_value(
+            cfg.hold_swap_distill_coef_start,
+            cfg.hold_swap_distill_coef_end,
+            cfg.hold_swap_distill_coef_ramp_updates,
             update,
         ),
     )
@@ -1517,6 +1576,39 @@ def _hold_probe_summary(
         "frac_below_eps": float(np.mean(arr < float(eps))),
         "frac_above_good": float(np.mean(arr > float(good_threshold))),
     }
+
+
+def _hold_swap_margin_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "median": float("nan"),
+            "p25": float("nan"),
+            "p75": float("nan"),
+            "frac_positive": float("nan"),
+            "frac_negative": float("nan"),
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "p25": float(np.percentile(arr, 25)),
+        "p75": float(np.percentile(arr, 75)),
+        "frac_positive": float(np.mean(arr > 0.0)),
+        "frac_negative": float(np.mean(arr < 0.0)),
+    }
+
+
+def hold_swap_teacher_prob_from_margin(margin: float, tau: float) -> float:
+    safe_tau = max(1e-4, float(tau))
+    scaled = float(margin) / safe_tau
+    if scaled >= 0.0:
+        z = math.exp(-scaled)
+        return float(1.0 / (1.0 + z))
+    z = math.exp(scaled)
+    return float(z / (1.0 + z))
 
 
 def evaluate_hold_margin_for_actions(
@@ -1755,6 +1847,209 @@ def new_hold_probe_accumulator() -> dict[str, Any]:
     }
 
 
+def evaluate_hold_swap_teacher_for_envs(
+    *,
+    env: WubEnvBridge,
+    env_ids: list[int],
+    env_piece_sources: list[str],
+    obs_adapter: ObservationAdapter,
+    model: PolicyValueNet,
+    device: torch.device,
+    gamma: float,
+    teacher_tau: float,
+) -> tuple[dict[int, dict[str, float | None]], dict[str, Any]]:
+    by_source: dict[str, dict[str, Any]] = {}
+    for source in env_piece_sources:
+        by_source.setdefault(
+            source,
+            {
+                "available": 0,
+                "unavailable": 0,
+                "margins": [],
+                "teacher_hold_probs": [],
+                "best_hold_scores": [],
+                "best_no_hold_scores": [],
+            },
+        )
+
+    if not env_ids:
+        return {}, {}
+
+    probe_result = env.evaluate_hold_candidates_many(env_ids=env_ids)
+    candidate_batches = probe_result.get("candidates", [])
+    flat_obs: list[list[float]] = []
+    flat_mapping: list[tuple[int, int]] = []
+    for batch_idx, candidates in enumerate(candidate_batches):
+        if not isinstance(candidates, list):
+            continue
+        for cand_idx, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            if bool(candidate.get("done", False)):
+                continue
+            obs = candidate.get("obs")
+            if not isinstance(obs, list) or not obs:
+                continue
+            flat_obs.append(obs)
+            flat_mapping.append((batch_idx, cand_idx))
+
+    continuation_values: dict[tuple[int, int], float] = {}
+    if flat_obs:
+        raw_obs = torch.as_tensor(np.asarray(flat_obs, dtype=np.float32), device=device)
+        with torch.no_grad():
+            probe_features = obs_adapter(raw_obs)
+            _probe_logits, probe_values = model(probe_features)
+        probe_values_np = probe_values.detach().cpu().numpy().astype(np.float64)
+        for mapping, value in zip(flat_mapping, probe_values_np.tolist()):
+            continuation_values[mapping] = float(value)
+
+    per_env: dict[int, dict[str, float | None]] = {}
+    for batch_idx, (env_id, source) in enumerate(zip(env_ids, env_piece_sources)):
+        source_stats = by_source.setdefault(
+            source,
+            {
+                "available": 0,
+                "unavailable": 0,
+                "margins": [],
+                "teacher_hold_probs": [],
+                "best_hold_scores": [],
+                "best_no_hold_scores": [],
+            },
+        )
+        candidates_raw = (
+            candidate_batches[batch_idx]
+            if batch_idx < len(candidate_batches)
+            and isinstance(candidate_batches[batch_idx], list)
+            else []
+        )
+        scored_hold: list[float] = []
+        scored_no_hold: list[float] = []
+        for cand_idx, candidate in enumerate(candidates_raw):
+            if not isinstance(candidate, dict):
+                continue
+            immediate = float(candidate.get("immediate_reward_no_hold_tax", 0.0))
+            done = bool(candidate.get("done", False))
+            value_term = (
+                0.0
+                if done
+                else float(continuation_values.get((batch_idx, cand_idx), 0.0))
+            )
+            score = immediate + (0.0 if done else float(gamma) * value_term)
+            if bool(candidate.get("hold_used", False)):
+                scored_hold.append(score)
+            else:
+                scored_no_hold.append(score)
+        if not scored_hold or not scored_no_hold:
+            source_stats["unavailable"] += 1
+            per_env[int(env_id)] = {
+                "margin": None,
+                "teacher_hold_prob": None,
+                "best_hold_score": None,
+                "best_no_hold_score": None,
+            }
+            continue
+        best_hold_score = float(max(scored_hold))
+        best_no_hold_score = float(max(scored_no_hold))
+        margin = best_hold_score - best_no_hold_score
+        teacher_hold_prob = hold_swap_teacher_prob_from_margin(
+            margin, teacher_tau
+        )
+        source_stats["available"] += 1
+        source_stats["margins"].append(margin)
+        source_stats["teacher_hold_probs"].append(teacher_hold_prob)
+        source_stats["best_hold_scores"].append(best_hold_score)
+        source_stats["best_no_hold_scores"].append(best_no_hold_score)
+        per_env[int(env_id)] = {
+            "margin": margin,
+            "teacher_hold_prob": teacher_hold_prob,
+            "best_hold_score": best_hold_score,
+            "best_no_hold_score": best_no_hold_score,
+        }
+
+    summary_by_source: dict[str, Any] = {}
+    for source, stats in by_source.items():
+        summary_by_source[source] = {
+            "available": int(stats["available"]),
+            "unavailable": int(stats["unavailable"]),
+            "margin": _hold_swap_margin_summary(stats["margins"]),
+            "mean_teacher_hold_prob": _safe_recent_mean(
+                stats["teacher_hold_probs"],
+                window=len(stats["teacher_hold_probs"]),
+            ),
+            "mean_best_hold_score": _safe_recent_mean(
+                stats["best_hold_scores"],
+                window=len(stats["best_hold_scores"]),
+            ),
+            "mean_best_no_hold_score": _safe_recent_mean(
+                stats["best_no_hold_scores"],
+                window=len(stats["best_no_hold_scores"]),
+            ),
+        }
+    return per_env, summary_by_source
+
+
+def new_hold_swap_teacher_accumulator() -> dict[str, Any]:
+    return {
+        "available": 0,
+        "unavailable": 0,
+        "margins": [],
+        "teacher_hold_probs": [],
+        "best_hold_scores": [],
+        "best_no_hold_scores": [],
+    }
+
+
+def accumulate_hold_swap_teacher_metrics(
+    accumulator: dict[str, dict[str, Any]],
+    *,
+    env_ids: list[int],
+    env_piece_sources: list[str],
+    per_env: dict[int, dict[str, float | None]],
+) -> None:
+    for env_id, source in zip(env_ids, env_piece_sources):
+        source_acc = accumulator.setdefault(source, new_hold_swap_teacher_accumulator())
+        env_result = per_env.get(int(env_id))
+        if not env_result or env_result.get("margin") is None:
+            source_acc["unavailable"] += 1
+            continue
+        source_acc["available"] += 1
+        for key, acc_key in (
+            ("margin", "margins"),
+            ("teacher_hold_prob", "teacher_hold_probs"),
+            ("best_hold_score", "best_hold_scores"),
+            ("best_no_hold_score", "best_no_hold_scores"),
+        ):
+            value = env_result.get(key)
+            if value is None or not math.isfinite(float(value)):
+                continue
+            source_acc[acc_key].append(float(value))
+
+
+def summarize_hold_swap_teacher_accumulator(
+    accumulator: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for source, stats in accumulator.items():
+        summary[source] = {
+            "available": int(stats["available"]),
+            "unavailable": int(stats["unavailable"]),
+            "margin": _hold_swap_margin_summary(stats["margins"]),
+            "mean_teacher_hold_prob": _safe_recent_mean(
+                stats["teacher_hold_probs"],
+                window=len(stats["teacher_hold_probs"]),
+            ),
+            "mean_best_hold_score": _safe_recent_mean(
+                stats["best_hold_scores"],
+                window=len(stats["best_hold_scores"]),
+            ),
+            "mean_best_no_hold_score": _safe_recent_mean(
+                stats["best_no_hold_scores"],
+                window=len(stats["best_no_hold_scores"]),
+            ),
+        }
+    return summary
+
+
 def accumulate_hold_action_counts(
     accumulator: dict[str, dict[str, Any]],
     *,
@@ -1849,15 +2144,17 @@ def summarize_hold_probe_accumulator(
         hold_actions = int(stats["hold_actions"])
         non_hold_actions = int(stats["non_hold_actions"])
         total_actions = hold_actions + non_hold_actions
+        if non_hold_actions > 0:
+            hold_rate = float(hold_actions / non_hold_actions)
+        elif hold_actions > 0:
+            hold_rate = float("inf")
+        else:
+            hold_rate = float("nan")
         summary[source] = {
             "hold_actions": hold_actions,
             "non_hold_actions": non_hold_actions,
             "total_actions": total_actions,
-            "hold_rate": (
-                float(hold_actions / total_actions)
-                if total_actions > 0
-                else float("nan")
-            ),
+            "hold_rate": hold_rate,
             "unavailable": int(stats["unavailable"]),
             "margin": _hold_probe_summary(stats["margins"], eps, good_threshold),
             "mean_best_hold_score": _safe_recent_mean(
@@ -2934,6 +3231,7 @@ def run_validation_eval(
             diag_kick_assisted_locks_values: list[float] = []
             diag_hold_uses_values: list[float] = []
             hold_probe_accumulator: dict[str, dict[str, Any]] = {}
+            hold_swap_accumulator: dict[str, dict[str, Any]] = {}
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -2994,6 +3292,7 @@ def run_validation_eval(
                     actions_np = (
                         actions_t.detach().cpu().numpy().astype(np.int64).tolist()
                     )
+                    hold_swap_coef_now = hold_swap_distill_coef_for_update(cfg, update)
                     if cfg.hold_margin_probe or cfg.hold_margin_penalty_base > 0.0:
                         if not is_hold_probe_supported(cfg.action_space_kind):
                             accumulate_hold_action_counts(
@@ -3033,6 +3332,43 @@ def run_validation_eval(
                             penalty_base=0.0,
                             penalty_threshold=cfg.hold_margin_penalty_threshold,
                         )
+                    if (
+                        str(cfg.action_space_kind).strip().lower()
+                        == "placement_hold_step_v2"
+                        and (
+                            cfg.hold_swap_probe
+                            or hold_swap_coef_now > 0.0
+                        )
+                    ):
+                        hold_idx = int(mask_np.shape[1]) - 1
+                        hold_env_pairs = [
+                            (env_id, piece_source_profile)
+                            for env_idx, env_id in enumerate(env_ids)
+                            if hold_idx >= 0 and mask_np[env_idx, hold_idx] > 0.5
+                        ]
+                        if hold_env_pairs:
+                            hold_env_ids = [env_id for env_id, _source in hold_env_pairs]
+                            hold_sources = [
+                                source for _env_id, source in hold_env_pairs
+                            ]
+                            per_env_hold_swap, _unused_summary = (
+                                evaluate_hold_swap_teacher_for_envs(
+                                    env=val_env,
+                                    env_ids=hold_env_ids,
+                                    env_piece_sources=hold_sources,
+                                    obs_adapter=obs_adapter,
+                                    model=model,
+                                    device=device,
+                                    gamma=cfg.gamma,
+                                    teacher_tau=cfg.hold_swap_teacher_tau,
+                                )
+                            )
+                            accumulate_hold_swap_teacher_metrics(
+                                hold_swap_accumulator,
+                                env_ids=hold_env_ids,
+                                env_piece_sources=hold_sources,
+                                per_env=per_env_hold_swap,
+                            )
 
                     step_result = val_env.step_many(env_ids=env_ids, actions=actions_np)
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
@@ -3116,6 +3452,15 @@ def run_validation_eval(
                                     > 0.5
                                 ):
                                     ep_hold_uses[env_idx] += 1.0
+                            elif (
+                                _info_num(
+                                    info,
+                                    ("placementHoldUsed",),
+                                    default=0.0,
+                                )
+                                > 0.5
+                            ):
+                                ep_hold_uses[env_idx] += 1.0
                             for key in episode_term_keys:
                                 if key == "reward_final":
                                     continue
@@ -3193,6 +3538,9 @@ def run_validation_eval(
                         hold_probe_accumulator,
                         eps=cfg.hold_margin_eps,
                         good_threshold=cfg.hold_margin_good_threshold,
+                    ).get(piece_source_profile),
+                    "hold_swap": summarize_hold_swap_teacher_accumulator(
+                        hold_swap_accumulator
                     ).get(piece_source_profile),
                 },
             }
@@ -3283,6 +3631,32 @@ def _format_hold_probe_log_lines(prefix: str, probe: Any) -> list[str]:
         ]
     )
     return lines
+
+
+def _format_hold_swap_log_lines(prefix: str, summary: Any) -> list[str]:
+    if not isinstance(summary, dict):
+        return []
+    margin = summary.get("margin")
+    margin_dict = margin if isinstance(margin, dict) else {}
+    return [
+        (
+            f"{prefix}: "
+            f"avail={int(summary.get('available', 0))} "
+            f"unavail={int(summary.get('unavailable', 0))} "
+            f"p_hold={_fmt_float(summary.get('mean_teacher_hold_prob'))} "
+            f"best_hold={_fmt_float(summary.get('mean_best_hold_score'))} "
+            f"best_no_hold={_fmt_float(summary.get('mean_best_no_hold_score'))}"
+        ),
+        (
+            "      margin: "
+            f"mean={_fmt_float(margin_dict.get('mean'))} "
+            f"med={_fmt_float(margin_dict.get('median'))} "
+            f"p25={_fmt_float(margin_dict.get('p25'))} "
+            f"p75={_fmt_float(margin_dict.get('p75'))} "
+            f"pos={_fmt_float(margin_dict.get('frac_positive'))} "
+            f"neg={_fmt_float(margin_dict.get('frac_negative'))}"
+        ),
+    ]
 
 
 BLEND_STEP_TERM_KEYS: tuple[str, ...] = (
@@ -4786,6 +5160,10 @@ def train(cfg: PPOConfig) -> None:
             f"hold_margin_probe={'y' if cfg.hold_margin_probe else 'n'}, "
             f"hold_margin_penalty_base={cfg.hold_margin_penalty_base:.4f}, "
             f"hold_margin_penalty_threshold={cfg.hold_margin_penalty_threshold:.4f}, "
+            f"hold_swap_probe={'y' if cfg.hold_swap_probe else 'n'}, "
+            f"hold_swap_distill_coef={cfg.hold_swap_distill_coef_start:.4f}->{cfg.hold_swap_distill_coef_end:.4f}/"
+            f"{cfg.hold_swap_distill_coef_ramp_updates}, "
+            f"hold_swap_teacher_tau={cfg.hold_swap_teacher_tau:.4f}, "
             f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -4797,6 +5175,14 @@ def train(cfg: PPOConfig) -> None:
                 "[ppo] note: hold-margin probe/shaping is ignored for "
                 f"action_space={cfg.action_space_kind}. "
                 "The old flat-action hold probe does not apply to explicit HOLD steps."
+            )
+        if str(cfg.action_space_kind).strip().lower() != "placement_hold_step_v2" and (
+            cfg.hold_swap_probe or cfg.hold_swap_distill_coef_start > 0.0
+        ):
+            print(
+                "[ppo] note: hold-swap probe/distillation is ignored for "
+                f"action_space={cfg.action_space_kind}. "
+                "Swap-utility teaching only applies to explicit HOLD action spaces."
             )
         write_json(
             out_dir / "config.json",
@@ -4959,9 +5345,13 @@ def train(cfg: PPOConfig) -> None:
                 profile_io_s = 0.0
                 mask_repair_update = {"rows": 0, "batches": 0}
                 hold_probe_update_accumulator: dict[str, dict[str, Any]] = {}
+                hold_swap_update_accumulator: dict[str, dict[str, Any]] = {}
                 curriculum_topk_now = curriculum_topk_for_update(cfg, update)
                 curriculum_bias_now = curriculum_bias_for_update(cfg, update)
                 distill_coef_now = distill_coef_for_update(cfg, update)
+                hold_swap_distill_coef_now = hold_swap_distill_coef_for_update(
+                    cfg, update
+                )
                 env.set_curriculum(
                     top_k=curriculum_topk_now,
                     bias_strength=curriculum_bias_now,
@@ -4988,6 +5378,12 @@ def train(cfg: PPOConfig) -> None:
                 )
                 action_score_buf = torch.zeros(
                     (cfg.num_steps, cfg.num_envs, action_dim), device=device
+                )
+                hold_swap_teacher_prob_buf = torch.zeros(
+                    (cfg.num_steps, cfg.num_envs), device=device
+                )
+                hold_swap_teacher_valid_buf = torch.zeros(
+                    (cfg.num_steps, cfg.num_envs), device=device
                 )
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
                 logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
@@ -5067,6 +5463,59 @@ def train(cfg: PPOConfig) -> None:
                             penalty_base=cfg.hold_margin_penalty_base,
                             penalty_threshold=cfg.hold_margin_penalty_threshold,
                         )
+                    if (
+                        str(cfg.action_space_kind).strip().lower()
+                        == "placement_hold_step_v2"
+                        and (
+                            cfg.hold_swap_probe
+                            or hold_swap_distill_coef_now > 0.0
+                        )
+                    ):
+                        hold_idx = action_dim - 1
+                        hold_env_pairs = [
+                            (env_idx, env_id, env_piece_sources[env_idx])
+                            for env_idx, env_id in enumerate(env_ids)
+                            if hold_idx >= 0 and mask_np[env_idx, hold_idx] > 0.5
+                        ]
+                        if hold_env_pairs:
+                            hold_env_ids = [
+                                env_id for _env_idx, env_id, _source in hold_env_pairs
+                            ]
+                            hold_sources = [
+                                source
+                                for _env_idx, _env_id, source in hold_env_pairs
+                            ]
+                            per_env_hold_swap, _unused_summary = (
+                                evaluate_hold_swap_teacher_for_envs(
+                                    env=env,
+                                    env_ids=hold_env_ids,
+                                    env_piece_sources=hold_sources,
+                                    obs_adapter=obs_adapter,
+                                    model=model,
+                                    device=device,
+                                    gamma=cfg.gamma,
+                                    teacher_tau=cfg.hold_swap_teacher_tau,
+                                )
+                            )
+                            accumulate_hold_swap_teacher_metrics(
+                                hold_swap_update_accumulator,
+                                env_ids=hold_env_ids,
+                                env_piece_sources=hold_sources,
+                                per_env=per_env_hold_swap,
+                            )
+                            for env_idx, env_id, _source in hold_env_pairs:
+                                env_result = per_env_hold_swap.get(int(env_id))
+                                if not env_result:
+                                    continue
+                                teacher_hold_prob = env_result.get("teacher_hold_prob")
+                                if teacher_hold_prob is None or not math.isfinite(
+                                    float(teacher_hold_prob)
+                                ):
+                                    continue
+                                hold_swap_teacher_prob_buf[step, env_idx] = float(
+                                    teacher_hold_prob
+                                )
+                                hold_swap_teacher_valid_buf[step, env_idx] = 1.0
                     env_step_start = time.perf_counter()
                     step_result = env.step_many(env_ids=env_ids, actions=actions_np)
                     profile_env_step_s += time.perf_counter() - env_step_start
@@ -5275,6 +5724,8 @@ def train(cfg: PPOConfig) -> None:
                 b_masks = mask_buf.reshape((-1, action_dim))
                 b_action_bias = action_bias_buf.reshape((-1, action_dim))
                 b_action_scores = action_score_buf.reshape((-1, action_dim))
+                b_hold_swap_teacher_prob = hold_swap_teacher_prob_buf.reshape(-1)
+                b_hold_swap_teacher_valid = hold_swap_teacher_valid_buf.reshape(-1)
                 b_actions = action_buf.reshape(-1)
                 b_logprobs = logprob_buf.reshape(-1)
                 b_advantages = advantages.reshape(-1)
@@ -5293,20 +5744,24 @@ def train(cfg: PPOConfig) -> None:
                 value_loss_value = 0.0
                 entropy_value = 0.0
                 distill_loss_value = 0.0
+                hold_swap_distill_loss_value = 0.0
                 total_loss_value = 0.0
                 policy_term_value = 0.0
                 value_term_value = 0.0
                 entropy_term_value = 0.0
                 distill_term_value = 0.0
+                hold_swap_distill_term_value = 0.0
                 policy_loss_sum = 0.0
                 value_loss_sum = 0.0
                 entropy_sum = 0.0
                 distill_loss_sum = 0.0
+                hold_swap_distill_loss_sum = 0.0
                 total_loss_sum = 0.0
                 policy_term_sum = 0.0
                 value_term_sum = 0.0
                 entropy_term_sum = 0.0
                 distill_term_sum = 0.0
+                hold_swap_distill_term_sum = 0.0
                 teacher_entropy_value = 0.0
                 teacher_max_prob_value = 0.0
                 teacher_uniform_row_frac_value = 0.0
@@ -5414,16 +5869,52 @@ def train(cfg: PPOConfig) -> None:
                         distill_loss = -torch.sum(
                             teacher_probs * student_log_probs, dim=-1
                         ).mean()
+                        hold_swap_distill_loss = torch.zeros(
+                            (), device=device, dtype=logits.dtype
+                        )
+                        if (
+                            hold_swap_distill_coef_now > 0.0
+                            and str(cfg.action_space_kind).strip().lower()
+                            == "placement_hold_step_v2"
+                            and action_dim > 1
+                        ):
+                            mb_hold_swap_valid = (
+                                b_hold_swap_teacher_valid[mb_inds] > 0.5
+                            )
+                            if bool(torch.any(mb_hold_swap_valid).item()):
+                                hold_idx = action_dim - 1
+                                non_hold_logsumexp = torch.logsumexp(
+                                    student_logits[:, :hold_idx], dim=-1
+                                )
+                                hold_gate_logit = (
+                                    student_logits[:, hold_idx] - non_hold_logsumexp
+                                )
+                                teacher_hold_prob = torch.clamp(
+                                    b_hold_swap_teacher_prob[mb_inds],
+                                    min=1e-4,
+                                    max=1.0 - 1e-4,
+                                )
+                                hold_swap_distill_loss = (
+                                    F.binary_cross_entropy_with_logits(
+                                        hold_gate_logit[mb_hold_swap_valid],
+                                        teacher_hold_prob[mb_hold_swap_valid],
+                                        reduction="mean",
+                                    )
+                                )
 
                         policy_term = policy_loss
                         value_term = cfg.vf_coef * value_loss
                         entropy_term = -ent_coef_now * entropy
                         distill_term = distill_coef_now * distill_loss
+                        hold_swap_distill_term = (
+                            hold_swap_distill_coef_now * hold_swap_distill_loss
+                        )
                         loss = (
                             policy_term
                             + value_term
                             + entropy_term
                             + distill_term
+                            + hold_swap_distill_term
                         )
 
                         optimizer.zero_grad(set_to_none=True)
@@ -5439,19 +5930,27 @@ def train(cfg: PPOConfig) -> None:
                         distill_loss_value = float(
                             distill_loss.detach().cpu().item()
                         )
+                        hold_swap_distill_loss_value = float(
+                            hold_swap_distill_loss.detach().cpu().item()
+                        )
                         policy_term_value = float(policy_term.detach().cpu().item())
                         value_term_value = float(value_term.detach().cpu().item())
                         entropy_term_value = float(entropy_term.detach().cpu().item())
                         distill_term_value = float(distill_term.detach().cpu().item())
+                        hold_swap_distill_term_value = float(
+                            hold_swap_distill_term.detach().cpu().item()
+                        )
                         total_loss_value = float(loss.detach().cpu().item())
                         policy_loss_sum += policy_loss_value
                         value_loss_sum += value_loss_value
                         entropy_sum += entropy_value
                         distill_loss_sum += distill_loss_value
+                        hold_swap_distill_loss_sum += hold_swap_distill_loss_value
                         policy_term_sum += policy_term_value
                         value_term_sum += value_term_value
                         entropy_term_sum += entropy_term_value
                         distill_term_sum += distill_term_value
+                        hold_swap_distill_term_sum += hold_swap_distill_term_value
                         total_loss_sum += total_loss_value
                         valid_f = (mb_mask > 0).to(dtype=teacher_probs.dtype)
                         teacher_uniform_row_frac_value = float(
@@ -5511,10 +6010,16 @@ def train(cfg: PPOConfig) -> None:
                 value_loss_value = value_loss_sum / updates_done_denom
                 entropy_value = entropy_sum / updates_done_denom
                 distill_loss_value = distill_loss_sum / updates_done_denom
+                hold_swap_distill_loss_value = (
+                    hold_swap_distill_loss_sum / updates_done_denom
+                )
                 policy_term_value = policy_term_sum / updates_done_denom
                 value_term_value = value_term_sum / updates_done_denom
                 entropy_term_value = entropy_term_sum / updates_done_denom
                 distill_term_value = distill_term_sum / updates_done_denom
+                hold_swap_distill_term_value = (
+                    hold_swap_distill_term_sum / updates_done_denom
+                )
                 total_loss_value = total_loss_sum / updates_done_denom
                 teacher_entropy_value = teacher_entropy_sum / updates_done_denom
                 teacher_max_prob_value = teacher_max_prob_sum / updates_done_denom
@@ -5560,6 +6065,9 @@ def train(cfg: PPOConfig) -> None:
                     eps=cfg.hold_margin_eps,
                     good_threshold=cfg.hold_margin_good_threshold,
                 )
+                hold_swap_summary = summarize_hold_swap_teacher_accumulator(
+                    hold_swap_update_accumulator
+                )
                 stats = {
                     "update": update,
                     "global_step": global_step,
@@ -5575,11 +6083,13 @@ def train(cfg: PPOConfig) -> None:
                     "value_loss": value_loss_value,
                     "entropy": entropy_value,
                     "distill_loss": distill_loss_value,
+                    "hold_swap_distill_loss": hold_swap_distill_loss_value,
                     "loss_total": total_loss_value,
                     "loss_policy_term": policy_term_value,
                     "loss_value_term": value_term_value,
                     "loss_entropy_term": entropy_term_value,
                     "loss_distill_term": distill_term_value,
+                    "loss_hold_swap_distill_term": hold_swap_distill_term_value,
                     "approx_kl": approx_kl_mean,
                     "clip_fraction": float(np.mean(clipfracs)) if clipfracs else 0.0,
                     "explained_variance": explained_var,
@@ -5623,6 +6133,8 @@ def train(cfg: PPOConfig) -> None:
                     "distill_teacher_alpha_used": cfg.distill_teacher_alpha,
                     "distill_teacher_tau_used": cfg.distill_teacher_tau,
                     "distill_teacher_top_m_used": cfg.distill_teacher_top_m,
+                    "hold_swap_distill_coef_used": hold_swap_distill_coef_now,
+                    "hold_swap_teacher_tau_used": cfg.hold_swap_teacher_tau,
                     "curriculum_topk_used": curriculum_topk_now,
                     "curriculum_bias_used": curriculum_bias_now,
                     "curriculum_danger_height_used": cfg.curriculum_danger_height,
@@ -5648,6 +6160,7 @@ def train(cfg: PPOConfig) -> None:
                     ),
                     "ret100_terms": ret100_terms,
                     "hold_probe_by_source": hold_probe_summary,
+                    "hold_swap_by_source": hold_swap_summary,
                 }
                 stats["ret100_hierarchy"] = _reward_hierarchy_from_terms(
                     stats.get("ret100_terms")
@@ -5911,11 +6424,13 @@ def train(cfg: PPOConfig) -> None:
                             f"ploss={stats['policy_loss']:.4f} "
                             f"vloss={stats['value_loss']:.4f} "
                             f"dloss={stats['distill_loss']:.4f} "
+                            f"hsloss={stats['hold_swap_distill_loss']:.4f} "
                             f"total={stats['loss_total']:.4f} "
                             f"| terms(p={stats['loss_policy_term']:.4f},"
                             f"v={stats['loss_value_term']:.4f},"
                             f"ent={stats['loss_entropy_term']:.4f},"
-                            f"dist={stats['loss_distill_term']:.4f}) "
+                            f"dist={stats['loss_distill_term']:.4f},"
+                            f"hold={stats['loss_hold_swap_distill_term']:.4f}) "
                             f"| ent={stats['entropy']:.4f} "
                             f"kl={stats['approx_kl']:.5f} "
                             f"clip={stats['clip_fraction']:.3f} "
@@ -5925,9 +6440,11 @@ def train(cfg: PPOConfig) -> None:
                             "  schedule: "
                             f"ent_coef={ent_coef_now:.5f} "
                             f"distill_coef={distill_coef_now:.5f} "
+                            f"hold_swap_coef={hold_swap_distill_coef_now:.5f} "
                             f"teacher_alpha={cfg.distill_teacher_alpha:.3f} "
                             f"tau={cfg.distill_teacher_tau:.3f} "
                             f"teacher_topm={cfg.distill_teacher_top_m} "
+                            f"hold_tau={cfg.hold_swap_teacher_tau:.3f} "
                             f"pclip={cfg.policy_clip_coef:.4f} "
                             f"vclip={cfg.value_clip_coef:.4f} "
                             f"p_lr={policy_lr_now:.6g} "
@@ -5992,6 +6509,16 @@ def train(cfg: PPOConfig) -> None:
                             _format_hold_probe_log_lines(
                                 f"  hold_probe[{source}]",
                                 probe_item,
+                            )
+                        )
+                    for source in validation_sources:
+                        hold_swap_item = hold_swap_summary.get(source)
+                        if hold_swap_item is None:
+                            continue
+                        log_lines.extend(
+                            _format_hold_swap_log_lines(
+                                f"  hold_swap[{source}]",
+                                hold_swap_item,
                             )
                         )
                     if not validation_by_source:
@@ -6110,6 +6637,12 @@ def train(cfg: PPOConfig) -> None:
                                     _format_hold_probe_log_lines(
                                         f"    val_hold_probe[{source}]",
                                         source_diag_dict.get("hold_probe"),
+                                    )
+                                )
+                                log_lines.extend(
+                                    _format_hold_swap_log_lines(
+                                        f"    val_hold_swap[{source}]",
+                                        source_diag_dict.get("hold_swap"),
                                     )
                                 )
                             else:
