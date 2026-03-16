@@ -117,6 +117,18 @@ class PPOConfig:
     bc_max_records: int | None
     bc_normalize_returns: bool
     bc_return_clip: float
+    bc_val_fraction: float
+    bc_min_epochs: int
+    bc_early_stop_patience: int
+    bc_eval_every_epochs: int
+    bc_rollout_eval_every_epochs: int
+    bc_kl_probe_size: int
+    bc_policy_lr_scale: float
+    bc_policy_head_lr_scale: float
+    bc_value_lr_scale: float
+    bc_adapter_lr_scale: float
+    bc_queue_encoder_lr_scale: float
+    bc_hold_output_lr_scale: float
     freeze_encoder_after_bc: bool
     freeze_conv_after_bc: bool
 
@@ -910,6 +922,81 @@ def parse_args() -> PPOConfig:
         help="Clip BC value targets after optional normalization (<=0 disables clipping).",
     )
     parser.add_argument(
+        "--bc-val-fraction",
+        type=float,
+        default=0.1,
+        help="Session-level validation split fraction for BC (0 disables val split).",
+    )
+    parser.add_argument(
+        "--bc-min-epochs",
+        type=int,
+        default=3,
+        help="Minimum BC epochs before early stopping can trigger.",
+    )
+    parser.add_argument(
+        "--bc-early-stop-patience",
+        type=int,
+        default=5,
+        help="BC early-stop patience on validation total loss (0 disables early stop).",
+    )
+    parser.add_argument(
+        "--bc-eval-every-epochs",
+        type=int,
+        default=1,
+        help="Run full BC train/val metrics every N epochs.",
+    )
+    parser.add_argument(
+        "--bc-rollout-eval-every-epochs",
+        type=int,
+        default=1,
+        help="Run deterministic BC rollout eval once every N epochs (0 disables).",
+    )
+    parser.add_argument(
+        "--bc-kl-probe-size",
+        type=int,
+        default=512,
+        help="Fixed train/val probe size for KL(epoch_t-1 || epoch_t) logging.",
+    )
+    parser.add_argument(
+        "--bc-policy-lr-scale",
+        type=float,
+        default=1.0,
+        help="BC LR scale for inherited policy torso.",
+    )
+    parser.add_argument(
+        "--bc-policy-head-lr-scale",
+        type=float,
+        default=1.0,
+        help="BC LR scale for policy head weights/bias.",
+    )
+    parser.add_argument(
+        "--bc-value-lr-scale",
+        type=float,
+        default=1.0,
+        help="BC LR scale for value tower.",
+    )
+    parser.add_argument(
+        "--bc-adapter-lr-scale",
+        type=float,
+        default=0.25,
+        help="BC LR scale for the observation encoder / board adapter.",
+    )
+    parser.add_argument(
+        "--bc-queue-encoder-lr-scale",
+        type=float,
+        default=1.0,
+        help="BC LR scale for the visible-queue encoder branch.",
+    )
+    parser.add_argument(
+        "--bc-hold-output-lr-scale",
+        type=float,
+        default=4.0,
+        help=(
+            "Extra BC gradient scale for the explicit HOLD logit in "
+            "placement_hold_step_v2."
+        ),
+    )
+    parser.add_argument(
         "--freeze-encoder-after-bc",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1106,6 +1193,18 @@ def parse_args() -> PPOConfig:
         ),
         bc_normalize_returns=bool(args.bc_normalize_returns),
         bc_return_clip=float(args.bc_return_clip),
+        bc_val_fraction=min(0.95, max(0.0, float(args.bc_val_fraction))),
+        bc_min_epochs=max(1, int(args.bc_min_epochs)),
+        bc_early_stop_patience=max(0, int(args.bc_early_stop_patience)),
+        bc_eval_every_epochs=max(1, int(args.bc_eval_every_epochs)),
+        bc_rollout_eval_every_epochs=max(0, int(args.bc_rollout_eval_every_epochs)),
+        bc_kl_probe_size=max(0, int(args.bc_kl_probe_size)),
+        bc_policy_lr_scale=max(0.0, float(args.bc_policy_lr_scale)),
+        bc_policy_head_lr_scale=max(0.0, float(args.bc_policy_head_lr_scale)),
+        bc_value_lr_scale=max(0.0, float(args.bc_value_lr_scale)),
+        bc_adapter_lr_scale=max(0.0, float(args.bc_adapter_lr_scale)),
+        bc_queue_encoder_lr_scale=max(0.0, float(args.bc_queue_encoder_lr_scale)),
+        bc_hold_output_lr_scale=max(0.0, float(args.bc_hold_output_lr_scale)),
         freeze_encoder_after_bc=bool(args.freeze_encoder_after_bc),
         freeze_conv_after_bc=bool(args.freeze_conv_after_bc),
     )
@@ -3271,7 +3370,7 @@ def load_bc_dataset(
     obs_dim: int,
     action_dim: int,
     max_records: int | None,
-) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+) -> tuple[dict[str, Any], dict[str, int]]:
     raw = json.loads(dataset_path.read_text(encoding="utf-8"))
     records = raw.get("records")
     if not isinstance(records, list):
@@ -3282,6 +3381,7 @@ def load_bc_dataset(
     action_rows: list[int] = []
     return_rows: list[float] = []
     return_mask_rows: list[float] = []
+    session_id_rows: list[str] = []
 
     skipped = {
         "invalid_record": 0,
@@ -3336,6 +3436,17 @@ def load_bc_dataset(
         obs_rows.append(obs_values)
         mask_rows.append(mask)
         action_rows.append(action_index)
+        source = rec.get("source")
+        session_id: str | None = None
+        if isinstance(source, dict):
+            candidate = source.get("sessionId")
+            if isinstance(candidate, str) and candidate.strip():
+                session_id = candidate.strip()
+        if session_id is None:
+            candidate = rec.get("sessionId")
+            if isinstance(candidate, str) and candidate.strip():
+                session_id = candidate.strip()
+        session_id_rows.append(session_id or f"record_{len(session_id_rows)}")
         if _is_finite_number(return_to_go):
             return_rows.append(float(return_to_go))
             return_mask_rows.append(1.0)
@@ -3352,14 +3463,492 @@ def load_bc_dataset(
         "actions": np.asarray(action_rows, dtype=np.int64),
         "returns": np.asarray(return_rows, dtype=np.float32),
         "returns_mask": np.asarray(return_mask_rows, dtype=np.float32),
+        "session_ids": np.asarray(session_id_rows, dtype=object),
     }
     stats = {
         "total_records": len(records),
         "used_records": int(payload["obs"].shape[0]),
         "with_returns": int(np.sum(payload["returns_mask"])),
+        "sessions": int(len(set(session_id_rows))),
         **skipped,
     }
     return payload, stats
+
+
+def split_bc_indices_by_session(
+    session_ids: np.ndarray,
+    *,
+    val_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int | float]]:
+    session_list = [str(v) for v in session_ids.tolist()]
+    unique_sessions = list(dict.fromkeys(session_list))
+    session_count = len(unique_sessions)
+    if session_count <= 1 or val_fraction <= 0.0:
+        all_indices = np.arange(len(session_list), dtype=np.int64)
+        return all_indices, np.zeros((0,), dtype=np.int64), {
+            "session_count": session_count,
+            "train_sessions": session_count,
+            "val_sessions": 0,
+            "train_records": int(len(all_indices)),
+            "val_records": 0,
+            "val_fraction_effective": 0.0,
+        }
+
+    shuffled_sessions = list(unique_sessions)
+    random.Random(seed).shuffle(shuffled_sessions)
+    val_session_count = int(round(session_count * float(val_fraction)))
+    val_session_count = max(1, min(session_count - 1, val_session_count))
+    val_sessions = set(shuffled_sessions[:val_session_count])
+    train_indices = np.asarray(
+        [idx for idx, sid in enumerate(session_list) if sid not in val_sessions],
+        dtype=np.int64,
+    )
+    val_indices = np.asarray(
+        [idx for idx, sid in enumerate(session_list) if sid in val_sessions],
+        dtype=np.int64,
+    )
+    if train_indices.size == 0 or val_indices.size == 0:
+        all_indices = np.arange(len(session_list), dtype=np.int64)
+        return all_indices, np.zeros((0,), dtype=np.int64), {
+            "session_count": session_count,
+            "train_sessions": session_count,
+            "val_sessions": 0,
+            "train_records": int(len(all_indices)),
+            "val_records": 0,
+            "val_fraction_effective": 0.0,
+        }
+    return train_indices, val_indices, {
+        "session_count": session_count,
+        "train_sessions": int(session_count - val_session_count),
+        "val_sessions": int(val_session_count),
+        "train_records": int(train_indices.size),
+        "val_records": int(val_indices.size),
+        "val_fraction_effective": float(val_indices.size / max(1, len(session_list))),
+    }
+
+
+def build_bc_optimizer(
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    *,
+    learning_rate: float,
+    policy_lr_scale: float,
+    policy_head_lr_scale: float,
+    value_lr_scale: float,
+    adapter_lr_scale: float,
+    queue_lr_scale: float,
+) -> torch.optim.Optimizer:
+    param_groups: list[dict[str, Any]] = []
+
+    policy_torso_params: list[nn.Parameter] = []
+    policy_torso_params.extend(
+        [p for p in model.policy_fc1.parameters() if p.requires_grad]
+    )
+    policy_torso_params.extend(
+        [p for p in model.policy_fc2.parameters() if p.requires_grad]
+    )
+    if policy_torso_params:
+        param_groups.append(
+            {
+                "params": policy_torso_params,
+                "lr": learning_rate * max(0.0, float(policy_lr_scale)),
+                "group_name": "bc_policy",
+            }
+        )
+
+    policy_head_params = [p for p in model.policy_head.parameters() if p.requires_grad]
+    if policy_head_params:
+        param_groups.append(
+            {
+                "params": policy_head_params,
+                "lr": learning_rate * max(0.0, float(policy_head_lr_scale)),
+                "group_name": "bc_policy_head",
+            }
+        )
+
+    value_params: list[nn.Parameter] = []
+    value_params.extend([p for p in model.value_fc1.parameters() if p.requires_grad])
+    value_params.extend([p for p in model.value_fc2.parameters() if p.requires_grad])
+    value_params.extend([p for p in model.value_head.parameters() if p.requires_grad])
+    if value_params:
+        param_groups.append(
+            {
+                "params": value_params,
+                "lr": learning_rate * max(0.0, float(value_lr_scale)),
+                "group_name": "bc_value",
+            }
+        )
+
+    if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        board_params = [
+            p for p in obs_adapter.board_adapter.parameters() if p.requires_grad
+        ]
+        if board_params:
+            param_groups.append(
+                {
+                    "params": board_params,
+                    "lr": learning_rate * max(0.0, float(adapter_lr_scale)),
+                    "group_name": "bc_adapter_board",
+                }
+            )
+        queue_params = [p for p in obs_adapter.queue_fc1.parameters() if p.requires_grad]
+        if queue_params:
+            param_groups.append(
+                {
+                    "params": queue_params,
+                    "lr": learning_rate * max(0.0, float(queue_lr_scale)),
+                    "group_name": "bc_queue",
+                }
+            )
+    else:
+        adapter_params = [p for p in obs_adapter.parameters() if p.requires_grad]
+        if adapter_params:
+            param_groups.append(
+                {
+                    "params": adapter_params,
+                    "lr": learning_rate * max(0.0, float(adapter_lr_scale)),
+                    "group_name": "bc_adapter",
+                }
+            )
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found for BC optimizer.")
+    return torch.optim.Adam(param_groups, lr=learning_rate, eps=1e-5)
+
+
+def scale_bc_hold_output_gradients(
+    model: PolicyValueNet,
+    *,
+    action_space_kind: str,
+    hold_output_lr_scale: float,
+) -> None:
+    if str(action_space_kind).strip().lower() != "placement_hold_step_v2":
+        return
+    scale = float(hold_output_lr_scale)
+    if not math.isfinite(scale) or scale <= 0.0 or abs(scale - 1.0) < 1e-12:
+        return
+    weight_grad = model.policy_head.weight.grad
+    if weight_grad is not None and weight_grad.ndim == 2 and weight_grad.shape[0] > 0:
+        weight_grad[-1].mul_(scale)
+    bias_grad = model.policy_head.bias.grad
+    if bias_grad is not None and bias_grad.ndim == 1 and bias_grad.shape[0] > 0:
+        bias_grad[-1].mul_(scale)
+
+
+def summarize_optimizer_group_lrs(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for group in optimizer.param_groups:
+        out[str(group.get("group_name", f"group_{len(out)}"))] = float(
+            group.get("lr", float("nan"))
+        )
+    return out
+
+
+def _bc_probe_indices(
+    indices: np.ndarray,
+    *,
+    size: int,
+    seed: int,
+) -> np.ndarray:
+    if size <= 0 or indices.size <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if indices.size <= size:
+        return np.asarray(indices, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    return np.asarray(rng.choice(indices, size=size, replace=False), dtype=np.int64)
+
+
+def _bc_mean_kl(prev_probs: np.ndarray | None, curr_probs: np.ndarray | None) -> float:
+    if prev_probs is None or curr_probs is None:
+        return float("nan")
+    if prev_probs.shape != curr_probs.shape or prev_probs.size == 0:
+        return float("nan")
+    eps = 1e-12
+    safe_prev = np.clip(prev_probs, eps, 1.0)
+    safe_curr = np.clip(curr_probs, eps, 1.0)
+    kl = np.sum(
+        np.where(
+            prev_probs > 0.0,
+            prev_probs * (np.log(safe_prev) - np.log(safe_curr)),
+            0.0,
+        ),
+        axis=1,
+    )
+    return float(np.mean(kl, dtype=np.float64)) if kl.size > 0 else float("nan")
+
+
+def collect_bc_policy_probe_probs(
+    *,
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    device: torch.device,
+    obs_t: torch.Tensor,
+    masks_t: torch.Tensor,
+    indices_np: np.ndarray,
+    batch_size: int,
+) -> np.ndarray | None:
+    if indices_np.size <= 0:
+        return None
+    probs_chunks: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, int(indices_np.size), max(1, int(batch_size))):
+            batch_indices_np = indices_np[start : start + max(1, int(batch_size))]
+            batch_indices = torch.as_tensor(
+                batch_indices_np,
+                device=device,
+                dtype=torch.long,
+            )
+            features = obs_adapter(obs_t[batch_indices])
+            logits, _values = model(features)
+            dist = masked_categorical(logits, masks_t[batch_indices])
+            probs_chunks.append(
+                dist.probs.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+    if not probs_chunks:
+        return None
+    return np.concatenate(probs_chunks, axis=0)
+
+
+def evaluate_bc_split(
+    *,
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    device: torch.device,
+    obs_t: torch.Tensor,
+    masks_t: torch.Tensor,
+    actions_t: torch.Tensor,
+    returns_target_t: torch.Tensor,
+    returns_mask_t: torch.Tensor,
+    indices_np: np.ndarray,
+    batch_size: int,
+    action_space_kind: str,
+    action_dim: int,
+    value_weight: float,
+) -> dict[str, float]:
+    if indices_np.size <= 0:
+        return {
+            "records": 0.0,
+            "actor_loss": float("nan"),
+            "value_loss": float("nan"),
+            "total_loss": float("nan"),
+            "accuracy": float("nan"),
+            "top5_accuracy": float("nan"),
+            "top10_accuracy": float("nan"),
+            "chosen_logprob": float("nan"),
+            "entropy": float("nan"),
+            "hold_label_rate": float("nan"),
+            "hold_pred_rate": float("nan"),
+            "hold_precision": float("nan"),
+            "hold_recall": float("nan"),
+            "hold_f1": float("nan"),
+        }
+
+    actor_loss_sum = 0.0
+    value_loss_weighted_sum = 0.0
+    chosen_logprob_sum = 0.0
+    entropy_sum = 0.0
+    correct_top1 = 0
+    correct_top5 = 0
+    correct_top10 = 0
+    total_count = 0
+    valid_return_total = 0.0
+    top5_k = min(5, max(1, int(action_dim)))
+    top10_k = min(10, max(1, int(action_dim)))
+    hold_index = int(action_dim - 1)
+    hold_label_count = 0
+    hold_pred_count = 0
+    hold_tp = 0
+    hold_fp = 0
+    hold_fn = 0
+    hold_metrics_enabled = (
+        str(action_space_kind).strip().lower() == "placement_hold_step_v2"
+    )
+
+    with torch.no_grad():
+        for start in range(0, int(indices_np.size), max(1, int(batch_size))):
+            batch_indices_np = indices_np[start : start + max(1, int(batch_size))]
+            batch_indices = torch.as_tensor(
+                batch_indices_np,
+                device=device,
+                dtype=torch.long,
+            )
+            features = obs_adapter(obs_t[batch_indices])
+            logits, values = model(features)
+            dist = masked_categorical(logits, masks_t[batch_indices])
+            log_probs = dist.log_prob(actions_t[batch_indices])
+            probs = dist.probs
+            target_actions = actions_t[batch_indices]
+            top1 = torch.argmax(probs, dim=-1)
+            top5 = torch.topk(probs, k=top5_k, dim=-1).indices
+            top10 = torch.topk(probs, k=top10_k, dim=-1).indices
+
+            batch_count = int(target_actions.shape[0])
+            total_count += batch_count
+            actor_loss_sum += float(
+                torch.sum(-log_probs).detach().cpu().item()
+            )
+            chosen_logprob_sum += float(torch.sum(log_probs).detach().cpu().item())
+            entropy_sum += float(torch.sum(dist.entropy()).detach().cpu().item())
+            correct_top1 += int(torch.sum(top1 == target_actions).detach().cpu().item())
+            correct_top5 += int(
+                torch.sum(torch.any(top5 == target_actions.unsqueeze(1), dim=1))
+                .detach()
+                .cpu()
+                .item()
+            )
+            correct_top10 += int(
+                torch.sum(torch.any(top10 == target_actions.unsqueeze(1), dim=1))
+                .detach()
+                .cpu()
+                .item()
+            )
+
+            mb_return_mask = returns_mask_t[batch_indices]
+            valid_returns = float(torch.sum(mb_return_mask).detach().cpu().item())
+            if valid_returns > 0:
+                sq_err = (values - returns_target_t[batch_indices]) ** 2
+                weighted_value_loss = 0.5 * torch.sum(sq_err * mb_return_mask)
+                value_loss_weighted_sum += float(
+                    weighted_value_loss.detach().cpu().item()
+                )
+                valid_return_total += valid_returns
+
+            if hold_metrics_enabled:
+                label_hold = target_actions == hold_index
+                pred_hold = top1 == hold_index
+                hold_label_count += int(torch.sum(label_hold).detach().cpu().item())
+                hold_pred_count += int(torch.sum(pred_hold).detach().cpu().item())
+                hold_tp += int(torch.sum(label_hold & pred_hold).detach().cpu().item())
+                hold_fp += int(
+                    torch.sum((~label_hold) & pred_hold).detach().cpu().item()
+                )
+                hold_fn += int(
+                    torch.sum(label_hold & (~pred_hold)).detach().cpu().item()
+                )
+
+    actor_mean = actor_loss_sum / max(1, total_count)
+    value_mean = (
+        value_loss_weighted_sum / max(1.0, valid_return_total)
+        if valid_return_total > 0
+        else 0.0
+    )
+    total_mean = actor_mean + float(value_weight) * value_mean
+    hold_precision = (
+        float(hold_tp / max(1, hold_tp + hold_fp))
+        if (hold_tp + hold_fp) > 0
+        else float("nan")
+    )
+    hold_recall = (
+        float(hold_tp / max(1, hold_tp + hold_fn))
+        if (hold_tp + hold_fn) > 0
+        else float("nan")
+    )
+    hold_f1 = (
+        float(2.0 * hold_precision * hold_recall / (hold_precision + hold_recall))
+        if math.isfinite(hold_precision)
+        and math.isfinite(hold_recall)
+        and (hold_precision + hold_recall) > 0.0
+        else float("nan")
+    )
+    return {
+        "records": float(total_count),
+        "actor_loss": float(actor_mean),
+        "value_loss": float(value_mean),
+        "total_loss": float(total_mean),
+        "accuracy": float(correct_top1 / max(1, total_count)),
+        "top5_accuracy": float(correct_top5 / max(1, total_count)),
+        "top10_accuracy": float(correct_top10 / max(1, total_count)),
+        "chosen_logprob": float(chosen_logprob_sum / max(1, total_count)),
+        "entropy": float(entropy_sum / max(1, total_count)),
+        "hold_label_rate": (
+            float(hold_label_count / max(1, total_count))
+            if hold_metrics_enabled
+            else float("nan")
+        ),
+        "hold_pred_rate": (
+            float(hold_pred_count / max(1, total_count))
+            if hold_metrics_enabled
+            else float("nan")
+        ),
+        "hold_precision": hold_precision,
+        "hold_recall": hold_recall,
+        "hold_f1": hold_f1,
+    }
+
+
+def run_bc_rollout_evals(
+    *,
+    env: WubEnvBridge,
+    env_id: int,
+    model: PolicyValueNet,
+    obs_adapter: ObservationAdapter,
+    device: torch.device,
+    cfg: PPOConfig,
+    epoch: int,
+    sources: list[str],
+) -> dict[str, dict[str, float | bool]]:
+    if cfg.bc_rollout_eval_every_epochs <= 0:
+        return {}
+    if epoch % max(1, int(cfg.bc_rollout_eval_every_epochs)) != 0:
+        return {}
+    env.set_curriculum(
+        top_k=0,
+        bias_strength=0.0,
+        danger_height=cfg.curriculum_danger_height,
+    )
+    out: dict[str, dict[str, float | bool]] = {}
+    max_steps = max(8, int(cfg.max_pieces_per_episode_val) * 4)
+    for source_index, source in enumerate(sources):
+        env.set_piece_source(source)
+        rollout = capture_single_policy_rollout(
+            env=env,
+            env_id=env_id,
+            seed=cfg.seed + 7_000_001 + epoch * 10_007 + source_index * 101,
+            model=model,
+            obs_adapter=obs_adapter,
+            device=device,
+            max_steps=max_steps,
+            deterministic=True,
+        )
+        out[source] = {
+            "episode_return": float(rollout.get("episode_return", 0.0)),
+            "episode_length": float(rollout.get("episode_length", 0)),
+            "done": bool(rollout.get("done", False)),
+        }
+    return out
+
+
+def format_bc_metrics_line(
+    prefix: str,
+    metrics: dict[str, float],
+    *,
+    hold_metrics: bool,
+) -> str:
+    out = (
+        f"{prefix}: "
+        f"actor={_fmt_float(metrics.get('actor_loss'), 4)} "
+        f"value={_fmt_float(metrics.get('value_loss'), 4)} "
+        f"total={_fmt_float(metrics.get('total_loss'), 4)} "
+        f"acc={_fmt_float(metrics.get('accuracy'))} "
+        f"top5={_fmt_float(metrics.get('top5_accuracy'))} "
+        f"top10={_fmt_float(metrics.get('top10_accuracy'))} "
+        f"logp={_fmt_float(metrics.get('chosen_logprob'), 4)} "
+        f"ent={_fmt_float(metrics.get('entropy'), 4)} "
+        f"kl_prev={_fmt_float(metrics.get('kl_prev'), 4)}"
+    )
+    if hold_metrics:
+        out += (
+            " "
+            f"hold(lbl={_fmt_float(metrics.get('hold_label_rate'))},"
+            f"pred={_fmt_float(metrics.get('hold_pred_rate'))},"
+            f"p={_fmt_float(metrics.get('hold_precision'))},"
+            f"r={_fmt_float(metrics.get('hold_recall'))},"
+            f"f1={_fmt_float(metrics.get('hold_f1'))})"
+        )
+    return out
 
 
 def run_bc_pretrain(
@@ -3369,6 +3958,9 @@ def run_bc_pretrain(
     device: torch.device,
     obs_dim: int,
     action_dim: int,
+    env: WubEnvBridge,
+    env_ids: list[int],
+    rollout_sources: list[str],
 ) -> dict[str, Any]:
     if not cfg.bc_dataset or cfg.bc_epochs <= 0:
         return {"enabled": False}
@@ -3386,6 +3978,7 @@ def run_bc_pretrain(
     actions_t = torch.from_numpy(batch["actions"]).to(device)
     returns_t = as_tensor(batch["returns"], device)
     returns_mask_t = as_tensor(batch["returns_mask"], device)
+    session_ids_np = np.asarray(batch["session_ids"], dtype=object)
     returns_target_t = returns_t.clone()
 
     valid_return_count = int(torch.sum(returns_mask_t).detach().cpu().item())
@@ -3418,14 +4011,65 @@ def run_bc_pretrain(
 
     sample_count = int(obs_t.shape[0])
     batch_size = min(cfg.bc_batch_size, sample_count)
-    optimizer = torch.optim.Adam(
-        trainable_parameters(model, obs_adapter), lr=cfg.bc_learning_rate, eps=1e-5
+    train_indices_np, val_indices_np, split_stats = split_bc_indices_by_session(
+        session_ids_np,
+        val_fraction=cfg.bc_val_fraction,
+        seed=cfg.seed,
     )
+    train_indices_t = torch.as_tensor(train_indices_np, device=device, dtype=torch.long)
+    val_enabled = val_indices_np.size > 0
+    optimizer = build_bc_optimizer(
+        model,
+        obs_adapter,
+        learning_rate=cfg.bc_learning_rate,
+        policy_lr_scale=cfg.bc_policy_lr_scale,
+        policy_head_lr_scale=cfg.bc_policy_head_lr_scale,
+        value_lr_scale=cfg.bc_value_lr_scale,
+        adapter_lr_scale=cfg.bc_adapter_lr_scale,
+        queue_lr_scale=cfg.bc_queue_encoder_lr_scale,
+    )
+    optimizer_group_lrs = summarize_optimizer_group_lrs(optimizer)
 
-    best_loss = float("inf")
+    best_metric = float("inf")
+    best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
     best_adapter_state: dict[str, torch.Tensor] | None = None
-    epoch_logs: list[dict[str, float]] = []
+    epoch_logs: list[dict[str, Any]] = []
+    hold_metrics_enabled = (
+        str(cfg.action_space_kind).strip().lower() == "placement_hold_step_v2"
+    )
+    patience_used = 0
+    stopped_early = False
+    stop_reason: str | None = None
+
+    train_probe_indices_np = _bc_probe_indices(
+        train_indices_np,
+        size=cfg.bc_kl_probe_size,
+        seed=cfg.seed + 17,
+    )
+    val_probe_indices_np = _bc_probe_indices(
+        val_indices_np,
+        size=cfg.bc_kl_probe_size,
+        seed=cfg.seed + 31,
+    )
+    prev_train_probe_probs = collect_bc_policy_probe_probs(
+        model=model,
+        obs_adapter=obs_adapter,
+        device=device,
+        obs_t=obs_t,
+        masks_t=masks_t,
+        indices_np=train_probe_indices_np,
+        batch_size=batch_size,
+    )
+    prev_val_probe_probs = collect_bc_policy_probe_probs(
+        model=model,
+        obs_adapter=obs_adapter,
+        device=device,
+        obs_t=obs_t,
+        masks_t=masks_t,
+        indices_np=val_probe_indices_np,
+        batch_size=batch_size,
+    )
     print(
         "[bc] "
         f"returns preprocess: normalize={'y' if cfg.bc_normalize_returns else 'n'} "
@@ -3433,16 +4077,29 @@ def run_bc_pretrain(
         f"valid_targets={valid_return_count} "
         f"mean={return_norm_mean:.4f} std={return_norm_std:.4f}"
     )
+    print(
+        "[bc] "
+        f"split: sessions(train={split_stats['train_sessions']}, val={split_stats['val_sessions']}) "
+        f"records(train={split_stats['train_records']}, val={split_stats['val_records']}) "
+        f"val_fraction={split_stats['val_fraction_effective']:.3f}"
+    )
+    print(
+        "[bc] optimizer: "
+        + ", ".join(
+            f"{key}={value:.6g}" for key, value in optimizer_group_lrs.items()
+        )
+        + (
+            f", hold_output_scale={cfg.bc_hold_output_lr_scale:.3f}"
+            if hold_metrics_enabled
+            else ""
+        )
+    )
 
     for epoch in range(1, cfg.bc_epochs + 1):
-        perm = torch.randperm(sample_count, device=device)
-        actor_loss_sum = 0.0
-        value_loss_sum = 0.0
-        total_loss_sum = 0.0
-        batch_count = 0
+        perm = torch.randperm(int(train_indices_t.shape[0]), device=device)
 
-        for start in range(0, sample_count, batch_size):
-            idx = perm[start : start + batch_size]
+        for start in range(0, int(train_indices_t.shape[0]), batch_size):
+            idx = train_indices_t[perm[start : start + batch_size]]
             obs_features = obs_adapter(obs_t[idx])
             logits, values = model(obs_features)
             dist = masked_categorical(logits, masks_t[idx])
@@ -3459,38 +4116,106 @@ def run_bc_pretrain(
             total_loss = actor_loss + cfg.bc_value_weight * value_loss
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
+            scale_bc_hold_output_gradients(
+                model,
+                action_space_kind=cfg.action_space_kind,
+                hold_output_lr_scale=cfg.bc_hold_output_lr_scale,
+            )
             nn.utils.clip_grad_norm_(
                 trainable_parameters(model, obs_adapter), cfg.max_grad_norm
             )
             optimizer.step()
 
-            actor_loss_sum += float(actor_loss.detach().cpu().item())
-            value_loss_sum += float(value_loss.detach().cpu().item())
-            total_loss_sum += float(total_loss.detach().cpu().item())
-            batch_count += 1
+        was_model_training = model.training
+        was_adapter_training = obs_adapter.training
+        model.eval()
+        obs_adapter.eval()
+        try:
+            train_metrics = evaluate_bc_split(
+                model=model,
+                obs_adapter=obs_adapter,
+                device=device,
+                obs_t=obs_t,
+                masks_t=masks_t,
+                actions_t=actions_t,
+                returns_target_t=returns_target_t,
+                returns_mask_t=returns_mask_t,
+                indices_np=train_indices_np,
+                batch_size=batch_size,
+                action_space_kind=cfg.action_space_kind,
+                action_dim=action_dim,
+                value_weight=cfg.bc_value_weight,
+            )
+            val_metrics = evaluate_bc_split(
+                model=model,
+                obs_adapter=obs_adapter,
+                device=device,
+                obs_t=obs_t,
+                masks_t=masks_t,
+                actions_t=actions_t,
+                returns_target_t=returns_target_t,
+                returns_mask_t=returns_mask_t,
+                indices_np=val_indices_np,
+                batch_size=batch_size,
+                action_space_kind=cfg.action_space_kind,
+                action_dim=action_dim,
+                value_weight=cfg.bc_value_weight,
+            )
+            current_train_probe_probs = collect_bc_policy_probe_probs(
+                model=model,
+                obs_adapter=obs_adapter,
+                device=device,
+                obs_t=obs_t,
+                masks_t=masks_t,
+                indices_np=train_probe_indices_np,
+                batch_size=batch_size,
+            )
+            current_val_probe_probs = collect_bc_policy_probe_probs(
+                model=model,
+                obs_adapter=obs_adapter,
+                device=device,
+                obs_t=obs_t,
+                masks_t=masks_t,
+                indices_np=val_probe_indices_np,
+                batch_size=batch_size,
+            )
+            train_metrics["kl_prev"] = _bc_mean_kl(
+                prev_train_probe_probs,
+                current_train_probe_probs,
+            )
+            val_metrics["kl_prev"] = _bc_mean_kl(
+                prev_val_probe_probs,
+                current_val_probe_probs,
+            )
+            prev_train_probe_probs = current_train_probe_probs
+            prev_val_probe_probs = current_val_probe_probs
+            rollout_eval = run_bc_rollout_evals(
+                env=env,
+                env_id=env_ids[0],
+                model=model,
+                obs_adapter=obs_adapter,
+                device=device,
+                cfg=cfg,
+                epoch=epoch,
+                sources=rollout_sources,
+            )
+        finally:
+            if was_model_training:
+                model.train()
+            if was_adapter_training:
+                obs_adapter.train()
 
-        denom = max(1, batch_count)
-        mean_actor_loss = actor_loss_sum / denom
-        mean_value_loss = value_loss_sum / denom
-        mean_total_loss = total_loss_sum / denom
-
-        epoch_log = {
-            "epoch": float(epoch),
-            "actor_loss": mean_actor_loss,
-            "value_loss": mean_value_loss,
-            "total_loss": mean_total_loss,
-        }
-        epoch_logs.append(epoch_log)
-        print(
-            "[bc] "
-            f"epoch={epoch}/{cfg.bc_epochs} "
-            f"actor={mean_actor_loss:.4f} "
-            f"value={mean_value_loss:.4f} "
-            f"total={mean_total_loss:.4f}"
+        selection_metric = (
+            float(val_metrics.get("total_loss", float("nan")))
+            if val_enabled
+            else float(train_metrics.get("total_loss", float("nan")))
         )
-
-        if math.isfinite(mean_total_loss) and mean_total_loss < best_loss:
-            best_loss = mean_total_loss
+        improved = math.isfinite(selection_metric) and (
+            not math.isfinite(best_metric) or selection_metric < (best_metric - 1e-6)
+        )
+        if improved:
+            best_metric = float(selection_metric)
+            best_epoch = int(epoch)
             best_state = {
                 key: tensor.detach().cpu().clone()
                 for key, tensor in model.state_dict().items()
@@ -3499,6 +4224,74 @@ def run_bc_pretrain(
                 key: tensor.detach().cpu().clone()
                 for key, tensor in obs_adapter.state_dict().items()
             }
+            patience_used = 0
+        elif val_enabled and cfg.bc_early_stop_patience > 0 and epoch >= cfg.bc_min_epochs:
+            patience_used += 1
+            if patience_used >= cfg.bc_early_stop_patience:
+                stopped_early = True
+                stop_reason = (
+                    f"no val improvement for {cfg.bc_early_stop_patience} epochs"
+                )
+
+        epoch_log = {
+            "epoch": int(epoch),
+            "train": train_metrics,
+            "val": val_metrics,
+            "rollout": rollout_eval,
+            "selection_metric": selection_metric,
+            "improved": bool(improved),
+            "patience_used": int(patience_used),
+        }
+        epoch_logs.append(epoch_log)
+
+        log_eval_due = (
+            epoch == 1
+            or epoch == cfg.bc_epochs
+            or epoch % max(1, cfg.bc_eval_every_epochs) == 0
+            or stopped_early
+        )
+        if log_eval_due:
+            print(f"[bc] epoch={epoch}/{cfg.bc_epochs}")
+            print(
+                "  "
+                + format_bc_metrics_line(
+                    "train",
+                    train_metrics,
+                    hold_metrics=hold_metrics_enabled,
+                )
+            )
+            if val_enabled:
+                print(
+                    "  "
+                    + format_bc_metrics_line(
+                        "val",
+                        val_metrics,
+                        hold_metrics=hold_metrics_enabled,
+                    )
+                )
+            if rollout_eval:
+                print(
+                    "  rollout: "
+                    + ", ".join(
+                        (
+                            f"{source}(ret={_fmt_float(result.get('episode_return'))},"
+                            f"len={_fmt_float(result.get('episode_length'), 0)},"
+                            f"done={'y' if bool(result.get('done')) else 'n'})"
+                        )
+                        for source, result in rollout_eval.items()
+                    )
+                )
+            if val_enabled and cfg.bc_early_stop_patience > 0:
+                print(
+                    "  "
+                    f"early_stop: best_epoch={best_epoch} "
+                    f"best_val={_fmt_float(best_metric, 4)} "
+                    f"patience={patience_used}/{cfg.bc_early_stop_patience}"
+                )
+
+        if stopped_early:
+            print(f"[bc] early stop at epoch {epoch}: {stop_reason}")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -3509,16 +4302,32 @@ def run_bc_pretrain(
         "enabled": True,
         "dataset_path": str(dataset_path),
         "epochs": cfg.bc_epochs,
+        "epochs_ran": len(epoch_logs),
         "batch_size": batch_size,
         "learning_rate": cfg.bc_learning_rate,
         "value_weight": cfg.bc_value_weight,
+        "val_fraction": cfg.bc_val_fraction,
+        "kl_probe_size": cfg.bc_kl_probe_size,
         "normalize_returns": cfg.bc_normalize_returns,
         "return_norm_mean": return_norm_mean,
         "return_norm_std": return_norm_std,
         "return_clip_used": return_clip_used,
         "returns_with_targets": valid_return_count,
         "dataset_stats": dataset_stats,
-        "best_total_loss": best_loss,
+        "split": split_stats,
+        "optimizer_group_lrs": optimizer_group_lrs,
+        "optimizer_group_scales": {
+            "policy": cfg.bc_policy_lr_scale,
+            "policy_head": cfg.bc_policy_head_lr_scale,
+            "value": cfg.bc_value_lr_scale,
+            "adapter": cfg.bc_adapter_lr_scale,
+            "queue": cfg.bc_queue_encoder_lr_scale,
+            "hold_output": cfg.bc_hold_output_lr_scale,
+        },
+        "best_total_loss": best_metric,
+        "best_epoch": best_epoch,
+        "early_stopped": stopped_early,
+        "stop_reason": stop_reason,
         "epoch_logs": epoch_logs,
     }
 
@@ -3636,7 +4445,7 @@ def train(cfg: PPOConfig) -> None:
         policy_observation_space = obs_adapter.policy_observation_space
 
         model = PolicyValueNet(obs_dim, cfg.hidden_dim, action_dim).to(device)
-        optimizer: torch.optim.Optimizer
+        optimizer: torch.optim.Optimizer | None = None
 
         global_step = 0
         start_update = 0
@@ -3722,7 +4531,17 @@ def train(cfg: PPOConfig) -> None:
         encoder_frozen_for_ppo = False
         encoder_freeze_mode_applied = "none"
 
-        if not cfg.resume_checkpoint:
+        bc_requested = bool(cfg.bc_dataset) and cfg.bc_epochs > 0
+        bc_allowed = (not cfg.resume_checkpoint) or cfg.resume_mode == "fresh"
+        bc_should_run = bc_requested and bc_allowed
+        if bc_requested and not bc_allowed:
+            print(
+                "[ppo] warning: BC was requested but skipped because "
+                "--resume-checkpoint is being used with --resume-mode continue."
+            )
+
+        bc_stats: dict[str, Any] = {"enabled": False}
+        if bc_should_run:
             bc_stats = run_bc_pretrain(
                 model=model,
                 obs_adapter=obs_adapter,
@@ -3730,6 +4549,13 @@ def train(cfg: PPOConfig) -> None:
                 device=device,
                 obs_dim=raw_obs_dim,
                 action_dim=action_dim,
+                env=env,
+                env_ids=env_ids,
+                rollout_sources=validation_sources,
+            )
+            env.set_piece_sources(
+                env_ids=env_ids,
+                piece_source_profiles=env_piece_sources,
             )
             if bc_stats.get("enabled"):
                 write_json(out_dir / "bc_stats.json", bc_stats)
@@ -3793,75 +4619,83 @@ def train(cfg: PPOConfig) -> None:
                     f"post_bc snapshot saved "
                     f"(policy={post_bc_artifact_path.name}, "
                     f"trajectory={'yes' if post_bc_trajectory_path is not None else 'no'}, "
-                    f"ret={post_bc_stats['episode_return']:.3f}, "
-                    f"len={post_bc_stats['episode_length']})"
+                        f"ret={post_bc_stats['episode_return']:.3f}, "
+                        f"len={post_bc_stats['episode_length']})"
                 )
-            if cfg.freeze_encoder_after_bc or cfg.freeze_conv_after_bc:
-                if bc_stats.get("enabled"):
-                    if cfg.freeze_encoder_after_bc:
-                        encoder_param_total = 0
-                        encoder_param_trainable = 0
-                        for param in obs_adapter.parameters():
-                            param_count = int(param.numel())
-                            encoder_param_total += param_count
-                            if param.requires_grad:
-                                encoder_param_trainable += param_count
-                            param.requires_grad = False
-                        encoder_frozen_for_ppo = encoder_param_total > 0
-                        if encoder_frozen_for_ppo:
-                            encoder_freeze_mode_applied = "all"
-                            print(
-                                "[ppo] encoder frozen after BC "
-                                f"(params={encoder_param_total}, trainable_before={encoder_param_trainable})"
-                            )
-                        else:
-                            print(
-                                "[ppo] encoder freeze requested after BC, "
-                                "but no trainable encoder params were found."
-                            )
-                    elif cfg.freeze_conv_after_bc:
-                        board_adapter = (
-                            obs_adapter.board_adapter
-                            if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
-                            else obs_adapter
+        if cfg.freeze_encoder_after_bc or cfg.freeze_conv_after_bc:
+            if bc_stats.get("enabled"):
+                if cfg.freeze_encoder_after_bc:
+                    encoder_param_total = 0
+                    encoder_param_trainable = 0
+                    for param in obs_adapter.parameters():
+                        param_count = int(param.numel())
+                        encoder_param_total += param_count
+                        if param.requires_grad:
+                            encoder_param_trainable += param_count
+                        param.requires_grad = False
+                    encoder_frozen_for_ppo = encoder_param_total > 0
+                    if encoder_frozen_for_ppo:
+                        encoder_freeze_mode_applied = "all"
+                        print(
+                            "[ppo] encoder frozen after BC "
+                            f"(params={encoder_param_total}, trainable_before={encoder_param_trainable})"
                         )
-                        if isinstance(board_adapter, WubHeadFromRawObservationAdapter):
-                            conv_param_total = 0
-                            conv_param_trainable = 0
-                            for conv in board_adapter.conv_layers:
-                                for param in conv.parameters():
-                                    param_count = int(param.numel())
-                                    conv_param_total += param_count
-                                    if param.requires_grad:
-                                        conv_param_trainable += param_count
-                                    param.requires_grad = False
-                            encoder_frozen_for_ppo = conv_param_total > 0
-                            if encoder_frozen_for_ppo:
-                                encoder_freeze_mode_applied = "conv"
-                                print(
-                                    "[ppo] encoder conv frozen after BC "
-                                    f"(params={conv_param_total}, trainable_before={conv_param_trainable})"
-                                )
-                            else:
-                                print(
-                                    "[ppo] conv freeze requested after BC, "
-                                    "but no trainable conv params were found."
-                                )
+                    else:
+                        print(
+                            "[ppo] encoder freeze requested after BC, "
+                            "but no trainable encoder params were found."
+                        )
+                elif cfg.freeze_conv_after_bc:
+                    board_adapter = (
+                        obs_adapter.board_adapter
+                        if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
+                        else obs_adapter
+                    )
+                    if isinstance(board_adapter, WubHeadFromRawObservationAdapter):
+                        conv_param_total = 0
+                        conv_param_trainable = 0
+                        for conv in board_adapter.conv_layers:
+                            for param in conv.parameters():
+                                param_count = int(param.numel())
+                                conv_param_total += param_count
+                                if param.requires_grad:
+                                    conv_param_trainable += param_count
+                                param.requires_grad = False
+                        encoder_frozen_for_ppo = conv_param_total > 0
+                        if encoder_frozen_for_ppo:
+                            encoder_freeze_mode_applied = "conv"
+                            print(
+                                "[ppo] encoder conv frozen after BC "
+                                f"(params={conv_param_total}, trainable_before={conv_param_trainable})"
+                            )
                         else:
                             print(
                                 "[ppo] conv freeze requested after BC, "
-                                "but observation adapter has no conv layers."
+                                "but no trainable conv params were found."
                             )
-                else:
-                    freeze_label = (
-                        "encoder"
-                        if cfg.freeze_encoder_after_bc
-                        else "encoder conv"
-                    )
-                    print(
-                        f"[ppo] {freeze_label} freeze requested after BC, "
-                        "but BC was skipped/disabled."
-                    )
+                    else:
+                        print(
+                            "[ppo] conv freeze requested after BC, "
+                            "but observation adapter has no conv layers."
+                        )
+            else:
+                freeze_label = (
+                    "encoder"
+                    if cfg.freeze_encoder_after_bc
+                    else "encoder conv"
+                )
+                print(
+                    f"[ppo] {freeze_label} freeze requested after BC, "
+                    "but BC was skipped/disabled."
+                )
+
+        if bc_should_run:
+            env.set_piece_sources(
+                env_ids=env_ids,
+                piece_source_profiles=env_piece_sources,
+            )
+
+        if optimizer is None or bc_should_run:
             optimizer = build_ppo_optimizer(
                 model,
                 obs_adapter,
@@ -3869,7 +4703,8 @@ def train(cfg: PPOConfig) -> None:
                 cfg.queue_encoder_lr_scale,
             )
 
-            # Reinitialize env batch after post-BC snapshot capture so PPO
+        if bc_should_run:
+            # Reinitialize env batch after BC eval/snapshot capture so PPO
             # always starts from a clean synchronized state.
             reset_seeds = [cfg.seed + i * 101 for i in range(cfg.num_envs)]
             reset_result = env.reset_many(env_ids=env_ids, seeds=reset_seeds)
