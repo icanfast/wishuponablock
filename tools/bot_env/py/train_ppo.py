@@ -102,6 +102,8 @@ class PPOConfig:
     hold_swap_distill_coef_end: float
     hold_swap_distill_coef_ramp_updates: int
     hold_swap_teacher_tau: float
+    hold_swap_margin_threshold: float
+    hold_swap_hold_bias: float
     validation_episodes_per_env: int
     validate_every_updates: int
     device: str
@@ -896,7 +898,19 @@ def parse_args() -> PPOConfig:
         "--hold-swap-teacher-tau",
         type=float,
         default=0.25,
-        help="Temperature for sigmoid(margin_swap / tau) hold teacher.",
+        help="Temperature for sigmoid((margin_swap - threshold - bias) / tau) hold teacher.",
+    )
+    parser.add_argument(
+        "--hold-swap-margin-threshold",
+        type=float,
+        default=0.0,
+        help="Required positive swap margin before the hold teacher turns favorable.",
+    )
+    parser.add_argument(
+        "--hold-swap-hold-bias",
+        type=float,
+        default=0.0,
+        help="Additional anti-hold bias in margin units for the hold teacher.",
     )
     parser.add_argument(
         "--validation-episodes-per-env",
@@ -1216,6 +1230,8 @@ def parse_args() -> PPOConfig:
             0, int(args.hold_swap_distill_coef_ramp_updates)
         ),
         hold_swap_teacher_tau=max(1e-4, float(args.hold_swap_teacher_tau)),
+        hold_swap_margin_threshold=float(args.hold_swap_margin_threshold),
+        hold_swap_hold_bias=float(args.hold_swap_hold_bias),
         validation_episodes_per_env=max(0, int(args.validation_episodes_per_env)),
         validate_every_updates=max(1, int(args.validate_every_updates)),
         device=args.device,
@@ -1601,9 +1617,14 @@ def _hold_swap_margin_summary(values: list[float]) -> dict[str, Any]:
     }
 
 
-def hold_swap_teacher_prob_from_margin(margin: float, tau: float) -> float:
+def hold_swap_teacher_prob_from_margin(
+    margin: float,
+    tau: float,
+    margin_threshold: float,
+    hold_bias: float,
+) -> float:
     safe_tau = max(1e-4, float(tau))
-    scaled = float(margin) / safe_tau
+    scaled = (float(margin) - float(margin_threshold) - float(hold_bias)) / safe_tau
     if scaled >= 0.0:
         z = math.exp(-scaled)
         return float(1.0 / (1.0 + z))
@@ -1857,6 +1878,8 @@ def evaluate_hold_swap_teacher_for_envs(
     device: torch.device,
     gamma: float,
     teacher_tau: float,
+    margin_threshold: float,
+    hold_bias: float,
 ) -> tuple[dict[int, dict[str, float | None]], dict[str, Any]]:
     by_source: dict[str, dict[str, Any]] = {}
     for source in env_piece_sources:
@@ -1952,7 +1975,10 @@ def evaluate_hold_swap_teacher_for_envs(
         best_no_hold_score = float(max(scored_no_hold))
         margin = best_hold_score - best_no_hold_score
         teacher_hold_prob = hold_swap_teacher_prob_from_margin(
-            margin, teacher_tau
+            margin,
+            teacher_tau,
+            margin_threshold,
+            hold_bias,
         )
         source_stats["available"] += 1
         source_stats["margins"].append(margin)
@@ -3361,6 +3387,8 @@ def run_validation_eval(
                                     device=device,
                                     gamma=cfg.gamma,
                                     teacher_tau=cfg.hold_swap_teacher_tau,
+                                    margin_threshold=cfg.hold_swap_margin_threshold,
+                                    hold_bias=cfg.hold_swap_hold_bias,
                                 )
                             )
                             accumulate_hold_swap_teacher_metrics(
@@ -5164,6 +5192,8 @@ def train(cfg: PPOConfig) -> None:
             f"hold_swap_distill_coef={cfg.hold_swap_distill_coef_start:.4f}->{cfg.hold_swap_distill_coef_end:.4f}/"
             f"{cfg.hold_swap_distill_coef_ramp_updates}, "
             f"hold_swap_teacher_tau={cfg.hold_swap_teacher_tau:.4f}, "
+            f"hold_swap_margin_threshold={cfg.hold_swap_margin_threshold:.4f}, "
+            f"hold_swap_hold_bias={cfg.hold_swap_hold_bias:.4f}, "
             f"obs_adapter_lr_scale={cfg.obs_adapter_lr_scale:.3f}, "
             f"encoder_frozen_after_bc={'y' if encoder_frozen_for_ppo else 'n'}, "
             f"encoder_freeze_mode={encoder_freeze_mode_applied})"
@@ -5495,6 +5525,8 @@ def train(cfg: PPOConfig) -> None:
                                     device=device,
                                     gamma=cfg.gamma,
                                     teacher_tau=cfg.hold_swap_teacher_tau,
+                                    margin_threshold=cfg.hold_swap_margin_threshold,
+                                    hold_bias=cfg.hold_swap_hold_bias,
                                 )
                             )
                             accumulate_hold_swap_teacher_metrics(
@@ -6445,6 +6477,8 @@ def train(cfg: PPOConfig) -> None:
                             f"tau={cfg.distill_teacher_tau:.3f} "
                             f"teacher_topm={cfg.distill_teacher_top_m} "
                             f"hold_tau={cfg.hold_swap_teacher_tau:.3f} "
+                            f"hold_m0={cfg.hold_swap_margin_threshold:.3f} "
+                            f"hold_bias={cfg.hold_swap_hold_bias:.3f} "
                             f"pclip={cfg.policy_clip_coef:.4f} "
                             f"vclip={cfg.value_clip_coef:.4f} "
                             f"p_lr={policy_lr_now:.6g} "
