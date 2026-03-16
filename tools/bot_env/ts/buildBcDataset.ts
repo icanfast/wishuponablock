@@ -61,6 +61,8 @@ type CliOptions = {
   returnGamma: number;
   maxSessions: number | null;
   maxRecords: number | null;
+  progressMode: 'auto' | 'rewrite' | 'log' | 'off';
+  progressLogEveryMs: number;
 };
 
 type BcRecord = {
@@ -141,6 +143,8 @@ const printUsage = (): void => {
     [--action-dim ${PLACEMENT_ACTION_DIM}] \\
     [--max-nodes ${DEFAULT_MAX_NODES}] \\
     [--return-gamma 0.995] \\
+    [--progress-mode auto|rewrite|log|off] \\
+    [--progress-log-every-ms 5000] \\
     [--max-sessions 1000] \\
     [--max-records 500000]`);
 };
@@ -158,6 +162,8 @@ const parseArgs = (argv: string[]): CliOptions | null => {
   let returnGamma = 0.995;
   let maxSessions: number | null = null;
   let maxRecords: number | null = null;
+  let progressMode: CliOptions['progressMode'] = 'auto';
+  let progressLogEveryMs = 5_000;
 
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -244,6 +250,31 @@ const parseArgs = (argv: string[]): CliOptions | null => {
       i += 1;
       continue;
     }
+    if (arg === '--progress-mode') {
+      const value = argv[i + 1]?.trim().toLowerCase();
+      if (
+        value === 'auto' ||
+        value === 'rewrite' ||
+        value === 'log' ||
+        value === 'off'
+      ) {
+        progressMode = value;
+      } else {
+        throw new Error(
+          '--progress-mode must be one of: auto, rewrite, log, off.',
+        );
+      }
+      i += 1;
+      continue;
+    }
+    if (arg === '--progress-log-every-ms') {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isFinite(parsed)) {
+        progressLogEveryMs = Math.max(0, Math.trunc(parsed));
+      }
+      i += 1;
+      continue;
+    }
     if (arg === '--max-sessions') {
       maxSessions = asInt(argv[i + 1], 1);
       i += 1;
@@ -274,6 +305,8 @@ const parseArgs = (argv: string[]): CliOptions | null => {
     returnGamma,
     maxSessions,
     maxRecords,
+    progressMode,
+    progressLogEveryMs,
   };
 };
 
@@ -515,14 +548,22 @@ const formatDuration = (elapsedMs: number): string => {
   return `${minutes}m${String(seconds).padStart(2, '0')}s`;
 };
 
-const createProgressReporter = () => {
+const createProgressReporter = (options?: {
+  mode?: 'auto' | 'rewrite' | 'log' | 'off';
+  logEveryMs?: number;
+}) => {
   const startedAt = Date.now();
+  const mode = options?.mode ?? 'auto';
   const tty = Boolean(process.stdout.isTTY);
+  const useRewrite = mode === 'rewrite' || (mode === 'auto' && tty);
+  const useLog = mode === 'log' || (mode === 'auto' && !tty);
+  const logEveryMs = Math.max(0, Math.trunc(options?.logEveryMs ?? 5_000));
   let lastRenderedAt = 0;
   let lastLoggedAt = 0;
   let lastLineLength = 0;
 
   const render = (snapshot: ProgressSnapshot, force = false): void => {
+    if (mode === 'off') return;
     const now = Date.now();
     const elapsedMs = now - startedAt;
     if (!force && now - lastRenderedAt < 200) return;
@@ -548,14 +589,14 @@ const createProgressReporter = () => {
       `| ${recPerSec.toFixed(1)} rec/s ` +
       `| ${formatDuration(elapsedMs)}`;
 
-    if (tty) {
+    if (useRewrite) {
       const padded = line.padEnd(lastLineLength, ' ');
       lastLineLength = Math.max(lastLineLength, line.length);
       process.stdout.write(`\r${padded}`);
       return;
     }
 
-    if (force || now - lastLoggedAt >= 5_000) {
+    if (useLog && (force || now - lastLoggedAt >= logEveryMs)) {
       lastLoggedAt = now;
       console.log(line);
     }
@@ -563,7 +604,7 @@ const createProgressReporter = () => {
 
   const close = (snapshot: ProgressSnapshot): void => {
     render(snapshot, true);
-    if (tty) process.stdout.write('\n');
+    if (useRewrite) process.stdout.write('\n');
   };
 
   return {
@@ -675,7 +716,10 @@ const main = async (): Promise<void> => {
     }
   }
   const files = [...discovered].sort();
-  const progress = createProgressReporter();
+  const progress = createProgressReporter({
+    mode: options.progressMode,
+    logEveryMs: options.progressLogEveryMs,
+  });
 
   const outputPath = path.resolve(options.outputPath);
   const writer = await createDatasetStreamWriter({
