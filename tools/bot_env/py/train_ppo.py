@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -5328,6 +5329,12 @@ def train(cfg: PPOConfig) -> None:
         best_stats: dict[str, Any] | None = None
         best_state_dict: dict[str, torch.Tensor] | None = None
         best_adapter_state_dict: dict[str, torch.Tensor] | None = None
+        latest_completed_update = 0
+        latest_completed_global_step = 0
+        latest_completed_stats: dict[str, Any] | None = None
+        latest_completed_model_state_dict: dict[str, torch.Tensor] | None = None
+        latest_completed_adapter_state_dict: dict[str, torch.Tensor] | None = None
+        latest_completed_optimizer_state_dict: dict[str, Any] | None = None
         did_interrupt = False
         last_log_wall: float | None = None
         try:
@@ -6804,9 +6811,72 @@ def train(cfg: PPOConfig) -> None:
                         f"t_since_last_log={_fmt_float(log_gap_seconds)}s"
                     )
 
+                latest_completed_update = int(update)
+                latest_completed_global_step = int(global_step)
+                latest_completed_stats = copy.deepcopy(stats)
+                latest_completed_model_state_dict = {
+                    key: tensor.detach().cpu().clone()
+                    for key, tensor in model.state_dict().items()
+                }
+                latest_completed_adapter_state_dict = {
+                    key: tensor.detach().cpu().clone()
+                    for key, tensor in obs_adapter.state_dict().items()
+                }
+                latest_completed_optimizer_state_dict = copy.deepcopy(
+                    optimizer.state_dict()
+                )
+
         except KeyboardInterrupt:
             did_interrupt = True
             print("[ppo] keyboard interrupt received; finishing with best available policy...")
+
+        if (
+            did_interrupt
+            and latest_completed_update > 0
+            and latest_completed_stats is not None
+            and latest_completed_model_state_dict is not None
+            and latest_completed_adapter_state_dict is not None
+            and latest_completed_optimizer_state_dict is not None
+        ):
+            model.load_state_dict(latest_completed_model_state_dict)
+            obs_adapter.load_state_dict(
+                latest_completed_adapter_state_dict, strict=False
+            )
+            optimizer.load_state_dict(latest_completed_optimizer_state_dict)
+            interrupted_ckpt_path = (
+                checkpoints_dir / f"ppo_update_{latest_completed_update:06d}.pt"
+            )
+            save_checkpoint(
+                checkpoint_path=interrupted_ckpt_path,
+                model=model,
+                obs_adapter=obs_adapter,
+                optimizer=optimizer,
+                cfg=cfg,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                global_step=latest_completed_global_step,
+                update=latest_completed_update,
+                stats=latest_completed_stats,
+            )
+            interrupted_artifact = export_bot_policy_artifact(
+                model,
+                obs_adapter,
+                cfg,
+                obs_dim,
+                action_dim,
+                policy_observation_space,
+            )
+            interrupted_artifact_path = (
+                artifacts_dir / f"bot_policy_update_{latest_completed_update:06d}.json"
+            )
+            write_json(interrupted_artifact_path, interrupted_artifact)
+            write_json(out_dir / "last_stats.json", latest_completed_stats)
+            print(
+                "[ppo] "
+                f"saved interrupted latest update={latest_completed_update} "
+                f"step={latest_completed_global_step} "
+                f"path={interrupted_ckpt_path}"
+            )
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
