@@ -518,15 +518,15 @@ const REWARD_V2_BOARD_QUALITY_WEIGHT = 0.2;
 const REWARD_V2_HOLE_REMOVE_WEIGHT = 0.05;
 const REWARD_V2_HOLE_CREATE_WEIGHT = REWARD_V2_HOLE_REMOVE_WEIGHT * 5;
 
-const REWARD_V3_LINE_WEIGHT = 0.45;
+const REWARD_V3_LINE_WEIGHT = 0.2;
 const REWARD_V3_COMPLEXITY_WEIGHT = 0.35;
 const REWARD_V3_BOARD_DELTA_WEIGHT = 0.15;
-const REWARD_V3_BOARD_ABSOLUTE_WEIGHT = 0.01;
+const REWARD_V3_BOARD_ABSOLUTE_WEIGHT = 0.005;
 const REWARD_V3_HOLE_CREATE_WEIGHT = 0.3;
 const REWARD_V3_HOLE_REMOVE_WEIGHT = 0.0;
 const REWARD_V3_DANGER_HEIGHT = 14;
 const REWARD_V3_DANGER_WEIGHT = 0.04;
-const REWARD_V3_FULL_CLEAR_BONUS = 20.0;
+const REWARD_V3_FULL_CLEAR_BONUS = 8.0;
 
 const computePlacementComplexityPenalty = (
   placement: Pick<
@@ -710,7 +710,7 @@ const computePieceRewardV3 = (
     topOut,
   } = options;
   const clampedLines = Math.max(0, linesDelta);
-  const linesTerm = Math.pow(clampedLines, 1.5) * REWARD_V3_LINE_WEIGHT;
+  const linesTerm = Math.pow(clampedLines, 2) * REWARD_V3_LINE_WEIGHT;
   const boardQualityDeltaTerm =
     boardQualityDelta * REWARD_V3_BOARD_DELTA_WEIGHT;
   const boardQualityAbsoluteTerm =
