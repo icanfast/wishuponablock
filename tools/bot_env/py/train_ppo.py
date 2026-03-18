@@ -3259,6 +3259,7 @@ def run_validation_eval(
             diag_hold_uses_values: list[float] = []
             hold_probe_accumulator: dict[str, dict[str, Any]] = {}
             hold_swap_accumulator: dict[str, dict[str, Any]] = {}
+            hold_swap_chosen_accumulator: dict[str, dict[str, Any]] = {}
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -3398,6 +3399,23 @@ def run_validation_eval(
                                 env_piece_sources=hold_sources,
                                 per_env=per_env_hold_swap,
                             )
+                            chosen_hold_env_ids = [
+                                env_id
+                                for env_idx, env_id, _source in hold_env_pairs
+                                if int(actions_np[env_idx]) == hold_idx
+                            ]
+                            chosen_hold_sources = [
+                                source
+                                for env_idx, _env_id, source in hold_env_pairs
+                                if int(actions_np[env_idx]) == hold_idx
+                            ]
+                            if chosen_hold_env_ids:
+                                accumulate_hold_swap_teacher_metrics(
+                                    hold_swap_chosen_accumulator,
+                                    env_ids=chosen_hold_env_ids,
+                                    env_piece_sources=chosen_hold_sources,
+                                    per_env=per_env_hold_swap,
+                                )
 
                     step_result = val_env.step_many(env_ids=env_ids, actions=actions_np)
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
@@ -3570,6 +3588,9 @@ def run_validation_eval(
                     ).get(piece_source_profile),
                     "hold_swap": summarize_hold_swap_teacher_accumulator(
                         hold_swap_accumulator
+                    ).get(piece_source_profile),
+                    "hold_swap_chosen": summarize_hold_swap_teacher_accumulator(
+                        hold_swap_chosen_accumulator
                     ).get(piece_source_profile),
                 },
             }
@@ -5392,6 +5413,7 @@ def train(cfg: PPOConfig) -> None:
                 mask_repair_update = {"rows": 0, "batches": 0}
                 hold_probe_update_accumulator: dict[str, dict[str, Any]] = {}
                 hold_swap_update_accumulator: dict[str, dict[str, Any]] = {}
+                hold_swap_chosen_update_accumulator: dict[str, dict[str, Any]] = {}
                 curriculum_topk_now = curriculum_topk_for_update(cfg, update)
                 curriculum_bias_now = curriculum_bias_for_update(cfg, update)
                 distill_coef_now = distill_coef_for_update(cfg, update)
@@ -5551,6 +5573,23 @@ def train(cfg: PPOConfig) -> None:
                                 env_piece_sources=hold_sources,
                                 per_env=per_env_hold_swap,
                             )
+                            chosen_hold_env_ids = [
+                                env_id
+                                for env_idx, env_id, _source in hold_env_pairs
+                                if int(actions_np[env_idx]) == hold_idx
+                            ]
+                            chosen_hold_sources = [
+                                source
+                                for env_idx, _env_id, source in hold_env_pairs
+                                if int(actions_np[env_idx]) == hold_idx
+                            ]
+                            if chosen_hold_env_ids:
+                                accumulate_hold_swap_teacher_metrics(
+                                    hold_swap_chosen_update_accumulator,
+                                    env_ids=chosen_hold_env_ids,
+                                    env_piece_sources=chosen_hold_sources,
+                                    per_env=per_env_hold_swap,
+                                )
                             for env_idx, env_id, _source in hold_env_pairs:
                                 env_result = per_env_hold_swap.get(int(env_id))
                                 if not env_result:
@@ -6128,6 +6167,9 @@ def train(cfg: PPOConfig) -> None:
                 hold_swap_summary = summarize_hold_swap_teacher_accumulator(
                     hold_swap_update_accumulator
                 )
+                hold_swap_chosen_summary = summarize_hold_swap_teacher_accumulator(
+                    hold_swap_chosen_update_accumulator
+                )
                 stats = {
                     "update": update,
                     "global_step": global_step,
@@ -6221,6 +6263,7 @@ def train(cfg: PPOConfig) -> None:
                     "ret100_terms": ret100_terms,
                     "hold_probe_by_source": hold_probe_summary,
                     "hold_swap_by_source": hold_swap_summary,
+                    "hold_swap_chosen_by_source": hold_swap_chosen_summary,
                 }
                 stats["ret100_hierarchy"] = _reward_hierarchy_from_terms(
                     stats.get("ret100_terms")
@@ -6583,6 +6626,21 @@ def train(cfg: PPOConfig) -> None:
                                 hold_swap_item,
                             )
                         )
+                    hold_swap_chosen_summary = (
+                        stats.get("hold_swap_chosen_by_source", {})
+                        if isinstance(stats.get("hold_swap_chosen_by_source"), dict)
+                        else {}
+                    )
+                    for source in validation_sources:
+                        hold_swap_chosen_item = hold_swap_chosen_summary.get(source)
+                        if hold_swap_chosen_item is None:
+                            continue
+                        log_lines.extend(
+                            _format_hold_swap_log_lines(
+                                f"  hold_swap_chosen[{source}]",
+                                hold_swap_chosen_item,
+                            )
+                        )
                     if not validation_by_source:
                         log_lines.append("  validation: skipped")
                     else:
@@ -6705,6 +6763,12 @@ def train(cfg: PPOConfig) -> None:
                                     _format_hold_swap_log_lines(
                                         f"    val_hold_swap[{source}]",
                                         source_diag_dict.get("hold_swap"),
+                                    )
+                                )
+                                log_lines.extend(
+                                    _format_hold_swap_log_lines(
+                                        f"    val_hold_swap_chosen[{source}]",
+                                        source_diag_dict.get("hold_swap_chosen"),
                                     )
                                 )
                             else:
