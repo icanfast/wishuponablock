@@ -3442,14 +3442,16 @@ def run_validation_eval(
                     ):
                         hold_idx = int(mask_np.shape[1]) - 1
                         hold_env_pairs = [
-                            (env_id, piece_source_profile)
+                            (env_idx, env_id, piece_source_profile)
                             for env_idx, env_id in enumerate(env_ids)
                             if hold_idx >= 0 and mask_np[env_idx, hold_idx] > 0.5
                         ]
                         if hold_env_pairs:
-                            hold_env_ids = [env_id for env_id, _source in hold_env_pairs]
+                            hold_env_ids = [
+                                env_id for _env_idx, env_id, _source in hold_env_pairs
+                            ]
                             hold_sources = [
-                                source for _env_id, source in hold_env_pairs
+                                source for _env_idx, _env_id, source in hold_env_pairs
                             ]
                             per_env_hold_swap, _unused_summary = (
                                 evaluate_hold_swap_teacher_for_envs(
