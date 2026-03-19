@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gzip
 import json
 import math
 import random
@@ -137,6 +138,13 @@ class PPOConfig:
     bc_adapter_lr_scale: float
     bc_queue_encoder_lr_scale: float
     bc_hold_output_lr_scale: float
+    midgame_reset_dataset: str | None
+    midgame_reset_prob: float
+    midgame_reset_max_records: int | None
+    midgame_reset_min_filled_cells: int
+    midgame_reset_max_filled_cells: int
+    midgame_reset_max_height: int
+    midgame_reset_top_clear_rows: int
     freeze_encoder_after_bc: bool
     freeze_conv_after_bc: bool
 
@@ -1067,6 +1075,50 @@ def parse_args() -> PPOConfig:
         default=0,
         help="Optional cap for BC records (0 means no cap).",
     )
+    parser.add_argument(
+        "--midgame-reset-dataset",
+        default=None,
+        help=(
+            "Optional BC dataset JSON to source train-only midgame reset boards from. "
+            "Defaults to --bc-dataset when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--midgame-reset-prob",
+        type=float,
+        default=0.0,
+        help="Probability that a train reset starts from a BC-sourced midgame board.",
+    )
+    parser.add_argument(
+        "--midgame-reset-max-records",
+        type=int,
+        default=0,
+        help="Optional cap for retained midgame reset boards after filtering (0 means no cap).",
+    )
+    parser.add_argument(
+        "--midgame-reset-min-filled-cells",
+        type=int,
+        default=20,
+        help="Minimum occupied cells for a BC-sourced midgame reset board.",
+    )
+    parser.add_argument(
+        "--midgame-reset-max-filled-cells",
+        type=int,
+        default=140,
+        help="Maximum occupied cells for a BC-sourced midgame reset board.",
+    )
+    parser.add_argument(
+        "--midgame-reset-max-height",
+        type=int,
+        default=16,
+        help="Maximum stack height allowed for a BC-sourced midgame reset board.",
+    )
+    parser.add_argument(
+        "--midgame-reset-top-clear-rows",
+        type=int,
+        default=2,
+        help="Require this many top rows to be empty in BC-sourced midgame reset boards.",
+    )
 
     args = parser.parse_args()
 
@@ -1269,6 +1321,26 @@ def parse_args() -> PPOConfig:
         bc_adapter_lr_scale=max(0.0, float(args.bc_adapter_lr_scale)),
         bc_queue_encoder_lr_scale=max(0.0, float(args.bc_queue_encoder_lr_scale)),
         bc_hold_output_lr_scale=max(0.0, float(args.bc_hold_output_lr_scale)),
+        midgame_reset_dataset=(
+            args.midgame_reset_dataset.strip()
+            if isinstance(args.midgame_reset_dataset, str)
+            and args.midgame_reset_dataset.strip()
+            else None
+        ),
+        midgame_reset_prob=min(1.0, max(0.0, float(args.midgame_reset_prob))),
+        midgame_reset_max_records=(
+            max(1, int(args.midgame_reset_max_records))
+            if int(args.midgame_reset_max_records) > 0
+            else None
+        ),
+        midgame_reset_min_filled_cells=max(
+            0, int(args.midgame_reset_min_filled_cells)
+        ),
+        midgame_reset_max_filled_cells=max(
+            0, int(args.midgame_reset_max_filled_cells)
+        ),
+        midgame_reset_max_height=max(0, int(args.midgame_reset_max_height)),
+        midgame_reset_top_clear_rows=max(0, int(args.midgame_reset_top_clear_rows)),
         freeze_encoder_after_bc=bool(args.freeze_encoder_after_bc),
         freeze_conv_after_bc=bool(args.freeze_conv_after_bc),
     )
@@ -3899,6 +3971,170 @@ def load_bc_dataset(
     return payload, stats
 
 
+def _midgame_board_height(board: np.ndarray) -> int:
+    if board.ndim != 2 or board.shape[0] <= 0:
+        return 0
+    occupied_rows = np.nonzero(np.any(board > 0, axis=1))[0]
+    if occupied_rows.size <= 0:
+        return 0
+    return int(board.shape[0] - int(occupied_rows[0]))
+
+
+def load_midgame_reset_pool(
+    dataset_path: Path,
+    *,
+    max_records: int | None,
+    min_filled_cells: int,
+    max_filled_cells: int,
+    max_height: int,
+    top_clear_rows: int,
+    seed: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    raw_bytes = dataset_path.read_bytes()
+    text = (
+        gzip.decompress(raw_bytes).decode("utf-8")
+        if dataset_path.suffix.lower() == ".gz"
+        else raw_bytes.decode("utf-8")
+    )
+    raw = json.loads(text)
+    observation_space = str(raw.get("observationSpace", "")).strip().lower()
+    if observation_space != "raw_v1":
+        raise ValueError(
+            "Midgame reset dataset must use raw_v1 observations. "
+            f"dataset_observation_space={observation_space or 'unknown'}"
+        )
+    records = raw.get("records")
+    if not isinstance(records, list):
+        raise ValueError("Midgame reset dataset missing records array.")
+
+    top_clear_rows = min(DEFAULT_BOARD_ROWS, max(0, int(top_clear_rows)))
+    boards: list[np.ndarray] = []
+    stats = {
+        "total_records": len(records),
+        "valid_obs": 0,
+        "kept": 0,
+        "invalid_obs": 0,
+        "filtered_filled": 0,
+        "filtered_height": 0,
+        "filtered_top_rows": 0,
+    }
+    for rec in records:
+        if not isinstance(rec, dict):
+            stats["invalid_obs"] += 1
+            continue
+        obs = rec.get("obs")
+        if (
+            not isinstance(obs, list)
+            or len(obs) < RAW_BOARD_SIZE
+            or any(not _is_finite_number(v) for v in obs[:RAW_BOARD_SIZE])
+        ):
+            stats["invalid_obs"] += 1
+            continue
+        board = (
+            np.asarray(obs[:RAW_BOARD_SIZE], dtype=np.float32)
+            .reshape(DEFAULT_BOARD_ROWS, DEFAULT_BOARD_COLS)
+            > 0.5
+        ).astype(np.uint8)
+        stats["valid_obs"] += 1
+        filled_cells = int(np.sum(board, dtype=np.int64))
+        if filled_cells < int(min_filled_cells) or filled_cells > int(max_filled_cells):
+            stats["filtered_filled"] += 1
+            continue
+        height = _midgame_board_height(board)
+        if height > int(max_height):
+            stats["filtered_height"] += 1
+            continue
+        if top_clear_rows > 0 and int(np.sum(board[:top_clear_rows], dtype=np.int64)) > 0:
+            stats["filtered_top_rows"] += 1
+            continue
+        boards.append(board)
+
+    if not boards:
+        raise ValueError("Midgame reset dataset produced zero usable boards after filtering.")
+
+    if max_records is not None and len(boards) > int(max_records):
+        rng = random.Random(int(seed) ^ 0x57A0D91)
+        keep_indices = sorted(rng.sample(range(len(boards)), int(max_records)))
+        boards = [boards[index] for index in keep_indices]
+
+    boards_np = np.stack(boards, axis=0).astype(np.uint8, copy=False)
+    filled_values = np.sum(boards_np, axis=(1, 2), dtype=np.int64)
+    height_values = np.asarray(
+        [_midgame_board_height(board) for board in boards_np],
+        dtype=np.int64,
+    )
+    stats["kept"] = int(boards_np.shape[0])
+    stats["mean_filled_cells"] = float(np.mean(filled_values, dtype=np.float64))
+    stats["mean_height"] = float(np.mean(height_values, dtype=np.float64))
+    stats["max_height_kept"] = int(np.max(height_values))
+    stats["min_filled_cells_kept"] = int(np.min(filled_values))
+    stats["max_filled_cells_kept"] = int(np.max(filled_values))
+    return boards_np, stats
+
+
+def sample_midgame_reset_initial_boards(
+    *,
+    reset_pool: np.ndarray | None,
+    env_count: int,
+    prob: float,
+    rng: random.Random,
+) -> tuple[list[list[list[int]] | None] | None, int]:
+    if (
+        reset_pool is None
+        or reset_pool.ndim != 3
+        or reset_pool.shape[0] <= 0
+        or prob <= 0.0
+        or env_count <= 0
+    ):
+        return None, 0
+    initial_boards: list[list[list[int]] | None] = []
+    requested = 0
+    pool_size = int(reset_pool.shape[0])
+    for _ in range(env_count):
+        if rng.random() < prob:
+            requested += 1
+            board_index = rng.randrange(pool_size)
+            initial_boards.append(reset_pool[board_index].astype(np.int64).tolist())
+        else:
+            initial_boards.append(None)
+    return (initial_boards if requested > 0 else None), requested
+
+
+def count_applied_midgame_resets(reset_result: dict[str, Any]) -> int:
+    infos = reset_result.get("infos")
+    if not isinstance(infos, list):
+        return 0
+    applied = 0
+    for info in infos:
+        if isinstance(info, dict) and bool(info.get("initialBoardAugmented", False)):
+            applied += 1
+    return applied
+
+
+def reset_many_for_training(
+    *,
+    env: WubEnvBridge,
+    env_ids: list[int],
+    seeds: list[int],
+    reset_pool: np.ndarray | None,
+    reset_prob: float,
+    rng: random.Random,
+) -> tuple[dict[str, Any], int, int]:
+    initial_boards, requested = sample_midgame_reset_initial_boards(
+        reset_pool=reset_pool,
+        env_count=len(env_ids),
+        prob=reset_prob,
+        rng=rng,
+    )
+    reset_result = env.reset_many(
+        env_ids=env_ids,
+        seeds=seeds,
+        initial_boards=initial_boards,
+    )
+    applied = count_applied_midgame_resets(reset_result)
+    return reset_result, requested, applied
+
+
 def split_bc_indices_by_session(
     session_ids: np.ndarray,
     *,
@@ -4870,6 +5106,9 @@ def train(cfg: PPOConfig) -> None:
 
         model = PolicyValueNet(obs_dim, cfg.hidden_dim, action_dim).to(device)
         optimizer: torch.optim.Optimizer | None = None
+        midgame_reset_pool: np.ndarray | None = None
+        midgame_reset_stats: dict[str, Any] | None = None
+        midgame_reset_rng = random.Random(cfg.seed ^ 0x6D5E77A1)
 
         global_step = 0
         start_update = 0
@@ -4951,6 +5190,46 @@ def train(cfg: PPOConfig) -> None:
                     f"artifact={artifact_action_space_kind} run={cfg.action_space_kind}"
                 )
             print(f"[ppo] initialized from bot artifact: {artifact_path}")
+
+        if cfg.midgame_reset_prob > 0.0:
+            midgame_dataset_path_str = cfg.midgame_reset_dataset or cfg.bc_dataset
+            if cfg.observation_space != "raw_v1":
+                print(
+                    "[ppo] warning: midgame reset augmentation requires raw_v1 observations; "
+                    "feature disabled for this run."
+                )
+            elif not midgame_dataset_path_str:
+                print(
+                    "[ppo] warning: midgame reset augmentation requested but no dataset "
+                    "was provided via --midgame-reset-dataset or --bc-dataset."
+                )
+            else:
+                midgame_dataset_path = Path(midgame_dataset_path_str).resolve()
+                try:
+                    midgame_reset_pool, midgame_reset_stats = load_midgame_reset_pool(
+                        midgame_dataset_path,
+                        max_records=cfg.midgame_reset_max_records,
+                        min_filled_cells=cfg.midgame_reset_min_filled_cells,
+                        max_filled_cells=cfg.midgame_reset_max_filled_cells,
+                        max_height=cfg.midgame_reset_max_height,
+                        top_clear_rows=cfg.midgame_reset_top_clear_rows,
+                        seed=cfg.seed,
+                    )
+                    print(
+                        "[ppo] midgame reset pool loaded "
+                        f"(dataset={midgame_dataset_path.name}, boards={midgame_reset_stats['kept']}, "
+                        f"prob={cfg.midgame_reset_prob:.3f}, "
+                        f"filled={midgame_reset_stats['mean_filled_cells']:.1f}, "
+                        f"height={midgame_reset_stats['mean_height']:.1f}, "
+                        f"top_clear_rows={cfg.midgame_reset_top_clear_rows})"
+                    )
+                except Exception as error:
+                    print(
+                        "[ppo] warning: failed to load midgame reset pool: "
+                        f"{error}"
+                    )
+                    midgame_reset_pool = None
+                    midgame_reset_stats = None
 
         encoder_frozen_for_ppo = False
         encoder_freeze_mode_applied = "none"
@@ -5045,6 +5324,56 @@ def train(cfg: PPOConfig) -> None:
                     f"trajectory={'yes' if post_bc_trajectory_path is not None else 'no'}, "
                         f"ret={post_bc_stats['episode_return']:.3f}, "
                         f"len={post_bc_stats['episode_length']})"
+                )
+        if bc_stats.get("enabled") or midgame_reset_pool is not None:
+            training_reset_seeds = [cfg.seed + 50_003 + i * 101 for i in range(cfg.num_envs)]
+            if midgame_reset_pool is not None:
+                (
+                    training_reset_result,
+                    training_midgame_requested,
+                    training_midgame_applied,
+                ) = reset_many_for_training(
+                    env=env,
+                    env_ids=env_ids,
+                    seeds=training_reset_seeds,
+                    reset_pool=midgame_reset_pool,
+                    reset_prob=cfg.midgame_reset_prob,
+                    rng=midgame_reset_rng,
+                )
+            else:
+                training_reset_result = env.reset_many(
+                    env_ids=env_ids,
+                    seeds=training_reset_seeds,
+                )
+                training_midgame_requested = 0
+                training_midgame_applied = 0
+            obs_np = np.asarray(training_reset_result["obs"], dtype=np.float32)
+            mask_repair_total = {"rows": 0, "batches": 0}
+            mask_np = ensure_action_masks(
+                np.asarray(training_reset_result["action_masks"], dtype=np.float32),
+                repair_stats=mask_repair_total,
+            )
+            action_bias_np = ensure_action_biases(
+                mask_np,
+                np.asarray(
+                    training_reset_result.get("action_biases", []), dtype=np.float32
+                )
+                if "action_biases" in training_reset_result
+                else None,
+            )
+            action_score_np = ensure_action_scores(
+                mask_np,
+                np.asarray(
+                    training_reset_result.get("action_scores", []), dtype=np.float32
+                )
+                if "action_scores" in training_reset_result
+                else None,
+            )
+            if midgame_reset_pool is not None:
+                print(
+                    "[ppo] training reset prepared "
+                    f"(midgame_requested={training_midgame_requested}, "
+                    f"midgame_applied={training_midgame_applied})"
                 )
         if cfg.freeze_encoder_after_bc or cfg.freeze_conv_after_bc:
             if bc_stats.get("enabled"):
@@ -5414,6 +5743,8 @@ def train(cfg: PPOConfig) -> None:
                 hold_probe_update_accumulator: dict[str, dict[str, Any]] = {}
                 hold_swap_update_accumulator: dict[str, dict[str, Any]] = {}
                 hold_swap_chosen_update_accumulator: dict[str, dict[str, Any]] = {}
+                midgame_reset_requested_update = 0
+                midgame_reset_applied_update = 0
                 curriculum_topk_now = curriculum_topk_for_update(cfg, update)
                 curriculum_bias_now = curriculum_bias_for_update(cfg, update)
                 distill_coef_now = distill_coef_for_update(cfg, update)
@@ -5739,7 +6070,23 @@ def train(cfg: PPOConfig) -> None:
                             for i in done_indices.tolist()
                         ]
                         env_reset_start = time.perf_counter()
-                        reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
+                        if midgame_reset_pool is not None:
+                            (
+                                reset_done,
+                                requested_midgame,
+                                applied_midgame,
+                            ) = reset_many_for_training(
+                                env=env,
+                                env_ids=done_env_ids,
+                                seeds=done_seeds,
+                                reset_pool=midgame_reset_pool,
+                                reset_prob=cfg.midgame_reset_prob,
+                                rng=midgame_reset_rng,
+                            )
+                            midgame_reset_requested_update += requested_midgame
+                            midgame_reset_applied_update += applied_midgame
+                        else:
+                            reset_done = env.reset_many(env_ids=done_env_ids, seeds=done_seeds)
                         profile_env_reset_s += time.perf_counter() - env_reset_start
                         reset_profile = reset_done.get("profile", {})
                         profile_env_reset_batch_s += _profile_num(
@@ -6247,6 +6594,9 @@ def train(cfg: PPOConfig) -> None:
                     "teacher_topm_row_frac": teacher_topm_row_frac_value,
                     "teacher_prob_sum": teacher_prob_sum_value,
                     "teacher_valid_actions": teacher_valid_actions_value,
+                    "midgame_reset_requested": int(midgame_reset_requested_update),
+                    "midgame_reset_applied": int(midgame_reset_applied_update),
+                    "midgame_reset_prob_used": float(cfg.midgame_reset_prob),
                     "sps": sps,
                     "update_seconds": update_core_seconds,
                     "update_core_seconds": update_core_seconds,
@@ -6578,6 +6928,13 @@ def train(cfg: PPOConfig) -> None:
                             f"valid={stats['teacher_valid_actions']:.1f})"
                         ),
                     ]
+                    if midgame_reset_pool is not None:
+                        log_lines.append(
+                            "  midgame_reset: "
+                            f"requested={int(stats.get('midgame_reset_requested', 0))} "
+                            f"applied={int(stats.get('midgame_reset_applied', 0))} "
+                            f"prob={_fmt_float(stats.get('midgame_reset_prob_used'))}"
+                        )
                     log_lines.extend(ret100_lines)
                     log_lines.extend(
                         [

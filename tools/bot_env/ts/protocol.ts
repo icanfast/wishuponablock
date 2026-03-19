@@ -59,6 +59,7 @@ export type InitPayload = {
 export type ResetManyPayload = {
   envIds?: number[];
   seeds?: number[];
+  initialBoards?: Array<number[][] | null>;
 };
 
 export type SetPieceSourcePayload = {

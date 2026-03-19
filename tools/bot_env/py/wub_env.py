@@ -117,10 +117,17 @@ class WubEnvBridge:
             payload["seed"] = int(seed)
         return self._request("init", payload)
 
-    def reset_many(self, env_ids: list[int], seeds: list[int] | None = None) -> dict[str, Any]:
+    def reset_many(
+        self,
+        env_ids: list[int],
+        seeds: list[int] | None = None,
+        initial_boards: list[list[list[int]] | None] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"envIds": [int(v) for v in env_ids]}
         if seeds is not None:
             payload["seeds"] = [int(v) for v in seeds]
+        if initial_boards is not None:
+            payload["initialBoards"] = initial_boards
         return self._request("reset_many", payload)
 
     def set_piece_source(self, piece_source_profile: str) -> dict[str, Any]:

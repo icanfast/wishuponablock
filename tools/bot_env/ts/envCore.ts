@@ -1245,6 +1245,9 @@ const buildPlacementChoices = (
 const boardToOccupancy = (board: Board): number[][] =>
   board.map((row) => row.map((cell) => (cell != null ? 1 : 0)));
 
+const occupancyToBoard = (occupancy: number[][]): Board =>
+  occupancy.map((row) => row.map((cell) => (cell > 0 ? 'I' : null)));
+
 const clampRotation = (value: number): 0 | 1 | 2 | 3 => {
   const normalized = Math.trunc(value) % 4;
   if (normalized === 1) return 1;
@@ -1366,7 +1369,10 @@ class BotEnv {
     this.syncPrevMetrics();
   }
 
-  reset(seed: number): {
+  reset(
+    seed: number,
+    initialBoardOccupancy?: number[][] | null,
+  ): {
     obs: number[];
     actionMask: number[];
     actionBias: number[];
@@ -1375,23 +1381,63 @@ class BotEnv {
     profile: BotEnvResetProfile;
   } {
     const resetStart = performance.now();
-    const built = this.buildGame(seed);
+    this.planningRng = new XorShift32(seed ^ 0x71e9135b);
+    let built = this.buildGame(seed);
+    let initialBoardAugmented = false;
+    let initialBoardFilledCells = 0;
+    const boardRows = built.game.state.board.length;
+    const boardCols = built.game.state.board[0]?.length ?? 0;
+    if (
+      Array.isArray(initialBoardOccupancy) &&
+      initialBoardOccupancy.length === boardRows &&
+      initialBoardOccupancy.every(
+        (row) => Array.isArray(row) && row.length === boardCols,
+      )
+    ) {
+      const occupancy = initialBoardOccupancy.map((row) =>
+        row.map((cell) => (cell > 0 ? 1 : 0)),
+      );
+      const board = occupancyToBoard(occupancy);
+      const filledCells = countBoardBlocks(board);
+      built.game.applyInitialBoard(board);
+      const augmentedChoices = buildPlacementChoices(
+        built.game.state,
+        this.actionDim,
+        this.actionSpaceKind,
+        this.actionCurriculum,
+        () => nextFloat(this.planningRng),
+      );
+      if (
+        !built.game.state.gameOver &&
+        augmentedChoices.actionMask.some((value) => value > 0)
+      ) {
+        this.cachedChoices = augmentedChoices;
+        initialBoardAugmented = true;
+        initialBoardFilledCells = filledCells;
+      } else {
+        built = this.buildGame(seed);
+        this.cachedChoices = null;
+      }
+    } else {
+      this.cachedChoices = null;
+    }
     this.game = built.game;
     this.runner = built.runner;
     this.done = false;
     this.piecesPlaced = 0;
     this.lockCount = 0;
     this.pendingHoldUsedForCurrentPiece = false;
-    this.planningRng = new XorShift32(seed ^ 0x71e9135b);
     this.startEpisodeCapture();
     const choicesStart = performance.now();
-    this.cachedChoices = buildPlacementChoices(
-      this.game.state,
-      this.actionDim,
-      this.actionSpaceKind,
-      this.actionCurriculum,
-      () => nextFloat(this.planningRng),
-    );
+    if (this.cachedChoices == null) {
+      this.cachedChoices = buildPlacementChoices(
+        this.game.state,
+        this.actionDim,
+        this.actionSpaceKind,
+        this.actionCurriculum,
+        () => nextFloat(this.planningRng),
+      );
+    }
     const choicesElapsedS = (performance.now() - choicesStart) / 1000;
     this.syncPrevMetrics();
     const obsStart = performance.now();
@@ -1412,6 +1458,8 @@ class BotEnv {
       info: {
         modeId: this.modeId,
         seed,
+        initialBoardAugmented,
+        initialBoardFilledCells,
       },
       profile: {
         total_s: totalElapsedS,
@@ -2425,7 +2473,11 @@ export class BotEnvPool {
     return pool;
   }
 
-  resetMany(envIds: number[], seeds: number[]): StepBatchResult {
+  resetMany(
+    envIds: number[],
+    seeds: number[],
+    initialBoards?: Array<number[][] | null>,
+  ): StepBatchResult {
     const batchStart = performance.now();
     const obs: number[][] = [];
     const actionMasks: number[][] = [];
@@ -2441,7 +2493,11 @@ export class BotEnvPool {
       const envId = envIds[i];
       const env = this.requireEnv(envId);
       const seed = clampInt(seeds[i], Date.now() + envId * 911, 1, 0x7fffffff);
-      const out = env.reset(seed);
+      const initialBoard =
+        Array.isArray(initialBoards) && i < initialBoards.length
+          ? initialBoards[i]
+          : null;
+      const out = env.reset(seed, initialBoard);
       obs.push(out.obs);
       actionMasks.push(out.actionMask);
       actionBiases.push(out.actionBias);

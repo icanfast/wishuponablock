@@ -38,6 +38,26 @@ const parseNumberArray = (value: unknown): number[] => {
   );
 };
 
+const parseInitialBoards = (value: unknown): Array<number[][] | null> => {
+  if (!Array.isArray(value)) return [];
+  return value.map((boardValue) => {
+    if (boardValue == null) return null;
+    if (!Array.isArray(boardValue)) return null;
+    const rows: number[][] = [];
+    for (const rowValue of boardValue) {
+      if (!Array.isArray(rowValue)) return null;
+      rows.push(
+        rowValue.map((cell) =>
+          typeof cell === 'number' && Number.isFinite(cell)
+            ? Math.trunc(cell)
+            : 0,
+        ),
+      );
+    }
+    return rows;
+  });
+};
+
 const ensurePool = (): BotEnvPool => {
   if (!pool)
     throw new Error('Environment pool is not initialized. Call init first.');
@@ -60,7 +80,11 @@ const handleResetMany = (id: number, payload: unknown): void => {
   const data = asObject(payload) as unknown as ResetManyPayload;
   const envIds = parseNumberArray(data.envIds);
   const seeds = parseNumberArray(data.seeds);
-  const result = ensurePool().resetMany(envIds, seeds);
+  const initialBoards = parseInitialBoards(data.initialBoards);
+  if (initialBoards.length > 0 && initialBoards.length !== envIds.length) {
+    throw new Error('envIds and initialBoards must have matching lengths.');
+  }
+  const result = ensurePool().resetMany(envIds, seeds, initialBoards);
   writeResponse({ id, ok: true, result });
 };
 
