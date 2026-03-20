@@ -39,6 +39,12 @@ DEFAULT_QUEUE_ENCODER_HIDDEN_DIM = 32
 DEFAULT_QUEUE_ENCODER_LR_SCALE = 5.0
 VALID_GENERATOR_SOURCES = ("bag7", "active_generator", "random")
 VALID_ACTION_SPACE_KINDS = ("placement_full_v1", "placement_hold_step_v2")
+VALID_POLICY_TRAIN_MODES = (
+    "full",
+    "conditioner_only",
+    "conditioner_plus_head_bias",
+    "conditioner_plus_head",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,10 @@ class PPOConfig:
     total_timesteps: int
     num_steps: int
     hidden_dim: int
+    behavior_token_count: int
+    behavior_token_dim: int
+    behavior_active_token_ids: tuple[int, ...]
+    policy_train_mode: str
     learning_rate: float
     obs_adapter_lr_scale: float
     queue_encoder_hidden_dim: int
@@ -150,7 +160,16 @@ class PPOConfig:
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, action_dim: int) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_dim: int,
+        action_dim: int,
+        *,
+        behavior_token_count: int = 1,
+        behavior_token_dim: int = 32,
+        behavior_active_token_ids: tuple[int, ...] = (0,),
+    ) -> None:
         super().__init__()
 
         def init_layer(
@@ -165,6 +184,19 @@ class PolicyValueNet(nn.Module):
         self.policy_fc1 = nn.Linear(obs_dim, hidden_dim)
         self.policy_fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.policy_head = nn.Linear(hidden_dim, action_dim)
+        self.behavior_token_count = max(1, int(behavior_token_count))
+        self.behavior_token_dim = max(1, int(behavior_token_dim))
+        self.behavior_token_embeddings = nn.Embedding(
+            self.behavior_token_count,
+            self.behavior_token_dim,
+        )
+        self.policy_conditioner = nn.Linear(
+            self.behavior_token_dim,
+            hidden_dim * 2,
+        )
+        self.active_behavior_token_ids = self._normalize_behavior_token_ids(
+            behavior_active_token_ids
+        )
 
         self.value_fc1 = nn.Linear(obs_dim, hidden_dim)
         self.value_fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -180,10 +212,90 @@ class PolicyValueNet(nn.Module):
         init_layer(self.value_fc2, std=math.sqrt(2.0))
         init_layer(self.policy_head, std=0.01)
         init_layer(self.value_head, std=1.0)
+        nn.init.normal_(self.behavior_token_embeddings.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.policy_conditioner.weight)
+        nn.init.zeros_(self.policy_conditioner.bias)
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _normalize_behavior_token_ids(
+        self,
+        token_ids: tuple[int, ...] | list[int] | None,
+    ) -> tuple[int, ...]:
+        raw_ids = token_ids if token_ids is not None else (0,)
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for token_id in raw_ids:
+            value = int(token_id)
+            if value < 0 or value >= self.behavior_token_count:
+                continue
+            if value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+        if not normalized:
+            normalized.append(0)
+        return tuple(normalized)
+
+    def set_active_behavior_token_ids(
+        self,
+        token_ids: tuple[int, ...] | list[int] | None,
+    ) -> None:
+        self.active_behavior_token_ids = self._normalize_behavior_token_ids(token_ids)
+
+    def _resolve_behavior_token_ids(
+        self,
+        batch_size: int,
+        device: torch.device,
+        behavior_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if behavior_token_ids is None:
+            return torch.as_tensor(
+                self.active_behavior_token_ids,
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(batch_size, -1)
+        token_ids = behavior_token_ids.to(device=device, dtype=torch.long)
+        if token_ids.ndim == 1:
+            return token_ids.unsqueeze(0).expand(batch_size, -1)
+        if token_ids.ndim != 2:
+            raise ValueError(
+                "behavior_token_ids must be rank 1 or 2. "
+                f"got shape={tuple(token_ids.shape)}"
+            )
+        if int(token_ids.shape[0]) != int(batch_size):
+            raise ValueError(
+                "behavior_token_ids batch mismatch. "
+                f"expected={batch_size} got={int(token_ids.shape[0])}"
+            )
+        return token_ids
+
+    def _apply_policy_conditioning(
+        self,
+        policy_hidden: torch.Tensor,
+        *,
+        behavior_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        token_ids = self._resolve_behavior_token_ids(
+            int(policy_hidden.shape[0]),
+            policy_hidden.device,
+            behavior_token_ids,
+        )
+        token_ids = token_ids.clamp(0, self.behavior_token_count - 1)
+        behavior_embedding = self.behavior_token_embeddings(token_ids).sum(dim=1)
+        gamma_beta = self.policy_conditioner(behavior_embedding)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        return policy_hidden * (1.0 + gamma) + beta
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        behavior_token_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         policy_hidden = torch.relu(self.policy_fc1(obs))
         policy_hidden = torch.relu(self.policy_fc2(policy_hidden))
+        policy_hidden = self._apply_policy_conditioning(
+            policy_hidden,
+            behavior_token_ids=behavior_token_ids,
+        )
         logits = self.policy_head(policy_hidden)
 
         value_hidden = torch.relu(self.value_fc1(obs))
@@ -696,6 +808,39 @@ def parse_args() -> PPOConfig:
     parser.add_argument("--num-steps", type=int, default=256)
 
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument(
+        "--behavior-token-count",
+        type=int,
+        default=256,
+        help="Capacity of the shared behavior/style token table.",
+    )
+    parser.add_argument(
+        "--behavior-token-dim",
+        type=int,
+        default=32,
+        help="Embedding size for each behavior/style token.",
+    )
+    parser.add_argument(
+        "--behavior-active-tokens",
+        nargs="*",
+        default=["0"],
+        help=(
+            "Active behavior token ids for this run or exported artifact. "
+            "Comma-separated values are allowed. Token 0 is the default GENERAL token."
+        ),
+    )
+    parser.add_argument(
+        "--policy-train-mode",
+        default="full",
+        choices=list(VALID_POLICY_TRAIN_MODES),
+        help=(
+            "Which policy-side parameters stay trainable during PPO. "
+            "'full' keeps current behavior. "
+            "'conditioner_only' trains only behavior embeddings + conditioner. "
+            "'conditioner_plus_head_bias' also trains policy_head.bias. "
+            "'conditioner_plus_head' also trains the full policy head."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument(
         "--obs-adapter-lr-scale",
@@ -1185,9 +1330,45 @@ def parse_args() -> PPOConfig:
             "Reward schedule must contain one function (v1/v2/v3) or two distinct functions."
         )
 
+    def _parse_behavior_active_tokens(token_count: int) -> tuple[int, ...]:
+        raw_values = args.behavior_active_tokens
+        expanded: list[str] = []
+        if isinstance(raw_values, list):
+            for token in raw_values:
+                for part in str(token).split(","):
+                    stripped = part.strip()
+                    if stripped:
+                        expanded.append(stripped)
+        if not expanded:
+            expanded = ["0"]
+        parsed: list[int] = []
+        seen: set[int] = set()
+        for token in expanded:
+            try:
+                token_id = int(token)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid behavior token id '{token}'. Expected an integer."
+                ) from error
+            if token_id < 0 or token_id >= token_count:
+                raise ValueError(
+                    "Behavior token id out of range. "
+                    f"token={token_id} valid=[0,{token_count - 1}]"
+                )
+            if token_id in seen:
+                continue
+            parsed.append(token_id)
+            seen.add(token_id)
+        if not parsed:
+            parsed = [0]
+        return tuple(parsed)
+
     try:
         generator_schedule = _parse_generator_schedule()
         reward_functions = _parse_reward_functions()
+        behavior_active_token_ids = _parse_behavior_active_tokens(
+            max(1, int(args.behavior_token_count))
+        )
     except ValueError as error:
         parser.error(str(error))
 
@@ -1234,6 +1415,10 @@ def parse_args() -> PPOConfig:
         total_timesteps=max(1, int(args.total_timesteps)),
         num_steps=max(1, int(args.num_steps)),
         hidden_dim=max(8, int(args.hidden_dim)),
+        behavior_token_count=max(1, int(args.behavior_token_count)),
+        behavior_token_dim=max(1, int(args.behavior_token_dim)),
+        behavior_active_token_ids=behavior_active_token_ids,
+        policy_train_mode=str(args.policy_train_mode).strip().lower(),
         learning_rate=float(args.learning_rate),
         obs_adapter_lr_scale=max(0.0, float(args.obs_adapter_lr_scale)),
         queue_encoder_hidden_dim=max(1, int(args.queue_encoder_hidden_dim)),
@@ -2331,6 +2516,112 @@ def scale_obs_adapter_gradients(obs_adapter: ObservationAdapter, scale: float) -
         param.grad.mul_(scale)
 
 
+def _set_module_requires_grad(module: nn.Module, requires_grad: bool) -> tuple[int, int]:
+    total = 0
+    trainable_before = 0
+    for param in module.parameters():
+        count = int(param.numel())
+        total += count
+        if param.requires_grad:
+            trainable_before += count
+        param.requires_grad = requires_grad
+    return total, trainable_before
+
+
+def apply_policy_train_mode(
+    model: PolicyValueNet,
+    policy_train_mode: str,
+) -> dict[str, Any]:
+    mode = str(policy_train_mode).strip().lower()
+    if mode not in VALID_POLICY_TRAIN_MODES:
+        raise ValueError(
+            f"Unsupported policy train mode '{policy_train_mode}'. "
+            f"Allowed: {', '.join(VALID_POLICY_TRAIN_MODES)}"
+        )
+
+    module_stats: list[tuple[str, int, int, int]] = []
+
+    def record_module(name: str, module: nn.Module, requires_grad: bool) -> None:
+        total, trainable_before = _set_module_requires_grad(module, requires_grad)
+        trainable_after = total if requires_grad else 0
+        module_stats.append((name, total, trainable_before, trainable_after))
+
+    if mode == "full":
+        record_module("policy_fc1", model.policy_fc1, True)
+        record_module("policy_fc2", model.policy_fc2, True)
+        record_module("policy_head", model.policy_head, True)
+    elif mode == "conditioner_only":
+        record_module("policy_fc1", model.policy_fc1, False)
+        record_module("policy_fc2", model.policy_fc2, False)
+        record_module("policy_head", model.policy_head, False)
+    elif mode == "conditioner_plus_head_bias":
+        record_module("policy_fc1", model.policy_fc1, False)
+        record_module("policy_fc2", model.policy_fc2, False)
+        policy_head_total = 0
+        policy_head_trainable_before = 0
+        for param in model.policy_head.parameters():
+            count = int(param.numel())
+            policy_head_total += count
+            if param.requires_grad:
+                policy_head_trainable_before += count
+        _set_module_requires_grad(model.policy_head, False)
+        if model.policy_head.bias is not None:
+            model.policy_head.bias.requires_grad = True
+        module_stats.append(
+            (
+                "policy_head",
+                policy_head_total,
+                policy_head_trainable_before,
+                int(model.policy_head.bias.numel())
+                if model.policy_head.bias is not None
+                else 0,
+            )
+        )
+    else:
+        record_module("policy_fc1", model.policy_fc1, False)
+        record_module("policy_fc2", model.policy_fc2, False)
+        record_module("policy_head", model.policy_head, True)
+
+    record_module("behavior_embeddings", model.behavior_token_embeddings, True)
+    record_module("policy_conditioner", model.policy_conditioner, True)
+
+    total_params = int(sum(total for _name, total, _before, _after in module_stats))
+    trainable_params = int(sum(after for _name, _total, _before, after in module_stats))
+    return {
+        "mode": mode,
+        "modules": [
+            {
+                "name": name,
+                "total": int(total),
+                "trainable_before": int(trainable_before),
+                "trainable_after": int(trainable_after),
+            }
+            for name, total, trainable_before, trainable_after in module_stats
+        ],
+        "policy_total": total_params,
+        "policy_trainable": trainable_params,
+    }
+
+
+def format_policy_train_mode_log(summary: dict[str, Any]) -> str:
+    modules = summary.get("modules", [])
+    module_parts: list[str] = []
+    if isinstance(modules, list):
+        for item in modules:
+            if not isinstance(item, dict):
+                continue
+            module_parts.append(
+                f"{item.get('name')}={int(item.get('trainable_after', 0))}/{int(item.get('total', 0))}"
+            )
+    modules_str = ", ".join(module_parts) if module_parts else "n/a"
+    return (
+        f"policy_train: mode={summary.get('mode')} "
+        f"trainable={int(summary.get('policy_trainable', 0))}/"
+        f"{int(summary.get('policy_total', 0))} "
+        f"({modules_str})"
+    )
+
+
 def build_ppo_optimizer(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
@@ -2343,6 +2634,12 @@ def build_ppo_optimizer(
     policy_params.extend([p for p in model.policy_fc1.parameters() if p.requires_grad])
     policy_params.extend([p for p in model.policy_fc2.parameters() if p.requires_grad])
     policy_params.extend([p for p in model.policy_head.parameters() if p.requires_grad])
+    policy_params.extend(
+        [p for p in model.behavior_token_embeddings.parameters() if p.requires_grad]
+    )
+    policy_params.extend(
+        [p for p in model.policy_conditioner.parameters() if p.requires_grad]
+    )
 
     value_params: list[nn.Parameter] = []
     value_params.extend(
@@ -2653,6 +2950,26 @@ def prepare_model_state_for_load(
                     f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
                 )
                 continue
+        if key == "behavior_token_embeddings.weight":
+            if (
+                target_tensor.ndim == 2
+                and value_tensor.ndim == 2
+                and int(target_tensor.shape[1]) == int(value_tensor.shape[1])
+                and int(value_tensor.shape[0]) <= int(target_tensor.shape[0])
+            ):
+                expanded = target_tensor.detach().clone()
+                expanded.zero_()
+                expanded[: int(value_tensor.shape[0]), :] = value_tensor.to(
+                    device=expanded.device,
+                    dtype=expanded.dtype,
+                )
+                prepared[key] = expanded
+                print(
+                    "[ppo] "
+                    f"adapted widened {key} from {source_label} "
+                    f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
+                )
+                continue
         print(
             "[ppo] warning: skipped incompatible tensor from "
             f"{source_label} for key={key} "
@@ -2762,6 +3079,24 @@ def export_bot_policy_artifact(
             model.policy_head.weight.detach().cpu().numpy().astype(np.float32)
         )  # [A, H]
         bp = model.policy_head.bias.detach().cpu().numpy().astype(np.float32)  # [A]
+        behavior_embeddings = (
+            model.behavior_token_embeddings.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [T, D]
+        behavior_policy_w = (
+            model.policy_conditioner.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [2H, D]
+        behavior_policy_b = (
+            model.policy_conditioner.bias.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [2H]
 
         # Value tower (new in split actor/critic architecture).
         wv1 = model.value_fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
@@ -2806,6 +3141,14 @@ def export_bot_policy_artifact(
             "wv": wv.reshape(-1).tolist(),  # [H]
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
+        "behaviorConditioning": {
+            "tokenCount": int(model.behavior_token_count),
+            "tokenDim": int(model.behavior_token_dim),
+            "activeTokenIds": [int(v) for v in model.active_behavior_token_ids],
+            "embeddings": behavior_embeddings.reshape(-1).tolist(),  # [T, D]
+            "policyAffineW": behavior_policy_w.T.reshape(-1).tolist(),  # [D, 2H]
+            "policyAffineB": behavior_policy_b.reshape(-1).tolist(),  # [2H]
+        },
     }
     if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
         artifact["encoderModel"] = obs_adapter.board_adapter.to_exported_encoder_model()
@@ -2848,6 +3191,7 @@ def load_from_artifact(
     hidden_dim = int(raw.get("hiddenDim", 0))
     action_dim = int(raw.get("actionDim", 0))
     queue_encoder_payload = raw.get("queueEncoder")
+    behavior_conditioning_payload = raw.get("behaviorConditioning")
 
     if input_dim <= 0 or hidden_dim <= 0 or action_dim <= 0:
         raise ValueError("Invalid artifact dims.")
@@ -2955,6 +3299,48 @@ def load_from_artifact(
         model.value_fc2.bias.copy_(torch.from_numpy(bv2))
         model.value_head.weight.copy_(torch.from_numpy(wv.reshape(1, hidden_dim)))
         model.value_head.bias.copy_(torch.from_numpy(bv))
+    if isinstance(behavior_conditioning_payload, dict):
+        token_count = int(behavior_conditioning_payload.get("tokenCount", 0))
+        token_dim = int(behavior_conditioning_payload.get("tokenDim", 0))
+        target_token_count = int(model.behavior_token_count)
+        target_token_dim = int(model.behavior_token_dim)
+        if token_count <= 0 or token_dim <= 0:
+            raise ValueError("Invalid artifact behaviorConditioning dims.")
+        if token_dim != target_token_dim:
+            raise ValueError(
+                "Artifact behaviorConditioning tokenDim mismatch. "
+                f"artifact={token_dim} model={target_token_dim}"
+            )
+        if token_count > target_token_count:
+            raise ValueError(
+                "Artifact behaviorConditioning tokenCount exceeds model capacity. "
+                f"artifact={token_count} model={target_token_count}"
+            )
+        embeddings = np.asarray(
+            behavior_conditioning_payload.get("embeddings", []),
+            dtype=np.float32,
+        ).reshape(token_count, token_dim)
+        policy_affine_w = np.asarray(
+            behavior_conditioning_payload.get("policyAffineW", []),
+            dtype=np.float32,
+        ).reshape(token_dim, hidden_dim * 2)
+        policy_affine_b = np.asarray(
+            behavior_conditioning_payload.get("policyAffineB", []),
+            dtype=np.float32,
+        ).reshape(hidden_dim * 2)
+        active_token_ids = [
+            int(v)
+            for v in behavior_conditioning_payload.get("activeTokenIds", [])
+            if 0 <= int(v) < target_token_count
+        ]
+        with torch.no_grad():
+            model.behavior_token_embeddings.weight.zero_()
+            model.behavior_token_embeddings.weight[:token_count, :].copy_(
+                torch.from_numpy(embeddings)
+            )
+            model.policy_conditioner.weight.copy_(torch.from_numpy(policy_affine_w.T))
+            model.policy_conditioner.bias.copy_(torch.from_numpy(policy_affine_b))
+        model.set_active_behavior_token_ids(active_token_ids)
     encoder_payload = raw.get("encoderModel")
     if isinstance(encoder_payload, dict):
         if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
@@ -3332,6 +3718,15 @@ def run_validation_eval(
             hold_probe_accumulator: dict[str, dict[str, Any]] = {}
             hold_swap_accumulator: dict[str, dict[str, Any]] = {}
             hold_swap_chosen_accumulator: dict[str, dict[str, Any]] = {}
+            behavior_probe_count = 0
+            behavior_probe_matches = 0
+            behavior_probe_enabled = (
+                int(getattr(model, "behavior_token_count", 0)) > 1
+                and tuple(getattr(model, "active_behavior_token_ids", (0,))) != (0,)
+            )
+            behavior_probe_active_tokens = [
+                int(v) for v in getattr(model, "active_behavior_token_ids", (0,))
+            ]
             blend_step_term_values: dict[str, list[float]] = {
                 key: [] for key in BLEND_STEP_TERM_KEYS
             }
@@ -3379,6 +3774,7 @@ def run_validation_eval(
                     raw_obs_t = as_tensor(obs_np, device)
                     mask_t = as_tensor(mask_np, device)
                     action_bias_t = as_tensor(action_bias_np, device)
+                    active_eval_mask_np = ~done_mask
                     with torch.no_grad():
                         features_t = obs_adapter(raw_obs_t)
                         logits_t, _values_t = model(features_t)
@@ -3389,6 +3785,41 @@ def run_validation_eval(
                             bias_alpha=0.0,  # Validation is actor-only.
                         )
                         actions_t = torch.argmax(dist_t.probs, dim=-1)
+                        if behavior_probe_enabled and bool(np.any(active_eval_mask_np)):
+                            base_token_ids_t = torch.zeros(
+                                (features_t.shape[0], 1),
+                                device=device,
+                                dtype=torch.long,
+                            )
+                            base_logits_t, _base_values_t = model(
+                                features_t,
+                                behavior_token_ids=base_token_ids_t,
+                            )
+                            base_dist_t = masked_categorical(
+                                base_logits_t,
+                                mask_t,
+                                action_bias=action_bias_t,
+                                bias_alpha=0.0,
+                            )
+                            base_actions_t = torch.argmax(base_dist_t.probs, dim=-1)
+                            active_eval_mask_t = torch.as_tensor(
+                                active_eval_mask_np,
+                                device=device,
+                                dtype=torch.bool,
+                            )
+                            behavior_probe_matches += int(
+                                (
+                                    base_actions_t[active_eval_mask_t]
+                                    == actions_t[active_eval_mask_t]
+                                )
+                                .sum()
+                                .detach()
+                                .cpu()
+                                .item()
+                            )
+                            behavior_probe_count += int(
+                                active_eval_mask_t.sum().detach().cpu().item()
+                            )
                     actions_np = (
                         actions_t.detach().cpu().numpy().astype(np.int64).tolist()
                     )
@@ -3499,7 +3930,7 @@ def run_validation_eval(
                         step_result["action_masks"], dtype=np.float32
                     )
 
-                    active_mask = ~done_mask
+                    active_mask = active_eval_mask_np
                     ep_return[active_mask] += rewards_np[active_mask].astype(np.float64)
                     ep_length[active_mask] += 1
 
@@ -3666,6 +4097,20 @@ def run_validation_eval(
                     "hold_swap_chosen": summarize_hold_swap_teacher_accumulator(
                         hold_swap_chosen_accumulator
                     ).get(piece_source_profile),
+                    "behavior_probe": (
+                        {
+                            "active_tokens": behavior_probe_active_tokens,
+                            "count": int(behavior_probe_count),
+                            "greedy_agreement": (
+                                float(behavior_probe_matches)
+                                / float(behavior_probe_count)
+                                if behavior_probe_count > 0
+                                else float("nan")
+                            ),
+                        }
+                        if behavior_probe_enabled
+                        else None
+                    ),
                 },
             }
     finally:
@@ -3780,6 +4225,29 @@ def _format_hold_swap_log_lines(prefix: str, summary: Any) -> list[str]:
             f"pos={_fmt_float(margin_dict.get('frac_positive'))} "
             f"neg={_fmt_float(margin_dict.get('frac_negative'))}"
         ),
+    ]
+
+
+def _format_behavior_probe_log_lines(prefix: str, probe: Any) -> list[str]:
+    if not isinstance(probe, dict):
+        return []
+    total = int(probe.get("count", 0))
+    if total <= 0:
+        return []
+    active_tokens = probe.get("active_tokens")
+    active_tokens_str = (
+        ",".join(str(int(v)) for v in active_tokens)
+        if isinstance(active_tokens, list) and active_tokens
+        else "?"
+    )
+    return [
+        (
+            f"{prefix}: "
+            f"active={active_tokens_str} "
+            f"base=0 "
+            f"agree={_fmt_float(probe.get('greedy_agreement'))} "
+            f"states={total}"
+        )
     ]
 
 
@@ -4226,6 +4694,22 @@ def build_bc_optimizer(
                 "params": policy_head_params,
                 "lr": learning_rate * max(0.0, float(policy_head_lr_scale)),
                 "group_name": "bc_policy_head",
+            }
+        )
+
+    behavior_params: list[nn.Parameter] = []
+    behavior_params.extend(
+        [p for p in model.behavior_token_embeddings.parameters() if p.requires_grad]
+    )
+    behavior_params.extend(
+        [p for p in model.policy_conditioner.parameters() if p.requires_grad]
+    )
+    if behavior_params:
+        param_groups.append(
+            {
+                "params": behavior_params,
+                "lr": learning_rate * max(0.0, float(policy_head_lr_scale)),
+                "group_name": "bc_behavior",
             }
         )
 
@@ -5106,11 +5590,25 @@ def train(cfg: PPOConfig) -> None:
         obs_dim = int(obs_adapter.policy_obs_dim)
         policy_observation_space = obs_adapter.policy_observation_space
 
-        model = PolicyValueNet(obs_dim, cfg.hidden_dim, action_dim).to(device)
+        model = PolicyValueNet(
+            obs_dim,
+            cfg.hidden_dim,
+            action_dim,
+            behavior_token_count=cfg.behavior_token_count,
+            behavior_token_dim=cfg.behavior_token_dim,
+            behavior_active_token_ids=cfg.behavior_active_token_ids,
+        ).to(device)
+        print(
+            "[ppo] behavior conditioning: "
+            f"tokens={cfg.behavior_token_count} "
+            f"dim={cfg.behavior_token_dim} "
+            f"active={','.join(str(v) for v in cfg.behavior_active_token_ids)}"
+        )
         optimizer: torch.optim.Optimizer | None = None
         midgame_reset_pool: np.ndarray | None = None
         midgame_reset_stats: dict[str, Any] | None = None
         midgame_reset_rng = random.Random(cfg.seed ^ 0x6D5E77A1)
+        force_rebuild_optimizer = False
 
         global_step = 0
         start_update = 0
@@ -5122,13 +5620,22 @@ def train(cfg: PPOConfig) -> None:
                 cfg.queue_encoder_lr_scale,
             )
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
+            load_optimizer_state = (
+                cfg.resume_mode == "continue"
+                and str(cfg.policy_train_mode).strip().lower() == "full"
+            )
+            if cfg.resume_mode == "continue" and not load_optimizer_state:
+                print(
+                    "[ppo] resume optimizer state disabled "
+                    f"(policy_train_mode={cfg.policy_train_mode} requires fresh optimizer groups)"
+                )
             loaded_global_step, loaded_update = load_checkpoint(
                 checkpoint_path,
                 model,
                 obs_adapter,
                 optimizer,
                 device,
-                load_optimizer_state=(cfg.resume_mode == "continue"),
+                load_optimizer_state=load_optimizer_state,
                 expected_phase_context_enabled=cfg.phase_context_enabled,
                 expected_action_space_kind=cfg.action_space_kind,
             )
@@ -5444,13 +5951,18 @@ def train(cfg: PPOConfig) -> None:
                     "but BC was skipped/disabled."
                 )
 
+        policy_train_summary = apply_policy_train_mode(model, cfg.policy_train_mode)
+        print("[ppo] " + format_policy_train_mode_log(policy_train_summary))
+        if str(cfg.policy_train_mode).strip().lower() != "full":
+            force_rebuild_optimizer = True
+
         if bc_should_run:
             env.set_piece_sources(
                 env_ids=env_ids,
                 piece_source_profiles=env_piece_sources,
             )
 
-        if optimizer is None or bc_should_run:
+        if optimizer is None or bc_should_run or force_rebuild_optimizer:
             optimizer = build_ppo_optimizer(
                 model,
                 obs_adapter,
@@ -7128,6 +7640,12 @@ def train(cfg: PPOConfig) -> None:
                                     _format_hold_swap_log_lines(
                                         f"    val_hold_swap_chosen[{source}]",
                                         source_diag_dict.get("hold_swap_chosen"),
+                                    )
+                                )
+                                log_lines.extend(
+                                    _format_behavior_probe_log_lines(
+                                        f"    val_behavior_probe[{source}]",
+                                        source_diag_dict.get("behavior_probe"),
                                     )
                                 )
                             else:
