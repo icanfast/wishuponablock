@@ -5912,6 +5912,10 @@ def train(cfg: PPOConfig) -> None:
 
         bc_stats: dict[str, Any] = {"enabled": False}
         if bc_should_run:
+            bc_policy_train_summary = apply_policy_train_mode(
+                model, cfg.policy_train_mode
+            )
+            print("[ppo] bc " + format_policy_train_mode_log(bc_policy_train_summary))
             bc_stats = run_bc_pretrain(
                 model=model,
                 obs_adapter=obs_adapter,
