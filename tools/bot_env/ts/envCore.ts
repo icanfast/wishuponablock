@@ -169,7 +169,14 @@ const normalizeRewardFunctionId = (
   value: unknown,
   fallback: RewardFunctionId,
 ): RewardFunctionId => {
-  if (value === 'v1' || value === 'v2' || value === 'v3') return value;
+  if (
+    value === 'v1' ||
+    value === 'v2' ||
+    value === 'v3' ||
+    value === 'harddrop_v1'
+  ) {
+    return value;
+  }
   return fallback;
 };
 
@@ -301,6 +308,8 @@ type PieceRewardBreakdown = {
   linesTerm: number;
   scoreTerm: number;
   timeTerm: number;
+  kickTerm: number;
+  softDropTerm: number;
   heightTerm: number;
   holeDeltaTerm: number;
   bumpinessDeltaTerm: number;
@@ -383,6 +392,11 @@ const blendPieceReward = (options: {
       linesTerm: mix(legacy.breakdown.linesTerm, target.breakdown.linesTerm),
       scoreTerm: mix(legacy.breakdown.scoreTerm, target.breakdown.scoreTerm),
       timeTerm: mix(legacy.breakdown.timeTerm, target.breakdown.timeTerm),
+      kickTerm: mix(legacy.breakdown.kickTerm, target.breakdown.kickTerm),
+      softDropTerm: mix(
+        legacy.breakdown.softDropTerm,
+        target.breakdown.softDropTerm,
+      ),
       heightTerm: mix(legacy.breakdown.heightTerm, target.breakdown.heightTerm),
       holeDeltaTerm: mix(
         legacy.breakdown.holeDeltaTerm,
@@ -472,6 +486,8 @@ const computePieceRewardV1 = (
       linesTerm,
       scoreTerm,
       timeTerm,
+      kickTerm: 0,
+      softDropTerm: 0,
       heightTerm: heightDeltaTerm,
       holeDeltaTerm,
       bumpinessDeltaTerm,
@@ -528,16 +544,52 @@ const REWARD_V3_DANGER_HEIGHT = 14;
 const REWARD_V3_DANGER_WEIGHT = 0.04;
 const REWARD_V3_FULL_CLEAR_BONUS = 8.0;
 
-const computePlacementComplexityPenalty = (
+const REWARD_HARDDROP_V1_LINE_WEIGHT = 0.2;
+const REWARD_HARDDROP_V1_COMPLEXITY_WEIGHT = 0.25;
+const REWARD_HARDDROP_V1_BOARD_DELTA_WEIGHT = 0.15;
+const REWARD_HARDDROP_V1_BOARD_ABSOLUTE_WEIGHT = 0.0025;
+const REWARD_HARDDROP_V1_HOLE_CREATE_WEIGHT = 0.6;
+const REWARD_HARDDROP_V1_HOLE_REMOVE_WEIGHT = 0.0;
+const REWARD_HARDDROP_V1_DANGER_HEIGHT = 16;
+const REWARD_HARDDROP_V1_DANGER_WEIGHT = 0.02;
+const REWARD_HARDDROP_V1_FULL_CLEAR_BONUS = 0.0;
+const REWARD_HARDDROP_V1_SRS_KICK_PENALTY = 0.35;
+const REWARD_HARDDROP_V1_SOFT_DROP_USED_PENALTY = 0.75;
+
+type PlacementPenaltyStats = {
+  rotateCwCcwCount: number;
+  rotate180Count: number;
+  softDropCount: number;
+  softDropUsed: boolean;
+  srsKickCount: number;
+};
+
+type PlacementComplexityPenaltyBreakdown = {
+  basePenalty: number;
+  holdPenalty: number;
+  kickPenalty: number;
+  softDropPenalty: number;
+  totalPenalty: number;
+};
+
+const computePlacementPenaltyStats = (
   placement: Pick<
     TrajectoryExecutorReachablePlacement,
     'commands' | 'holdUsed' | 'srsKickCount'
   > | null,
-): number => {
-  if (!placement) return 0;
+): PlacementPenaltyStats => {
   let rotateCwCcwCount = 0;
   let rotate180Count = 0;
   let softDropCount = 0;
+  if (!placement) {
+    return {
+      rotateCwCcwCount,
+      rotate180Count,
+      softDropCount,
+      softDropUsed: false,
+      srsKickCount: 0,
+    };
+  }
   for (const command of placement.commands) {
     if (command === 'rotate_cw' || command === 'rotate_ccw') {
       rotateCwCcwCount += 1;
@@ -547,26 +599,59 @@ const computePlacementComplexityPenalty = (
       softDropCount += 1;
     }
   }
-  const srsKickCount = Math.max(0, Math.trunc(placement.srsKickCount ?? 0));
-  return (
-    placement.commands.length * PLACEMENT_COMPLEXITY_CMD_WEIGHT +
-    rotateCwCcwCount * PLACEMENT_COMPLEXITY_ROT_CW_CCW_WEIGHT +
-    rotate180Count * PLACEMENT_COMPLEXITY_ROT_180_WEIGHT +
-    srsKickCount * PLACEMENT_COMPLEXITY_SRS_KICK_WEIGHT +
-    softDropCount * PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT +
-    (placement.holdUsed ? PLACEMENT_HOLD_COMPLEXITY_PENALTY : 0)
-  );
+  return {
+    rotateCwCcwCount,
+    rotate180Count,
+    softDropCount,
+    softDropUsed: softDropCount > 0,
+    srsKickCount: Math.max(0, Math.trunc(placement.srsKickCount ?? 0)),
+  };
 };
 
-const computePlacementComplexityPenaltyWithoutHoldTax = (
+const computePlacementComplexityPenaltyBreakdown = (
+  placement: Pick<
+    TrajectoryExecutorReachablePlacement,
+    'commands' | 'holdUsed' | 'srsKickCount'
+  > | null,
+): PlacementComplexityPenaltyBreakdown => {
+  if (!placement) {
+    return {
+      basePenalty: 0,
+      holdPenalty: 0,
+      kickPenalty: 0,
+      softDropPenalty: 0,
+      totalPenalty: 0,
+    };
+  }
+  const { rotateCwCcwCount, rotate180Count, softDropUsed, srsKickCount } =
+    computePlacementPenaltyStats(placement);
+  const basePenalty =
+    placement.commands.length * PLACEMENT_COMPLEXITY_CMD_WEIGHT +
+    rotateCwCcwCount * PLACEMENT_COMPLEXITY_ROT_CW_CCW_WEIGHT +
+    rotate180Count * PLACEMENT_COMPLEXITY_ROT_180_WEIGHT;
+  const holdPenalty = placement.holdUsed
+    ? PLACEMENT_HOLD_COMPLEXITY_PENALTY
+    : 0;
+  const kickPenalty = srsKickCount * PLACEMENT_COMPLEXITY_SRS_KICK_WEIGHT;
+  const softDropPenalty = softDropUsed
+    ? PLACEMENT_COMPLEXITY_SOFT_DROP_WEIGHT
+    : 0;
+  return {
+    basePenalty,
+    holdPenalty,
+    kickPenalty,
+    softDropPenalty,
+    totalPenalty: basePenalty + holdPenalty + kickPenalty + softDropPenalty,
+  };
+};
+
+const computePlacementComplexityPenalty = (
   placement: Pick<
     TrajectoryExecutorReachablePlacement,
     'commands' | 'holdUsed' | 'srsKickCount'
   > | null,
 ): number => {
-  const penalty = computePlacementComplexityPenalty(placement);
-  if (!placement?.holdUsed) return penalty;
-  return Math.max(0, penalty - PLACEMENT_HOLD_COMPLEXITY_PENALTY);
+  return computePlacementComplexityPenaltyBreakdown(placement).totalPenalty;
 };
 
 const computeLineClearScoreDelta = (
@@ -594,6 +679,8 @@ const zeroRewardBreakdown = (): PieceRewardResult['breakdown'] => ({
   linesTerm: 0,
   scoreTerm: 0,
   timeTerm: 0,
+  kickTerm: 0,
+  softDropTerm: 0,
   heightTerm: 0,
   holeDeltaTerm: 0,
   bumpinessDeltaTerm: 0,
@@ -651,34 +738,48 @@ const computeHoldStepRewardV3 = (): PieceRewardResult => {
 
 const computePieceRewardV2 = (
   options: PieceRewardInputs & {
-    placementComplexityPenalty: number;
+    baseComplexityPenalty: number;
+    kickComplexityPenalty: number;
+    softDropComplexityPenalty: number;
   },
 ): PieceRewardResult => {
   const {
     linesDelta,
     boardQualityDelta,
     holesDelta,
-    placementComplexityPenalty,
+    baseComplexityPenalty,
+    kickComplexityPenalty,
+    softDropComplexityPenalty,
     topOut,
   } = options;
   const clampedLines = Math.max(0, linesDelta);
   const linesTerm = Math.pow(clampedLines, 1.5) * REWARD_V2_LINE_WEIGHT;
   const boardQualityDeltaTerm =
     boardQualityDelta * REWARD_V2_BOARD_QUALITY_WEIGHT;
-  const timeTerm = -placementComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
+  const timeTerm = -baseComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
+  const kickTerm = -kickComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
+  const softDropTerm = -softDropComplexityPenalty * REWARD_V2_COMPLEXITY_WEIGHT;
   const holeDeltaTerm =
     holesDelta >= 0
       ? -holesDelta * REWARD_V2_HOLE_CREATE_WEIGHT
       : -holesDelta * REWARD_V2_HOLE_REMOVE_WEIGHT;
   const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
   const reward =
-    linesTerm + boardQualityDeltaTerm + timeTerm + holeDeltaTerm + topOutTerm;
+    linesTerm +
+    boardQualityDeltaTerm +
+    timeTerm +
+    kickTerm +
+    softDropTerm +
+    holeDeltaTerm +
+    topOutTerm;
   return {
     reward,
     breakdown: {
       linesTerm,
       scoreTerm: 0,
       timeTerm,
+      kickTerm,
+      softDropTerm,
       heightTerm: 0,
       holeDeltaTerm,
       bumpinessDeltaTerm: 0,
@@ -693,7 +794,9 @@ const computePieceRewardV2 = (
 
 const computePieceRewardV3 = (
   options: PieceRewardInputs & {
-    placementComplexityPenalty: number;
+    baseComplexityPenalty: number;
+    kickComplexityPenalty: number;
+    softDropComplexityPenalty: number;
     afterMaxHeight: number;
     afterBoardQuality: number;
     isFullClear: boolean;
@@ -703,7 +806,9 @@ const computePieceRewardV3 = (
     linesDelta,
     boardQualityDelta,
     holesDelta,
-    placementComplexityPenalty,
+    baseComplexityPenalty,
+    kickComplexityPenalty,
+    softDropComplexityPenalty,
     afterMaxHeight,
     afterBoardQuality,
     isFullClear,
@@ -721,7 +826,9 @@ const computePieceRewardV3 = (
       : -Math.min(-holesDelta, 1) * REWARD_V3_HOLE_REMOVE_WEIGHT;
   const danger = Math.max(0, afterMaxHeight - REWARD_V3_DANGER_HEIGHT);
   const heightTerm = -(danger * danger) * REWARD_V3_DANGER_WEIGHT;
-  const timeTerm = -placementComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
+  const timeTerm = -baseComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
+  const kickTerm = -kickComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
+  const softDropTerm = -softDropComplexityPenalty * REWARD_V3_COMPLEXITY_WEIGHT;
   const fullClearTerm = isFullClear ? REWARD_V3_FULL_CLEAR_BONUS : 0;
   const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
   const reward =
@@ -731,6 +838,8 @@ const computePieceRewardV3 = (
     holeDeltaTerm +
     heightTerm +
     timeTerm +
+    kickTerm +
+    softDropTerm +
     fullClearTerm +
     topOutTerm;
   return {
@@ -739,6 +848,8 @@ const computePieceRewardV3 = (
       linesTerm,
       scoreTerm: 0,
       timeTerm,
+      kickTerm,
+      softDropTerm,
       heightTerm,
       holeDeltaTerm,
       bumpinessDeltaTerm: 0,
@@ -749,6 +860,137 @@ const computePieceRewardV3 = (
       topOutTerm,
     },
   };
+};
+
+const computePieceRewardHarddropV1 = (
+  options: PieceRewardInputs & {
+    baseComplexityPenalty: number;
+    kickComplexityPenalty: number;
+    softDropComplexityPenalty: number;
+    afterMaxHeight: number;
+    afterBoardQuality: number;
+    isFullClear: boolean;
+    srsKickCount: number;
+    softDropUsed: boolean;
+  },
+): PieceRewardResult => {
+  const {
+    linesDelta,
+    boardQualityDelta,
+    holesDelta,
+    baseComplexityPenalty,
+    kickComplexityPenalty,
+    softDropComplexityPenalty,
+    afterMaxHeight,
+    afterBoardQuality,
+    isFullClear,
+    srsKickCount,
+    softDropUsed,
+    topOut,
+  } = options;
+  const clampedLines = Math.max(0, linesDelta);
+  const linesTerm = Math.pow(clampedLines, 2) * REWARD_HARDDROP_V1_LINE_WEIGHT;
+  const boardQualityDeltaTerm =
+    boardQualityDelta * REWARD_HARDDROP_V1_BOARD_DELTA_WEIGHT;
+  const boardQualityAbsoluteTerm =
+    -Math.max(0, afterBoardQuality) * REWARD_HARDDROP_V1_BOARD_ABSOLUTE_WEIGHT;
+  const holeDeltaTerm =
+    holesDelta > 0
+      ? -holesDelta * REWARD_HARDDROP_V1_HOLE_CREATE_WEIGHT
+      : -Math.min(-holesDelta, 1) * REWARD_HARDDROP_V1_HOLE_REMOVE_WEIGHT;
+  const danger = Math.max(0, afterMaxHeight - REWARD_HARDDROP_V1_DANGER_HEIGHT);
+  const heightTerm = -(danger * danger) * REWARD_HARDDROP_V1_DANGER_WEIGHT;
+  const timeTerm =
+    -baseComplexityPenalty * REWARD_HARDDROP_V1_COMPLEXITY_WEIGHT;
+  const kickTerm =
+    -kickComplexityPenalty * REWARD_HARDDROP_V1_COMPLEXITY_WEIGHT -
+    srsKickCount * REWARD_HARDDROP_V1_SRS_KICK_PENALTY;
+  const softDropTerm =
+    -softDropComplexityPenalty * REWARD_HARDDROP_V1_COMPLEXITY_WEIGHT -
+    (softDropUsed ? REWARD_HARDDROP_V1_SOFT_DROP_USED_PENALTY : 0);
+  const fullClearTerm = isFullClear ? REWARD_HARDDROP_V1_FULL_CLEAR_BONUS : 0;
+  const topOutTerm = topOut ? -TOP_OUT_PENALTY : 0;
+  const reward =
+    linesTerm +
+    boardQualityDeltaTerm +
+    boardQualityAbsoluteTerm +
+    holeDeltaTerm +
+    heightTerm +
+    timeTerm +
+    kickTerm +
+    softDropTerm +
+    fullClearTerm +
+    topOutTerm;
+  return {
+    reward,
+    breakdown: {
+      linesTerm,
+      scoreTerm: 0,
+      timeTerm,
+      kickTerm,
+      softDropTerm,
+      heightTerm,
+      holeDeltaTerm,
+      bumpinessDeltaTerm: 0,
+      boardScoreTerm: 0,
+      boardQualityDeltaTerm,
+      boardQualityAbsoluteTerm,
+      fullClearTerm,
+      topOutTerm,
+    },
+  };
+};
+
+type PlacementRewardEvalInputs = PieceRewardInputs & {
+  baseComplexityPenalty: number;
+  kickComplexityPenalty: number;
+  softDropComplexityPenalty: number;
+  afterMaxHeight: number;
+  afterBoardQuality: number;
+  isFullClear: boolean;
+  srsKickCount: number;
+  softDropUsed: boolean;
+};
+
+const computePieceRewardById = (
+  rewardFunctionId: RewardFunctionId,
+  options: PlacementRewardEvalInputs,
+): PieceRewardResult => {
+  if (rewardFunctionId === 'v1') {
+    return computePieceRewardV1(options);
+  }
+  if (rewardFunctionId === 'v2') {
+    return computePieceRewardV2(options);
+  }
+  if (rewardFunctionId === 'harddrop_v1') {
+    return computePieceRewardHarddropV1(options);
+  }
+  return computePieceRewardV3(options);
+};
+
+const computeHoldStepRewardById = (
+  rewardFunctionId: RewardFunctionId,
+  modeId: string,
+  timeDeltaMs: number,
+): PieceRewardResult => {
+  if (rewardFunctionId === 'v1') {
+    return computeHoldStepRewardV1(modeId, timeDeltaMs);
+  }
+  if (rewardFunctionId === 'v2') {
+    return computeHoldStepRewardV2();
+  }
+  if (rewardFunctionId === 'harddrop_v1') {
+    const timeTerm =
+      -PLACEMENT_HOLD_COMPLEXITY_PENALTY * REWARD_HARDDROP_V1_COMPLEXITY_WEIGHT;
+    return {
+      reward: timeTerm,
+      breakdown: {
+        ...zeroRewardBreakdown(),
+        timeTerm,
+      },
+    };
+  }
+  return computeHoldStepRewardV3();
 };
 
 const cloneBoard = (board: Board): Board => board.map((row) => [...row]);
@@ -894,10 +1136,50 @@ const scorePlacementCandidate = (options: {
   beforeMetrics: BoardQualityMetrics;
   placement: TrajectoryExecutorReachablePlacement;
   board: Board;
+  rewardFunctionId: RewardFunctionId;
+  modeId: string;
 }): number => {
-  const { beforeMetrics, placement, board } = options;
+  const { beforeMetrics, placement, board, rewardFunctionId, modeId } = options;
   const applied = applyPlacementToBoard(board, placement);
   if (applied.invalid) return -1e9;
+  if (rewardFunctionId === 'harddrop_v1') {
+    const afterMetrics = evaluateBoardQuality(applied.boardAfter);
+    const beforeHeight = getStackHeight(board);
+    const afterHeight = getStackHeight(applied.boardAfter);
+    const beforeHoles = countBoardHoles(board);
+    const afterHoles = countBoardHoles(applied.boardAfter);
+    const beforeBumpiness = computeBoardBumpiness(board);
+    const afterBumpiness = computeBoardBumpiness(applied.boardAfter);
+    const beforeBlocks = countBoardBlocks(board);
+    const afterBlocks = countBoardBlocks(applied.boardAfter);
+    const complexityBreakdown =
+      computePlacementComplexityPenaltyBreakdown(placement);
+    const placementStats = computePlacementPenaltyStats(placement);
+    const rewardResult = computePieceRewardHarddropV1({
+      modeId,
+      linesDelta: applied.linesCleared,
+      scoreDelta: 0,
+      timeDeltaMs: 0,
+      heightDelta: afterHeight - beforeHeight,
+      holesDelta: afterHoles - beforeHoles,
+      bumpinessDelta: afterBumpiness - beforeBumpiness,
+      boardScoreDelta: 0,
+      boardQualityDelta: beforeMetrics.quality - afterMetrics.quality,
+      topOut: applied.hasAboveTop,
+      baseComplexityPenalty: complexityBreakdown.basePenalty,
+      kickComplexityPenalty: complexityBreakdown.kickPenalty,
+      softDropComplexityPenalty: complexityBreakdown.softDropPenalty,
+      afterMaxHeight: afterHeight,
+      afterBoardQuality: afterMetrics.quality,
+      isFullClear: afterBlocks === 0 && beforeBlocks > 0,
+      srsKickCount: placementStats.srsKickCount,
+      softDropUsed: placementStats.softDropUsed,
+    });
+    const reward = Number.isFinite(rewardResult.reward)
+      ? rewardResult.reward
+      : -1e9;
+    return reward;
+  }
   const afterMetrics = evaluateBoardQuality(applied.boardAfter);
   const improvement = beforeMetrics.quality - afterMetrics.quality;
   const complexityPenalty = computePlacementComplexityPenalty(placement);
@@ -1050,6 +1332,8 @@ const buildPlacementChoices = (
   actionDim: number,
   actionSpaceKind: BotActionSpaceKind,
   curriculum: ActionCurriculumConfig,
+  rewardFunctionId: RewardFunctionId,
+  modeId: string,
   random: (() => number) | null = null,
 ): {
   commandsBySlot: Array<InputFrame[] | null>;
@@ -1095,6 +1379,8 @@ const buildPlacementChoices = (
           beforeMetrics,
           placement,
           board: state.board,
+          rewardFunctionId,
+          modeId,
         });
         if (score > bestHoldActionScore) {
           bestHoldActionScore = score;
@@ -1106,6 +1392,8 @@ const buildPlacementChoices = (
       beforeMetrics,
       placement,
       board: state.board,
+      rewardFunctionId,
+      modeId,
     });
     if (
       actionMask[actionIndex] > 0 &&
@@ -1351,6 +1639,7 @@ class BotEnv {
     private readonly queuePolicyId: string,
     private readonly maxPiecesPerEpisode: number,
     private readonly placementExecutionMode: PlacementExecutionMode,
+    private readonly planningRewardFunction: RewardFunctionId,
     seed: number,
   ) {
     this.pieceSource = pieceSource;
@@ -1363,6 +1652,8 @@ class BotEnv {
       this.actionDim,
       this.actionSpaceKind,
       this.actionCurriculum,
+      this.planningRewardFunction,
+      this.modeId,
       () => nextFloat(this.planningRng),
     );
     this.startEpisodeCapture();
@@ -1405,6 +1696,8 @@ class BotEnv {
         this.actionDim,
         this.actionSpaceKind,
         this.actionCurriculum,
+        this.planningRewardFunction,
+        this.modeId,
         () => nextFloat(this.planningRng),
       );
       if (
@@ -1435,6 +1728,8 @@ class BotEnv {
         this.actionDim,
         this.actionSpaceKind,
         this.actionCurriculum,
+        this.planningRewardFunction,
+        this.modeId,
         () => nextFloat(this.planningRng),
       );
     }
@@ -1482,6 +1777,8 @@ class BotEnv {
       this.actionDim,
       this.actionSpaceKind,
       this.actionCurriculum,
+      this.planningRewardFunction,
+      this.modeId,
       () => nextFloat(this.planningRng),
     );
   }
@@ -1503,6 +1800,8 @@ class BotEnv {
       PLACEMENT_ACTION_DIM,
       'placement_full_v1',
       this.actionCurriculum,
+      this.planningRewardFunction,
+      this.modeId,
       () => nextFloat(this.planningRng),
     );
     const blendWeights = normalizeRewardBlendWeights(rewardBlend);
@@ -1530,8 +1829,9 @@ class BotEnv {
       const afterHoles = countBoardHoles(applied.boardAfter);
       const afterBumpiness = computeBoardBumpiness(applied.boardAfter);
       const afterBlocks = countBoardBlocks(applied.boardAfter);
-      const placementComplexityPenalty =
-        computePlacementComplexityPenaltyWithoutHoldTax(placement);
+      const complexityBreakdown =
+        computePlacementComplexityPenaltyBreakdown(placement);
+      const placementStats = computePlacementPenaltyStats(placement);
       const timeDeltaMs = Math.max(
         0,
         Math.trunc(placement.commands.length * FIXED_STEP_MS),
@@ -1550,7 +1850,7 @@ class BotEnv {
           postLock.totalLinesClearedAfter,
         );
       const isFullClear = afterBlocks === 0 && before.blocks > 0;
-      const rewardV1 = computePieceRewardV1({
+      const rewardInputs = {
         modeId: this.modeId,
         linesDelta,
         scoreDelta,
@@ -1561,40 +1861,20 @@ class BotEnv {
         boardScoreDelta,
         boardQualityDelta,
         topOut: postLock.topOut,
-      });
-      const rewardV2 = computePieceRewardV2({
-        modeId: this.modeId,
-        linesDelta,
-        scoreDelta,
-        timeDeltaMs,
-        heightDelta,
-        holesDelta,
-        bumpinessDelta,
-        boardScoreDelta,
-        boardQualityDelta,
-        topOut: postLock.topOut,
-        placementComplexityPenalty,
-      });
-      const rewardV3 = computePieceRewardV3({
-        modeId: this.modeId,
-        linesDelta,
-        scoreDelta,
-        timeDeltaMs,
-        heightDelta,
-        holesDelta,
-        bumpinessDelta,
-        boardScoreDelta,
-        boardQualityDelta,
-        topOut: postLock.topOut,
-        placementComplexityPenalty,
+        baseComplexityPenalty: complexityBreakdown.basePenalty,
+        kickComplexityPenalty: complexityBreakdown.kickPenalty,
+        softDropComplexityPenalty: complexityBreakdown.softDropPenalty,
         afterMaxHeight: afterHeight,
         afterBoardQuality: afterQuality.quality,
         isFullClear,
-      });
+        srsKickCount: placementStats.srsKickCount,
+        softDropUsed: placementStats.softDropUsed,
+      };
       const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
-        v1: rewardV1,
-        v2: rewardV2,
-        v3: rewardV3,
+        v1: computePieceRewardById('v1', rewardInputs),
+        v2: computePieceRewardById('v2', rewardInputs),
+        v3: computePieceRewardById('v3', rewardInputs),
+        harddrop_v1: computePieceRewardById('harddrop_v1', rewardInputs),
       };
       const rewardResult = blendPieceReward({
         legacy: rewardById[rewardFunctionFrom],
@@ -1644,6 +1924,8 @@ class BotEnv {
           this.actionDim,
           this.actionSpaceKind,
           this.actionCurriculum,
+          this.planningRewardFunction,
+          this.modeId,
           () => nextFloat(this.planningRng),
         );
       this.cachedChoices = choices;
@@ -1689,6 +1971,8 @@ class BotEnv {
         this.actionDim,
         this.actionSpaceKind,
         this.actionCurriculum,
+        this.planningRewardFunction,
+        this.modeId,
         () => nextFloat(this.planningRng),
       );
     this.cachedChoices = choices;
@@ -1783,59 +2067,43 @@ class BotEnv {
             'commands' | 'holdUsed' | 'srsKickCount'
           >)
         : selectedPlacement;
-    const placementComplexityPenalty =
-      computePlacementComplexityPenalty(rewardPlacement);
-    const rewardV1 = isHoldStepAction
-      ? computeHoldStepRewardV1(this.modeId, timeDeltaMs)
-      : computePieceRewardV1({
-          modeId: this.modeId,
-          linesDelta,
-          scoreDelta,
-          timeDeltaMs,
-          heightDelta,
-          holesDelta,
-          bumpinessDelta,
-          boardScoreDelta: before.boardScore - after.boardScore,
-          boardQualityDelta,
-          topOut: this.game.state.gameOver,
-        });
-    const rewardV2 = isHoldStepAction
-      ? computeHoldStepRewardV2()
-      : computePieceRewardV2({
-          modeId: this.modeId,
-          linesDelta,
-          scoreDelta,
-          timeDeltaMs,
-          heightDelta,
-          holesDelta,
-          bumpinessDelta,
-          boardScoreDelta: before.boardScore - after.boardScore,
-          boardQualityDelta,
-          topOut: this.game.state.gameOver,
-          placementComplexityPenalty,
-        });
-    const rewardV3 = isHoldStepAction
-      ? computeHoldStepRewardV3()
-      : computePieceRewardV3({
-          modeId: this.modeId,
-          linesDelta,
-          scoreDelta,
-          timeDeltaMs,
-          heightDelta,
-          holesDelta,
-          bumpinessDelta,
-          boardScoreDelta: before.boardScore - after.boardScore,
-          boardQualityDelta,
-          topOut: this.game.state.gameOver,
-          placementComplexityPenalty,
-          afterMaxHeight: after.height,
-          afterBoardQuality: after.boardQuality,
-          isFullClear,
-        });
+    const complexityBreakdown =
+      computePlacementComplexityPenaltyBreakdown(rewardPlacement);
+    const rewardPlacementStats = computePlacementPenaltyStats(rewardPlacement);
+    const rewardInputs = {
+      modeId: this.modeId,
+      linesDelta,
+      scoreDelta,
+      timeDeltaMs,
+      heightDelta,
+      holesDelta,
+      bumpinessDelta,
+      boardScoreDelta: before.boardScore - after.boardScore,
+      boardQualityDelta,
+      topOut: this.game.state.gameOver,
+      baseComplexityPenalty:
+        complexityBreakdown.basePenalty + complexityBreakdown.holdPenalty,
+      kickComplexityPenalty: complexityBreakdown.kickPenalty,
+      softDropComplexityPenalty: complexityBreakdown.softDropPenalty,
+      afterMaxHeight: after.height,
+      afterBoardQuality: after.boardQuality,
+      isFullClear,
+      srsKickCount: rewardPlacementStats.srsKickCount,
+      softDropUsed: rewardPlacementStats.softDropUsed,
+    };
     const rewardById: Record<RewardFunctionId, PieceRewardResult> = {
-      v1: rewardV1,
-      v2: rewardV2,
-      v3: rewardV3,
+      v1: isHoldStepAction
+        ? computeHoldStepRewardById('v1', this.modeId, timeDeltaMs)
+        : computePieceRewardById('v1', rewardInputs),
+      v2: isHoldStepAction
+        ? computeHoldStepRewardById('v2', this.modeId, timeDeltaMs)
+        : computePieceRewardById('v2', rewardInputs),
+      v3: isHoldStepAction
+        ? computeHoldStepRewardById('v3', this.modeId, timeDeltaMs)
+        : computePieceRewardById('v3', rewardInputs),
+      harddrop_v1: isHoldStepAction
+        ? computeHoldStepRewardById('harddrop_v1', this.modeId, timeDeltaMs)
+        : computePieceRewardById('harddrop_v1', rewardInputs),
     };
     const rewardLegacy = rewardById[rewardFunctionFrom];
     const rewardTarget = rewardById[rewardFunctionTo];
@@ -1852,6 +2120,9 @@ class BotEnv {
       linesTerm: rewardLegacy.breakdown.linesTerm * blendWeights.legacyWeight,
       scoreTerm: rewardLegacy.breakdown.scoreTerm * blendWeights.legacyWeight,
       timeTerm: rewardLegacy.breakdown.timeTerm * blendWeights.legacyWeight,
+      kickTerm: rewardLegacy.breakdown.kickTerm * blendWeights.legacyWeight,
+      softDropTerm:
+        rewardLegacy.breakdown.softDropTerm * blendWeights.legacyWeight,
       heightTerm: rewardLegacy.breakdown.heightTerm * blendWeights.legacyWeight,
       holeDeltaTerm:
         rewardLegacy.breakdown.holeDeltaTerm * blendWeights.legacyWeight,
@@ -1873,6 +2144,9 @@ class BotEnv {
       linesTerm: rewardTarget.breakdown.linesTerm * blendWeights.targetWeight,
       scoreTerm: rewardTarget.breakdown.scoreTerm * blendWeights.targetWeight,
       timeTerm: rewardTarget.breakdown.timeTerm * blendWeights.targetWeight,
+      kickTerm: rewardTarget.breakdown.kickTerm * blendWeights.targetWeight,
+      softDropTerm:
+        rewardTarget.breakdown.softDropTerm * blendWeights.targetWeight,
       heightTerm: rewardTarget.breakdown.heightTerm * blendWeights.targetWeight,
       holeDeltaTerm:
         rewardTarget.breakdown.holeDeltaTerm * blendWeights.targetWeight,
@@ -1929,6 +2203,8 @@ class BotEnv {
       this.actionDim,
       this.actionSpaceKind,
       this.actionCurriculum,
+      this.planningRewardFunction,
+      this.modeId,
       () => nextFloat(this.planningRng),
     );
     const choicesNextElapsedS = (performance.now() - choicesNextStart) / 1000;
@@ -1975,6 +2251,8 @@ class BotEnv {
         rewardLegacyTermLines: rewardLegacy.breakdown.linesTerm,
         rewardLegacyTermScore: rewardLegacy.breakdown.scoreTerm,
         rewardLegacyTermTime: rewardLegacy.breakdown.timeTerm,
+        rewardLegacyTermKick: rewardLegacy.breakdown.kickTerm,
+        rewardLegacyTermSoftDrop: rewardLegacy.breakdown.softDropTerm,
         rewardLegacyTermHeight: rewardLegacy.breakdown.heightTerm,
         rewardLegacyTermHoles: rewardLegacy.breakdown.holeDeltaTerm,
         rewardLegacyTermBumpiness: rewardLegacy.breakdown.bumpinessDeltaTerm,
@@ -1988,6 +2266,8 @@ class BotEnv {
         rewardTargetTermLines: rewardTarget.breakdown.linesTerm,
         rewardTargetTermScore: rewardTarget.breakdown.scoreTerm,
         rewardTargetTermTime: rewardTarget.breakdown.timeTerm,
+        rewardTargetTermKick: rewardTarget.breakdown.kickTerm,
+        rewardTargetTermSoftDrop: rewardTarget.breakdown.softDropTerm,
         rewardTargetTermHeight: rewardTarget.breakdown.heightTerm,
         rewardTargetTermHoles: rewardTarget.breakdown.holeDeltaTerm,
         rewardTargetTermBumpiness: rewardTarget.breakdown.bumpinessDeltaTerm,
@@ -2004,6 +2284,10 @@ class BotEnv {
           rewardLegacyContributionBreakdown.scoreTerm,
         rewardLegacyContributionTermTime:
           rewardLegacyContributionBreakdown.timeTerm,
+        rewardLegacyContributionTermKick:
+          rewardLegacyContributionBreakdown.kickTerm,
+        rewardLegacyContributionTermSoftDrop:
+          rewardLegacyContributionBreakdown.softDropTerm,
         rewardLegacyContributionTermHeight:
           rewardLegacyContributionBreakdown.heightTerm,
         rewardLegacyContributionTermHoles:
@@ -2026,6 +2310,10 @@ class BotEnv {
           rewardTargetContributionBreakdown.scoreTerm,
         rewardTargetContributionTermTime:
           rewardTargetContributionBreakdown.timeTerm,
+        rewardTargetContributionTermKick:
+          rewardTargetContributionBreakdown.kickTerm,
+        rewardTargetContributionTermSoftDrop:
+          rewardTargetContributionBreakdown.softDropTerm,
         rewardTargetContributionTermHeight:
           rewardTargetContributionBreakdown.heightTerm,
         rewardTargetContributionTermHoles:
@@ -2045,6 +2333,8 @@ class BotEnv {
         rewardTermLines: rewardResult.breakdown.linesTerm,
         rewardTermScore: rewardResult.breakdown.scoreTerm,
         rewardTermTime: rewardResult.breakdown.timeTerm,
+        rewardTermKick: rewardResult.breakdown.kickTerm,
+        rewardTermSoftDrop: rewardResult.breakdown.softDropTerm,
         rewardTermHeight: rewardResult.breakdown.heightTerm,
         rewardTermHoles: rewardResult.breakdown.holeDeltaTerm,
         rewardTermBumpiness: rewardResult.breakdown.bumpinessDeltaTerm,
@@ -2460,6 +2750,7 @@ export class BotEnvPool {
           queuePolicyId,
           maxPiecesPerEpisode,
           placementExecutionMode,
+          rewardFunctionTo,
           seed,
         ),
       );

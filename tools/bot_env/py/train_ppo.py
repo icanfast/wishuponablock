@@ -781,7 +781,7 @@ def parse_args() -> PPOConfig:
         default=None,
         help=(
             "Reward schedule definition. Accepts one or two items (space/comma-separated). "
-            "One item ('v1' / 'v2' / 'v3') uses that reward only. "
+            "One item ('v1' / 'v2' / 'v3' / 'harddrop_v1') uses that reward only. "
             "Two items (for example: 'v1 v3') blend first->second using --reward-blend-updates."
         ),
     )
@@ -1300,9 +1300,10 @@ def parse_args() -> PPOConfig:
 
     def _normalize_reward_function(value: str) -> str:
         normalized = str(value).strip().lower()
-        if normalized not in ("v1", "v2", "v3"):
+        if normalized not in ("v1", "v2", "v3", "harddrop_v1"):
             raise ValueError(
-                f"Unsupported reward function '{value}'. Allowed: v1, v2, v3."
+                "Unsupported reward function "
+                f"'{value}'. Allowed: v1, v2, v3, harddrop_v1."
             )
         return normalized
 
@@ -1327,7 +1328,8 @@ def parse_args() -> PPOConfig:
                 )
             return parsed
         raise ValueError(
-            "Reward schedule must contain one function (v1/v2/v3) or two distinct functions."
+            "Reward schedule must contain one function "
+            "(v1/v2/v3/harddrop_v1) or two distinct functions."
         )
 
     def _parse_behavior_active_tokens(token_count: int) -> tuple[int, ...]:
@@ -1589,7 +1591,7 @@ def fixed_reward_blend_step_for_cfg(cfg: PPOConfig) -> int | None:
         return None
     if reward_functions[0] == "v1":
         return 0
-    if reward_functions[0] in ("v2", "v3"):
+    if reward_functions[0] in ("v2", "v3", "harddrop_v1"):
         # Force fully-target reward from the first training step.
         return 1_000_000_000
     return None
@@ -4287,6 +4289,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "lines": data.get("v1_term_lines"),
                 "score": data.get("v1_term_score"),
                 "time": data.get("v1_term_time"),
+                "kick": data.get("v1_term_kick"),
+                "soft_drop": data.get("v1_term_soft_drop"),
                 "height": data.get("v1_term_height"),
                 "holes": data.get("v1_term_holes"),
                 "bumpiness": data.get("v1_term_bumpiness"),
@@ -4304,6 +4308,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "lines": data.get("v2_term_lines"),
                 "score": data.get("v2_term_score"),
                 "time": data.get("v2_term_time"),
+                "kick": data.get("v2_term_kick"),
+                "soft_drop": data.get("v2_term_soft_drop"),
                 "height": data.get("v2_term_height"),
                 "holes": data.get("v2_term_holes"),
                 "bumpiness": data.get("v2_term_bumpiness"),
@@ -4318,6 +4324,8 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "lines": data.get("term_lines"),
             "score": data.get("term_score"),
             "time": data.get("term_time"),
+            "kick": data.get("term_kick"),
+            "soft_drop": data.get("term_soft_drop"),
             "height": data.get("term_height"),
             "holes": data.get("term_holes"),
             "bumpiness": data.get("term_bumpiness"),
@@ -6136,6 +6144,8 @@ def train(cfg: PPOConfig) -> None:
             "term_lines": ("rewardTermLines",),
             "term_score": ("rewardTermScore",),
             "term_time": ("rewardTermTime",),
+            "term_kick": ("rewardTermKick",),
+            "term_soft_drop": ("rewardTermSoftDrop",),
             "term_height": ("rewardTermHeight",),
             "term_holes": ("rewardTermHoles",),
             "term_bumpiness": ("rewardTermBumpiness",),
@@ -6147,6 +6157,8 @@ def train(cfg: PPOConfig) -> None:
             "v1_term_lines": ("rewardLegacyContributionTermLines",),
             "v1_term_score": ("rewardLegacyContributionTermScore",),
             "v1_term_time": ("rewardLegacyContributionTermTime",),
+            "v1_term_kick": ("rewardLegacyContributionTermKick",),
+            "v1_term_soft_drop": ("rewardLegacyContributionTermSoftDrop",),
             "v1_term_height": ("rewardLegacyContributionTermHeight",),
             "v1_term_holes": ("rewardLegacyContributionTermHoles",),
             "v1_term_bumpiness": ("rewardLegacyContributionTermBumpiness",),
@@ -6160,6 +6172,8 @@ def train(cfg: PPOConfig) -> None:
             "v2_term_lines": ("rewardTargetContributionTermLines",),
             "v2_term_score": ("rewardTargetContributionTermScore",),
             "v2_term_time": ("rewardTargetContributionTermTime",),
+            "v2_term_kick": ("rewardTargetContributionTermKick",),
+            "v2_term_soft_drop": ("rewardTargetContributionTermSoftDrop",),
             "v2_term_height": ("rewardTargetContributionTermHeight",),
             "v2_term_holes": ("rewardTargetContributionTermHoles",),
             "v2_term_bumpiness": ("rewardTargetContributionTermBumpiness",),
@@ -7313,6 +7327,8 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
+                                f"kick={_fmt_float(ret_terms.get('v1_term_kick'))} "
+                                f"soft={_fmt_float(ret_terms.get('v1_term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
                                 f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
@@ -7327,6 +7343,8 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
+                                f"kick={_fmt_float(ret_terms.get('v2_term_kick'))} "
+                                f"soft={_fmt_float(ret_terms.get('v2_term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('v2_term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
                                 f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
@@ -7341,6 +7359,8 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('term_time'))} "
+                                f"kick={_fmt_float(ret_terms.get('term_kick'))} "
+                                f"soft={_fmt_float(ret_terms.get('term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('term_holes'))} "
                                 f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
@@ -7368,6 +7388,8 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('term_time'))} "
+                                f"kick={_fmt_float(ret_terms.get('term_kick'))} "
+                                f"soft={_fmt_float(ret_terms.get('term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('term_holes'))} "
                                 f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
@@ -7560,6 +7582,8 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
+                                        + f"kick={_fmt_float(source_terms_dict.get('v1_term_kick'))} "
+                                        + f"soft={_fmt_float(source_terms_dict.get('v1_term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
@@ -7576,6 +7600,8 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('v2_term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('v2_term_time'))} "
+                                        + f"kick={_fmt_float(source_terms_dict.get('v2_term_kick'))} "
+                                        + f"soft={_fmt_float(source_terms_dict.get('v2_term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('v2_term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('v2_term_holes'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
@@ -7605,6 +7631,8 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('term_time'))} "
+                                        + f"kick={_fmt_float(source_terms_dict.get('term_kick'))} "
+                                        + f"soft={_fmt_float(source_terms_dict.get('term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('term_holes'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('term_bumpiness'))} "

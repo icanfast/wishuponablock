@@ -1,7 +1,7 @@
 export type PieceSourceProfile = 'bag7' | 'active_generator' | 'random';
 export type BotObservationSpace = 'model_head_v1' | 'raw_v1';
 export type PlacementExecutionMode = 'commands' | 'teleport';
-export type RewardFunctionId = 'v1' | 'v2' | 'v3';
+export type RewardFunctionId = 'v1' | 'v2' | 'v3' | 'harddrop_v1';
 export type BotActionSpaceKind = 'placement_full_v1' | 'placement_hold_step_v2';
 
 export type JsonValue =
