@@ -602,6 +602,13 @@ async function boot() {
   let botGuiInputSource: BotGuiInspectInputSource | null = null;
   let botGuiInspectEnabled = false;
   let botGuiStepMode = false;
+  let botGuiInspectRuntimeConfig: {
+    model: LoadedModel | null;
+    apmInput: number;
+    seed: number;
+    greedy: boolean;
+    stepMode: boolean;
+  } | null = null;
   let replayGuiInputSource: TrajectoryReplayGuiInputSource | null = null;
   let replayGuiInspectEnabled = false;
   let replayExecutorStepMode = false;
@@ -1485,7 +1492,13 @@ async function boot() {
       adminBotPolicy.behaviorConditioning.tokenCount,
     );
     adminBotPolicy.behaviorConditioning.activeTokenIds = normalized;
-    return `Loaded policy behavior tokens set to ${normalized.join(', ')}.`;
+    const runtimeSuffix = refreshRunningBotGuiInspectPolicy()
+      ? ' Running GUI inspect policy updated.'
+      : '';
+    return (
+      `Loaded policy behavior tokens set to ${normalized.join(', ')}.` +
+      runtimeSuffix
+    );
   };
 
   const resetLoadedBotPolicyBehaviorTokens = (): string => {
@@ -1498,7 +1511,13 @@ async function boot() {
       adminBotPolicy.behaviorConditioning.tokenCount,
     );
     adminBotPolicy.behaviorConditioning.activeTokenIds = restored;
-    return `Loaded policy behavior tokens restored to ${restored.join(', ')}.`;
+    const runtimeSuffix = refreshRunningBotGuiInspectPolicy()
+      ? ' Running GUI inspect policy updated.'
+      : '';
+    return (
+      `Loaded policy behavior tokens restored to ${restored.join(', ')}.` +
+      runtimeSuffix
+    );
   };
 
   const prepareAdminManifest = async (
@@ -2168,6 +2187,32 @@ async function boot() {
     }
   };
 
+  const refreshRunningBotGuiInspectPolicy = (): boolean => {
+    if (
+      !botGuiInspectEnabled ||
+      !botGuiInputSource ||
+      !botGuiInspectRuntimeConfig ||
+      !adminBotPolicy
+    ) {
+      return false;
+    }
+    setBotInspectTargetGhost(null);
+    botGuiInputSource = createGuiInspectBotInputSource({
+      model: botGuiInspectRuntimeConfig.model,
+      policy: adminBotPolicy,
+      apmInput: botGuiInspectRuntimeConfig.apmInput,
+      executionMode: botGuiInspectRuntimeConfig.stepMode ? 'step' : 'apm',
+      seed: botGuiInspectRuntimeConfig.seed,
+      greedy: botGuiInspectRuntimeConfig.greedy,
+      debugTrace: true,
+      onLog: (line) => console.info(line),
+      onTargetGhostChange: (ghost) => setBotInspectTargetGhost(ghost),
+    });
+    runtime?.setInputSource(activeInputSource);
+    runtime?.renderNow();
+    return true;
+  };
+
   const startAdminBotGuiInspect = async (options?: {
     apmInput?: number;
     seed?: number;
@@ -2223,6 +2268,13 @@ async function boot() {
       onLog: (line) => console.info(line),
       onTargetGhostChange: (ghost) => setBotInspectTargetGhost(ghost),
     });
+    botGuiInspectRuntimeConfig = {
+      model: reference.model,
+      apmInput,
+      seed,
+      greedy: options?.greedy !== false,
+      stepMode,
+    };
     botGuiInspectEnabled = true;
     botGuiStepMode = stepMode;
     applyBotGuiPieceSourceProfile(pieceSourceProfile);
@@ -2264,6 +2316,7 @@ async function boot() {
     botGuiInspectEnabled = false;
     botGuiStepMode = false;
     botGuiInputSource = null;
+    botGuiInspectRuntimeConfig = null;
     setBotInspectTargetGhost(null);
     applyBotGuiPieceSourceProfile('active_generator');
     const gameCfg = settingsStore.get().game;
