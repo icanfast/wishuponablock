@@ -190,9 +190,18 @@ class PolicyValueNet(nn.Module):
             self.behavior_token_count,
             self.behavior_token_dim,
         )
-        self.policy_conditioner = nn.Linear(
+        self.policy_gate = nn.Linear(
             self.behavior_token_dim,
             hidden_dim * 2,
+        )
+        self.behavior_adapter_hidden_dim = max(64, int(hidden_dim))
+        self.policy_adapter_fc1 = nn.Linear(
+            hidden_dim + self.behavior_token_dim,
+            self.behavior_adapter_hidden_dim,
+        )
+        self.policy_adapter_fc2 = nn.Linear(
+            self.behavior_adapter_hidden_dim,
+            hidden_dim,
         )
         self.active_behavior_token_ids = self._normalize_behavior_token_ids(
             behavior_active_token_ids
@@ -213,8 +222,11 @@ class PolicyValueNet(nn.Module):
         init_layer(self.policy_head, std=0.01)
         init_layer(self.value_head, std=1.0)
         nn.init.normal_(self.behavior_token_embeddings.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.policy_conditioner.weight)
-        nn.init.zeros_(self.policy_conditioner.bias)
+        nn.init.zeros_(self.policy_gate.weight)
+        nn.init.zeros_(self.policy_gate.bias)
+        init_layer(self.policy_adapter_fc1, std=math.sqrt(2.0))
+        nn.init.zeros_(self.policy_adapter_fc2.weight)
+        nn.init.zeros_(self.policy_adapter_fc2.bias)
 
     def _normalize_behavior_token_ids(
         self,
@@ -281,9 +293,13 @@ class PolicyValueNet(nn.Module):
         )
         token_ids = token_ids.clamp(0, self.behavior_token_count - 1)
         behavior_embedding = self.behavior_token_embeddings(token_ids).sum(dim=1)
-        gamma_beta = self.policy_conditioner(behavior_embedding)
+        gamma_beta = self.policy_gate(behavior_embedding)
         gamma, beta = gamma_beta.chunk(2, dim=-1)
-        return policy_hidden * (1.0 + gamma) + beta
+        base_hidden = policy_hidden * (1.0 + gamma) + beta
+        adapter_input = torch.cat((base_hidden, behavior_embedding), dim=-1)
+        adapter_hidden = torch.relu(self.policy_adapter_fc1(adapter_input))
+        adapter_delta = self.policy_adapter_fc2(adapter_hidden)
+        return base_hidden + adapter_delta
 
     def forward(
         self,
@@ -2585,7 +2601,9 @@ def apply_policy_train_mode(
         record_module("policy_head", model.policy_head, True)
 
     record_module("behavior_embeddings", model.behavior_token_embeddings, True)
-    record_module("policy_conditioner", model.policy_conditioner, True)
+    record_module("policy_gate", model.policy_gate, True)
+    record_module("policy_adapter_fc1", model.policy_adapter_fc1, True)
+    record_module("policy_adapter_fc2", model.policy_adapter_fc2, True)
 
     total_params = int(sum(total for _name, total, _before, _after in module_stats))
     trainable_params = int(sum(after for _name, _total, _before, after in module_stats))
@@ -2639,8 +2657,12 @@ def build_ppo_optimizer(
     policy_params.extend(
         [p for p in model.behavior_token_embeddings.parameters() if p.requires_grad]
     )
+    policy_params.extend([p for p in model.policy_gate.parameters() if p.requires_grad])
     policy_params.extend(
-        [p for p in model.policy_conditioner.parameters() if p.requires_grad]
+        [p for p in model.policy_adapter_fc1.parameters() if p.requires_grad]
+    )
+    policy_params.extend(
+        [p for p in model.policy_adapter_fc2.parameters() if p.requires_grad]
     )
 
     value_params: list[nn.Parameter] = []
@@ -2972,6 +2994,38 @@ def prepare_model_state_for_load(
                     f"(loaded_shape={tuple(value_tensor.shape)}, target_shape={tuple(target_tensor.shape)})"
                 )
                 continue
+        if key == "policy_conditioner.weight":
+            target_gate = current_state.get("policy_gate.weight")
+            if (
+                target_gate is not None
+                and tuple(target_gate.shape) == tuple(value_tensor.shape)
+            ):
+                prepared["policy_gate.weight"] = value_tensor.to(
+                    device=target_gate.device,
+                    dtype=target_gate.dtype,
+                )
+                print(
+                    "[ppo] "
+                    f"remapped legacy {key} to policy_gate.weight from {source_label} "
+                    f"(shape={tuple(value_tensor.shape)})"
+                )
+                continue
+        if key == "policy_conditioner.bias":
+            target_gate_bias = current_state.get("policy_gate.bias")
+            if (
+                target_gate_bias is not None
+                and tuple(target_gate_bias.shape) == tuple(value_tensor.shape)
+            ):
+                prepared["policy_gate.bias"] = value_tensor.to(
+                    device=target_gate_bias.device,
+                    dtype=target_gate_bias.dtype,
+                )
+                print(
+                    "[ppo] "
+                    f"remapped legacy {key} to policy_gate.bias from {source_label} "
+                    f"(shape={tuple(value_tensor.shape)})"
+                )
+                continue
         print(
             "[ppo] warning: skipped incompatible tensor from "
             f"{source_label} for key={key} "
@@ -3088,17 +3142,41 @@ def export_bot_policy_artifact(
             .astype(np.float32)
         )  # [T, D]
         behavior_policy_w = (
-            model.policy_conditioner.weight.detach()
+            model.policy_gate.weight.detach()
             .cpu()
             .numpy()
             .astype(np.float32)
         )  # [2H, D]
         behavior_policy_b = (
-            model.policy_conditioner.bias.detach()
+            model.policy_gate.bias.detach()
             .cpu()
             .numpy()
             .astype(np.float32)
         )  # [2H]
+        behavior_adapter_w1 = (
+            model.policy_adapter_fc1.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [Ah, H + D]
+        behavior_adapter_b1 = (
+            model.policy_adapter_fc1.bias.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [Ah]
+        behavior_adapter_w2 = (
+            model.policy_adapter_fc2.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [H, Ah]
+        behavior_adapter_b2 = (
+            model.policy_adapter_fc2.bias.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [H]
 
         # Value tower (new in split actor/critic architecture).
         wv1 = model.value_fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
@@ -3144,12 +3222,18 @@ def export_bot_policy_artifact(
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
         "behaviorConditioning": {
+            "version": 2,
             "tokenCount": int(model.behavior_token_count),
             "tokenDim": int(model.behavior_token_dim),
             "activeTokenIds": [int(v) for v in model.active_behavior_token_ids],
             "embeddings": behavior_embeddings.reshape(-1).tolist(),  # [T, D]
-            "policyAffineW": behavior_policy_w.T.reshape(-1).tolist(),  # [D, 2H]
-            "policyAffineB": behavior_policy_b.reshape(-1).tolist(),  # [2H]
+            "policyGateW": behavior_policy_w.T.reshape(-1).tolist(),  # [D, 2H]
+            "policyGateB": behavior_policy_b.reshape(-1).tolist(),  # [2H]
+            "policyAdapterHiddenDim": int(model.behavior_adapter_hidden_dim),
+            "policyAdapterW1": behavior_adapter_w1.T.reshape(-1).tolist(),  # [H + D, Ah]
+            "policyAdapterB1": behavior_adapter_b1.reshape(-1).tolist(),  # [Ah]
+            "policyAdapterW2": behavior_adapter_w2.T.reshape(-1).tolist(),  # [Ah, H]
+            "policyAdapterB2": behavior_adapter_b2.reshape(-1).tolist(),  # [H]
         },
     }
     if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
@@ -3306,6 +3390,7 @@ def load_from_artifact(
         token_dim = int(behavior_conditioning_payload.get("tokenDim", 0))
         target_token_count = int(model.behavior_token_count)
         target_token_dim = int(model.behavior_token_dim)
+        target_adapter_hidden_dim = int(model.behavior_adapter_hidden_dim)
         if token_count <= 0 or token_dim <= 0:
             raise ValueError("Invalid artifact behaviorConditioning dims.")
         if token_dim != target_token_dim:
@@ -3322,26 +3407,81 @@ def load_from_artifact(
             behavior_conditioning_payload.get("embeddings", []),
             dtype=np.float32,
         ).reshape(token_count, token_dim)
-        policy_affine_w = np.asarray(
-            behavior_conditioning_payload.get("policyAffineW", []),
-            dtype=np.float32,
-        ).reshape(token_dim, hidden_dim * 2)
-        policy_affine_b = np.asarray(
-            behavior_conditioning_payload.get("policyAffineB", []),
-            dtype=np.float32,
-        ).reshape(hidden_dim * 2)
         active_token_ids = [
             int(v)
             for v in behavior_conditioning_payload.get("activeTokenIds", [])
             if 0 <= int(v) < target_token_count
         ]
+        version = int(behavior_conditioning_payload.get("version", 1))
         with torch.no_grad():
             model.behavior_token_embeddings.weight.zero_()
             model.behavior_token_embeddings.weight[:token_count, :].copy_(
                 torch.from_numpy(embeddings)
             )
-            model.policy_conditioner.weight.copy_(torch.from_numpy(policy_affine_w.T))
-            model.policy_conditioner.bias.copy_(torch.from_numpy(policy_affine_b))
+            model.policy_gate.weight.zero_()
+            model.policy_gate.bias.zero_()
+            model.policy_adapter_fc2.weight.zero_()
+            model.policy_adapter_fc2.bias.zero_()
+        if version >= 2:
+            adapter_hidden_dim = int(
+                behavior_conditioning_payload.get("policyAdapterHiddenDim", 0)
+            )
+            if adapter_hidden_dim != target_adapter_hidden_dim:
+                raise ValueError(
+                    "Artifact behaviorConditioning policyAdapterHiddenDim mismatch. "
+                    f"artifact={adapter_hidden_dim} model={target_adapter_hidden_dim}"
+                )
+            policy_gate_w = np.asarray(
+                behavior_conditioning_payload.get("policyGateW", []),
+                dtype=np.float32,
+            ).reshape(token_dim, hidden_dim * 2)
+            policy_gate_b = np.asarray(
+                behavior_conditioning_payload.get("policyGateB", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim * 2)
+            policy_adapter_w1 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterW1", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim + token_dim, adapter_hidden_dim)
+            policy_adapter_b1 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterB1", []),
+                dtype=np.float32,
+            ).reshape(adapter_hidden_dim)
+            policy_adapter_w2 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterW2", []),
+                dtype=np.float32,
+            ).reshape(adapter_hidden_dim, hidden_dim)
+            policy_adapter_b2 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterB2", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim)
+            with torch.no_grad():
+                model.policy_gate.weight.copy_(torch.from_numpy(policy_gate_w.T))
+                model.policy_gate.bias.copy_(torch.from_numpy(policy_gate_b))
+                model.policy_adapter_fc1.weight.copy_(
+                    torch.from_numpy(policy_adapter_w1.T)
+                )
+                model.policy_adapter_fc1.bias.copy_(
+                    torch.from_numpy(policy_adapter_b1)
+                )
+                model.policy_adapter_fc2.weight.copy_(
+                    torch.from_numpy(policy_adapter_w2.T)
+                )
+                model.policy_adapter_fc2.bias.copy_(
+                    torch.from_numpy(policy_adapter_b2)
+                )
+        else:
+            policy_affine_w = np.asarray(
+                behavior_conditioning_payload.get("policyAffineW", []),
+                dtype=np.float32,
+            ).reshape(token_dim, hidden_dim * 2)
+            policy_affine_b = np.asarray(
+                behavior_conditioning_payload.get("policyAffineB", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim * 2)
+            with torch.no_grad():
+                model.policy_gate.weight.copy_(torch.from_numpy(policy_affine_w.T))
+                model.policy_gate.bias.copy_(torch.from_numpy(policy_affine_b))
         model.set_active_behavior_token_ids(active_token_ids)
     encoder_payload = raw.get("encoderModel")
     if isinstance(encoder_payload, dict):
@@ -4709,8 +4849,12 @@ def build_bc_optimizer(
     behavior_params.extend(
         [p for p in model.behavior_token_embeddings.parameters() if p.requires_grad]
     )
+    behavior_params.extend([p for p in model.policy_gate.parameters() if p.requires_grad])
     behavior_params.extend(
-        [p for p in model.policy_conditioner.parameters() if p.requires_grad]
+        [p for p in model.policy_adapter_fc1.parameters() if p.requires_grad]
+    )
+    behavior_params.extend(
+        [p for p in model.policy_adapter_fc2.parameters() if p.requires_grad]
     )
     if behavior_params:
         param_groups.append(

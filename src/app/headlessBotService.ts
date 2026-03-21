@@ -76,12 +76,20 @@ type QueueEncoderArtifact = {
 };
 
 type BehaviorConditioningArtifact = {
+  version?: number;
   tokenDim: number;
   tokenCount: number;
   activeTokenIds: number[];
   embeddings: number[];
-  policyAffineW: number[];
-  policyAffineB: number[];
+  policyGateW?: number[];
+  policyGateB?: number[];
+  policyAdapterHiddenDim?: number;
+  policyAdapterW1?: number[];
+  policyAdapterB1?: number[];
+  policyAdapterW2?: number[];
+  policyAdapterB2?: number[];
+  policyAffineW?: number[];
+  policyAffineB?: number[];
 };
 
 type QueueEncoderParams = {
@@ -92,12 +100,18 @@ type QueueEncoderParams = {
 };
 
 type BehaviorConditioningParams = {
+  version: number;
   tokenDim: number;
   tokenCount: number;
   activeTokenIds: number[];
   embeddings: Float32Array;
-  policyAffineW: Float32Array;
-  policyAffineB: Float32Array;
+  policyGateW: Float32Array;
+  policyGateB: Float32Array;
+  policyAdapterHiddenDim: number;
+  policyAdapterW1: Float32Array;
+  policyAdapterB1: Float32Array;
+  policyAdapterW2: Float32Array;
+  policyAdapterB2: Float32Array;
 };
 
 export type BotActionSpaceKind =
@@ -405,15 +419,26 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
     : null,
   behaviorConditioning: params.behaviorConditioning
     ? {
+        version: params.behaviorConditioning.version,
         tokenDim: params.behaviorConditioning.tokenDim,
         tokenCount: params.behaviorConditioning.tokenCount,
         activeTokenIds: [...params.behaviorConditioning.activeTokenIds],
         embeddings: new Float32Array(params.behaviorConditioning.embeddings),
-        policyAffineW: new Float32Array(
-          params.behaviorConditioning.policyAffineW,
+        policyGateW: new Float32Array(params.behaviorConditioning.policyGateW),
+        policyGateB: new Float32Array(params.behaviorConditioning.policyGateB),
+        policyAdapterHiddenDim:
+          params.behaviorConditioning.policyAdapterHiddenDim,
+        policyAdapterW1: new Float32Array(
+          params.behaviorConditioning.policyAdapterW1,
         ),
-        policyAffineB: new Float32Array(
-          params.behaviorConditioning.policyAffineB,
+        policyAdapterB1: new Float32Array(
+          params.behaviorConditioning.policyAdapterB1,
+        ),
+        policyAdapterW2: new Float32Array(
+          params.behaviorConditioning.policyAdapterW2,
+        ),
+        policyAdapterB2: new Float32Array(
+          params.behaviorConditioning.policyAdapterB2,
         ),
       }
     : null,
@@ -979,21 +1004,46 @@ const applyBehaviorConditioning = (
       tokenVec[d] += conditioning.embeddings[base + d] ?? 0;
     }
   }
-  const conditioned = new Float32Array(params.hiddenDim);
+  const baseHidden = new Float32Array(params.hiddenDim);
   for (let h = 0; h < params.hiddenDim; h += 1) {
-    let gamma = conditioning.policyAffineB[h] ?? 0;
-    let beta = conditioning.policyAffineB[params.hiddenDim + h] ?? 0;
+    let gamma = conditioning.policyGateB[h] ?? 0;
+    let beta = conditioning.policyGateB[params.hiddenDim + h] ?? 0;
     for (let d = 0; d < conditioning.tokenDim; d += 1) {
       const value = tokenVec[d];
       gamma +=
-        value * (conditioning.policyAffineW[d * params.hiddenDim * 2 + h] ?? 0);
+        value * (conditioning.policyGateW[d * params.hiddenDim * 2 + h] ?? 0);
       beta +=
         value *
-        (conditioning.policyAffineW[
+        (conditioning.policyGateW[
           d * params.hiddenDim * 2 + params.hiddenDim + h
         ] ?? 0);
     }
-    conditioned[h] = hidden[h] * (1 + gamma) + beta;
+    baseHidden[h] = hidden[h] * (1 + gamma) + beta;
+  }
+  const adapterInputDim = params.hiddenDim + conditioning.tokenDim;
+  const adapterHidden = new Float32Array(conditioning.policyAdapterHiddenDim);
+  for (let ah = 0; ah < conditioning.policyAdapterHiddenDim; ah += 1) {
+    let sum = conditioning.policyAdapterB1[ah] ?? 0;
+    for (let i = 0; i < adapterInputDim; i += 1) {
+      const inputValue =
+        i < params.hiddenDim ? baseHidden[i] : tokenVec[i - params.hiddenDim];
+      sum +=
+        inputValue *
+        (conditioning.policyAdapterW1[
+          i * conditioning.policyAdapterHiddenDim + ah
+        ] ?? 0);
+    }
+    adapterHidden[ah] = sum > 0 ? sum : 0;
+  }
+  const conditioned = new Float32Array(params.hiddenDim);
+  for (let h = 0; h < params.hiddenDim; h += 1) {
+    let delta = conditioning.policyAdapterB2[h] ?? 0;
+    for (let ah = 0; ah < conditioning.policyAdapterHiddenDim; ah += 1) {
+      delta +=
+        adapterHidden[ah] *
+        (conditioning.policyAdapterW2[ah * params.hiddenDim + h] ?? 0);
+    }
+    conditioned[h] = baseHidden[h] + delta;
   }
   return conditioned;
 };
@@ -1615,6 +1665,7 @@ const trainWithTfjsReinforce = async (options: {
       : null,
     behaviorConditioning: options.params.behaviorConditioning
       ? {
+          version: options.params.behaviorConditioning.version,
           tokenDim: options.params.behaviorConditioning.tokenDim,
           tokenCount: options.params.behaviorConditioning.tokenCount,
           activeTokenIds: [
@@ -1623,11 +1674,25 @@ const trainWithTfjsReinforce = async (options: {
           embeddings: new Float32Array(
             options.params.behaviorConditioning.embeddings,
           ),
-          policyAffineW: new Float32Array(
-            options.params.behaviorConditioning.policyAffineW,
+          policyGateW: new Float32Array(
+            options.params.behaviorConditioning.policyGateW,
           ),
-          policyAffineB: new Float32Array(
-            options.params.behaviorConditioning.policyAffineB,
+          policyGateB: new Float32Array(
+            options.params.behaviorConditioning.policyGateB,
+          ),
+          policyAdapterHiddenDim:
+            options.params.behaviorConditioning.policyAdapterHiddenDim,
+          policyAdapterW1: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterW1,
+          ),
+          policyAdapterB1: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterB1,
+          ),
+          policyAdapterW2: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterW2,
+          ),
+          policyAdapterB2: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterB2,
           ),
         }
       : null,
@@ -1850,6 +1915,7 @@ const trainWithTfjsPpo = async (options: {
       : null,
     behaviorConditioning: options.params.behaviorConditioning
       ? {
+          version: options.params.behaviorConditioning.version,
           tokenDim: options.params.behaviorConditioning.tokenDim,
           tokenCount: options.params.behaviorConditioning.tokenCount,
           activeTokenIds: [
@@ -1858,11 +1924,25 @@ const trainWithTfjsPpo = async (options: {
           embeddings: new Float32Array(
             options.params.behaviorConditioning.embeddings,
           ),
-          policyAffineW: new Float32Array(
-            options.params.behaviorConditioning.policyAffineW,
+          policyGateW: new Float32Array(
+            options.params.behaviorConditioning.policyGateW,
           ),
-          policyAffineB: new Float32Array(
-            options.params.behaviorConditioning.policyAffineB,
+          policyGateB: new Float32Array(
+            options.params.behaviorConditioning.policyGateB,
+          ),
+          policyAdapterHiddenDim:
+            options.params.behaviorConditioning.policyAdapterHiddenDim,
+          policyAdapterW1: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterW1,
+          ),
+          policyAdapterB1: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterB1,
+          ),
+          policyAdapterW2: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterW2,
+          ),
+          policyAdapterB2: new Float32Array(
+            options.params.behaviorConditioning.policyAdapterB2,
           ),
         }
       : null,
@@ -2136,12 +2216,27 @@ const toArtifact = (
     : undefined,
   behaviorConditioning: params.behaviorConditioning
     ? {
+        version: params.behaviorConditioning.version,
         tokenDim: params.behaviorConditioning.tokenDim,
         tokenCount: params.behaviorConditioning.tokenCount,
         activeTokenIds: [...params.behaviorConditioning.activeTokenIds],
         embeddings: Array.from(params.behaviorConditioning.embeddings),
-        policyAffineW: Array.from(params.behaviorConditioning.policyAffineW),
-        policyAffineB: Array.from(params.behaviorConditioning.policyAffineB),
+        policyGateW: Array.from(params.behaviorConditioning.policyGateW),
+        policyGateB: Array.from(params.behaviorConditioning.policyGateB),
+        policyAdapterHiddenDim:
+          params.behaviorConditioning.policyAdapterHiddenDim,
+        policyAdapterW1: Array.from(
+          params.behaviorConditioning.policyAdapterW1,
+        ),
+        policyAdapterB1: Array.from(
+          params.behaviorConditioning.policyAdapterB1,
+        ),
+        policyAdapterW2: Array.from(
+          params.behaviorConditioning.policyAdapterW2,
+        ),
+        policyAdapterB2: Array.from(
+          params.behaviorConditioning.policyAdapterB2,
+        ),
       }
     : undefined,
   weights: {
@@ -2206,6 +2301,10 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
   }
   let behaviorConditioning: BehaviorConditioningParams | null = null;
   if (behaviorConditioningRaw != null) {
+    const version = Math.max(
+      1,
+      Math.trunc(Number(behaviorConditioningRaw.version ?? 1)),
+    );
     const tokenDim = Math.max(1, Math.trunc(behaviorConditioningRaw.tokenDim));
     const tokenCount = Math.max(
       1,
@@ -2219,31 +2318,103 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
     const embeddings = new Float32Array(
       behaviorConditioningRaw.embeddings ?? [],
     );
-    const policyAffineW = new Float32Array(
-      behaviorConditioningRaw.policyAffineW ?? [],
-    );
-    const policyAffineB = new Float32Array(
-      behaviorConditioningRaw.policyAffineB ?? [],
-    );
     if (
       embeddings.length !== tokenCount * tokenDim ||
-      policyAffineW.length !== tokenDim * hiddenDim * 2 ||
-      policyAffineB.length !== hiddenDim * 2 ||
-      !isFiniteArray(embeddings) ||
-      !isFiniteArray(policyAffineW) ||
-      !isFiniteArray(policyAffineB)
+      !isFiniteArray(embeddings)
     ) {
       throw new Error('Invalid bot policy behavior conditioning dimensions.');
     }
-    behaviorConditioning = {
-      tokenDim,
-      tokenCount,
-      activeTokenIds:
-        activeTokenIds.length > 0 ? Array.from(new Set(activeTokenIds)) : [0],
-      embeddings,
-      policyAffineW,
-      policyAffineB,
-    };
+    const activeTokens =
+      activeTokenIds.length > 0 ? Array.from(new Set(activeTokenIds)) : [0];
+    if (version >= 2) {
+      const policyAdapterHiddenDim = Math.max(
+        1,
+        Math.trunc(
+          Number(behaviorConditioningRaw.policyAdapterHiddenDim ?? hiddenDim),
+        ),
+      );
+      const policyGateW = new Float32Array(
+        behaviorConditioningRaw.policyGateW ?? [],
+      );
+      const policyGateB = new Float32Array(
+        behaviorConditioningRaw.policyGateB ?? [],
+      );
+      const policyAdapterW1 = new Float32Array(
+        behaviorConditioningRaw.policyAdapterW1 ?? [],
+      );
+      const policyAdapterB1 = new Float32Array(
+        behaviorConditioningRaw.policyAdapterB1 ?? [],
+      );
+      const policyAdapterW2 = new Float32Array(
+        behaviorConditioningRaw.policyAdapterW2 ?? [],
+      );
+      const policyAdapterB2 = new Float32Array(
+        behaviorConditioningRaw.policyAdapterB2 ?? [],
+      );
+      if (
+        policyGateW.length !== tokenDim * hiddenDim * 2 ||
+        policyGateB.length !== hiddenDim * 2 ||
+        policyAdapterW1.length !==
+          (hiddenDim + tokenDim) * policyAdapterHiddenDim ||
+        policyAdapterB1.length !== policyAdapterHiddenDim ||
+        policyAdapterW2.length !== policyAdapterHiddenDim * hiddenDim ||
+        policyAdapterB2.length !== hiddenDim ||
+        !isFiniteArray(policyGateW) ||
+        !isFiniteArray(policyGateB) ||
+        !isFiniteArray(policyAdapterW1) ||
+        !isFiniteArray(policyAdapterB1) ||
+        !isFiniteArray(policyAdapterW2) ||
+        !isFiniteArray(policyAdapterB2)
+      ) {
+        throw new Error('Invalid bot policy behavior conditioning dimensions.');
+      }
+      behaviorConditioning = {
+        version: 2,
+        tokenDim,
+        tokenCount,
+        activeTokenIds: activeTokens,
+        embeddings,
+        policyGateW,
+        policyGateB,
+        policyAdapterHiddenDim,
+        policyAdapterW1,
+        policyAdapterB1,
+        policyAdapterW2,
+        policyAdapterB2,
+      };
+    } else {
+      const policyAffineW = new Float32Array(
+        behaviorConditioningRaw.policyAffineW ?? [],
+      );
+      const policyAffineB = new Float32Array(
+        behaviorConditioningRaw.policyAffineB ?? [],
+      );
+      if (
+        policyAffineW.length !== tokenDim * hiddenDim * 2 ||
+        policyAffineB.length !== hiddenDim * 2 ||
+        !isFiniteArray(policyAffineW) ||
+        !isFiniteArray(policyAffineB)
+      ) {
+        throw new Error('Invalid bot policy behavior conditioning dimensions.');
+      }
+      const policyAdapterHiddenDim = Math.max(1, hiddenDim);
+      behaviorConditioning = {
+        version: 2,
+        tokenDim,
+        tokenCount,
+        activeTokenIds: activeTokens,
+        embeddings,
+        policyGateW: policyAffineW,
+        policyGateB: policyAffineB,
+        policyAdapterHiddenDim,
+        policyAdapterW1: new Float32Array(
+          (hiddenDim + tokenDim) * policyAdapterHiddenDim,
+        ),
+        policyAdapterB1: new Float32Array(policyAdapterHiddenDim),
+        policyAdapterW2: new Float32Array(policyAdapterHiddenDim * hiddenDim),
+        policyAdapterB2: new Float32Array(hiddenDim),
+      };
+    }
   }
   const macroActions =
     actionSpaceKind === 'macro_v1'
@@ -2462,6 +2633,10 @@ export const parseBotPolicyArtifactFromUnknown = (
       : undefined,
     behaviorConditioning: isRecord(value.behaviorConditioning)
       ? {
+          version: Math.max(
+            1,
+            Math.trunc(Number(value.behaviorConditioning.version ?? 1)),
+          ),
           tokenDim: Math.max(
             1,
             Math.trunc(Number(value.behaviorConditioning.tokenDim)),
@@ -2479,6 +2654,46 @@ export const parseBotPolicyArtifactFromUnknown = (
             : [0],
           embeddings: Array.isArray(value.behaviorConditioning.embeddings)
             ? value.behaviorConditioning.embeddings.map((item) => Number(item))
+            : [],
+          policyGateW: Array.isArray(value.behaviorConditioning.policyGateW)
+            ? value.behaviorConditioning.policyGateW.map((item) => Number(item))
+            : [],
+          policyGateB: Array.isArray(value.behaviorConditioning.policyGateB)
+            ? value.behaviorConditioning.policyGateB.map((item) => Number(item))
+            : [],
+          policyAdapterHiddenDim: Math.max(
+            1,
+            Math.trunc(
+              Number(value.behaviorConditioning.policyAdapterHiddenDim ?? 1),
+            ),
+          ),
+          policyAdapterW1: Array.isArray(
+            value.behaviorConditioning.policyAdapterW1,
+          )
+            ? value.behaviorConditioning.policyAdapterW1.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyAdapterB1: Array.isArray(
+            value.behaviorConditioning.policyAdapterB1,
+          )
+            ? value.behaviorConditioning.policyAdapterB1.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyAdapterW2: Array.isArray(
+            value.behaviorConditioning.policyAdapterW2,
+          )
+            ? value.behaviorConditioning.policyAdapterW2.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyAdapterB2: Array.isArray(
+            value.behaviorConditioning.policyAdapterB2,
+          )
+            ? value.behaviorConditioning.policyAdapterB2.map((item) =>
+                Number(item),
+              )
             : [],
           policyAffineW: Array.isArray(value.behaviorConditioning.policyAffineW)
             ? value.behaviorConditioning.policyAffineW.map((item) =>
