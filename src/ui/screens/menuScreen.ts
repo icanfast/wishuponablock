@@ -199,6 +199,13 @@ export type MenuBotPoliciesPage = {
   };
 };
 
+export type MenuBotBehaviorConditioningInfo = {
+  tokenCount: number;
+  activeTokenIds: number[];
+  defaultTokenIds: number[];
+  knownTokenIds: number[];
+};
+
 type MenuGameModeId =
   | 'practice'
   | 'sprint'
@@ -335,6 +342,11 @@ export type MenuScreenOptions = {
     jsonText: string;
     sourceName?: string | null;
   }) => Promise<string>;
+  onBotLabGetLoadedBehaviorConditioning: () => MenuBotBehaviorConditioningInfo | null;
+  onBotLabSetLoadedBehaviorTokens: (
+    tokenIds: number[],
+  ) => Promise<string> | string;
+  onBotLabResetLoadedBehaviorTokens: () => Promise<string> | string;
   onBotLabPublishPolicy: (options?: {
     pin?: boolean;
     setCurrent?: boolean;
@@ -453,6 +465,9 @@ export function createMenuScreen(options: MenuScreenOptions): MenuScreen {
     onBotLabListPolicies,
     onBotLabLoadPolicyById,
     onBotLabImportPolicyJson,
+    onBotLabGetLoadedBehaviorConditioning,
+    onBotLabSetLoadedBehaviorTokens,
+    onBotLabResetLoadedBehaviorTokens,
     onBotLabPublishPolicy,
     onBotLabSelectCurrentPolicy,
     onBotLabPinPolicy,
@@ -3423,6 +3438,121 @@ input[type=number] {
     return wrapper;
   };
 
+  const botLabBehaviorLabel = makeSectionLabel('BEHAVIOR TOKENS');
+  Object.assign(botLabBehaviorLabel.style, { marginTop: '4px' });
+  const botLabBehaviorSummary = document.createElement('div');
+  Object.assign(botLabBehaviorSummary.style, {
+    color: '#8fa0b8',
+    fontSize: '11px',
+    lineHeight: '1.45',
+    whiteSpace: 'pre-wrap',
+  });
+  const botLabBehaviorKnownTokens = document.createElement('div');
+  Object.assign(botLabBehaviorKnownTokens.style, {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '6px',
+    alignItems: 'center',
+  });
+  const botLabBehaviorTokenInput = document.createElement('input');
+  botLabBehaviorTokenInput.type = 'text';
+  botLabBehaviorTokenInput.placeholder = 'token ids, e.g. 0,1';
+  Object.assign(botLabBehaviorTokenInput.style, {
+    color: '#e2e8f0',
+    background: '#0b0f14',
+    border: '1px solid #1f2a37',
+    borderRadius: '4px',
+    fontSize: '12px',
+    padding: '6px 8px',
+    width: '100%',
+    boxSizing: 'border-box',
+  });
+  const botLabBehaviorTokenField = makeBotLabField(
+    'Active Token Ids',
+    botLabBehaviorTokenInput,
+  );
+  const botLabBehaviorButtons = document.createElement('div');
+  Object.assign(botLabBehaviorButtons.style, {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '6px',
+  });
+  const botLabBehaviorApplyButton = makeMenuButton('APPLY TOKENS');
+  const botLabBehaviorResetButton = makeMenuButton('USE ARTIFACT DEFAULT');
+  Object.assign(botLabBehaviorApplyButton.style, { flex: '1' });
+  Object.assign(botLabBehaviorResetButton.style, { flex: '1' });
+  botLabBehaviorButtons.appendChild(botLabBehaviorApplyButton);
+  botLabBehaviorButtons.appendChild(botLabBehaviorResetButton);
+  const botLabBehaviorKnownToggleMap = new Map<number, HTMLInputElement>();
+
+  const syncBotLabBehaviorTokenInputFromKnownToggles = (): void => {
+    const tokenIds = Array.from(botLabBehaviorKnownToggleMap.entries())
+      .filter(([, input]) => input.checked)
+      .map(([tokenId]) => tokenId)
+      .sort((a, b) => a - b);
+    botLabBehaviorTokenInput.value = tokenIds.join(',');
+  };
+
+  const parseBotLabBehaviorTokenIds = (
+    raw: string,
+    tokenCount: number,
+  ): number[] => {
+    const out: number[] = [];
+    const seen = new Set<number>();
+    for (const token of raw.split(/[,\s]+/)) {
+      const trimmed = token.trim();
+      if (!trimmed) continue;
+      const value = Number(trimmed);
+      if (!Number.isFinite(value) || !Number.isInteger(value)) {
+        throw new Error(`Invalid token id '${trimmed}'. Expected an integer.`);
+      }
+      const tokenId = Math.trunc(value);
+      if (tokenId < 0 || tokenId >= tokenCount) {
+        throw new Error(
+          `Token id ${tokenId} out of range. Valid ids: 0-${Math.max(0, tokenCount - 1)}.`,
+        );
+      }
+      if (seen.has(tokenId)) continue;
+      seen.add(tokenId);
+      out.push(tokenId);
+    }
+    return out;
+  };
+
+  const renderBotLabBehaviorControls = (): void => {
+    botLabBehaviorKnownToggleMap.clear();
+    botLabBehaviorKnownTokens.innerHTML = '';
+    const info = botLabBehaviorInfo;
+    if (!info) {
+      botLabBehaviorSummary.textContent =
+        'Loaded policy has no behavior conditioning.';
+      botLabBehaviorTokenInput.value = '';
+      return;
+    }
+    const activeIds = [...info.activeTokenIds].sort((a, b) => a - b);
+    const defaultIds = [...info.defaultTokenIds].sort((a, b) => a - b);
+    const knownIds = [...info.knownTokenIds].sort((a, b) => a - b);
+    botLabBehaviorSummary.textContent = [
+      `Token count: ${info.tokenCount}`,
+      `Current: ${activeIds.length > 0 ? activeIds.join(', ') : '(none)'}`,
+      `Artifact default: ${defaultIds.length > 0 ? defaultIds.join(', ') : '(none)'}`,
+      `Known menu ids: ${knownIds.length > 0 ? knownIds.join(', ') : '(none)'}`,
+    ].join('\n');
+    botLabBehaviorTokenInput.value = activeIds.join(',');
+    for (const tokenId of knownIds) {
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.checked = activeIds.includes(tokenId);
+      toggle.addEventListener('change', () => {
+        syncBotLabBehaviorTokenInputFromKnownToggles();
+      });
+      botLabBehaviorKnownToggleMap.set(tokenId, toggle);
+      botLabBehaviorKnownTokens.appendChild(
+        makeInlineToggle(`token ${tokenId}`, toggle),
+      );
+    }
+  };
+
   const botLabTrainLabel = makeSectionLabel('TRAIN / VALIDATE');
   Object.assign(botLabTrainLabel.style, { marginTop: '4px' });
   const botLabTrainControls = document.createElement('div');
@@ -3731,6 +3861,11 @@ input[type=number] {
   botLabPanel.appendChild(botLabPolicyButtonsRow);
   botLabPanel.appendChild(botLabPublishRow);
   botLabPanel.appendChild(botLabPublishPolicyButton);
+  botLabPanel.appendChild(botLabBehaviorLabel);
+  botLabPanel.appendChild(botLabBehaviorSummary);
+  botLabPanel.appendChild(botLabBehaviorKnownTokens);
+  botLabPanel.appendChild(botLabBehaviorTokenField);
+  botLabPanel.appendChild(botLabBehaviorButtons);
   botLabPanel.appendChild(botLabTrainLabel);
   botLabPanel.appendChild(botLabTrainControls);
   botLabPanel.appendChild(botLabWarmStartRow);
@@ -3776,6 +3911,7 @@ input[type=number] {
   let botLabCurrentPolicyId: string | null = null;
   let botLabPolicyCursor: string | null = null;
   let botLabGuiInspectRunning = false;
+  let botLabBehaviorInfo: MenuBotBehaviorConditioningInfo | null = null;
   let lastTrainingPresetKey = '';
   const statusColor = (tone: MenuAuthStatusTone): string => {
     if (tone === 'success') return '#8fd19e';
@@ -4479,6 +4615,9 @@ input[type=number] {
       `Axes: ${formatModelAxesCompact(currentModelAxes)}`,
       `Listed policies: ${botLabPolicies.length}`,
       selectedLine,
+      botLabBehaviorInfo
+        ? `Loaded behavior tokens: ${botLabBehaviorInfo.activeTokenIds.length > 0 ? botLabBehaviorInfo.activeTokenIds.join(', ') : '(none)'}`
+        : 'Loaded behavior tokens: (none)',
       `Next page: ${botLabPolicyCursor ? 'available' : 'none'}`,
       `GUI inspect: ${botLabGuiInspectRunning ? 'running' : 'stopped'}`,
     ].join('\n');
@@ -4493,6 +4632,7 @@ input[type=number] {
       currentAuthState.loading || botLabActionPending || botLabListPending;
     const hasPolicies = botLabPolicies.length > 0;
     const hasSelected = botLabSelectedPolicyId != null;
+    botLabBehaviorInfo = onBotLabGetLoadedBehaviorConditioning();
 
     botLabButton.style.display = isAdmin ? 'block' : 'none';
     botLabSummary.textContent = formatBotLabSummary(isAdmin);
@@ -4502,6 +4642,11 @@ input[type=number] {
     botLabPolicyButtonsRow.style.display = isAdmin ? 'flex' : 'none';
     botLabPublishRow.style.display = isAdmin ? 'flex' : 'none';
     botLabPublishPolicyButton.style.display = isAdmin ? 'block' : 'none';
+    botLabBehaviorLabel.style.display = isAdmin ? 'block' : 'none';
+    botLabBehaviorSummary.style.display = isAdmin ? 'block' : 'none';
+    botLabBehaviorKnownTokens.style.display = isAdmin ? 'flex' : 'none';
+    botLabBehaviorTokenField.style.display = isAdmin ? 'flex' : 'none';
+    botLabBehaviorButtons.style.display = isAdmin ? 'flex' : 'none';
     botLabTrainLabel.style.display = isAdmin ? 'block' : 'none';
     botLabTrainControls.style.display = isAdmin ? 'grid' : 'none';
     botLabWarmStartRow.style.display = isAdmin ? 'inline-flex' : 'none';
@@ -4517,6 +4662,7 @@ input[type=number] {
     botLabGenerateButton.style.display = isAdmin ? 'block' : 'none';
     botLabBenchmarkButton.style.display = isAdmin ? 'block' : 'none';
     botLabApplyBenchmarkArchButton.style.display = isAdmin ? 'block' : 'none';
+    renderBotLabBehaviorControls();
 
     botLabFetchCurrentButton.disabled = !isAdmin || busy;
     botLabRefreshPoliciesButton.disabled = !isAdmin || busy;
@@ -4532,6 +4678,13 @@ input[type=number] {
     botLabPublishPinToggle.disabled = !isAdmin || busy;
     botLabPublishCurrentToggle.disabled = !isAdmin || busy;
     botLabPublishPolicyButton.disabled = !isAdmin || busy;
+    const hasBehaviorInfo = botLabBehaviorInfo != null;
+    botLabBehaviorTokenInput.disabled = !isAdmin || busy || !hasBehaviorInfo;
+    botLabBehaviorApplyButton.disabled = !isAdmin || busy || !hasBehaviorInfo;
+    botLabBehaviorResetButton.disabled = !isAdmin || busy || !hasBehaviorInfo;
+    for (const toggle of botLabBehaviorKnownToggleMap.values()) {
+      toggle.disabled = !isAdmin || busy || !hasBehaviorInfo;
+    }
     botLabEpisodesInput.disabled = !isAdmin || busy;
     botLabMaxPiecesInput.disabled = !isAdmin || busy;
     botLabSeedInput.disabled = !isAdmin || busy;
@@ -4579,6 +4732,14 @@ input[type=number] {
     setVisualState(
       botLabPublishPolicyButton,
       !botLabPublishPolicyButton.disabled,
+    );
+    setVisualState(
+      botLabBehaviorApplyButton,
+      !botLabBehaviorApplyButton.disabled,
+    );
+    setVisualState(
+      botLabBehaviorResetButton,
+      !botLabBehaviorResetButton.disabled,
     );
     setVisualState(botLabTrainButton, !botLabTrainButton.disabled);
     setVisualState(
@@ -5816,6 +5977,59 @@ input[type=number] {
     } catch (error) {
       setBotLabActionStatus(
         toErrorMessage(error, 'Could not publish bot policy.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabBehaviorApplyButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    if (!botLabBehaviorInfo) {
+      setBotLabActionStatus(
+        'Loaded policy has no behavior conditioning.',
+        'error',
+      );
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Applying behavior tokens...');
+    updateBotLabControls();
+    try {
+      const parsedTokenIds = parseBotLabBehaviorTokenIds(
+        botLabBehaviorTokenInput.value,
+        botLabBehaviorInfo.tokenCount,
+      );
+      const tokenIds = parsedTokenIds.length > 0 ? parsedTokenIds : [0];
+      const message = await onBotLabSetLoadedBehaviorTokens(tokenIds);
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not apply behavior tokens.'),
+        'error',
+      );
+    } finally {
+      botLabActionPending = false;
+      updateBotLabControls();
+    }
+  });
+
+  botLabBehaviorResetButton.addEventListener('click', async () => {
+    if (botLabActionPending) return;
+    botLabActionPending = true;
+    setBotLabActionStatus('Restoring artifact default behavior tokens...');
+    updateBotLabControls();
+    try {
+      const message = await onBotLabResetLoadedBehaviorTokens();
+      setBotLabActionStatus(message, 'success');
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(
+          error,
+          'Could not restore artifact default behavior tokens.',
+        ),
         'error',
       );
     } finally {

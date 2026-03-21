@@ -118,6 +118,7 @@ import {
   type MenuAdminRecordingsQuery,
   type MenuAdminManifestQuery,
   type MenuAdminGlobalBaselineSummary,
+  type MenuBotBehaviorConditioningInfo,
   type MenuBotPoliciesPage,
   type MenuScreen,
 } from './ui/screens/menuScreen';
@@ -1408,8 +1409,97 @@ async function boot() {
   } | null = null;
   let adminBotPolicy: BotPolicyArtifact | null = null;
   let adminBotPolicyRecord: AdminBotPolicyRecord | null = null;
+  let adminBotPolicyDefaultBehaviorTokenIds: number[] | null = null;
   let adminBenchmarkSuggestedArch: 'full' | 'lean' | null = null;
   let botGuiInspectGeneratorBackup: GeneratorType | null = null;
+
+  const normalizeBehaviorTokenIds = (
+    tokenIds: number[],
+    tokenCount: number,
+  ): number[] => {
+    const safeTokenCount = Math.max(1, Math.trunc(tokenCount));
+    const normalized: number[] = [];
+    const seen = new Set<number>();
+    for (const rawTokenId of tokenIds) {
+      const tokenId = Math.trunc(rawTokenId);
+      if (
+        !Number.isFinite(rawTokenId) ||
+        tokenId < 0 ||
+        tokenId >= safeTokenCount ||
+        seen.has(tokenId)
+      ) {
+        continue;
+      }
+      seen.add(tokenId);
+      normalized.push(tokenId);
+    }
+    return normalized.length > 0 ? normalized : [0];
+  };
+
+  const captureDefaultBehaviorTokenIds = (
+    policy: BotPolicyArtifact | null,
+  ): void => {
+    const conditioning = policy?.behaviorConditioning;
+    if (!conditioning) {
+      adminBotPolicyDefaultBehaviorTokenIds = null;
+      return;
+    }
+    adminBotPolicyDefaultBehaviorTokenIds = normalizeBehaviorTokenIds(
+      conditioning.activeTokenIds,
+      conditioning.tokenCount,
+    );
+  };
+
+  const getLoadedBotPolicyBehaviorConditioning =
+    (): MenuBotBehaviorConditioningInfo | null => {
+      const conditioning = adminBotPolicy?.behaviorConditioning;
+      if (!conditioning) {
+        return null;
+      }
+      const tokenCount = Math.max(1, Math.trunc(conditioning.tokenCount));
+      const activeTokenIds = normalizeBehaviorTokenIds(
+        conditioning.activeTokenIds,
+        tokenCount,
+      );
+      const defaultTokenIds = normalizeBehaviorTokenIds(
+        adminBotPolicyDefaultBehaviorTokenIds ?? conditioning.activeTokenIds,
+        tokenCount,
+      );
+      const knownTokenIds = Array.from(
+        new Set<number>([0, ...defaultTokenIds, ...activeTokenIds]),
+      ).sort((a, b) => a - b);
+      return {
+        tokenCount,
+        activeTokenIds,
+        defaultTokenIds,
+        knownTokenIds,
+      };
+    };
+
+  const setLoadedBotPolicyBehaviorTokens = (tokenIds: number[]): string => {
+    if (!adminBotPolicy?.behaviorConditioning) {
+      throw new Error('Loaded policy has no behavior conditioning.');
+    }
+    const normalized = normalizeBehaviorTokenIds(
+      tokenIds,
+      adminBotPolicy.behaviorConditioning.tokenCount,
+    );
+    adminBotPolicy.behaviorConditioning.activeTokenIds = normalized;
+    return `Loaded policy behavior tokens set to ${normalized.join(', ')}.`;
+  };
+
+  const resetLoadedBotPolicyBehaviorTokens = (): string => {
+    if (!adminBotPolicy?.behaviorConditioning) {
+      throw new Error('Loaded policy has no behavior conditioning.');
+    }
+    const restored = normalizeBehaviorTokenIds(
+      adminBotPolicyDefaultBehaviorTokenIds ??
+        adminBotPolicy.behaviorConditioning.activeTokenIds,
+      adminBotPolicy.behaviorConditioning.tokenCount,
+    );
+    adminBotPolicy.behaviorConditioning.activeTokenIds = restored;
+    return `Loaded policy behavior tokens restored to ${restored.join(', ')}.`;
+  };
 
   const prepareAdminManifest = async (
     query: MenuAdminManifestQuery,
@@ -1580,6 +1670,7 @@ async function boot() {
     adminBotPolicy = loaded.artifact;
     adminBotPolicy.id = current.current.id;
     adminBotPolicy.modeId = current.current.modeId;
+    captureDefaultBehaviorTokenIds(adminBotPolicy);
     return `Loaded current bot policy: ${current.current.id} (v${current.current.version}).`;
   };
 
@@ -1630,6 +1721,7 @@ async function boot() {
     adminBotPolicy = loaded.artifact;
     adminBotPolicy.id = loaded.policy.id;
     adminBotPolicy.modeId = loaded.policy.modeId;
+    captureDefaultBehaviorTokenIds(adminBotPolicy);
     return `Loaded bot policy ${loaded.policy.id} (v${loaded.policy.version}).`;
   };
 
@@ -1653,6 +1745,7 @@ async function boot() {
       archId: selector.archId,
       queuePolicyId: selector.queuePolicyId,
     };
+    captureDefaultBehaviorTokenIds(adminBotPolicy);
     const sourceSuffix =
       typeof payload.sourceName === 'string' && payload.sourceName.trim().length
         ? ` from ${payload.sourceName.trim()}`
@@ -1728,6 +1821,7 @@ async function boot() {
       adminBotPolicy = loaded.artifact;
       adminBotPolicy.id = selected.id;
       adminBotPolicy.modeId = selected.modeId;
+      captureDefaultBehaviorTokenIds(adminBotPolicy);
     }
     return `Selected current policy ${selected.id}.`;
   };
@@ -1789,6 +1883,7 @@ async function boot() {
     }
     adminBotPolicy = result.policyArtifact;
     adminBotPolicyRecord = null;
+    captureDefaultBehaviorTokenIds(adminBotPolicy);
     const lossSuffix =
       result.finalLoss != null
         ? ` finalLoss=${result.finalLoss.toExponential(3)}`
@@ -3971,6 +4066,10 @@ async function boot() {
     onBotLabListPolicies: listAdminBotPolicies,
     onBotLabLoadPolicyById: loadAdminBotPolicyById,
     onBotLabImportPolicyJson: importAdminBotPolicyJson,
+    onBotLabGetLoadedBehaviorConditioning:
+      getLoadedBotPolicyBehaviorConditioning,
+    onBotLabSetLoadedBehaviorTokens: setLoadedBotPolicyBehaviorTokens,
+    onBotLabResetLoadedBehaviorTokens: resetLoadedBotPolicyBehaviorTokens,
     onBotLabPublishPolicy: (options) =>
       publishAdminBotPolicy({
         pin: options?.pin,
