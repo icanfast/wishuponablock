@@ -4429,10 +4429,12 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "lines": data.get("v1_term_lines"),
                 "score": data.get("v1_term_score"),
                 "time": data.get("v1_term_time"),
+                "hold": data.get("v1_term_hold"),
                 "kick": data.get("v1_term_kick"),
                 "soft_drop": data.get("v1_term_soft_drop"),
                 "height": data.get("v1_term_height"),
                 "holes": data.get("v1_term_holes"),
+                "holes_extended": data.get("v1_term_holes_extended"),
                 "bumpiness": data.get("v1_term_bumpiness"),
                 "board_score": data.get("v1_term_board_score"),
                 "board_quality": data.get("v1_term_board_quality"),
@@ -4448,10 +4450,12 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
                 "lines": data.get("v2_term_lines"),
                 "score": data.get("v2_term_score"),
                 "time": data.get("v2_term_time"),
+                "hold": data.get("v2_term_hold"),
                 "kick": data.get("v2_term_kick"),
                 "soft_drop": data.get("v2_term_soft_drop"),
                 "height": data.get("v2_term_height"),
                 "holes": data.get("v2_term_holes"),
+                "holes_extended": data.get("v2_term_holes_extended"),
                 "bumpiness": data.get("v2_term_bumpiness"),
                 "board_score": data.get("v2_term_board_score"),
                 "board_quality": data.get("v2_term_board_quality"),
@@ -4464,10 +4468,12 @@ def _reward_hierarchy_from_terms(terms: dict[str, Any] | None) -> dict[str, Any]
             "lines": data.get("term_lines"),
             "score": data.get("term_score"),
             "time": data.get("term_time"),
+            "hold": data.get("term_hold"),
             "kick": data.get("term_kick"),
             "soft_drop": data.get("term_soft_drop"),
             "height": data.get("term_height"),
             "holes": data.get("term_holes"),
+            "holes_extended": data.get("term_holes_extended"),
             "bumpiness": data.get("term_bumpiness"),
             "board_score": data.get("term_board_score"),
             "board_quality": data.get("term_board_quality"),
@@ -6288,10 +6294,12 @@ def train(cfg: PPOConfig) -> None:
             "term_lines": ("rewardTermLines",),
             "term_score": ("rewardTermScore",),
             "term_time": ("rewardTermTime",),
+            "term_hold": ("rewardTermHold",),
             "term_kick": ("rewardTermKick",),
             "term_soft_drop": ("rewardTermSoftDrop",),
             "term_height": ("rewardTermHeight",),
             "term_holes": ("rewardTermHoles",),
+            "term_holes_extended": ("rewardTermHolesExtended",),
             "term_bumpiness": ("rewardTermBumpiness",),
             "term_board_score": ("rewardTermBoardScore",),
             "term_board_quality": ("rewardTermBoardQuality",),
@@ -6301,10 +6309,12 @@ def train(cfg: PPOConfig) -> None:
             "v1_term_lines": ("rewardLegacyContributionTermLines",),
             "v1_term_score": ("rewardLegacyContributionTermScore",),
             "v1_term_time": ("rewardLegacyContributionTermTime",),
+            "v1_term_hold": ("rewardLegacyContributionTermHold",),
             "v1_term_kick": ("rewardLegacyContributionTermKick",),
             "v1_term_soft_drop": ("rewardLegacyContributionTermSoftDrop",),
             "v1_term_height": ("rewardLegacyContributionTermHeight",),
             "v1_term_holes": ("rewardLegacyContributionTermHoles",),
+            "v1_term_holes_extended": ("rewardLegacyContributionTermHolesExtended",),
             "v1_term_bumpiness": ("rewardLegacyContributionTermBumpiness",),
             "v1_term_board_score": ("rewardLegacyContributionTermBoardScore",),
             "v1_term_board_quality": ("rewardLegacyContributionTermBoardQuality",),
@@ -6316,10 +6326,12 @@ def train(cfg: PPOConfig) -> None:
             "v2_term_lines": ("rewardTargetContributionTermLines",),
             "v2_term_score": ("rewardTargetContributionTermScore",),
             "v2_term_time": ("rewardTargetContributionTermTime",),
+            "v2_term_hold": ("rewardTargetContributionTermHold",),
             "v2_term_kick": ("rewardTargetContributionTermKick",),
             "v2_term_soft_drop": ("rewardTargetContributionTermSoftDrop",),
             "v2_term_height": ("rewardTargetContributionTermHeight",),
             "v2_term_holes": ("rewardTargetContributionTermHoles",),
+            "v2_term_holes_extended": ("rewardTargetContributionTermHolesExtended",),
             "v2_term_bumpiness": ("rewardTargetContributionTermBumpiness",),
             "v2_term_board_score": ("rewardTargetContributionTermBoardScore",),
             "v2_term_board_quality": ("rewardTargetContributionTermBoardQuality",),
@@ -7471,10 +7483,12 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('v1_term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('v1_term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('v1_term_time'))} "
+                                f"hold={_fmt_float(ret_terms.get('v1_term_hold'))} "
                                 f"kick={_fmt_float(ret_terms.get('v1_term_kick'))} "
                                 f"soft={_fmt_float(ret_terms.get('v1_term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('v1_term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('v1_term_holes'))} "
+                                f"holes_ext={_fmt_float(ret_terms.get('v1_term_holes_extended'))} "
                                 f"bump={_fmt_float(ret_terms.get('v1_term_bumpiness'))} "
                                 f"board={_fmt_float(ret_terms.get('v1_term_board_score'))} "
                                 f"q={_fmt_float(ret_terms.get('v1_term_board_quality'))} "
@@ -7487,10 +7501,12 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('v2_term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('v2_term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('v2_term_time'))} "
+                                f"hold={_fmt_float(ret_terms.get('v2_term_hold'))} "
                                 f"kick={_fmt_float(ret_terms.get('v2_term_kick'))} "
                                 f"soft={_fmt_float(ret_terms.get('v2_term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('v2_term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('v2_term_holes'))} "
+                                f"holes_ext={_fmt_float(ret_terms.get('v2_term_holes_extended'))} "
                                 f"bump={_fmt_float(ret_terms.get('v2_term_bumpiness'))} "
                                 f"board={_fmt_float(ret_terms.get('v2_term_board_score'))} "
                                 f"q={_fmt_float(ret_terms.get('v2_term_board_quality'))} "
@@ -7503,10 +7519,12 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('term_time'))} "
+                                f"hold={_fmt_float(ret_terms.get('term_hold'))} "
                                 f"kick={_fmt_float(ret_terms.get('term_kick'))} "
                                 f"soft={_fmt_float(ret_terms.get('term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('term_holes'))} "
+                                f"holes_ext={_fmt_float(ret_terms.get('term_holes_extended'))} "
                                 f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
                                 f"board={_fmt_float(ret_terms.get('term_board_score'))} "
                                 f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
@@ -7532,10 +7550,12 @@ def train(cfg: PPOConfig) -> None:
                                 f"lines={_fmt_float(ret_terms.get('term_lines'))} "
                                 f"score={_fmt_float(ret_terms.get('term_score'))} "
                                 f"time={_fmt_float(ret_terms.get('term_time'))} "
+                                f"hold={_fmt_float(ret_terms.get('term_hold'))} "
                                 f"kick={_fmt_float(ret_terms.get('term_kick'))} "
                                 f"soft={_fmt_float(ret_terms.get('term_soft_drop'))} "
                                 f"height={_fmt_float(ret_terms.get('term_height'))} "
                                 f"holes={_fmt_float(ret_terms.get('term_holes'))} "
+                                f"holes_ext={_fmt_float(ret_terms.get('term_holes_extended'))} "
                                 f"bump={_fmt_float(ret_terms.get('term_bumpiness'))} "
                                 f"board={_fmt_float(ret_terms.get('term_board_score'))} "
                                 f"q={_fmt_float(ret_terms.get('term_board_quality'))} "
@@ -7726,10 +7746,12 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('v1_term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('v1_term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('v1_term_time'))} "
+                                        + f"hold={_fmt_float(source_terms_dict.get('v1_term_hold'))} "
                                         + f"kick={_fmt_float(source_terms_dict.get('v1_term_kick'))} "
                                         + f"soft={_fmt_float(source_terms_dict.get('v1_term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('v1_term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('v1_term_holes'))} "
+                                        + f"holes_ext={_fmt_float(source_terms_dict.get('v1_term_holes_extended'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('v1_term_bumpiness'))} "
                                         + f"board={_fmt_float(source_terms_dict.get('v1_term_board_score'))} "
                                         + f"q={_fmt_float(source_terms_dict.get('v1_term_board_quality'))} "
@@ -7744,10 +7766,12 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('v2_term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('v2_term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('v2_term_time'))} "
+                                        + f"hold={_fmt_float(source_terms_dict.get('v2_term_hold'))} "
                                         + f"kick={_fmt_float(source_terms_dict.get('v2_term_kick'))} "
                                         + f"soft={_fmt_float(source_terms_dict.get('v2_term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('v2_term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('v2_term_holes'))} "
+                                        + f"holes_ext={_fmt_float(source_terms_dict.get('v2_term_holes_extended'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('v2_term_bumpiness'))} "
                                         + f"board={_fmt_float(source_terms_dict.get('v2_term_board_score'))} "
                                         + f"q={_fmt_float(source_terms_dict.get('v2_term_board_quality'))} "
@@ -7775,10 +7799,12 @@ def train(cfg: PPOConfig) -> None:
                                         + f"lines={_fmt_float(source_terms_dict.get('term_lines'))} "
                                         + f"score={_fmt_float(source_terms_dict.get('term_score'))} "
                                         + f"time={_fmt_float(source_terms_dict.get('term_time'))} "
+                                        + f"hold={_fmt_float(source_terms_dict.get('term_hold'))} "
                                         + f"kick={_fmt_float(source_terms_dict.get('term_kick'))} "
                                         + f"soft={_fmt_float(source_terms_dict.get('term_soft_drop'))} "
                                         + f"height={_fmt_float(source_terms_dict.get('term_height'))} "
                                         + f"holes={_fmt_float(source_terms_dict.get('term_holes'))} "
+                                        + f"holes_ext={_fmt_float(source_terms_dict.get('term_holes_extended'))} "
                                         + f"bump={_fmt_float(source_terms_dict.get('term_bumpiness'))} "
                                         + f"board={_fmt_float(source_terms_dict.get('term_board_score'))} "
                                         + f"q={_fmt_float(source_terms_dict.get('term_board_quality'))} "
