@@ -5994,15 +5994,24 @@ input[type=number] {
       );
       return;
     }
-    botLabActionPending = true;
-    setBotLabActionStatus('Applying behavior tokens...');
-    updateBotLabControls();
+    let tokenIds: number[];
     try {
       const parsedTokenIds = parseBotLabBehaviorTokenIds(
         botLabBehaviorTokenInput.value,
         botLabBehaviorInfo.tokenCount,
       );
-      const tokenIds = parsedTokenIds.length > 0 ? parsedTokenIds : [0];
+      tokenIds = parsedTokenIds.length > 0 ? parsedTokenIds : [0];
+    } catch (error) {
+      setBotLabActionStatus(
+        toErrorMessage(error, 'Could not apply behavior tokens.'),
+        'error',
+      );
+      return;
+    }
+    botLabActionPending = true;
+    setBotLabActionStatus('Applying behavior tokens...');
+    updateBotLabControls();
+    try {
       const message = await onBotLabSetLoadedBehaviorTokens(tokenIds);
       setBotLabActionStatus(message, 'success');
     } catch (error) {
