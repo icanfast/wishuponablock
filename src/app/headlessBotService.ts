@@ -88,6 +88,11 @@ type BehaviorConditioningArtifact = {
   policyAdapterB1?: number[];
   policyAdapterW2?: number[];
   policyAdapterB2?: number[];
+  policyLogitAdapterHiddenDim?: number;
+  policyLogitAdapterW1?: number[];
+  policyLogitAdapterB1?: number[];
+  policyLogitAdapterW2?: number[];
+  policyLogitAdapterB2?: number[];
   policyAffineW?: number[];
   policyAffineB?: number[];
 };
@@ -112,6 +117,11 @@ type BehaviorConditioningParams = {
   policyAdapterB1: Float32Array;
   policyAdapterW2: Float32Array;
   policyAdapterB2: Float32Array;
+  policyLogitAdapterHiddenDim: number;
+  policyLogitAdapterW1: Float32Array;
+  policyLogitAdapterB1: Float32Array;
+  policyLogitAdapterW2: Float32Array;
+  policyLogitAdapterB2: Float32Array;
 };
 
 export type BotActionSpaceKind =
@@ -439,6 +449,20 @@ const clonePolicyParams = (params: PolicyParams): PolicyParams => ({
         ),
         policyAdapterB2: new Float32Array(
           params.behaviorConditioning.policyAdapterB2,
+        ),
+        policyLogitAdapterHiddenDim:
+          params.behaviorConditioning.policyLogitAdapterHiddenDim,
+        policyLogitAdapterW1: new Float32Array(
+          params.behaviorConditioning.policyLogitAdapterW1,
+        ),
+        policyLogitAdapterB1: new Float32Array(
+          params.behaviorConditioning.policyLogitAdapterB1,
+        ),
+        policyLogitAdapterW2: new Float32Array(
+          params.behaviorConditioning.policyLogitAdapterW2,
+        ),
+        policyLogitAdapterB2: new Float32Array(
+          params.behaviorConditioning.policyLogitAdapterB2,
         ),
       }
     : null,
@@ -990,10 +1014,10 @@ const createShuffledIndices = (size: number, rng: XorShift32): Int32Array => {
 const applyBehaviorConditioning = (
   params: PolicyParams,
   hidden: Float32Array,
-): Float32Array => {
+): { hidden: Float32Array; tokenVec: Float32Array | null } => {
   const conditioning = params.behaviorConditioning;
   if (!conditioning || conditioning.activeTokenIds.length <= 0) {
-    return hidden;
+    return { hidden, tokenVec: null };
   }
   const tokenVec = new Float32Array(conditioning.tokenDim);
   for (const rawTokenId of conditioning.activeTokenIds) {
@@ -1045,7 +1069,7 @@ const applyBehaviorConditioning = (
     }
     conditioned[h] = baseHidden[h] + delta;
   }
-  return conditioned;
+  return { hidden: conditioned, tokenVec };
 };
 
 const forwardPolicy = (
@@ -1072,12 +1096,46 @@ const forwardPolicy = (
     }
     hidden2[h] = sum > 0 ? sum : 0;
   }
-  const conditionedHidden2 = applyBehaviorConditioning(params, hidden2);
+  const conditionedResult = applyBehaviorConditioning(params, hidden2);
+  const conditionedHidden2 = conditionedResult.hidden;
+  const conditioning = params.behaviorConditioning;
+  const tokenVec = conditionedResult.tokenVec;
+  let logitAdapterHidden: Float32Array | null = null;
+  if (conditioning && tokenVec) {
+    const adapterInputDim = params.hiddenDim + conditioning.tokenDim;
+    logitAdapterHidden = new Float32Array(
+      conditioning.policyLogitAdapterHiddenDim,
+    );
+    for (let lh = 0; lh < conditioning.policyLogitAdapterHiddenDim; lh += 1) {
+      let logitHiddenSum = conditioning.policyLogitAdapterB1[lh] ?? 0;
+      for (let i = 0; i < adapterInputDim; i += 1) {
+        const inputValue =
+          i < params.hiddenDim
+            ? conditionedHidden2[i]
+            : tokenVec[i - params.hiddenDim];
+        logitHiddenSum +=
+          inputValue *
+          (conditioning.policyLogitAdapterW1[
+            i * conditioning.policyLogitAdapterHiddenDim + lh
+          ] ?? 0);
+      }
+      logitAdapterHidden[lh] = logitHiddenSum > 0 ? logitHiddenSum : 0;
+    }
+  }
   const logits = new Float32Array(params.actionDim);
   for (let a = 0; a < params.actionDim; a += 1) {
     let sum = params.bp[a];
     for (let h = 0; h < params.hiddenDim; h += 1) {
       sum += conditionedHidden2[h] * params.wp[h * params.actionDim + a];
+    }
+    if (conditioning && logitAdapterHidden) {
+      let logitDelta = conditioning.policyLogitAdapterB2[a] ?? 0;
+      for (let lh = 0; lh < conditioning.policyLogitAdapterHiddenDim; lh += 1) {
+        logitDelta +=
+          logitAdapterHidden[lh] *
+          (conditioning.policyLogitAdapterW2[lh * params.actionDim + a] ?? 0);
+      }
+      sum += logitDelta;
     }
     logits[a] =
       actionMask && actionMask[a] <= 0 ? Number.NEGATIVE_INFINITY : sum;
@@ -1694,6 +1752,20 @@ const trainWithTfjsReinforce = async (options: {
           policyAdapterB2: new Float32Array(
             options.params.behaviorConditioning.policyAdapterB2,
           ),
+          policyLogitAdapterHiddenDim:
+            options.params.behaviorConditioning.policyLogitAdapterHiddenDim,
+          policyLogitAdapterW1: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterW1,
+          ),
+          policyLogitAdapterB1: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterB1,
+          ),
+          policyLogitAdapterW2: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterW2,
+          ),
+          policyLogitAdapterB2: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterB2,
+          ),
         }
       : null,
     w1: new Float32Array(w1.dataSync() as Float32Array),
@@ -1943,6 +2015,20 @@ const trainWithTfjsPpo = async (options: {
           ),
           policyAdapterB2: new Float32Array(
             options.params.behaviorConditioning.policyAdapterB2,
+          ),
+          policyLogitAdapterHiddenDim:
+            options.params.behaviorConditioning.policyLogitAdapterHiddenDim,
+          policyLogitAdapterW1: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterW1,
+          ),
+          policyLogitAdapterB1: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterB1,
+          ),
+          policyLogitAdapterW2: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterW2,
+          ),
+          policyLogitAdapterB2: new Float32Array(
+            options.params.behaviorConditioning.policyLogitAdapterB2,
           ),
         }
       : null,
@@ -2237,6 +2323,20 @@ const toArtifact = (
         policyAdapterB2: Array.from(
           params.behaviorConditioning.policyAdapterB2,
         ),
+        policyLogitAdapterHiddenDim:
+          params.behaviorConditioning.policyLogitAdapterHiddenDim,
+        policyLogitAdapterW1: Array.from(
+          params.behaviorConditioning.policyLogitAdapterW1,
+        ),
+        policyLogitAdapterB1: Array.from(
+          params.behaviorConditioning.policyLogitAdapterB1,
+        ),
+        policyLogitAdapterW2: Array.from(
+          params.behaviorConditioning.policyLogitAdapterW2,
+        ),
+        policyLogitAdapterB2: Array.from(
+          params.behaviorConditioning.policyLogitAdapterB2,
+        ),
       }
     : undefined,
   weights: {
@@ -2351,6 +2451,27 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
       const policyAdapterB2 = new Float32Array(
         behaviorConditioningRaw.policyAdapterB2 ?? [],
       );
+      const policyLogitAdapterHiddenDim = Math.max(
+        1,
+        Math.trunc(
+          Number(
+            behaviorConditioningRaw.policyLogitAdapterHiddenDim ??
+              Math.max(64, Math.trunc(hiddenDim / 2)),
+          ),
+        ),
+      );
+      const policyLogitAdapterW1 = new Float32Array(
+        behaviorConditioningRaw.policyLogitAdapterW1 ?? [],
+      );
+      const policyLogitAdapterB1 = new Float32Array(
+        behaviorConditioningRaw.policyLogitAdapterB1 ?? [],
+      );
+      const policyLogitAdapterW2 = new Float32Array(
+        behaviorConditioningRaw.policyLogitAdapterW2 ?? [],
+      );
+      const policyLogitAdapterB2 = new Float32Array(
+        behaviorConditioningRaw.policyLogitAdapterB2 ?? [],
+      );
       if (
         policyGateW.length !== tokenDim * hiddenDim * 2 ||
         policyGateB.length !== hiddenDim * 2 ||
@@ -2359,17 +2480,29 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
         policyAdapterB1.length !== policyAdapterHiddenDim ||
         policyAdapterW2.length !== policyAdapterHiddenDim * hiddenDim ||
         policyAdapterB2.length !== hiddenDim ||
+        (version >= 3 &&
+          (policyLogitAdapterW1.length !==
+            (hiddenDim + tokenDim) * policyLogitAdapterHiddenDim ||
+            policyLogitAdapterB1.length !== policyLogitAdapterHiddenDim ||
+            policyLogitAdapterW2.length !==
+              policyLogitAdapterHiddenDim * actionDim ||
+            policyLogitAdapterB2.length !== actionDim)) ||
         !isFiniteArray(policyGateW) ||
         !isFiniteArray(policyGateB) ||
         !isFiniteArray(policyAdapterW1) ||
         !isFiniteArray(policyAdapterB1) ||
         !isFiniteArray(policyAdapterW2) ||
-        !isFiniteArray(policyAdapterB2)
+        !isFiniteArray(policyAdapterB2) ||
+        (version >= 3 &&
+          (!isFiniteArray(policyLogitAdapterW1) ||
+            !isFiniteArray(policyLogitAdapterB1) ||
+            !isFiniteArray(policyLogitAdapterW2) ||
+            !isFiniteArray(policyLogitAdapterB2)))
       ) {
         throw new Error('Invalid bot policy behavior conditioning dimensions.');
       }
       behaviorConditioning = {
-        version: 2,
+        version: version >= 3 ? 3 : 2,
         tokenDim,
         tokenCount,
         activeTokenIds: activeTokens,
@@ -2381,6 +2514,23 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
         policyAdapterB1,
         policyAdapterW2,
         policyAdapterB2,
+        policyLogitAdapterHiddenDim,
+        policyLogitAdapterW1:
+          version >= 3
+            ? policyLogitAdapterW1
+            : new Float32Array(
+                (hiddenDim + tokenDim) * policyLogitAdapterHiddenDim,
+              ),
+        policyLogitAdapterB1:
+          version >= 3
+            ? policyLogitAdapterB1
+            : new Float32Array(policyLogitAdapterHiddenDim),
+        policyLogitAdapterW2:
+          version >= 3
+            ? policyLogitAdapterW2
+            : new Float32Array(policyLogitAdapterHiddenDim * actionDim),
+        policyLogitAdapterB2:
+          version >= 3 ? policyLogitAdapterB2 : new Float32Array(actionDim),
       };
     } else {
       const policyAffineW = new Float32Array(
@@ -2399,7 +2549,7 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
       }
       const policyAdapterHiddenDim = Math.max(1, hiddenDim);
       behaviorConditioning = {
-        version: 2,
+        version: 3,
         tokenDim,
         tokenCount,
         activeTokenIds: activeTokens,
@@ -2413,6 +2563,17 @@ const fromArtifact = (policy: BotPolicyArtifact): PolicyParams => {
         policyAdapterB1: new Float32Array(policyAdapterHiddenDim),
         policyAdapterW2: new Float32Array(policyAdapterHiddenDim * hiddenDim),
         policyAdapterB2: new Float32Array(hiddenDim),
+        policyLogitAdapterHiddenDim: Math.max(64, Math.trunc(hiddenDim / 2)),
+        policyLogitAdapterW1: new Float32Array(
+          (hiddenDim + tokenDim) * Math.max(64, Math.trunc(hiddenDim / 2)),
+        ),
+        policyLogitAdapterB1: new Float32Array(
+          Math.max(64, Math.trunc(hiddenDim / 2)),
+        ),
+        policyLogitAdapterW2: new Float32Array(
+          Math.max(64, Math.trunc(hiddenDim / 2)) * actionDim,
+        ),
+        policyLogitAdapterB2: new Float32Array(actionDim),
       };
     }
   }
@@ -2692,6 +2853,42 @@ export const parseBotPolicyArtifactFromUnknown = (
             value.behaviorConditioning.policyAdapterB2,
           )
             ? value.behaviorConditioning.policyAdapterB2.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyLogitAdapterHiddenDim: Math.max(
+            1,
+            Math.trunc(
+              Number(
+                value.behaviorConditioning.policyLogitAdapterHiddenDim ?? 1,
+              ),
+            ),
+          ),
+          policyLogitAdapterW1: Array.isArray(
+            value.behaviorConditioning.policyLogitAdapterW1,
+          )
+            ? value.behaviorConditioning.policyLogitAdapterW1.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyLogitAdapterB1: Array.isArray(
+            value.behaviorConditioning.policyLogitAdapterB1,
+          )
+            ? value.behaviorConditioning.policyLogitAdapterB1.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyLogitAdapterW2: Array.isArray(
+            value.behaviorConditioning.policyLogitAdapterW2,
+          )
+            ? value.behaviorConditioning.policyLogitAdapterW2.map((item) =>
+                Number(item),
+              )
+            : [],
+          policyLogitAdapterB2: Array.isArray(
+            value.behaviorConditioning.policyLogitAdapterB2,
+          )
+            ? value.behaviorConditioning.policyLogitAdapterB2.map((item) =>
                 Number(item),
               )
             : [],

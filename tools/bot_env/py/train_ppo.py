@@ -72,6 +72,8 @@ class PPOConfig:
     behavior_active_token_ids: tuple[int, ...]
     policy_train_mode: str
     learning_rate: float
+    policy_head_lr_scale: float
+    behavior_lr_scale: float
     obs_adapter_lr_scale: float
     queue_encoder_hidden_dim: int
     queue_encoder_lr_scale: float
@@ -144,6 +146,7 @@ class PPOConfig:
     bc_kl_probe_size: int
     bc_policy_lr_scale: float
     bc_policy_head_lr_scale: float
+    bc_behavior_lr_scale: float
     bc_value_lr_scale: float
     bc_adapter_lr_scale: float
     bc_queue_encoder_lr_scale: float
@@ -203,6 +206,15 @@ class PolicyValueNet(nn.Module):
             self.behavior_adapter_hidden_dim,
             hidden_dim,
         )
+        self.behavior_logit_adapter_hidden_dim = max(64, hidden_dim // 2)
+        self.policy_logit_adapter_fc1 = nn.Linear(
+            hidden_dim + self.behavior_token_dim,
+            self.behavior_logit_adapter_hidden_dim,
+        )
+        self.policy_logit_adapter_fc2 = nn.Linear(
+            self.behavior_logit_adapter_hidden_dim,
+            action_dim,
+        )
         self.active_behavior_token_ids = self._normalize_behavior_token_ids(
             behavior_active_token_ids
         )
@@ -227,6 +239,9 @@ class PolicyValueNet(nn.Module):
         init_layer(self.policy_adapter_fc1, std=math.sqrt(2.0))
         nn.init.zeros_(self.policy_adapter_fc2.weight)
         nn.init.zeros_(self.policy_adapter_fc2.bias)
+        init_layer(self.policy_logit_adapter_fc1, std=math.sqrt(2.0))
+        nn.init.zeros_(self.policy_logit_adapter_fc2.weight)
+        nn.init.zeros_(self.policy_logit_adapter_fc2.bias)
 
     def _normalize_behavior_token_ids(
         self,
@@ -285,7 +300,7 @@ class PolicyValueNet(nn.Module):
         policy_hidden: torch.Tensor,
         *,
         behavior_token_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         token_ids = self._resolve_behavior_token_ids(
             int(policy_hidden.shape[0]),
             policy_hidden.device,
@@ -299,7 +314,7 @@ class PolicyValueNet(nn.Module):
         adapter_input = torch.cat((base_hidden, behavior_embedding), dim=-1)
         adapter_hidden = torch.relu(self.policy_adapter_fc1(adapter_input))
         adapter_delta = self.policy_adapter_fc2(adapter_hidden)
-        return base_hidden + adapter_delta
+        return base_hidden + adapter_delta, behavior_embedding
 
     def forward(
         self,
@@ -308,11 +323,16 @@ class PolicyValueNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         policy_hidden = torch.relu(self.policy_fc1(obs))
         policy_hidden = torch.relu(self.policy_fc2(policy_hidden))
-        policy_hidden = self._apply_policy_conditioning(
+        policy_hidden, behavior_embedding = self._apply_policy_conditioning(
             policy_hidden,
             behavior_token_ids=behavior_token_ids,
         )
         logits = self.policy_head(policy_hidden)
+        logit_adapter_input = torch.cat((policy_hidden, behavior_embedding), dim=-1)
+        logit_adapter_hidden = torch.relu(
+            self.policy_logit_adapter_fc1(logit_adapter_input)
+        )
+        logits = logits + self.policy_logit_adapter_fc2(logit_adapter_hidden)
 
         value_hidden = torch.relu(self.value_fc1(obs))
         value_hidden = torch.relu(self.value_fc2(value_hidden))
@@ -859,6 +879,20 @@ def parse_args() -> PPOConfig:
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument(
+        "--policy-head-lr-scale",
+        type=float,
+        default=1.0,
+        help="PPO LR scale for policy_head when it is trainable.",
+    )
+    parser.add_argument(
+        "--behavior-lr-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "PPO LR scale for behavior embeddings/gate/hidden adapter/logit adapter."
+        ),
+    )
+    parser.add_argument(
         "--obs-adapter-lr-scale",
         type=float,
         default=DEFAULT_OBS_ADAPTER_LR_SCALE,
@@ -1192,6 +1226,12 @@ def parse_args() -> PPOConfig:
         help="BC LR scale for policy head weights/bias.",
     )
     parser.add_argument(
+        "--bc-behavior-lr-scale",
+        type=float,
+        default=1.0,
+        help="BC LR scale for behavior embeddings/gate/hidden adapter/logit adapter.",
+    )
+    parser.add_argument(
         "--bc-value-lr-scale",
         type=float,
         default=1.0,
@@ -1438,6 +1478,8 @@ def parse_args() -> PPOConfig:
         behavior_active_token_ids=behavior_active_token_ids,
         policy_train_mode=str(args.policy_train_mode).strip().lower(),
         learning_rate=float(args.learning_rate),
+        policy_head_lr_scale=max(0.0, float(args.policy_head_lr_scale)),
+        behavior_lr_scale=max(0.0, float(args.behavior_lr_scale)),
         obs_adapter_lr_scale=max(0.0, float(args.obs_adapter_lr_scale)),
         queue_encoder_hidden_dim=max(1, int(args.queue_encoder_hidden_dim)),
         queue_encoder_lr_scale=max(0.0, float(args.queue_encoder_lr_scale)),
@@ -1520,6 +1562,7 @@ def parse_args() -> PPOConfig:
         bc_kl_probe_size=max(0, int(args.bc_kl_probe_size)),
         bc_policy_lr_scale=max(0.0, float(args.bc_policy_lr_scale)),
         bc_policy_head_lr_scale=max(0.0, float(args.bc_policy_head_lr_scale)),
+        bc_behavior_lr_scale=max(0.0, float(args.bc_behavior_lr_scale)),
         bc_value_lr_scale=max(0.0, float(args.bc_value_lr_scale)),
         bc_adapter_lr_scale=max(0.0, float(args.bc_adapter_lr_scale)),
         bc_queue_encoder_lr_scale=max(0.0, float(args.bc_queue_encoder_lr_scale)),
@@ -2604,6 +2647,8 @@ def apply_policy_train_mode(
     record_module("policy_gate", model.policy_gate, True)
     record_module("policy_adapter_fc1", model.policy_adapter_fc1, True)
     record_module("policy_adapter_fc2", model.policy_adapter_fc2, True)
+    record_module("policy_logit_adapter_fc1", model.policy_logit_adapter_fc1, True)
+    record_module("policy_logit_adapter_fc2", model.policy_logit_adapter_fc2, True)
 
     total_params = int(sum(total for _name, total, _before, _after in module_stats))
     trainable_params = int(sum(after for _name, _total, _before, after in module_stats))
@@ -2646,6 +2691,8 @@ def build_ppo_optimizer(
     model: PolicyValueNet,
     obs_adapter: ObservationAdapter,
     learning_rate: float,
+    policy_head_lr_scale: float,
+    behavior_lr_scale: float,
     queue_encoder_lr_scale: float,
 ) -> torch.optim.Optimizer:
     # Split optimizer groups so we can slow policy/trunk updates during PPO warmup
@@ -2653,16 +2700,23 @@ def build_ppo_optimizer(
     policy_params: list[nn.Parameter] = []
     policy_params.extend([p for p in model.policy_fc1.parameters() if p.requires_grad])
     policy_params.extend([p for p in model.policy_fc2.parameters() if p.requires_grad])
-    policy_params.extend([p for p in model.policy_head.parameters() if p.requires_grad])
-    policy_params.extend(
+    policy_head_params = [p for p in model.policy_head.parameters() if p.requires_grad]
+    behavior_params: list[nn.Parameter] = []
+    behavior_params.extend(
         [p for p in model.behavior_token_embeddings.parameters() if p.requires_grad]
     )
-    policy_params.extend([p for p in model.policy_gate.parameters() if p.requires_grad])
-    policy_params.extend(
+    behavior_params.extend([p for p in model.policy_gate.parameters() if p.requires_grad])
+    behavior_params.extend(
         [p for p in model.policy_adapter_fc1.parameters() if p.requires_grad]
     )
-    policy_params.extend(
+    behavior_params.extend(
         [p for p in model.policy_adapter_fc2.parameters() if p.requires_grad]
+    )
+    behavior_params.extend(
+        [p for p in model.policy_logit_adapter_fc1.parameters() if p.requires_grad]
+    )
+    behavior_params.extend(
+        [p for p in model.policy_logit_adapter_fc2.parameters() if p.requires_grad]
     )
 
     value_params: list[nn.Parameter] = []
@@ -2681,6 +2735,22 @@ def build_ppo_optimizer(
                 "params": policy_params,
                 "lr": learning_rate,
                 "group_name": "policy",
+            }
+        )
+    if policy_head_params:
+        param_groups.append(
+            {
+                "params": policy_head_params,
+                "lr": learning_rate * max(0.0, float(policy_head_lr_scale)),
+                "group_name": "policy_head",
+            }
+        )
+    if behavior_params:
+        param_groups.append(
+            {
+                "params": behavior_params,
+                "lr": learning_rate * max(0.0, float(behavior_lr_scale)),
+                "group_name": "behavior",
             }
         )
     if value_params:
@@ -2733,17 +2803,25 @@ def apply_warmup_lr_schedule(
     warmup_active: bool,
     warmup_policy_lr_scale: float,
     warmup_value_lr_scale: float,
+    policy_head_lr_scale: float,
+    behavior_lr_scale: float,
     obs_adapter_lr_scale: float,
     queue_encoder_lr_scale: float,
 ) -> tuple[float, float, float, float]:
     policy_lr = base_lr * (warmup_policy_lr_scale if warmup_active else 1.0)
     value_lr = base_lr * (warmup_value_lr_scale if warmup_active else 1.0)
+    policy_head_lr = policy_lr * max(0.0, float(policy_head_lr_scale))
+    behavior_lr = policy_lr * max(0.0, float(behavior_lr_scale))
     board_adapter_lr = policy_lr * max(0.0, float(obs_adapter_lr_scale))
     queue_lr = base_lr * max(0.0, float(queue_encoder_lr_scale))
     for group in optimizer.param_groups:
         group_name = str(group.get("group_name", "policy"))
         if group_name == "value":
             group["lr"] = value_lr
+        elif group_name == "policy_head":
+            group["lr"] = policy_head_lr
+        elif group_name == "behavior":
+            group["lr"] = behavior_lr
         elif group_name == "queue":
             group["lr"] = queue_lr
         elif group_name in ("adapter_board", "adapter"):
@@ -2889,9 +2967,8 @@ def format_adapter_state_log(summary: dict[str, Any]) -> str:
     else:
         checks_str = "unknown"
     return (
-        "adapter("
+        "obs_adapter("
         f"status={summary.get('status')},"
-        f"conv={summary.get('conv_status')},"
         f"queue={summary.get('queue_status')},"
         f"trainable={summary.get('adapter_trainable')}/{summary.get('adapter_total')},"
         f"in_opt={'y' if summary.get('adapter_in_optimizer') else 'n'},"
@@ -2903,6 +2980,41 @@ def format_adapter_state_log(summary: dict[str, Any]) -> str:
         f"checks={checks_str}"
         ")"
     )
+
+
+def summarize_optimizer_groups(
+    optimizer: torch.optim.Optimizer,
+) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for index, group in enumerate(optimizer.param_groups):
+        params = list(group.get("params", []))
+        summary.append(
+            {
+                "name": str(group.get("group_name", f"group_{index}")),
+                "lr": float(group.get("lr", float("nan"))),
+                "params": int(
+                    sum(
+                        int(param.numel())
+                        for param in params
+                        if isinstance(param, torch.Tensor)
+                    )
+                ),
+            }
+        )
+    return summary
+
+
+def format_optimizer_groups_log(groups: list[dict[str, Any]]) -> str:
+    if not groups:
+        return "optimizer_groups: none"
+    parts: list[str] = []
+    for item in groups:
+        if not isinstance(item, dict):
+            continue
+        parts.append(
+            f"{item.get('name')}={int(item.get('params', 0))}@{float(item.get('lr', 0.0)):.6g}"
+        )
+    return "optimizer_groups: " + (", ".join(parts) if parts else "none")
 
 
 def adapt_widened_input_weight(
@@ -3177,6 +3289,30 @@ def export_bot_policy_artifact(
             .numpy()
             .astype(np.float32)
         )  # [H]
+        behavior_logit_adapter_w1 = (
+            model.policy_logit_adapter_fc1.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [Lh, H + D]
+        behavior_logit_adapter_b1 = (
+            model.policy_logit_adapter_fc1.bias.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [Lh]
+        behavior_logit_adapter_w2 = (
+            model.policy_logit_adapter_fc2.weight.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [A, Lh]
+        behavior_logit_adapter_b2 = (
+            model.policy_logit_adapter_fc2.bias.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )  # [A]
 
         # Value tower (new in split actor/critic architecture).
         wv1 = model.value_fc1.weight.detach().cpu().numpy().astype(np.float32)  # [H, I]
@@ -3222,7 +3358,7 @@ def export_bot_policy_artifact(
             "bv": bv.reshape(-1).tolist(),  # [1]
         },
         "behaviorConditioning": {
-            "version": 2,
+            "version": 3,
             "tokenCount": int(model.behavior_token_count),
             "tokenDim": int(model.behavior_token_dim),
             "activeTokenIds": [int(v) for v in model.active_behavior_token_ids],
@@ -3234,6 +3370,11 @@ def export_bot_policy_artifact(
             "policyAdapterB1": behavior_adapter_b1.reshape(-1).tolist(),  # [Ah]
             "policyAdapterW2": behavior_adapter_w2.T.reshape(-1).tolist(),  # [Ah, H]
             "policyAdapterB2": behavior_adapter_b2.reshape(-1).tolist(),  # [H]
+            "policyLogitAdapterHiddenDim": int(model.behavior_logit_adapter_hidden_dim),
+            "policyLogitAdapterW1": behavior_logit_adapter_w1.T.reshape(-1).tolist(),  # [H + D, Lh]
+            "policyLogitAdapterB1": behavior_logit_adapter_b1.reshape(-1).tolist(),  # [Lh]
+            "policyLogitAdapterW2": behavior_logit_adapter_w2.T.reshape(-1).tolist(),  # [Lh, A]
+            "policyLogitAdapterB2": behavior_logit_adapter_b2.reshape(-1).tolist(),  # [A]
         },
     }
     if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
@@ -3422,7 +3563,96 @@ def load_from_artifact(
             model.policy_gate.bias.zero_()
             model.policy_adapter_fc2.weight.zero_()
             model.policy_adapter_fc2.bias.zero_()
-        if version >= 2:
+            model.policy_logit_adapter_fc2.weight.zero_()
+            model.policy_logit_adapter_fc2.bias.zero_()
+        if version >= 3:
+            adapter_hidden_dim = int(
+                behavior_conditioning_payload.get("policyAdapterHiddenDim", 0)
+            )
+            if adapter_hidden_dim != target_adapter_hidden_dim:
+                raise ValueError(
+                    "Artifact behaviorConditioning policyAdapterHiddenDim mismatch. "
+                    f"artifact={adapter_hidden_dim} model={target_adapter_hidden_dim}"
+                )
+            policy_gate_w = np.asarray(
+                behavior_conditioning_payload.get("policyGateW", []),
+                dtype=np.float32,
+            ).reshape(token_dim, hidden_dim * 2)
+            policy_gate_b = np.asarray(
+                behavior_conditioning_payload.get("policyGateB", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim * 2)
+            policy_adapter_w1 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterW1", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim + token_dim, adapter_hidden_dim)
+            policy_adapter_b1 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterB1", []),
+                dtype=np.float32,
+            ).reshape(adapter_hidden_dim)
+            policy_adapter_w2 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterW2", []),
+                dtype=np.float32,
+            ).reshape(adapter_hidden_dim, hidden_dim)
+            policy_adapter_b2 = np.asarray(
+                behavior_conditioning_payload.get("policyAdapterB2", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim)
+            logit_adapter_hidden_dim = int(
+                behavior_conditioning_payload.get("policyLogitAdapterHiddenDim", 0)
+            )
+            target_logit_adapter_hidden_dim = int(
+                model.behavior_logit_adapter_hidden_dim
+            )
+            if logit_adapter_hidden_dim != target_logit_adapter_hidden_dim:
+                raise ValueError(
+                    "Artifact behaviorConditioning policyLogitAdapterHiddenDim mismatch. "
+                    f"artifact={logit_adapter_hidden_dim} model={target_logit_adapter_hidden_dim}"
+                )
+            policy_logit_adapter_w1 = np.asarray(
+                behavior_conditioning_payload.get("policyLogitAdapterW1", []),
+                dtype=np.float32,
+            ).reshape(hidden_dim + token_dim, logit_adapter_hidden_dim)
+            policy_logit_adapter_b1 = np.asarray(
+                behavior_conditioning_payload.get("policyLogitAdapterB1", []),
+                dtype=np.float32,
+            ).reshape(logit_adapter_hidden_dim)
+            policy_logit_adapter_w2 = np.asarray(
+                behavior_conditioning_payload.get("policyLogitAdapterW2", []),
+                dtype=np.float32,
+            ).reshape(logit_adapter_hidden_dim, target_action_dim)
+            policy_logit_adapter_b2 = np.asarray(
+                behavior_conditioning_payload.get("policyLogitAdapterB2", []),
+                dtype=np.float32,
+            ).reshape(target_action_dim)
+            with torch.no_grad():
+                model.policy_gate.weight.copy_(torch.from_numpy(policy_gate_w.T))
+                model.policy_gate.bias.copy_(torch.from_numpy(policy_gate_b))
+                model.policy_adapter_fc1.weight.copy_(
+                    torch.from_numpy(policy_adapter_w1.T)
+                )
+                model.policy_adapter_fc1.bias.copy_(
+                    torch.from_numpy(policy_adapter_b1)
+                )
+                model.policy_adapter_fc2.weight.copy_(
+                    torch.from_numpy(policy_adapter_w2.T)
+                )
+                model.policy_adapter_fc2.bias.copy_(
+                    torch.from_numpy(policy_adapter_b2)
+                )
+                model.policy_logit_adapter_fc1.weight.copy_(
+                    torch.from_numpy(policy_logit_adapter_w1.T)
+                )
+                model.policy_logit_adapter_fc1.bias.copy_(
+                    torch.from_numpy(policy_logit_adapter_b1)
+                )
+                model.policy_logit_adapter_fc2.weight.copy_(
+                    torch.from_numpy(policy_logit_adapter_w2.T)
+                )
+                model.policy_logit_adapter_fc2.bias.copy_(
+                    torch.from_numpy(policy_logit_adapter_b2)
+                )
+        elif version >= 2:
             adapter_hidden_dim = int(
                 behavior_conditioning_payload.get("policyAdapterHiddenDim", 0)
             )
@@ -4819,6 +5049,7 @@ def build_bc_optimizer(
     learning_rate: float,
     policy_lr_scale: float,
     policy_head_lr_scale: float,
+    behavior_lr_scale: float,
     value_lr_scale: float,
     adapter_lr_scale: float,
     queue_lr_scale: float,
@@ -4862,11 +5093,17 @@ def build_bc_optimizer(
     behavior_params.extend(
         [p for p in model.policy_adapter_fc2.parameters() if p.requires_grad]
     )
+    behavior_params.extend(
+        [p for p in model.policy_logit_adapter_fc1.parameters() if p.requires_grad]
+    )
+    behavior_params.extend(
+        [p for p in model.policy_logit_adapter_fc2.parameters() if p.requires_grad]
+    )
     if behavior_params:
         param_groups.append(
             {
                 "params": behavior_params,
-                "lr": learning_rate * max(0.0, float(policy_head_lr_scale)),
+                "lr": learning_rate * max(0.0, float(behavior_lr_scale)),
                 "group_name": "bc_behavior",
             }
         )
@@ -5328,6 +5565,7 @@ def run_bc_pretrain(
         learning_rate=cfg.bc_learning_rate,
         policy_lr_scale=cfg.bc_policy_lr_scale,
         policy_head_lr_scale=cfg.bc_policy_head_lr_scale,
+        behavior_lr_scale=cfg.bc_behavior_lr_scale,
         value_lr_scale=cfg.bc_value_lr_scale,
         adapter_lr_scale=cfg.bc_adapter_lr_scale,
         queue_lr_scale=cfg.bc_queue_encoder_lr_scale,
@@ -5623,6 +5861,7 @@ def run_bc_pretrain(
         "optimizer_group_scales": {
             "policy": cfg.bc_policy_lr_scale,
             "policy_head": cfg.bc_policy_head_lr_scale,
+            "behavior": cfg.bc_behavior_lr_scale,
             "value": cfg.bc_value_lr_scale,
             "adapter": cfg.bc_adapter_lr_scale,
             "queue": cfg.bc_queue_encoder_lr_scale,
@@ -5775,6 +6014,8 @@ def train(cfg: PPOConfig) -> None:
                 model,
                 obs_adapter,
                 cfg.learning_rate,
+                cfg.policy_head_lr_scale,
+                cfg.behavior_lr_scale,
                 cfg.queue_encoder_lr_scale,
             )
             checkpoint_path = Path(cfg.resume_checkpoint).resolve()
@@ -6129,6 +6370,8 @@ def train(cfg: PPOConfig) -> None:
                 model,
                 obs_adapter,
                 cfg.learning_rate,
+                cfg.policy_head_lr_scale,
+                cfg.behavior_lr_scale,
                 cfg.queue_encoder_lr_scale,
             )
 
@@ -6176,7 +6419,9 @@ def train(cfg: PPOConfig) -> None:
             obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
             queue_lr=first_update_queue_lr,
         )
+        startup_optimizer_groups = summarize_optimizer_groups(optimizer)
         print("[ppo] " + format_adapter_state_log(startup_adapter_state))
+        print("[ppo] " + format_optimizer_groups_log(startup_optimizer_groups))
 
         print(
             "[ppo] starting training "
@@ -6186,6 +6431,8 @@ def train(cfg: PPOConfig) -> None:
             f"action_space={cfg.action_space_kind}, "
             f"policy_obs_space={policy_observation_space}, "
             f"raw_obs_dim={raw_obs_dim}, policy_obs_dim={obs_dim}, action_dim={action_dim}, "
+            f"policy_head_lr_scale={cfg.policy_head_lr_scale:.3f}, "
+            f"behavior_lr_scale={cfg.behavior_lr_scale:.3f}, "
             f"queue_hidden_dim={cfg.queue_encoder_hidden_dim}, "
             f"queue_lr_scale={cfg.queue_encoder_lr_scale:.3f}, "
             f"batch_size={batch_size}, updates={num_updates}, "
@@ -6249,6 +6496,11 @@ def train(cfg: PPOConfig) -> None:
                 "[ppo] note: generic action distillation excludes the explicit HOLD action "
                 "for action_space=placement_hold_step_v2. HOLD is supervised only by the "
                 "hold-swap teacher."
+            )
+        if str(cfg.action_space_kind).strip().lower() == "placement_hold_step_v2":
+            print(
+                "[ppo] note: explicit HOLD transitions use gamma_t=1.0 in GAE/returns, "
+                "so HOLD does not consume an extra discount step."
             )
         write_json(
             out_dir / "config.json",
@@ -6395,6 +6647,8 @@ def train(cfg: PPOConfig) -> None:
                     warmup_active=warmup_active,
                     warmup_policy_lr_scale=cfg.warmup_policy_lr_scale,
                     warmup_value_lr_scale=cfg.warmup_value_lr_scale,
+                    policy_head_lr_scale=cfg.policy_head_lr_scale,
+                    behavior_lr_scale=cfg.behavior_lr_scale,
                     obs_adapter_lr_scale=cfg.obs_adapter_lr_scale,
                     queue_encoder_lr_scale=cfg.queue_encoder_lr_scale,
                 )
@@ -6475,6 +6729,11 @@ def train(cfg: PPOConfig) -> None:
                 action_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device, dtype=torch.long)
                 logprob_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
                 reward_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+                discount_buf = torch.full(
+                    (cfg.num_steps, cfg.num_envs),
+                    float(cfg.gamma),
+                    device=device,
+                )
                 done_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
                 value_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
 
@@ -6657,6 +6916,19 @@ def train(cfg: PPOConfig) -> None:
                     rewards_np = np.asarray(step_result["rewards"], dtype=np.float32)
                     infos_raw = step_result.get("infos", [])
                     dones_np = np.asarray(step_result["dones"], dtype=np.float32)
+                    discounts_np = np.full(
+                        (cfg.num_envs,),
+                        float(cfg.gamma),
+                        dtype=np.float32,
+                    )
+                    if isinstance(infos_raw, list):
+                        max_info = min(len(infos_raw), cfg.num_envs)
+                        for env_idx in range(max_info):
+                            info = infos_raw[env_idx]
+                            if isinstance(info, dict) and bool(
+                                info.get("holdStepObserved", False)
+                            ):
+                                discounts_np[env_idx] = 1.0
                     if hold_penalties_by_env_id:
                         for env_idx, env_id in enumerate(env_ids):
                             penalty = hold_penalties_by_env_id.get(int(env_id))
@@ -6664,6 +6936,7 @@ def train(cfg: PPOConfig) -> None:
                                 rewards_np[env_idx] -= np.float32(penalty)
 
                     reward_buf[step] = as_tensor(rewards_np, device)
+                    discount_buf[step] = as_tensor(discounts_np, device)
                     done_buf[step] = as_tensor(dones_np, device)
 
                     ep_return += rewards_np.astype(np.float64)
@@ -6829,6 +7102,7 @@ def train(cfg: PPOConfig) -> None:
                 advantages = torch.zeros_like(reward_buf, device=device)
                 lastgaelam = torch.zeros(cfg.num_envs, device=device)
                 for t in reversed(range(cfg.num_steps)):
+                    transition_gamma = discount_buf[t]
                     if t == cfg.num_steps - 1:
                         next_non_terminal = 1.0 - done_buf[t]
                         next_values = next_value
@@ -6837,8 +7111,18 @@ def train(cfg: PPOConfig) -> None:
                         # Use done_t for both TD bootstrap and GAE recursion masks.
                         next_non_terminal = 1.0 - done_buf[t]
                         next_values = value_buf[t + 1]
-                    delta = reward_buf[t] + cfg.gamma * next_values * next_non_terminal - value_buf[t]
-                    lastgaelam = delta + cfg.gamma * cfg.gae_lambda * next_non_terminal * lastgaelam
+                    delta = (
+                        reward_buf[t]
+                        + transition_gamma * next_values * next_non_terminal
+                        - value_buf[t]
+                    )
+                    lastgaelam = (
+                        delta
+                        + transition_gamma
+                        * cfg.gae_lambda
+                        * next_non_terminal
+                        * lastgaelam
+                    )
                     advantages[t] = lastgaelam
                 returns = advantages + value_buf
 
@@ -7610,14 +7894,6 @@ def train(cfg: PPOConfig) -> None:
                             f"v_lr={value_lr_now:.6g} "
                             f"target_kl={target_kl_now:.5f} "
                             f"validate={'y' if should_validate else 'n'}"
-                        ),
-                        (
-                            "  adapter: "
-                            f"status={stats['adapter_status']} "
-                            f"conv={stats['adapter_conv_status']} "
-                            f"lr_scale={stats['adapter_lr_scale_used']:.3f} "
-                            f"eff_lr={stats['adapter_effective_lr_used']:.6g} "
-                            f"checks={adapter_checks_label}"
                         ),
                         (
                             "  curriculum: "
