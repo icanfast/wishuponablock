@@ -135,6 +135,7 @@ const handleSetCurriculum = (id: number, payload: unknown): void => {
       top_k: config.topK,
       bias_strength: config.biasStrength,
       danger_height: config.dangerHeight,
+      compute_scores: config.computeScores,
     },
   });
 };

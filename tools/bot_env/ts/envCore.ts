@@ -77,12 +77,14 @@ type ActionCurriculumConfig = {
   topK: number;
   biasStrength: number;
   dangerHeight: number;
+  computeScores: boolean;
 };
 
 const DEFAULT_ACTION_CURRICULUM: ActionCurriculumConfig = {
   topK: 0,
   biasStrength: 0,
   dangerHeight: DEFAULT_CURRICULUM_DANGER_HEIGHT,
+  computeScores: true,
 };
 
 const EMPTY_INPUT: InputFrame = {
@@ -145,10 +147,12 @@ const normalizeActionCurriculum = (
     1,
     64,
   );
+  const computeScores = payload?.computeScores !== false;
   return {
     topK,
     biasStrength,
     dangerHeight,
+    computeScores,
   };
 };
 
@@ -1768,6 +1772,10 @@ const buildPlacementChoices = (
   );
   const actionScores = new Array<number>(actionDim).fill(0);
   const scoringContext = buildPlacementScoringContext(state, modeId);
+  const scoreRequired =
+    curriculum.computeScores ||
+    curriculum.topK > 0 ||
+    curriculum.biasStrength > 0;
   for (const placement of placements) {
     const actionIndex =
       actionSpaceKind === 'placement_hold_step_v2'
@@ -1778,11 +1786,13 @@ const buildPlacementChoices = (
     if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
       continue;
     }
-    const score = scorePlacementCandidate({
-      context: scoringContext,
-      placement,
-      rewardFunctionId,
-    });
+    const score = scoreRequired
+      ? scorePlacementCandidate({
+          context: scoringContext,
+          placement,
+          rewardFunctionId,
+        })
+      : 0;
     if (
       actionMask[actionIndex] > 0 &&
       commandsBySlot[actionIndex] &&
@@ -1806,11 +1816,13 @@ const buildPlacementChoices = (
     state.canHold &&
     actionDim > PLACEMENT_ACTION_HOLD_STEP_INDEX
   ) {
-    const holdActionScore = scoreHoldStepActionDetailed({
-      context: scoringContext,
-      rewardFunctionId,
-    }).score;
-    if (Number.isFinite(holdActionScore)) {
+    const holdActionScore = scoreRequired
+      ? scoreHoldStepActionDetailed({
+          context: scoringContext,
+          rewardFunctionId,
+        }).score
+      : 0;
+    if (!scoreRequired || Number.isFinite(holdActionScore)) {
       actionMask[PLACEMENT_ACTION_HOLD_STEP_INDEX] = 1;
       scoresBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = holdActionScore;
       actionScores[PLACEMENT_ACTION_HOLD_STEP_INDEX] = holdActionScore;
@@ -1862,6 +1874,7 @@ const buildPlacementChoices = (
     scoringContext.beforeMetrics.maxHeight >= curriculum.dangerHeight;
 
   if (
+    scoreRequired &&
     curriculum.topK > 0 &&
     !dangerBypass &&
     legalIndices.length > curriculum.topK
@@ -1880,7 +1893,7 @@ const buildPlacementChoices = (
   const kept = actionMask
     .map((value, index) => (value > 0 ? index : -1))
     .filter((value) => value >= 0);
-  if (kept.length > 0) {
+  if (scoreRequired && kept.length > 0) {
     const finiteScorePairs = kept
       .map((index) => ({ index, score: scoresBySlot[index] }))
       .filter((entry) => Number.isFinite(entry.score));
@@ -2338,9 +2351,7 @@ class BotEnv {
         });
         probes.push({
           action_index: actionIndex,
-          planning_score: Number.isFinite(choices.actionScores[actionIndex])
-            ? choices.actionScores[actionIndex]
-            : holdScore.score,
+          planning_score: holdScore.score,
           immediate_score: holdScore.immediateScore,
           continuation_best_score: holdScore.continuationBestScore,
           hold_step: true,
@@ -2375,9 +2386,7 @@ class BotEnv {
         evaluation?.rewardResult.breakdown ?? zeroRewardBreakdown();
       probes.push({
         action_index: actionIndex,
-        planning_score: Number.isFinite(choices.actionScores[actionIndex])
-          ? choices.actionScores[actionIndex]
-          : details.score,
+        planning_score: details.score,
         immediate_score: details.immediateScore,
         continuation_best_score: details.continuationBestScore,
         hold_step: false,

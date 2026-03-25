@@ -1720,6 +1720,21 @@ def hold_swap_distill_coef_for_update(cfg: PPOConfig, update: int) -> float:
     )
 
 
+def should_compute_planning_scores(
+    *,
+    curriculum_topk: int,
+    curriculum_bias: float,
+    distill_coef: float,
+) -> bool:
+    if int(curriculum_topk) > 0:
+        return True
+    if float(curriculum_bias) > 0.0:
+        return True
+    if float(distill_coef) > 0.0:
+        return True
+    return False
+
+
 def ensure_action_masks(
     mask_np: np.ndarray,
     repair_stats: dict[str, int] | None = None,
@@ -4180,6 +4195,7 @@ def run_validation_eval(
                 top_k=0,
                 bias_strength=0.0,
                 danger_height=cfg.curriculum_danger_height,
+                compute_scores=False,
             )
 
             returns: list[float] = []
@@ -5543,6 +5559,7 @@ def run_bc_rollout_evals(
         top_k=0,
         bias_strength=0.0,
         danger_height=cfg.curriculum_danger_height,
+        compute_scores=False,
     )
     out: dict[str, dict[str, float | bool]] = {}
     max_steps = max(8, int(cfg.max_pieces_per_episode_val) * 4)
@@ -6048,6 +6065,20 @@ def train(cfg: PPOConfig) -> None:
         )
         env.set_piece_sources(env_ids=env_ids, piece_source_profiles=env_piece_sources)
         validation_sources = unique_generator_sources(cfg)
+        initial_update = min(num_updates, max(1, start_update + 1))
+        initial_curriculum_topk = curriculum_topk_for_update(cfg, initial_update)
+        initial_curriculum_bias = curriculum_bias_for_update(cfg, initial_update)
+        initial_distill_coef = distill_coef_for_update(cfg, initial_update)
+        env.set_curriculum(
+            top_k=initial_curriculum_topk,
+            bias_strength=initial_curriculum_bias,
+            danger_height=cfg.curriculum_danger_height,
+            compute_scores=should_compute_planning_scores(
+                curriculum_topk=initial_curriculum_topk,
+                curriculum_bias=initial_curriculum_bias,
+                distill_coef=initial_distill_coef,
+            ),
+        )
         source_mix_label = ",".join(
             f"{key}:{env_piece_source_counts[key]}"
             for key in sorted(env_piece_source_counts.keys())
@@ -6801,6 +6832,11 @@ def train(cfg: PPOConfig) -> None:
                     top_k=curriculum_topk_now,
                     bias_strength=curriculum_bias_now,
                     danger_height=cfg.curriculum_danger_height,
+                    compute_scores=should_compute_planning_scores(
+                        curriculum_topk=curriculum_topk_now,
+                        curriculum_bias=curriculum_bias_now,
+                        distill_coef=distill_coef_now,
+                    ),
                 )
                 if fixed_blend_step is not None:
                     blend_step_now = int(fixed_blend_step)

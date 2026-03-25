@@ -76,6 +76,7 @@ export type SetCurriculumPayload = {
   topK?: number;
   biasStrength?: number;
   dangerHeight?: number;
+  computeScores?: boolean;
 };
 
 export type SetRewardBlendStepPayload = {

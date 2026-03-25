@@ -154,6 +154,7 @@ class WubEnvBridge:
         top_k: int | None = None,
         bias_strength: float | None = None,
         danger_height: int | None = None,
+        compute_scores: bool | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if top_k is not None:
@@ -162,6 +163,8 @@ class WubEnvBridge:
             payload["biasStrength"] = float(bias_strength)
         if danger_height is not None:
             payload["dangerHeight"] = int(danger_height)
+        if compute_scores is not None:
+            payload["computeScores"] = bool(compute_scores)
         return self._request("set_curriculum", payload)
 
     def set_reward_blend_step(self, transition_step: int) -> dict[str, Any]:
