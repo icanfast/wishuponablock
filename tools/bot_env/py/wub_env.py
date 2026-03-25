@@ -183,6 +183,12 @@ class WubEnvBridge:
         }
         return self._request("evaluate_hold_candidates_many", payload)
 
+    def probe_actions_many(self, env_ids: list[int]) -> dict[str, Any]:
+        payload = {
+            "envIds": [int(v) for v in env_ids],
+        }
+        return self._request("probe_actions_many", payload)
+
     def pop_trajectory(self) -> dict[str, Any]:
         return self._request("pop_trajectory", {})
 

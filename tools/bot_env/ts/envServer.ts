@@ -7,6 +7,7 @@ import type {
   EvaluateHoldCandidatesManyPayload,
   InitPayload,
   JsonObject,
+  ProbeActionsManyPayload,
   ResetManyPayload,
   SetCurriculumPayload,
   SetPieceSourcesPayload,
@@ -175,6 +176,13 @@ const handleEvaluateHoldCandidatesMany = (
   writeResponse({ id, ok: true, result });
 };
 
+const handleProbeActionsMany = (id: number, payload: unknown): void => {
+  const data = asObject(payload) as unknown as ProbeActionsManyPayload;
+  const envIds = parseNumberArray(data.envIds);
+  const result = ensurePool().probeActionsMany(envIds);
+  writeResponse({ id, ok: true, result });
+};
+
 const handlePopTrajectory = (id: number): void => {
   const trajectory = ensurePool().popTrajectorySession();
   writeResponse({
@@ -221,6 +229,9 @@ const handleRequest = async (line: string): Promise<void> => {
       return;
     case 'evaluate_hold_candidates_many':
       handleEvaluateHoldCandidatesMany(id, parsed.payload);
+      return;
+    case 'probe_actions_many':
+      handleProbeActionsMany(id, parsed.payload);
       return;
     case 'pop_trajectory':
       handlePopTrajectory(id);

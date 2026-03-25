@@ -23,6 +23,7 @@ export type BridgeRequest = {
     | 'set_curriculum'
     | 'set_reward_blend_step'
     | 'evaluate_hold_candidates_many'
+    | 'probe_actions_many'
     | 'reset_many'
     | 'step_many'
     | 'pop_trajectory'
@@ -90,6 +91,10 @@ export type EvaluateHoldCandidatesManyPayload = {
   envIds?: number[];
 };
 
+export type ProbeActionsManyPayload = {
+  envIds?: number[];
+};
+
 export type HoldCandidateEvaluation = {
   action_index: number;
   hold_used: boolean;
@@ -100,6 +105,40 @@ export type HoldCandidateEvaluation = {
 
 export type EvaluateHoldCandidatesBatchResult = {
   candidates: HoldCandidateEvaluation[][];
+};
+
+export type PlacementActionProbe = {
+  action_index: number;
+  planning_score: number;
+  immediate_score: number;
+  continuation_best_score: number;
+  hold_step: boolean;
+  hold_used: boolean;
+  done: boolean;
+  top_out: boolean;
+  lines_cleared: number;
+  height_delta: number;
+  holes_delta: number;
+  hold_term: number;
+  kick_term: number;
+  soft_drop_term: number;
+  hole_term: number;
+  hole_extended_term: number;
+  board_quality_delta_term: number;
+  board_quality_absolute_term: number;
+  commands: string[];
+  lock_piece?: string;
+  lock_rotation?: number;
+  lock_x?: number;
+  lock_y?: number;
+};
+
+export type ProbeActionsBatchResult = {
+  obs: number[][];
+  action_masks: number[][];
+  action_biases: number[][];
+  action_scores: number[][];
+  probes: PlacementActionProbe[][];
 };
 
 export type StepBatchResult = {

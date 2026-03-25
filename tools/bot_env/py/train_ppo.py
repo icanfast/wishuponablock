@@ -1849,6 +1849,110 @@ def masked_categorical(
     return Categorical(logits=masked_logits)
 
 
+def probe_behavior_policy_actions(
+    *,
+    env: WubEnvBridge,
+    env_ids: list[int],
+    obs_adapter: ObservationAdapter,
+    model: PolicyValueNet,
+    device: torch.device,
+    active_token_ids: tuple[int, ...] | list[int] | None = None,
+    base_token_ids: tuple[int, ...] | list[int] = (0,),
+) -> list[dict[str, Any]]:
+    probe_result = env.probe_actions_many(env_ids=env_ids)
+    obs_np = np.asarray(probe_result.get("obs", []), dtype=np.float32)
+    if obs_np.ndim != 2 or obs_np.shape[0] != len(env_ids):
+        return []
+    mask_np = ensure_action_masks(
+        np.asarray(probe_result.get("action_masks", []), dtype=np.float32)
+    )
+    if mask_np.shape[0] != len(env_ids):
+        return []
+
+    raw_obs_t = as_tensor(obs_np, device)
+    mask_t = as_tensor(mask_np, device)
+    active_tokens = (
+        tuple(int(v) for v in active_token_ids)
+        if active_token_ids is not None
+        else tuple(int(v) for v in getattr(model, "active_behavior_token_ids", (0,)))
+    )
+    if not active_tokens:
+        active_tokens = (0,)
+    base_tokens = tuple(int(v) for v in base_token_ids) or (0,)
+
+    active_token_ids_t = torch.as_tensor(
+        active_tokens,
+        device=device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(raw_obs_t.shape[0], -1)
+    base_token_ids_t = torch.as_tensor(
+        base_tokens,
+        device=device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(raw_obs_t.shape[0], -1)
+
+    with torch.no_grad():
+        features_t = obs_adapter(raw_obs_t)
+        active_logits_t, _active_values_t = model(
+            features_t,
+            behavior_token_ids=active_token_ids_t,
+        )
+        base_logits_t, _base_values_t = model(
+            features_t,
+            behavior_token_ids=base_token_ids_t,
+        )
+        active_dist_t = masked_categorical(
+            active_logits_t,
+            mask_t,
+            action_bias=None,
+            bias_alpha=0.0,
+        )
+        base_dist_t = masked_categorical(
+            base_logits_t,
+            mask_t,
+            action_bias=None,
+            bias_alpha=0.0,
+        )
+
+    active_probs_np = active_dist_t.probs.detach().cpu().numpy().astype(np.float64)
+    base_probs_np = base_dist_t.probs.detach().cpu().numpy().astype(np.float64)
+    active_logits_np = active_logits_t.detach().cpu().numpy().astype(np.float64)
+    base_logits_np = base_logits_t.detach().cpu().numpy().astype(np.float64)
+    probes_by_env = probe_result.get("probes", [])
+
+    merged: list[dict[str, Any]] = []
+    for env_idx, env_id in enumerate(env_ids):
+        probe_rows_raw = (
+            probes_by_env[env_idx]
+            if env_idx < len(probes_by_env) and isinstance(probes_by_env[env_idx], list)
+            else []
+        )
+        probe_rows: list[dict[str, Any]] = []
+        for candidate in probe_rows_raw:
+            if not isinstance(candidate, dict):
+                continue
+            action_index = int(candidate.get("action_index", -1))
+            if action_index < 0 or action_index >= active_probs_np.shape[1]:
+                continue
+            row = dict(candidate)
+            row["active_prob"] = float(active_probs_np[env_idx, action_index])
+            row["base_prob"] = float(base_probs_np[env_idx, action_index])
+            row["active_logit"] = float(active_logits_np[env_idx, action_index])
+            row["base_logit"] = float(base_logits_np[env_idx, action_index])
+            probe_rows.append(row)
+        merged.append(
+            {
+                "env_id": int(env_id),
+                "active_tokens": [int(v) for v in active_tokens],
+                "base_tokens": [int(v) for v in base_tokens],
+                "active_greedy_action": int(np.argmax(active_probs_np[env_idx])),
+                "base_greedy_action": int(np.argmax(base_probs_np[env_idx])),
+                "rows": probe_rows,
+            }
+        )
+    return merged
+
+
 def is_hold_probe_supported(action_space_kind: str) -> bool:
     return str(action_space_kind).strip().lower() == "placement_full_v1"
 

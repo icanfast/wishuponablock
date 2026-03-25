@@ -50,8 +50,10 @@ import type {
   BotActionSpaceKind,
   InitPayload,
   JsonObject,
+  PlacementActionProbe,
   PlacementExecutionMode,
   PieceSourceProfile,
+  ProbeActionsBatchResult,
   RewardFunctionId,
   SetCurriculumPayload,
   StepBatchResult,
@@ -588,6 +590,8 @@ const REWARD_HARDDROP_V1_HOLE_EXTENDED_DELTA_WEIGHT = 0.2;
 const REWARD_HARDDROP_V1_HOLE_EXTENDED_ABSOLUTE_WEIGHT = 0.005;
 const HARDDROP_HOLE_EXTENDED_SEGMENT_WEIGHT = 1.0;
 const HARDDROP_HOLE_EXTENDED_COVER_WEIGHT = 2.0;
+const HARDDROP_PLANNING_LOOKAHEAD_WEIGHT = 0.9;
+const HARDDROP_PLANNING_LOOKAHEAD_DEPTH = 1;
 
 type PlacementPenaltyStats = {
   rotateCwCcwCount: number;
@@ -1220,70 +1224,377 @@ const applyPlacementToBoard = (
   };
 };
 
-const scorePlacementCandidate = (options: {
-  beforeMetrics: BoardQualityMetrics;
-  placement: TrajectoryExecutorReachablePlacement;
-  board: Board;
-  rewardFunctionId: RewardFunctionId;
+type PlacementScoringContext = {
+  state: GameState;
   modeId: string;
-}): number => {
-  const { beforeMetrics, placement, board, rewardFunctionId, modeId } = options;
-  const applied = applyPlacementToBoard(board, placement);
-  if (applied.invalid) return -1e9;
+  beforeMetrics: BoardQualityMetrics;
+  beforeHeight: number;
+  beforeHoles: number;
+  beforeBumpiness: number;
+  beforeBlocks: number;
+  beforeBoardScore: number;
+};
+
+type PlacementImmediateEvaluation = {
+  applied: ReturnType<typeof applyPlacementToBoard>;
+  postLock: ReturnType<typeof buildPostLockStateForPlacement>;
+  afterMetrics: BoardQualityMetrics;
+  rewardInputs: PlacementRewardEvalInputs;
+  rewardResult: PieceRewardResult;
+  placementStats: PlacementPenaltyStats;
+  linesCleared: number;
+  heightDelta: number;
+  holesDelta: number;
+};
+
+type PlacementPlanningScore = {
+  score: number;
+  immediateScore: number;
+  continuationBestScore: number;
+  evaluation: PlacementImmediateEvaluation | null;
+};
+
+type HoldStepPlanningScore = {
+  score: number;
+  immediateScore: number;
+  continuationBestScore: number;
+  rewardResult: PieceRewardResult;
+  postHold: {
+    done: boolean;
+    topOut: boolean;
+    state: GameState | null;
+  };
+};
+
+const buildPlacementScoringContext = (
+  state: GameState,
+  modeId: string,
+): PlacementScoringContext => {
+  const beforeMetrics = evaluateBoardQuality(state.board);
+  return {
+    state,
+    modeId,
+    beforeMetrics,
+    beforeHeight: beforeMetrics.maxHeight,
+    beforeHoles: countBoardHoles(state.board),
+    beforeBumpiness: beforeMetrics.bumpiness,
+    beforeBlocks: countBoardBlocks(state.board),
+    beforeBoardScore: scoreCharcuterieBoard(
+      state.board,
+      state.gameOver,
+      state.totalLinesCleared,
+    ),
+  };
+};
+
+const evaluatePlacementImmediateReward = (options: {
+  context: PlacementScoringContext;
+  placement: TrajectoryExecutorReachablePlacement;
+  rewardFunctionId: RewardFunctionId;
+}): PlacementImmediateEvaluation | null => {
+  const { context, placement, rewardFunctionId } = options;
+  const applied = applyPlacementToBoard(context.state.board, placement);
+  if (applied.invalid) return null;
+  const postLock = buildPostLockStateForPlacement({
+    state: context.state,
+    boardAfter: applied.boardAfter,
+    placement,
+    linesCleared: applied.linesCleared,
+    topOut: applied.hasAboveTop,
+  });
+  const afterMetrics = evaluateBoardQuality(applied.boardAfter);
+  const afterHeight = afterMetrics.maxHeight;
+  const afterHoles = countBoardHoles(applied.boardAfter);
+  const afterBlocks = countBoardBlocks(applied.boardAfter);
+  const complexityBreakdown =
+    computePlacementComplexityPenaltyBreakdown(placement);
+  const placementStats = computePlacementPenaltyStats(placement);
+  const rewardInputs: PlacementRewardEvalInputs = {
+    modeId: context.modeId,
+    linesDelta: applied.linesCleared,
+    scoreDelta: postLock.scoreDelta,
+    timeDeltaMs: Math.max(
+      0,
+      Math.trunc(placement.commands.length * FIXED_STEP_MS),
+    ),
+    heightDelta: afterHeight - context.beforeHeight,
+    holesDelta: afterHoles - context.beforeHoles,
+    bumpinessDelta: afterMetrics.bumpiness - context.beforeBumpiness,
+    boardScoreDelta:
+      context.beforeBoardScore -
+      scoreCharcuterieBoard(
+        applied.boardAfter,
+        postLock.topOut,
+        postLock.totalLinesClearedAfter,
+      ),
+    boardQualityDelta: context.beforeMetrics.quality - afterMetrics.quality,
+    boardHoleExtendedQualityDelta:
+      context.beforeMetrics.holeExtendedQuality -
+      afterMetrics.holeExtendedQuality,
+    topOut: postLock.topOut,
+    baseComplexityPenalty: complexityBreakdown.basePenalty,
+    holdComplexityPenalty: complexityBreakdown.holdPenalty,
+    kickComplexityPenalty: complexityBreakdown.kickPenalty,
+    softDropComplexityPenalty: complexityBreakdown.softDropPenalty,
+    afterMaxHeight: afterHeight,
+    afterBoardQuality: afterMetrics.quality,
+    afterBoardHoleExtendedQuality: afterMetrics.holeExtendedQuality,
+    isFullClear: afterBlocks === 0 && context.beforeBlocks > 0,
+    srsKickCount: placementStats.srsKickCount,
+    softDropUsed: placementStats.softDropUsed,
+  };
+  return {
+    applied,
+    postLock,
+    afterMetrics,
+    rewardInputs,
+    rewardResult: computePieceRewardById(rewardFunctionId, rewardInputs),
+    placementStats,
+    linesCleared: applied.linesCleared,
+    heightDelta: rewardInputs.heightDelta,
+    holesDelta: rewardInputs.holesDelta,
+  };
+};
+
+const buildPostHoldStepState = (
+  state: GameState,
+): {
+  done: boolean;
+  topOut: boolean;
+  state: GameState | null;
+} => {
+  if (!state.canHold) {
+    return {
+      done: true,
+      topOut: false,
+      state: null,
+    };
+  }
+  const holdAfter = state.active.k;
+  let activeAfter: PieceKind | null = null;
+  let previewAfter: Array<PieceKind | null> = [];
+  if (state.hold == null) {
+    activeAfter = state.next[0] ?? null;
+    previewAfter = padVisibleQueue(state.next.slice(1, 6));
+  } else {
+    activeAfter = state.hold;
+    previewAfter = padVisibleQueue(state.next.slice(0, 5));
+  }
+  if (activeAfter == null) {
+    return {
+      done: true,
+      topOut: false,
+      state: null,
+    };
+  }
+  const spawnedActive: ActivePiece = {
+    k: activeAfter,
+    r: 0,
+    x: SPAWN_X,
+    y: SPAWN_Y,
+  };
+  if (collides(state.board, spawnedActive)) {
+    return {
+      done: true,
+      topOut: true,
+      state: null,
+    };
+  }
+  return {
+    done: false,
+    topOut: false,
+    state: {
+      board: cloneBoard(state.board),
+      active: spawnedActive,
+      ghostY: spawnedActive.y + dropDistance(state.board, spawnedActive),
+      hold: holdAfter,
+      canHold: false,
+      next: previewAfter
+        .filter((piece): piece is PieceKind => piece != null)
+        .slice(0, 5),
+      mlQueueProbabilities: [],
+      gameOver: false,
+      gameWon: false,
+      combo: state.combo,
+      timeMs: Math.max(0, Math.trunc(state.timeMs + FIXED_STEP_MS)),
+      totalLinesCleared: Math.max(0, Math.trunc(state.totalLinesCleared)),
+      lineGoal:
+        state.lineGoal != null ? Math.max(1, Math.trunc(state.lineGoal)) : null,
+      level: Math.max(1, Math.trunc(state.level)),
+      score: Math.max(0, Math.trunc(state.score)),
+      scoringEnabled: Boolean(state.scoringEnabled),
+    },
+  };
+};
+
+const scorePlacementCandidateDetailed = (options: {
+  context: PlacementScoringContext;
+  placement: TrajectoryExecutorReachablePlacement;
+  rewardFunctionId: RewardFunctionId;
+  harddropLookaheadDepth?: number;
+}): PlacementPlanningScore => {
+  const {
+    context,
+    placement,
+    rewardFunctionId,
+    harddropLookaheadDepth = HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
+  } = options;
   if (rewardFunctionId === 'harddrop_v1') {
-    const afterMetrics = evaluateBoardQuality(applied.boardAfter);
-    const beforeHeight = getStackHeight(board);
-    const afterHeight = getStackHeight(applied.boardAfter);
-    const beforeHoles = countBoardHoles(board);
-    const afterHoles = countBoardHoles(applied.boardAfter);
-    const beforeBumpiness = computeBoardBumpiness(board);
-    const afterBumpiness = computeBoardBumpiness(applied.boardAfter);
-    const beforeBlocks = countBoardBlocks(board);
-    const afterBlocks = countBoardBlocks(applied.boardAfter);
-    const complexityBreakdown =
-      computePlacementComplexityPenaltyBreakdown(placement);
-    const placementStats = computePlacementPenaltyStats(placement);
-    const rewardResult = computePieceRewardHarddropV1({
-      modeId,
-      linesDelta: applied.linesCleared,
-      scoreDelta: 0,
-      timeDeltaMs: 0,
-      heightDelta: afterHeight - beforeHeight,
-      holesDelta: afterHoles - beforeHoles,
-      bumpinessDelta: afterBumpiness - beforeBumpiness,
-      boardScoreDelta: 0,
-      boardQualityDelta: beforeMetrics.quality - afterMetrics.quality,
-      boardHoleExtendedQualityDelta:
-        beforeMetrics.holeExtendedQuality - afterMetrics.holeExtendedQuality,
-      topOut: applied.hasAboveTop,
-      baseComplexityPenalty: complexityBreakdown.basePenalty,
-      holdComplexityPenalty: complexityBreakdown.holdPenalty,
-      kickComplexityPenalty: complexityBreakdown.kickPenalty,
-      softDropComplexityPenalty: complexityBreakdown.softDropPenalty,
-      afterMaxHeight: afterHeight,
-      afterBoardQuality: afterMetrics.quality,
-      afterBoardHoleExtendedQuality: afterMetrics.holeExtendedQuality,
-      isFullClear: afterBlocks === 0 && beforeBlocks > 0,
-      srsKickCount: placementStats.srsKickCount,
-      softDropUsed: placementStats.softDropUsed,
+    const evaluation = evaluatePlacementImmediateReward({
+      context,
+      placement,
+      rewardFunctionId,
     });
-    const reward = Number.isFinite(rewardResult.reward)
-      ? rewardResult.reward
+    if (evaluation == null) {
+      return {
+        score: -1e9,
+        immediateScore: -1e9,
+        continuationBestScore: 0,
+        evaluation: null,
+      };
+    }
+    const immediateScore = Number.isFinite(evaluation.rewardResult.reward)
+      ? evaluation.rewardResult.reward
       : -1e9;
-    return reward;
+    let continuationBestScore = 0;
+    if (
+      harddropLookaheadDepth > 0 &&
+      !evaluation.postLock.done &&
+      evaluation.postLock.state != null
+    ) {
+      const continuationContext = buildPlacementScoringContext(
+        evaluation.postLock.state,
+        context.modeId,
+      );
+      const continuationPlacements = enumerateTrajectoryExecutorPlacements({
+        board: evaluation.postLock.state.board,
+        active: evaluation.postLock.state.active,
+        hold: evaluation.postLock.state.hold,
+        canHold: evaluation.postLock.state.canHold,
+        nextPieceOnFirstHold: evaluation.postLock.state.next[0] ?? null,
+        maxNodesPerBranch: 20_000,
+        allowSoftDrop: true,
+        shuffleSearchActions: false,
+      });
+      let bestContinuationScore = Number.NEGATIVE_INFINITY;
+      for (const continuationPlacement of continuationPlacements) {
+        const continuationScore = scorePlacementCandidateDetailed({
+          context: continuationContext,
+          placement: continuationPlacement,
+          rewardFunctionId,
+          harddropLookaheadDepth: harddropLookaheadDepth - 1,
+        }).score;
+        if (continuationScore > bestContinuationScore) {
+          bestContinuationScore = continuationScore;
+        }
+      }
+      if (Number.isFinite(bestContinuationScore)) {
+        continuationBestScore = bestContinuationScore;
+      }
+    }
+    const score =
+      immediateScore +
+      continuationBestScore * HARDDROP_PLANNING_LOOKAHEAD_WEIGHT;
+    return {
+      score: Number.isFinite(score) ? score : -1e9,
+      immediateScore,
+      continuationBestScore,
+      evaluation,
+    };
+  }
+
+  const applied = applyPlacementToBoard(context.state.board, placement);
+  if (applied.invalid) {
+    return {
+      score: -1e9,
+      immediateScore: -1e9,
+      continuationBestScore: 0,
+      evaluation: null,
+    };
   }
   const afterMetrics = evaluateBoardQuality(applied.boardAfter);
-  const improvement = beforeMetrics.quality - afterMetrics.quality;
+  const improvement = context.beforeMetrics.quality - afterMetrics.quality;
   const complexityPenalty = computePlacementComplexityPenalty(placement);
-
   let score =
     improvement +
     applied.linesCleared * PLACEMENT_LINE_CLEAR_BONUS -
     complexityPenalty;
   if (applied.hasAboveTop) score -= PLACEMENT_TOP_OUT_PENALTY;
   if (!Number.isFinite(score)) score = -1e9;
-  return score;
+  return {
+    score,
+    immediateScore: score,
+    continuationBestScore: 0,
+    evaluation: null,
+  };
 };
+
+const scoreHoldStepActionDetailed = (options: {
+  context: PlacementScoringContext;
+  rewardFunctionId: RewardFunctionId;
+  harddropLookaheadDepth?: number;
+}): HoldStepPlanningScore => {
+  const {
+    context,
+    rewardFunctionId,
+    harddropLookaheadDepth = HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
+  } = options;
+  const immediateReward = computeHoldStepRewardById(
+    rewardFunctionId,
+    context.modeId,
+    Math.max(0, Math.trunc(FIXED_STEP_MS)),
+  );
+  const postHold = buildPostHoldStepState(context.state);
+  let continuationBestScore = 0;
+  if (!postHold.done && postHold.state != null) {
+    const continuationContext = buildPlacementScoringContext(
+      postHold.state,
+      context.modeId,
+    );
+    const continuationPlacements = enumerateTrajectoryExecutorPlacements({
+      board: postHold.state.board,
+      active: postHold.state.active,
+      hold: postHold.state.hold,
+      canHold: postHold.state.canHold,
+      nextPieceOnFirstHold: postHold.state.next[0] ?? null,
+      maxNodesPerBranch: 20_000,
+      allowSoftDrop: true,
+      shuffleSearchActions: false,
+    });
+    let bestContinuationScore = Number.NEGATIVE_INFINITY;
+    for (const continuationPlacement of continuationPlacements) {
+      const continuationScore = scorePlacementCandidateDetailed({
+        context: continuationContext,
+        placement: continuationPlacement,
+        rewardFunctionId,
+        harddropLookaheadDepth,
+      }).score;
+      if (continuationScore > bestContinuationScore) {
+        bestContinuationScore = continuationScore;
+      }
+    }
+    if (Number.isFinite(bestContinuationScore)) {
+      continuationBestScore = bestContinuationScore;
+    }
+  }
+  const score = immediateReward.reward + continuationBestScore;
+  return {
+    score: Number.isFinite(score) ? score : -1e9,
+    immediateScore: Number.isFinite(immediateReward.reward)
+      ? immediateReward.reward
+      : -1e9,
+    continuationBestScore,
+    rewardResult: immediateReward,
+    postHold,
+  };
+};
+
+const scorePlacementCandidate = (options: {
+  context: PlacementScoringContext;
+  placement: TrajectoryExecutorReachablePlacement;
+  rewardFunctionId: RewardFunctionId;
+  harddropLookaheadDepth?: number;
+}): number => scorePlacementCandidateDetailed(options).score;
 
 const padVisibleQueue = (
   pieces: Array<PieceKind | null>,
@@ -1456,8 +1767,7 @@ const buildPlacementChoices = (
     Number.NEGATIVE_INFINITY,
   );
   const actionScores = new Array<number>(actionDim).fill(0);
-  const beforeMetrics = evaluateBoardQuality(state.board);
-  let bestHoldActionScore = Number.NEGATIVE_INFINITY;
+  const scoringContext = buildPlacementScoringContext(state, modeId);
   for (const placement of placements) {
     const actionIndex =
       actionSpaceKind === 'placement_hold_step_v2'
@@ -1466,26 +1776,12 @@ const buildPlacementChoices = (
           : placementActionIndexFromNoHoldPlacement(placement)
         : placementActionIndexFromPlacement(placement);
     if (actionIndex == null || actionIndex < 0 || actionIndex >= actionDim) {
-      if (actionSpaceKind === 'placement_hold_step_v2' && placement.holdUsed) {
-        const score = scorePlacementCandidate({
-          beforeMetrics,
-          placement,
-          board: state.board,
-          rewardFunctionId,
-          modeId,
-        });
-        if (score > bestHoldActionScore) {
-          bestHoldActionScore = score;
-        }
-      }
       continue;
     }
     const score = scorePlacementCandidate({
-      beforeMetrics,
+      context: scoringContext,
       placement,
-      board: state.board,
       rewardFunctionId,
-      modeId,
     });
     if (
       actionMask[actionIndex] > 0 &&
@@ -1508,16 +1804,21 @@ const buildPlacementChoices = (
   if (
     actionSpaceKind === 'placement_hold_step_v2' &&
     state.canHold &&
-    actionDim > PLACEMENT_ACTION_HOLD_STEP_INDEX &&
-    Number.isFinite(bestHoldActionScore)
+    actionDim > PLACEMENT_ACTION_HOLD_STEP_INDEX
   ) {
-    actionMask[PLACEMENT_ACTION_HOLD_STEP_INDEX] = 1;
-    scoresBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = bestHoldActionScore;
-    actionScores[PLACEMENT_ACTION_HOLD_STEP_INDEX] = bestHoldActionScore;
-    placementsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = null;
-    commandsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = [
-      trajectoryExecutorCommandToInputFrame('hold'),
-    ];
+    const holdActionScore = scoreHoldStepActionDetailed({
+      context: scoringContext,
+      rewardFunctionId,
+    }).score;
+    if (Number.isFinite(holdActionScore)) {
+      actionMask[PLACEMENT_ACTION_HOLD_STEP_INDEX] = 1;
+      scoresBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = holdActionScore;
+      actionScores[PLACEMENT_ACTION_HOLD_STEP_INDEX] = holdActionScore;
+      placementsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = null;
+      commandsBySlot[PLACEMENT_ACTION_HOLD_STEP_INDEX] = [
+        trajectoryExecutorCommandToInputFrame('hold'),
+      ];
+    }
   }
   if (actionMask.every((value) => value <= 0)) {
     const fallbackLockY =
@@ -1557,7 +1858,8 @@ const buildPlacementChoices = (
   for (let i = 0; i < actionMask.length; i += 1) {
     if (actionMask[i] > 0) legalIndices.push(i);
   }
-  const dangerBypass = beforeMetrics.maxHeight >= curriculum.dangerHeight;
+  const dangerBypass =
+    scoringContext.beforeMetrics.maxHeight >= curriculum.dangerHeight;
 
   if (
     curriculum.topK > 0 &&
@@ -1991,6 +2293,127 @@ class BotEnv {
       });
     }
     return candidates;
+  }
+
+  probeActions(): {
+    obs: number[];
+    actionMask: number[];
+    actionBias: number[];
+    actionScores: number[];
+    probes: PlacementActionProbe[];
+  } {
+    const choices =
+      this.cachedChoices ??
+      buildPlacementChoices(
+        this.game.state,
+        this.actionDim,
+        this.actionSpaceKind,
+        this.actionCurriculum,
+        this.planningRewardFunction,
+        this.modeId,
+        () => nextFloat(this.planningRng),
+      );
+    this.cachedChoices = choices;
+    const obs = encodeObservation(
+      this.observationSpace,
+      this.model,
+      this.game.state,
+      this.includePhaseContext,
+    );
+    const context = buildPlacementScoringContext(this.game.state, this.modeId);
+    const probes: PlacementActionProbe[] = [];
+    for (
+      let actionIndex = 0;
+      actionIndex < choices.actionMask.length;
+      actionIndex += 1
+    ) {
+      if (choices.actionMask[actionIndex] <= 0) continue;
+      const isHoldStepAction =
+        this.actionSpaceKind === 'placement_hold_step_v2' &&
+        actionIndex === PLACEMENT_ACTION_HOLD_STEP_INDEX;
+      if (isHoldStepAction) {
+        const holdScore = scoreHoldStepActionDetailed({
+          context,
+          rewardFunctionId: this.planningRewardFunction,
+        });
+        probes.push({
+          action_index: actionIndex,
+          planning_score: Number.isFinite(choices.actionScores[actionIndex])
+            ? choices.actionScores[actionIndex]
+            : holdScore.score,
+          immediate_score: holdScore.immediateScore,
+          continuation_best_score: holdScore.continuationBestScore,
+          hold_step: true,
+          hold_used: true,
+          done: holdScore.postHold.done,
+          top_out: holdScore.postHold.topOut,
+          lines_cleared: 0,
+          height_delta: 0,
+          holes_delta: 0,
+          hold_term: holdScore.rewardResult.breakdown.holdTerm,
+          kick_term: holdScore.rewardResult.breakdown.kickTerm,
+          soft_drop_term: holdScore.rewardResult.breakdown.softDropTerm,
+          hole_term: holdScore.rewardResult.breakdown.holeDeltaTerm,
+          hole_extended_term: holdScore.rewardResult.breakdown.holeExtendedTerm,
+          board_quality_delta_term:
+            holdScore.rewardResult.breakdown.boardQualityDeltaTerm,
+          board_quality_absolute_term:
+            holdScore.rewardResult.breakdown.boardQualityAbsoluteTerm,
+          commands: ['hold'],
+        });
+        continue;
+      }
+      const placement = choices.placementsBySlot[actionIndex];
+      if (!placement) continue;
+      const details = scorePlacementCandidateDetailed({
+        context,
+        placement,
+        rewardFunctionId: this.planningRewardFunction,
+      });
+      const evaluation = details.evaluation;
+      const breakdown =
+        evaluation?.rewardResult.breakdown ?? zeroRewardBreakdown();
+      probes.push({
+        action_index: actionIndex,
+        planning_score: Number.isFinite(choices.actionScores[actionIndex])
+          ? choices.actionScores[actionIndex]
+          : details.score,
+        immediate_score: details.immediateScore,
+        continuation_best_score: details.continuationBestScore,
+        hold_step: false,
+        hold_used: Boolean(placement.holdUsed),
+        done: evaluation?.postLock.done ?? false,
+        top_out: evaluation?.postLock.topOut ?? false,
+        lines_cleared: evaluation?.linesCleared ?? 0,
+        height_delta: evaluation?.heightDelta ?? 0,
+        holes_delta: evaluation?.holesDelta ?? 0,
+        hold_term: breakdown.holdTerm,
+        kick_term: breakdown.kickTerm,
+        soft_drop_term: breakdown.softDropTerm,
+        hole_term: breakdown.holeDeltaTerm,
+        hole_extended_term: breakdown.holeExtendedTerm,
+        board_quality_delta_term: breakdown.boardQualityDeltaTerm,
+        board_quality_absolute_term: breakdown.boardQualityAbsoluteTerm,
+        commands: [...placement.commands],
+        lock_piece: String(placement.lockPiece),
+        lock_rotation: Math.trunc(placement.lockRotation),
+        lock_x: Math.trunc(placement.lockX),
+        lock_y: Math.trunc(placement.lockY),
+      });
+    }
+    probes.sort((a, b) => {
+      if (b.planning_score !== a.planning_score) {
+        return b.planning_score - a.planning_score;
+      }
+      return a.action_index - b.action_index;
+    });
+    return {
+      obs,
+      actionMask: choices.actionMask,
+      actionBias: choices.actionBiases,
+      actionScores: choices.actionScores,
+      probes,
+    };
   }
 
   step(
@@ -2954,6 +3377,30 @@ export class BotEnvPool {
     }
     return {
       candidates,
+    };
+  }
+
+  probeActionsMany(envIds: number[]): ProbeActionsBatchResult {
+    const obs: number[][] = [];
+    const actionMasks: number[][] = [];
+    const actionBiases: number[][] = [];
+    const actionScores: number[][] = [];
+    const probes: PlacementActionProbe[][] = [];
+    for (let i = 0; i < envIds.length; i += 1) {
+      const env = this.requireEnv(envIds[i]);
+      const result = env.probeActions();
+      obs.push(result.obs);
+      actionMasks.push(result.actionMask);
+      actionBiases.push(result.actionBias);
+      actionScores.push(result.actionScores);
+      probes.push(result.probes);
+    }
+    return {
+      obs,
+      action_masks: actionMasks,
+      action_biases: actionBiases,
+      action_scores: actionScores,
+      probes,
     };
   }
 
