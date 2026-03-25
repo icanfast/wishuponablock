@@ -6065,7 +6065,7 @@ def train(cfg: PPOConfig) -> None:
         )
         env.set_piece_sources(env_ids=env_ids, piece_source_profiles=env_piece_sources)
         validation_sources = unique_generator_sources(cfg)
-        initial_update = min(num_updates, max(1, start_update + 1))
+        initial_update = max(1, start_update + 1)
         initial_curriculum_topk = curriculum_topk_for_update(cfg, initial_update)
         initial_curriculum_bias = curriculum_bias_for_update(cfg, initial_update)
         initial_distill_coef = distill_coef_for_update(cfg, initial_update)
