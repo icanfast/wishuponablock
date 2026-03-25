@@ -596,6 +596,7 @@ const HARDDROP_HOLE_EXTENDED_SEGMENT_WEIGHT = 1.0;
 const HARDDROP_HOLE_EXTENDED_COVER_WEIGHT = 2.0;
 const HARDDROP_PLANNING_LOOKAHEAD_WEIGHT = 0.9;
 const HARDDROP_PLANNING_LOOKAHEAD_DEPTH = 1;
+const HARDDROP_PLANNING_LOOKAHEAD_TOP_ACTIONS = 6;
 
 type PlacementPenaltyStats = {
   rotateCwCcwCount: number;
@@ -1776,6 +1777,10 @@ const buildPlacementChoices = (
     curriculum.computeScores ||
     curriculum.topK > 0 ||
     curriculum.biasStrength > 0;
+  const useHarddropBeamLookahead =
+    scoreRequired &&
+    rewardFunctionId === 'harddrop_v1' &&
+    HARDDROP_PLANNING_LOOKAHEAD_DEPTH > 0;
   for (const placement of placements) {
     const actionIndex =
       actionSpaceKind === 'placement_hold_step_v2'
@@ -1791,6 +1796,9 @@ const buildPlacementChoices = (
           context: scoringContext,
           placement,
           rewardFunctionId,
+          harddropLookaheadDepth: useHarddropBeamLookahead
+            ? 0
+            : HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
         })
       : 0;
     if (
@@ -1820,6 +1828,9 @@ const buildPlacementChoices = (
       ? scoreHoldStepActionDetailed({
           context: scoringContext,
           rewardFunctionId,
+          harddropLookaheadDepth: useHarddropBeamLookahead
+            ? 0
+            : HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
         }).score
       : 0;
     if (!scoreRequired || Number.isFinite(holdActionScore)) {
@@ -1869,6 +1880,49 @@ const buildPlacementChoices = (
   const legalIndices: number[] = [];
   for (let i = 0; i < actionMask.length; i += 1) {
     if (actionMask[i] > 0) legalIndices.push(i);
+  }
+  if (useHarddropBeamLookahead && legalIndices.length > 0) {
+    const rankedForLookahead = [...legalIndices].sort((a, b) => {
+      const sa = Number.isFinite(scoresBySlot[a]) ? scoresBySlot[a] : -1e12;
+      const sb = Number.isFinite(scoresBySlot[b]) ? scoresBySlot[b] : -1e12;
+      return sb - sa;
+    });
+    const lookaheadCount = Math.max(
+      1,
+      Math.min(
+        HARDDROP_PLANNING_LOOKAHEAD_TOP_ACTIONS,
+        rankedForLookahead.length,
+      ),
+    );
+    for (const actionIndex of rankedForLookahead.slice(0, lookaheadCount)) {
+      if (
+        actionSpaceKind === 'placement_hold_step_v2' &&
+        actionIndex === PLACEMENT_ACTION_HOLD_STEP_INDEX
+      ) {
+        const holdDetailedScore = scoreHoldStepActionDetailed({
+          context: scoringContext,
+          rewardFunctionId,
+          harddropLookaheadDepth: HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
+        }).score;
+        scoresBySlot[actionIndex] = holdDetailedScore;
+        actionScores[actionIndex] = Number.isFinite(holdDetailedScore)
+          ? holdDetailedScore
+          : 0;
+        continue;
+      }
+      const placement = placementsBySlot[actionIndex];
+      if (!placement) continue;
+      const detailedScore = scorePlacementCandidateDetailed({
+        context: scoringContext,
+        placement,
+        rewardFunctionId,
+        harddropLookaheadDepth: HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
+      }).score;
+      scoresBySlot[actionIndex] = detailedScore;
+      actionScores[actionIndex] = Number.isFinite(detailedScore)
+        ? detailedScore
+        : 0;
+    }
   }
   const dangerBypass =
     scoringContext.beforeMetrics.maxHeight >= curriculum.dangerHeight;
