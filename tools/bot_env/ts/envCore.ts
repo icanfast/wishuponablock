@@ -594,8 +594,14 @@ const REWARD_HARDDROP_V1_HOLE_EXTENDED_DELTA_WEIGHT = 0.2;
 const REWARD_HARDDROP_V1_HOLE_EXTENDED_ABSOLUTE_WEIGHT = 0.005;
 const HARDDROP_HOLE_EXTENDED_SEGMENT_WEIGHT = 1.0;
 const HARDDROP_HOLE_EXTENDED_COVER_WEIGHT = 2.0;
-const HARDDROP_PLANNING_LOOKAHEAD_WEIGHT = 0.9;
-const HARDDROP_PLANNING_LOOKAHEAD_DEPTH = 1;
+const HARDDROP_LOCAL_TEACHER_NEW_HOLE_PENALTY = 100;
+const HARDDROP_LOCAL_TEACHER_HOLE_REMOVE_BONUS = 20;
+const HARDDROP_LOCAL_TEACHER_HOLE_EXTENDED_DELTA_WEIGHT = 1.0;
+const HARDDROP_LOCAL_TEACHER_HOLE_EXTENDED_ABSOLUTE_WEIGHT = 0.1;
+const HARDDROP_LOCAL_TEACHER_SOFT_DROP_PENALTY = 8;
+const HARDDROP_LOCAL_TEACHER_KICK_PENALTY = 4;
+const HARDDROP_LOCAL_TEACHER_HOLD_USED_PENALTY = 1;
+const HARDDROP_PLANNING_LOOKAHEAD_DEPTH = 0;
 const HARDDROP_PLANNING_LOOKAHEAD_TOP_ACTIONS = 6;
 
 type PlacementPenaltyStats = {
@@ -1432,18 +1438,55 @@ const buildPostHoldStepState = (
   };
 };
 
+const computeHarddropLocalTeacherScore = (
+  evaluation: PlacementImmediateEvaluation,
+): number => {
+  const { rewardInputs, rewardResult, linesCleared, postLock, placementStats } =
+    evaluation;
+  const holeCreatePenalty =
+    Math.max(0, rewardInputs.holesDelta) *
+    HARDDROP_LOCAL_TEACHER_NEW_HOLE_PENALTY;
+  const holeRemoveBonus =
+    Math.max(0, -rewardInputs.holesDelta) *
+    HARDDROP_LOCAL_TEACHER_HOLE_REMOVE_BONUS;
+  const holeExtendedDeltaBonus =
+    rewardInputs.boardHoleExtendedQualityDelta *
+    HARDDROP_LOCAL_TEACHER_HOLE_EXTENDED_DELTA_WEIGHT;
+  const holeExtendedAbsolutePenalty =
+    Math.max(0, rewardInputs.afterBoardHoleExtendedQuality) *
+    HARDDROP_LOCAL_TEACHER_HOLE_EXTENDED_ABSOLUTE_WEIGHT;
+  const softDropPenalty = rewardInputs.softDropUsed
+    ? HARDDROP_LOCAL_TEACHER_SOFT_DROP_PENALTY
+    : 0;
+  const kickPenalty =
+    placementStats.srsKickCount * HARDDROP_LOCAL_TEACHER_KICK_PENALTY;
+  const holdUsedPenalty =
+    rewardInputs.holdComplexityPenalty > 0
+      ? HARDDROP_LOCAL_TEACHER_HOLD_USED_PENALTY
+      : 0;
+  const topOutPenalty = postLock.topOut ? TOP_OUT_PENALTY * 10 : 0;
+  const lineBonus = Math.max(0, linesCleared) * 0.25;
+  const score =
+    rewardResult.reward +
+    lineBonus +
+    holeRemoveBonus +
+    holeExtendedDeltaBonus -
+    holeCreatePenalty -
+    holeExtendedAbsolutePenalty -
+    softDropPenalty -
+    kickPenalty -
+    holdUsedPenalty -
+    topOutPenalty;
+  return Number.isFinite(score) ? score : -1e9;
+};
+
 const scorePlacementCandidateDetailed = (options: {
   context: PlacementScoringContext;
   placement: TrajectoryExecutorReachablePlacement;
   rewardFunctionId: RewardFunctionId;
   harddropLookaheadDepth?: number;
 }): PlacementPlanningScore => {
-  const {
-    context,
-    placement,
-    rewardFunctionId,
-    harddropLookaheadDepth = HARDDROP_PLANNING_LOOKAHEAD_DEPTH,
-  } = options;
+  const { context, placement, rewardFunctionId } = options;
   if (rewardFunctionId === 'harddrop_v1') {
     const evaluation = evaluatePlacementImmediateReward({
       context,
@@ -1461,45 +1504,8 @@ const scorePlacementCandidateDetailed = (options: {
     const immediateScore = Number.isFinite(evaluation.rewardResult.reward)
       ? evaluation.rewardResult.reward
       : -1e9;
-    let continuationBestScore = 0;
-    if (
-      harddropLookaheadDepth > 0 &&
-      !evaluation.postLock.done &&
-      evaluation.postLock.state != null
-    ) {
-      const continuationContext = buildPlacementScoringContext(
-        evaluation.postLock.state,
-        context.modeId,
-      );
-      const continuationPlacements = enumerateTrajectoryExecutorPlacements({
-        board: evaluation.postLock.state.board,
-        active: evaluation.postLock.state.active,
-        hold: evaluation.postLock.state.hold,
-        canHold: evaluation.postLock.state.canHold,
-        nextPieceOnFirstHold: evaluation.postLock.state.next[0] ?? null,
-        maxNodesPerBranch: 20_000,
-        allowSoftDrop: true,
-        shuffleSearchActions: false,
-      });
-      let bestContinuationScore = Number.NEGATIVE_INFINITY;
-      for (const continuationPlacement of continuationPlacements) {
-        const continuationScore = scorePlacementCandidateDetailed({
-          context: continuationContext,
-          placement: continuationPlacement,
-          rewardFunctionId,
-          harddropLookaheadDepth: harddropLookaheadDepth - 1,
-        }).score;
-        if (continuationScore > bestContinuationScore) {
-          bestContinuationScore = continuationScore;
-        }
-      }
-      if (Number.isFinite(bestContinuationScore)) {
-        continuationBestScore = bestContinuationScore;
-      }
-    }
-    const score =
-      immediateScore +
-      continuationBestScore * HARDDROP_PLANNING_LOOKAHEAD_WEIGHT;
+    const continuationBestScore = 0;
+    const score = computeHarddropLocalTeacherScore(evaluation);
     return {
       score: Number.isFinite(score) ? score : -1e9,
       immediateScore,
@@ -1551,7 +1557,7 @@ const scoreHoldStepActionDetailed = (options: {
   );
   const postHold = buildPostHoldStepState(context.state);
   let continuationBestScore = 0;
-  if (!postHold.done && postHold.state != null) {
+  if (harddropLookaheadDepth > 0 && !postHold.done && postHold.state != null) {
     const continuationContext = buildPlacementScoringContext(
       postHold.state,
       context.modeId,
@@ -1582,7 +1588,10 @@ const scoreHoldStepActionDetailed = (options: {
       continuationBestScore = bestContinuationScore;
     }
   }
-  const score = immediateReward.reward + continuationBestScore;
+  const score =
+    rewardFunctionId === 'harddrop_v1'
+      ? immediateReward.reward
+      : immediateReward.reward + continuationBestScore;
   return {
     score: Number.isFinite(score) ? score : -1e9,
     immediateScore: Number.isFinite(immediateReward.reward)

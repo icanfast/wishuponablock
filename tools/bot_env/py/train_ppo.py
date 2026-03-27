@@ -84,6 +84,7 @@ class PPOConfig:
     clip_vloss: bool
     ent_coef: float
     vf_coef: float
+    normalize_value_targets: bool
     max_grad_norm: float
     update_epochs: int
     minibatch_size: int
@@ -938,6 +939,15 @@ def parse_args() -> PPOConfig:
     )
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument(
+        "--normalize-value-targets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Normalize PPO value targets per rollout batch for critic loss only. "
+            "Policy-side rewards/advantages stay in raw units."
+        ),
+    )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--update-epochs", type=int, default=8)
     parser.add_argument("--minibatch-size", type=int, default=1024)
@@ -1490,6 +1500,7 @@ def parse_args() -> PPOConfig:
         clip_vloss=bool(args.clip_vloss),
         ent_coef=float(args.ent_coef),
         vf_coef=float(args.vf_coef),
+        normalize_value_targets=bool(args.normalize_value_targets),
         max_grad_norm=float(args.max_grad_norm),
         update_epochs=max(1, int(args.update_epochs)),
         minibatch_size=max(1, int(args.minibatch_size)),
@@ -2981,6 +2992,7 @@ def summarize_adapter_state(
     conv_trainable = 0
     queue_total = 0
     queue_trainable = 0
+    queue_optimizer_params = 0
     board_adapter = (
         obs_adapter.board_adapter
         if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter)
@@ -2994,11 +3006,16 @@ def summarize_adapter_state(
                 if param.requires_grad:
                     conv_trainable += count
     if isinstance(obs_adapter, RawV1BoardQueueObservationAdapter):
+        queue_param_ids = {id(p) for p in obs_adapter.queue_fc1.parameters()}
         for param in obs_adapter.queue_fc1.parameters():
             count = int(param.numel())
             queue_total += count
             if param.requires_grad:
                 queue_trainable += count
+        for group in optimizer.param_groups:
+            for param in group.get("params", []):
+                if id(param) in queue_param_ids:
+                    queue_optimizer_params += int(param.numel())
 
     adapter_frozen = adapter_trainable <= 0
     in_optimizer = optimizer_adapter_params > 0
@@ -3064,6 +3081,7 @@ def summarize_adapter_state(
         "conv_status": conv_status,
         "queue_total": queue_total,
         "queue_trainable": queue_trainable,
+        "queue_optimizer_params": queue_optimizer_params,
         "queue_status": queue_status,
         "queue_lr": float(queue_lr),
         "checks_ok": len(checks) == 0,
@@ -3088,14 +3106,17 @@ def format_adapter_state_log(summary: dict[str, Any]) -> str:
     return (
         "obs_adapter("
         f"status={summary.get('status')},"
-        f"queue={summary.get('queue_status')},"
+        f"queue={summary.get('queue_status')}("
+        f"{summary.get('queue_trainable')}/{summary.get('queue_total')},"
+        f"opt={summary.get('queue_optimizer_params')},"
+        f"lr={float(summary.get('queue_lr', 0.0)):.6g}"
+        "),"
         f"trainable={summary.get('adapter_trainable')}/{summary.get('adapter_total')},"
         f"in_opt={'y' if summary.get('adapter_in_optimizer') else 'n'},"
         f"opt_params={summary.get('optimizer_adapter_params')},"
         f"groups={groups_str},"
         f"lr_scale={float(summary.get('obs_adapter_lr_scale', 0.0)):.3f},"
         f"eff_lr={float(summary.get('effective_lr', 0.0)):.6g},"
-        f"queue_lr={float(summary.get('queue_lr', 0.0)):.6g},"
         f"checks={checks_str}"
         ")"
     )
@@ -6557,6 +6578,11 @@ def train(cfg: PPOConfig) -> None:
         startup_optimizer_groups = summarize_optimizer_groups(optimizer)
         print("[ppo] " + format_adapter_state_log(startup_adapter_state))
         print("[ppo] " + format_optimizer_groups_log(startup_optimizer_groups))
+        print(
+            "[ppo] "
+            f"value_targets: normalize={'y' if cfg.normalize_value_targets else 'n'} "
+            "(critic loss only)"
+        )
 
         print(
             "[ppo] starting training "
@@ -7277,6 +7303,22 @@ def train(cfg: PPOConfig) -> None:
                 b_advantages = advantages.reshape(-1)
                 b_returns = returns.reshape(-1)
                 b_values = value_buf.reshape(-1)
+                value_target_mean = 0.0
+                value_target_std = 1.0
+                b_value_targets = b_returns
+                if cfg.normalize_value_targets:
+                    value_target_mean = float(b_returns.mean().detach().cpu().item())
+                    value_target_std = float(
+                        b_returns.std(unbiased=False).detach().cpu().item()
+                    )
+                    if (
+                        not math.isfinite(value_target_std)
+                        or value_target_std < 1e-6
+                    ):
+                        value_target_std = 1.0
+                    b_value_targets = (
+                        b_returns - value_target_mean
+                    ) / value_target_std
 
                 adv_mean = b_advantages.mean()
                 adv_std = b_advantages.std(unbiased=False) + 1e-8
@@ -7288,6 +7330,7 @@ def train(cfg: PPOConfig) -> None:
                 approx_kl_value = 0.0
                 policy_loss_value = 0.0
                 value_loss_value = 0.0
+                value_loss_raw_value = 0.0
                 entropy_value = 0.0
                 distill_loss_value = 0.0
                 hold_swap_distill_loss_value = 0.0
@@ -7299,6 +7342,7 @@ def train(cfg: PPOConfig) -> None:
                 hold_swap_distill_term_value = 0.0
                 policy_loss_sum = 0.0
                 value_loss_sum = 0.0
+                value_loss_raw_sum = 0.0
                 entropy_sum = 0.0
                 distill_loss_sum = 0.0
                 hold_swap_distill_loss_sum = 0.0
@@ -7375,21 +7419,62 @@ def train(cfg: PPOConfig) -> None:
                         policy_loss = torch.max(pg_loss_1, pg_loss_2).mean()
 
                         value_pred = new_values
+                        mb_returns_raw = b_returns[mb_inds]
+                        mb_value_targets = b_value_targets[mb_inds]
                         if cfg.clip_vloss:
                             value_pred_clipped = b_values[mb_inds] + (
                                 value_pred - b_values[mb_inds]
                             ).clamp(-cfg.value_clip_coef, cfg.value_clip_coef)
-                            value_losses = (value_pred - b_returns[mb_inds]) ** 2
+                            if cfg.normalize_value_targets:
+                                value_pred_for_loss = (
+                                    value_pred - value_target_mean
+                                ) / value_target_std
+                                value_pred_clipped_for_loss = (
+                                    value_pred_clipped - value_target_mean
+                                ) / value_target_std
+                            else:
+                                value_pred_for_loss = value_pred
+                                value_pred_clipped_for_loss = value_pred_clipped
+                            value_losses = (
+                                value_pred_for_loss - mb_value_targets
+                            ) ** 2
                             value_losses_clipped = (
-                                value_pred_clipped - b_returns[mb_inds]
+                                value_pred_clipped_for_loss - mb_value_targets
                             ) ** 2
                             value_loss = (
                                 0.5
                                 * torch.max(value_losses, value_losses_clipped).mean()
                             )
+                            raw_value_losses = (value_pred - mb_returns_raw) ** 2
+                            raw_value_losses_clipped = (
+                                value_pred_clipped - mb_returns_raw
+                            ) ** 2
+                            raw_value_loss = (
+                                0.5
+                                * torch.max(
+                                    raw_value_losses,
+                                    raw_value_losses_clipped,
+                                ).mean()
+                            )
                         else:
                             value_loss = (
-                                0.5 * ((value_pred - b_returns[mb_inds]) ** 2).mean()
+                                0.5
+                                * (
+                                    (
+                                        (
+                                            (value_pred - value_target_mean)
+                                            / value_target_std
+                                        )
+                                        if cfg.normalize_value_targets
+                                        else value_pred
+                                    )
+                                    - mb_value_targets
+                                )
+                                .pow(2)
+                                .mean()
+                            )
+                            raw_value_loss = (
+                                0.5 * ((value_pred - mb_returns_raw) ** 2).mean()
                             )
 
                         # Distillation: teacher from stop-grad steered policy
@@ -7484,6 +7569,9 @@ def train(cfg: PPOConfig) -> None:
 
                         policy_loss_value = float(policy_loss.detach().cpu().item())
                         value_loss_value = float(value_loss.detach().cpu().item())
+                        value_loss_raw_value = float(
+                            raw_value_loss.detach().cpu().item()
+                        )
                         entropy_value = float(entropy.detach().cpu().item())
                         distill_loss_value = float(
                             distill_loss.detach().cpu().item()
@@ -7501,6 +7589,7 @@ def train(cfg: PPOConfig) -> None:
                         total_loss_value = float(loss.detach().cpu().item())
                         policy_loss_sum += policy_loss_value
                         value_loss_sum += value_loss_value
+                        value_loss_raw_sum += value_loss_raw_value
                         entropy_sum += entropy_value
                         distill_loss_sum += distill_loss_value
                         hold_swap_distill_loss_sum += hold_swap_distill_loss_value
@@ -7566,6 +7655,7 @@ def train(cfg: PPOConfig) -> None:
                 updates_done_denom = float(max(1, updates_done))
                 policy_loss_value = policy_loss_sum / updates_done_denom
                 value_loss_value = value_loss_sum / updates_done_denom
+                value_loss_raw_value = value_loss_raw_sum / updates_done_denom
                 entropy_value = entropy_sum / updates_done_denom
                 distill_loss_value = distill_loss_sum / updates_done_denom
                 hold_swap_distill_loss_value = (
@@ -7642,6 +7732,7 @@ def train(cfg: PPOConfig) -> None:
                     "reward_blend_fixed_step": fixed_blend_step,
                     "policy_loss": policy_loss_value,
                     "value_loss": value_loss_value,
+                    "value_loss_raw": value_loss_raw_value,
                     "entropy": entropy_value,
                     "distill_loss": distill_loss_value,
                     "hold_swap_distill_loss": hold_swap_distill_loss_value,
@@ -7663,6 +7754,9 @@ def train(cfg: PPOConfig) -> None:
                     "value_clip_coef_used": cfg.value_clip_coef,
                     "policy_lr_used": policy_lr_now,
                     "value_lr_used": value_lr_now,
+                    "value_target_normalized": bool(cfg.normalize_value_targets),
+                    "value_target_mean": value_target_mean,
+                    "value_target_std": value_target_std,
                     "adapter_status": adapter_state_now.get("status"),
                     "adapter_conv_status": adapter_state_now.get("conv_status"),
                     "adapter_trainable_params": int(
@@ -8004,6 +8098,7 @@ def train(cfg: PPOConfig) -> None:
                             "  losses: "
                             f"ploss={stats['policy_loss']:.4f} "
                             f"vloss={stats['value_loss']:.4f} "
+                            f"{'vraw=' + format(float(stats['value_loss_raw']), '.4f') + ' ' if stats.get('value_target_normalized') else ''}"
                             f"dloss={stats['distill_loss']:.4f} "
                             f"hsloss={stats['hold_swap_distill_loss']:.4f} "
                             f"total={stats['loss_total']:.4f} "
