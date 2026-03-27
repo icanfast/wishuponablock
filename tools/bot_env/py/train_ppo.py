@@ -127,6 +127,7 @@ class PPOConfig:
     out_dir: str
     run_name: str
     server_cmd: str | None
+    env_server_shards: int
     resume_checkpoint: str | None
     resume_mode: str
     init_artifact: str | None
@@ -1152,6 +1153,15 @@ def parse_args() -> PPOConfig:
         default=None,
         help='Override bridge server command (example: "npx --yes tsx tools/bot_env/ts/envServer.ts").',
     )
+    parser.add_argument(
+        "--env-server-shards",
+        type=int,
+        default=4,
+        help=(
+            "Number of env server subprocess shards. "
+            "1 preserves the old fully synchronous single-server behavior."
+        ),
+    )
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument(
         "--resume-mode",
@@ -1549,6 +1559,7 @@ def parse_args() -> PPOConfig:
         out_dir=args.out_dir,
         run_name=run_name,
         server_cmd=args.server_cmd,
+        env_server_shards=max(1, int(args.env_server_shards)),
         resume_checkpoint=args.resume_checkpoint,
         resume_mode=str(args.resume_mode),
         init_artifact=args.init_artifact,
@@ -4188,7 +4199,11 @@ def run_validation_eval(
             if len(cfg.reward_functions) >= 2
             else reward_fn_from
         )
-        with WubEnvBridge(server_cmd=server_cmd, cwd=repo_root) as val_env:
+        with WubEnvBridge(
+            server_cmd=server_cmd,
+            cwd=repo_root,
+            shard_count=cfg.env_server_shards,
+        ) as val_env:
             init_result = val_env.init(
                 mode_id=cfg.mode_id,
                 num_envs=cfg.num_envs,
@@ -6039,7 +6054,11 @@ def train(cfg: PPOConfig) -> None:
         else None
     )
 
-    with WubEnvBridge(server_cmd=server_cmd, cwd=repo_root) as env:
+    with WubEnvBridge(
+        server_cmd=server_cmd,
+        cwd=repo_root,
+        shard_count=cfg.env_server_shards,
+    ) as env:
         fixed_blend_step = fixed_reward_blend_step_for_cfg(cfg)
         blend_unit_effective = effective_reward_blend_unit(cfg)
         blend_start_step = (
@@ -6587,6 +6606,7 @@ def train(cfg: PPOConfig) -> None:
         print(
             "[ppo] starting training "
             f"(device={device.type}, env_obs_space={cfg.observation_space}, "
+            f"env_server_shards={cfg.env_server_shards}, "
             f"phase_context={'on' if cfg.phase_context_enabled else 'off'}, "
             f"placement_exec={cfg.placement_execution_mode}, "
             f"action_space={cfg.action_space_kind}, "
